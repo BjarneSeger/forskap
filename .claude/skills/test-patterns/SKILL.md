@@ -13,15 +13,17 @@ GitLab mock; reuse the helpers below instead of inventing new scaffolding.
 `FakeGitlab` implements `GitlabApi` for every suite (handlers, sync, queue,
 reconnect).
 - **Reads** are routed by `Listing::path()`: `serve(path, rows)` sets the JSON rows
-  every call to that path returns (empty by default); `fail_next(path, FakeErr)`
-  queues one-shot failures; `gate(path)` holds the next call until the returned
+  every call to that path returns (empty by default), `serve_next(path, rows)`
+  answers only the next call (e.g. a page walk that differs from its follow-up
+  delta); `fail_next(path, FakeErr)` queues one-shot failures; `gate(path)` holds the next call until the returned
   `Notify` fires (`fake.gated` signals that the call started). `serve_timelogs(..)`
   covers the GraphQL timelog read.
 - **Writes** succeed unless `fail_next_write(FakeErr)` queued a failure; `writes()`
   logs `(op, kind, project_id, iid)`.
 - Assert on traffic with `calls()`, `calls_to(path)`, `timelog_calls()`,
   `read_calls()` — e.g. "a read never touches GitLab" is `read_calls() == 0`.
-- `FakeErr::{Transient, Throttled(status), Rejected}` build the matching `Error`.
+- `FakeErr::{Transient, Throttled(status), Rejected, Unauthorized}` build the
+  matching `Error` (`Unauthorized` is a 401: a dead token).
 - JSON builders `issue_json`, `event_json`; `eventually(what, || cond)` polls up to 2 s.
 
 ## Handler tests (`src/handlers/tests.rs`)
