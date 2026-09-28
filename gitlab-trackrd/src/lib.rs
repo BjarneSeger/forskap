@@ -24,5 +24,7 @@ pub mod secrets;
 pub mod server;
 pub mod service;
 pub mod sync;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod usage;
 pub mod write;

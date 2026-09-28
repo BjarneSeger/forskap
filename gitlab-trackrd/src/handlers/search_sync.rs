@@ -145,7 +145,9 @@ impl Handlers {
         let mut degraded = false;
         let mut effective = match population {
             SearchPopulation::All => Population::All,
-            SearchPopulation::Member => Population::Member,
+            // Only the sync engine knows the tracked set; member is the
+            // closest this legacy sync can do.
+            SearchPopulation::Member | SearchPopulation::Tracked => Population::Member,
             SearchPopulation::Auto => {
                 if is_gitlab_com(&session.host) {
                     debug!("population=auto on gitlab.com; using member fetches");

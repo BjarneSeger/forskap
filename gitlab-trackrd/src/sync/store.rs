@@ -280,6 +280,10 @@ impl Commit<'_> {
         Ok(())
     }
 
+    pub fn remove_view(&mut self, name: &str) {
+        self.batch.remove(&self.store.views, name);
+    }
+
     pub fn set_job(&mut self, key: &str, state: &JobState) -> Result<()> {
         self.batch
             .insert(&self.store.jobs, key, serde_json::to_vec(state)?);
