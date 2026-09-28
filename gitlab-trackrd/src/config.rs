@@ -67,6 +67,10 @@ pub struct Config {
     /// Search-cache population and sync cadence.
     #[config(nested)]
     pub search: SearchConfig,
+
+    /// Open-statistics retention (what `Search` ranks by).
+    #[config(nested)]
+    pub usage: UsageConfig,
 }
 
 /// Varlink server settings (see `server.rs`).
@@ -185,6 +189,24 @@ pub struct HistoryConfig {
 
 impl HistoryConfig {
     /// Retention horizon: the oldest timelog kept on disk.
+    pub fn retention(&self) -> Duration {
+        Duration::from_hours(self.retention_hours)
+    }
+}
+
+/// Open-statistics retention, consumed by the `RecordOpen` handler via
+/// `usage.rs`.
+#[derive(Debug, ConfiqueConfig)]
+pub struct UsageConfig {
+    /// How long an issue/MR keeps its "frequently opened" ranking after its
+    /// last open, in hours; older entries are dropped on the next recorded
+    /// open. (90 days by default.)
+    #[config(default = 2160)]
+    pub retention_hours: u64,
+}
+
+impl UsageConfig {
+    /// Retention horizon: the oldest last-open kept.
     pub fn retention(&self) -> Duration {
         Duration::from_hours(self.retention_hours)
     }

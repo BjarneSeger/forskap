@@ -42,6 +42,12 @@ async fn main() -> Result<()> {
             kinds,
             limit,
         } => cmd::search::run(query, kinds, limit, output).await,
+        Command::Open {
+            issuable,
+            mr,
+            project_id,
+            no_browser,
+        } => cmd::open::run(&issuable, mr, project_id, no_browser).await,
         Command::Log {
             issuable,
             duration,
@@ -61,7 +67,8 @@ async fn main() -> Result<()> {
             stale,
             issues,
             search,
-        } => cmd::refresh::run(quick, slow, stale, issues, search).await,
+            usage,
+        } => cmd::refresh::run(quick, slow, stale, issues, search, usage).await,
         Command::Config { action } => {
             cmd::config::run(action);
             Ok(())

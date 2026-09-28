@@ -24,7 +24,10 @@ struct IssueBuckets {
     by_group: BTreeMap<String, Vec<Issue>>,
 }
 
-const ISSUES_KEYSPACE: &str = "issues_cache_v1";
+/// `v2`: rows carry the wire `Issue`'s `open_count`. Bumping the keyspace makes
+/// a pre-upgrade cache read as cold (`None`) instead of a JSON error;
+/// `ISSUE_CACHE_SCHEMA_VERSION` in `refresh_meta.rs` forces the refill.
+const ISSUES_KEYSPACE: &str = "issues_cache_v2";
 
 const KEY: &str = "assigned";
 
@@ -161,6 +164,7 @@ mod tests {
             parent: String::new(),
             total_time: String::new(),
             graph_status: String::new(),
+            open_count: 0,
         }
     }
 

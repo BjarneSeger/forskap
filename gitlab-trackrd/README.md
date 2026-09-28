@@ -42,6 +42,7 @@ Keys are grouped into TOML tables, one per concern:
 | `[search]` `population` | `"auto"` | What the search cache holds for issues/MRs: `"all"` = everything the token can see (`scope=all`; big initial sync on large instances), `"member"` = only member projects, `"auto"` = `"member"` on gitlab.com (which rejects the global fetch), otherwise `"all"` with automatic fallback to `"member"` until the next full resync if the instance rejects it. Projects and groups are always membership-scoped. |
 | `[search]` `partial_interval_secs` | `1800` | Minimum seconds between incremental search-cache syncs (30 min). Restarting inside this window does not re-poll GitLab. |
 | `[search]` `full_interval_secs` | `604800` | Seconds between full search-cache resyncs (7 days), which also remove deleted items. |
+| `[usage]` `retention_hours` | `2160` | How long an issue/MR keeps its `RecordOpen` ranking after its last open (90 days); older entries are dropped on the next recorded open. |
 
 Credentials are configured through the `org.thehoster.gitlab.trackrd.Login`
 interface or by just calling `tt login`.

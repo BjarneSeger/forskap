@@ -20,6 +20,13 @@ use crate::error::Result;
 /// `timelog_id`.
 pub const HISTORY_SCHEMA_VERSION: u32 = 1;
 
+/// Bumped when the persisted assigned-issue rows (the wire `Issue`, stored
+/// verbatim by `cache.rs`) gain a required field. A stamp with an older
+/// version makes the quick refresh due regardless of its cadence, so the
+/// cache — unreadable or empty after the keyspace bump — refills at the first
+/// post-upgrade warm-up instead of the next interval.
+pub const ISSUE_CACHE_SCHEMA_VERSION: u32 = 1;
+
 /// Refresh-tier bookkeeping. `0` means "never" — both for a fresh database and
 /// after `ClearCache` — which makes the next run unconditionally due.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -39,6 +46,11 @@ pub struct RefreshStamps {
     /// forcing one full-retention backfill.
     #[serde(default)]
     pub schema_version: u32,
+    /// The assigned-issue row schema the last quick refresh wrote; see
+    /// [`ISSUE_CACHE_SCHEMA_VERSION`]. Defaults to 0 for pre-existing stamps,
+    /// forcing one refill.
+    #[serde(default)]
+    pub issue_cache_schema_version: u32,
 }
 
 const REFRESH_META_KEYSPACE: &str = "refresh_meta_v1";
@@ -144,6 +156,17 @@ mod tests {
             serde_json::from_str(r#"{"last_quick_sync_secs": 7, "last_slow_sync_secs": 7}"#)
                 .unwrap();
         assert_eq!(s.backfilled_retention_hours, 0);
+    }
+
+    #[test]
+    fn stamps_without_issue_schema_field_still_parse() {
+        let s: RefreshStamps =
+            serde_json::from_str(r#"{"last_quick_sync_secs": 7, "last_slow_sync_secs": 7}"#)
+                .unwrap();
+        assert_eq!(
+            s.issue_cache_schema_version, 0,
+            "reads as stale → refill due"
+        );
     }
 
     #[test]

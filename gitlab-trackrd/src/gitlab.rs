@@ -709,6 +709,7 @@ fn issue_with_labels(v: &serde_json::Value) -> IssueWithLabels {
                 .unwrap_or("")
                 .to_string(),
             graph_status: String::new(),
+            open_count: 0,
         },
         labels,
     }

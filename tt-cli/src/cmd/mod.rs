@@ -10,6 +10,7 @@ pub mod list;
 pub mod log;
 pub mod login;
 pub mod logout;
+pub mod open;
 pub mod project;
 pub mod prompt;
 pub mod queue;

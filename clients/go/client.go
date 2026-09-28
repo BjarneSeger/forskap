@@ -102,7 +102,8 @@ type SearchResults struct {
 // Search searches the daemon's locally cached corpus (no GitLab round-trip).
 // kinds optionally restricts the reply to a subset of "issues", "merge_requests",
 // "projects", "groups" (nil = all four); limit caps each result set separately
-// (nil = daemon default of 50).
+// (nil = daemon default of 50). Issues and MRs come most-opened first (see
+// RecordOpen); an empty query lists only items with recorded opens.
 func (c *Client) Search(ctx context.Context, query string, kinds *[]string, limit *int64) (SearchResults, error) {
 	issues, mrs, projects, groups, err := Search().Call(ctx, c.conn, query, kinds, limit)
 	return SearchResults{issues, mrs, projects, groups}, err
@@ -129,6 +130,14 @@ func (c *Client) AssignSelf(ctx context.Context, projectID, iid int64, kind Issu
 // UnassignSelf removes the authenticated user from an issuable's assignees.
 func (c *Client) UnassignSelf(ctx context.Context, projectID, iid int64, kind IssuableKind) error {
 	return UnassignSelf().Call(ctx, c.conn, projectID, iid, kind)
+}
+
+// RecordOpen counts one open of an issue or merge request in the daemon's
+// local open statistics; Search ranks frequently opened items first and
+// reports the count as open_count. Local bookkeeping only: it succeeds while
+// the daemon is dormant and never contacts GitLab.
+func (c *Client) RecordOpen(ctx context.Context, projectID, iid int64, kind IssuableKind) error {
+	return RecordOpen().Call(ctx, c.conn, projectID, iid, kind)
 }
 
 // ClearCache clears the daemon's cache, optionally scoped to the given keys

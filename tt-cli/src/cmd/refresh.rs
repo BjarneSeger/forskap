@@ -4,13 +4,22 @@
 //! history bands) — use it after editing an issue in the GitLab UI when you
 //! don't want to wait out the daemon's refresh interval. The per-band flags
 //! clear only the named caches; cleared history bands are re-fetched right away.
+//! `--usage` is the exception: open statistics are user data, so only that
+//! explicit flag drops them.
 
 use anyhow::Result;
 use gitlab_trackr_api::VarlinkClientInterface;
 
 use crate::{client, config};
 
-pub async fn run(quick: bool, slow: bool, stale: bool, issues: bool, search: bool) -> Result<()> {
+pub async fn run(
+    quick: bool,
+    slow: bool,
+    stale: bool,
+    issues: bool,
+    search: bool,
+    usage: bool,
+) -> Result<()> {
     // Collect the requested scopes. No flags ⇒ `None`, which the daemon reads
     // as "clear everything".
     let mut scope: Vec<String> = Vec::new();
@@ -28,6 +37,9 @@ pub async fn run(quick: bool, slow: bool, stale: bool, issues: bool, search: boo
     }
     if search {
         scope.push("search".to_string());
+    }
+    if usage {
+        scope.push("usage".to_string());
     }
     let scope = if scope.is_empty() { None } else { Some(scope) };
 
