@@ -372,39 +372,28 @@ impl GitlabApi for GitlabClient {
         &self,
         since: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<FetchedTimelog>> {
-        let endpoint = MyTimelogs {
-            start_time: since.to_rfc3339(),
-        };
-
-        // Retry transient (network) failures like the issues fetch does: a
-        // read is idempotent, so a momentary blip is absorbed here instead of
-        // demoting the whole session (see `handlers::note_gitlab_error`).
-        let raw: serde_json::Value = retry_transient("fetch timelogs", || async {
-            endpoint.query_async(&self.inner).await.map_err(classify)
-        })
-        .await?;
-
-        if let Some(errs) = raw["errors"].as_array()
-            && !errs.is_empty()
-        {
-            let msg = errs
-                .iter()
-                .filter_map(|e| e["message"].as_str())
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(Error::Gitlab(format!("currentUser.timelogs: {msg}")));
+        let mut out: Vec<FetchedTimelog> = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let endpoint = MyTimelogs {
+                start_time: since.to_rfc3339(),
+                after: after.clone(),
+            };
+            // Retry transient (network) failures like the issues fetch does: a
+            // read is idempotent, so a momentary blip is absorbed here instead
+            // of demoting the whole session (see `handlers::note_gitlab_error`).
+            let raw: serde_json::Value = retry_transient("fetch timelogs", || async {
+                endpoint.query_async(&self.inner).await.map_err(classify)
+            })
+            .await?;
+            let (page, next) = timelogs_page(&raw)?;
+            out.extend(page);
+            match next {
+                // A repeated cursor would loop forever.
+                Some(cursor) if after.as_ref() != Some(&cursor) => after = Some(cursor),
+                _ => break,
+            }
         }
-
-        let nodes = raw["data"]["currentUser"]["timelogs"]["nodes"]
-            .as_array()
-            .cloned()
-            .ok_or_else(|| {
-                Error::Gitlab(format!(
-                    "currentUser.timelogs returned unexpected shape: {raw}"
-                ))
-            })?;
-
-        let mut out: Vec<FetchedTimelog> = nodes.iter().filter_map(timelog_from_node).collect();
 
         out.sort_by_key(|t| std::cmp::Reverse(t.spent_at_secs));
         info!(count = out.len(), "fetched timelogs from GitLab");
@@ -1052,6 +1041,8 @@ impl gitlab::api::Endpoint for ListProjectBoards {
 /// clients) still show up.
 struct MyTimelogs {
     start_time: String,
+    /// `endCursor` of the previous page; `None` for the first.
+    after: Option<String>,
 }
 
 impl gitlab::api::Endpoint for MyTimelogs {
@@ -1070,9 +1061,10 @@ impl gitlab::api::Endpoint for MyTimelogs {
     fn body(&self) -> std::result::Result<Option<(&'static str, Vec<u8>)>, gitlab::api::BodyError> {
         let body = serde_json::json!({
             "query": r#"
-                query($start: Time!) {
+                query($start: Time!, $after: String) {
                     currentUser {
-                        timelogs(startTime: $start) {
+                        timelogs(startTime: $start, first: 100, after: $after) {
+                            pageInfo { hasNextPage endCursor }
                             nodes {
                                 id
                                 timeSpent
@@ -1086,10 +1078,42 @@ impl gitlab::api::Endpoint for MyTimelogs {
                     }
                 }
             "#,
-            "variables": { "start": self.start_time },
+            "variables": { "start": self.start_time, "after": self.after },
         });
         Ok(Some(("application/json", serde_json::to_vec(&body)?)))
     }
+}
+
+/// Parse one `currentUser.timelogs` response page into its timelogs and the
+/// cursor of the next page (`None` on the last one).
+fn timelogs_page(raw: &serde_json::Value) -> Result<(Vec<FetchedTimelog>, Option<String>)> {
+    if let Some(errs) = raw["errors"].as_array()
+        && !errs.is_empty()
+    {
+        let msg = errs
+            .iter()
+            .filter_map(|e| e["message"].as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(Error::Gitlab(format!("currentUser.timelogs: {msg}")));
+    }
+
+    let connection = &raw["data"]["currentUser"]["timelogs"];
+    let nodes = connection["nodes"].as_array().ok_or_else(|| {
+        Error::Gitlab(format!(
+            "currentUser.timelogs returned unexpected shape: {raw}"
+        ))
+    })?;
+    let next = connection["pageInfo"]["hasNextPage"]
+        .as_bool()
+        .unwrap_or(false)
+        .then(|| {
+            connection["pageInfo"]["endCursor"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .flatten();
+    Ok((nodes.iter().filter_map(timelog_from_node).collect(), next))
 }
 
 /// Parse one `currentUser.timelogs` node. `None` skips the node: an
@@ -1504,6 +1528,42 @@ mod tests {
             "issue": { "iid": 1, "title": "t", "webUrl": "u" },
         });
         assert_eq!(timelog_from_node(&no_project).unwrap().project_id, 0);
+    }
+
+    #[test]
+    fn timelogs_page_follows_the_cursor_until_the_last_page() {
+        let node = serde_json::json!({
+            "id": "gid://gitlab/Timelog/11",
+            "timeSpent": 60,
+            "spentAt": "2026-07-01T10:00:00Z",
+            "issue": { "iid": "1", "title": "t", "webUrl": "u" },
+        });
+        let page = |has_next: bool| {
+            serde_json::json!({"data": {"currentUser": {"timelogs": {
+                "pageInfo": { "hasNextPage": has_next, "endCursor": "abc" },
+                "nodes": [node.clone()],
+            }}}})
+        };
+
+        let (logs, next) = timelogs_page(&page(true)).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(next.as_deref(), Some("abc"));
+
+        let (_, next) = timelogs_page(&page(false)).unwrap();
+        assert_eq!(next, None, "last page ends the walk");
+
+        let no_page_info = serde_json::json!({"data": {"currentUser": {"timelogs": {
+            "nodes": [],
+        }}}});
+        assert_eq!(timelogs_page(&no_page_info).unwrap().1, None);
+    }
+
+    #[test]
+    fn timelogs_page_surfaces_graphql_errors_and_bad_shapes() {
+        let errors = serde_json::json!({"errors": [{"message": "nope"}]});
+        assert!(matches!(timelogs_page(&errors), Err(Error::Gitlab(m)) if m.contains("nope")));
+        let bad = serde_json::json!({"data": {"currentUser": null}});
+        assert!(timelogs_page(&bad).is_err());
     }
 
     #[test]
