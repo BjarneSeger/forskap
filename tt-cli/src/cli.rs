@@ -67,16 +67,35 @@ pub enum Command {
     /// Search the daemon's cached issues, merge requests, projects, and
     /// groups. Matches titles, labels, and project/group paths
     /// case-insensitively; a query like `#123` finds issues/MRs by number.
-    /// Pure cache read — freshness comes from the background search sync.
+    /// Issues/MRs you open often (`tt open`) rank first; with no query at all
+    /// it lists just those. Pure cache read — freshness comes from the
+    /// background search sync.
     Search {
-        /// Search text.
-        query: String,
+        /// Search text. Omit it to list the frequently opened issues/MRs.
+        query: Option<String>,
         /// Restrict to one or more result kinds. Repeat the flag to combine.
         #[arg(long = "kind", value_enum, value_name = "KIND")]
         kinds: Vec<SearchKind>,
         /// Maximum results per kind (daemon default: 50).
         #[arg(long)]
         limit: Option<i64>,
+    },
+    /// Open an issue or merge request in the browser and count the open, so
+    /// it ranks higher in `tt search` (and launchers built on it).
+    Open {
+        /// Issue or MR reference (`42`, `#42`, or `!42`; quote sigils in
+        /// bash/zsh).
+        #[arg(value_name = "REF")]
+        issuable: String,
+        /// Treat a bare number as a merge request.
+        #[arg(long)]
+        mr: bool,
+        /// Project ID. If omitted, resolved like `tt log`.
+        #[arg(short = 'p', long)]
+        project_id: Option<i64>,
+        /// Only record the open and print the URL; don't launch a browser.
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Log time on an issue or merge request non-interactively.
     Log {
@@ -116,6 +135,7 @@ pub enum Command {
     /// Drop the daemon's caches and re-fetch. With no flags it clears
     /// everything (issues, boards, and all history bands); pass band flags to
     /// target only those. Cleared history bands are re-fetched immediately.
+    /// Open statistics are user data and only go with an explicit `--usage`.
     Refresh {
         /// Clear the quick history band (the last 24h).
         #[arg(long)]
@@ -133,6 +153,10 @@ pub enum Command {
         /// full search resync.
         #[arg(long)]
         search: bool,
+        /// Forget the open counts behind `tt search` ranking (never cleared
+        /// implicitly).
+        #[arg(long)]
+        usage: bool,
     },
     /// Inspect or scaffold the user configuration file.
     Config {

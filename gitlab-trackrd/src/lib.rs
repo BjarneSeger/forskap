@@ -22,3 +22,4 @@ pub mod search;
 pub mod secrets;
 pub mod server;
 pub mod service;
+pub mod usage;

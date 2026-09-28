@@ -27,6 +27,7 @@ use gitlab_trackrd::search::{
     MrAssignee, SEARCH_SCHEMA_VERSION, SearchGroup, SearchIssue, SearchMr, SearchProject,
     SyncStamps,
 };
+use gitlab_trackrd::usage::UsageStats;
 
 /// The user id the seeded stamps claim ran the sync; assigned-MR benches
 /// filter for this id.
@@ -64,6 +65,7 @@ pub fn dormant_env() -> BenchEnv {
     let history = Arc::new(HistoryCache::open(&db).unwrap());
     let search = Arc::new(gitlab_trackrd::search::SearchCache::open(&db).unwrap());
     let refresh_meta = Arc::new(RefreshMeta::open(&db).unwrap());
+    let usage = Arc::new(UsageStats::open(&db).unwrap());
     let config: SharedConfig = Arc::new(std::sync::RwLock::new(gitlab_trackrd::config::defaults()));
     let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config)).unwrap();
     drop(_guard);
@@ -75,6 +77,7 @@ pub fn dormant_env() -> BenchEnv {
             history,
             search,
             refresh_meta,
+            usage,
             queue,
             config,
             reconnect_signal: Arc::new(Notify::new()),
@@ -214,6 +217,7 @@ pub fn wire_issue(i: u64) -> Issue {
         parent: String::new(),
         total_time: String::new(),
         graph_status: String::new(),
+        open_count: 0,
     }
 }
 

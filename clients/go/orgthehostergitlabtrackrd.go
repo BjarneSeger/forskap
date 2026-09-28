@@ -21,6 +21,7 @@ type Issue struct {
 	Parent       string `json:"parent"`
 	Total_time   string `json:"total_time"`
 	Graph_status string `json:"graph_status"`
+	Open_count   int64  `json:"open_count"`
 }
 
 type IssuableKind string
@@ -57,6 +58,7 @@ type MergeRequest struct {
 	Web_url    string   `json:"web_url"`
 	State      string   `json:"state"`
 	Assignees  []string `json:"assignees"`
+	Open_count int64    `json:"open_count"`
 }
 
 type Project struct {
@@ -571,6 +573,65 @@ func (m UnassignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection
 	}, nil
 }
 
+type RecordOpen_methods struct{}
+
+func RecordOpen() RecordOpen_methods { return RecordOpen_methods{} }
+
+func (m RecordOpen_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, project_id_in_, iid_in_, kind_in_)
+	if err_ != nil {
+		return
+	}
+	_, err_ = receive(ctx)
+	return
+}
+
+func (m RecordOpen_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (uint64, error), error) {
+	var in struct {
+		Project_id int64        `json:"project_id"`
+		Iid        int64        `json:"iid"`
+		Kind       IssuableKind `json:"kind"`
+	}
+	in.Project_id = project_id_in_
+	in.Iid = iid_in_
+	in.Kind = kind_in_
+	receive, err := c.Send(ctx, "org.thehoster.gitlab.trackrd.RecordOpen", in, flags)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (flags uint64, err error) {
+		flags, err = receive(ctx, nil)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		return
+	}, nil
+}
+
+func (m RecordOpen_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+	var in struct {
+		Project_id int64        `json:"project_id"`
+		Iid        int64        `json:"iid"`
+		Kind       IssuableKind `json:"kind"`
+	}
+	in.Project_id = project_id_in_
+	in.Iid = iid_in_
+	in.Kind = kind_in_
+	receive, err := c.Upgrade(ctx, "org.thehoster.gitlab.trackrd.RecordOpen", in)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (flags uint64, conn varlink.ReadWriterContext, err error) {
+		flags, conn, err = receive(ctx, nil)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		return
+	}, nil
+}
+
 type ClearCache_methods struct{}
 
 func ClearCache() ClearCache_methods { return ClearCache_methods{} }
@@ -1040,6 +1101,7 @@ type orgthehostergitlabtrackrdInterface interface {
 	Close(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	AssignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	UnassignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
+	RecordOpen(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]string) error
 	GetHistory(ctx context.Context, c VarlinkCall, days_ *int64) error
 	GetFailures(ctx context.Context, c VarlinkCall) error
@@ -1115,6 +1177,10 @@ func (c *VarlinkCall) ReplyAssignSelf(ctx context.Context) error {
 }
 
 func (c *VarlinkCall) ReplyUnassignSelf(ctx context.Context) error {
+	return c.Reply(ctx, nil)
+}
+
+func (c *VarlinkCall) ReplyRecordOpen(ctx context.Context) error {
 	return c.Reply(ctx, nil)
 }
 
@@ -1196,6 +1262,10 @@ func (s *VarlinkInterface) AssignSelf(ctx context.Context, c VarlinkCall, projec
 
 func (s *VarlinkInterface) UnassignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.gitlab.trackrd.UnassignSelf")
+}
+
+func (s *VarlinkInterface) RecordOpen(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error {
+	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.gitlab.trackrd.RecordOpen")
 }
 
 func (s *VarlinkInterface) ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]string) error {
@@ -1320,6 +1390,18 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 		}
 		return s.orgthehostergitlabtrackrdInterface.UnassignSelf(ctx, VarlinkCall{call}, in.Project_id, in.Iid, in.Kind)
 
+	case "RecordOpen":
+		var in struct {
+			Project_id int64        `json:"project_id"`
+			Iid        int64        `json:"iid"`
+			Kind       IssuableKind `json:"kind"`
+		}
+		err := call.GetParameters(&in)
+		if err != nil {
+			return call.ReplyInvalidParameter(ctx, "parameters")
+		}
+		return s.orgthehostergitlabtrackrdInterface.RecordOpen(ctx, VarlinkCall{call}, in.Project_id, in.Iid, in.Kind)
+
 	case "ClearCache":
 		var in struct {
 			Scope *[]string `json:"scope,omitempty"`
@@ -1408,7 +1490,8 @@ type Issue (
   state: string,
   parent: string,
   total_time: string,
-  graph_status: string
+  graph_status: string,
+  open_count: int
 )
 
 type IssuableKind (issue, merge_request)
@@ -1444,7 +1527,8 @@ type MergeRequest (
   title: string,
   web_url: string,
   state: string,
-  assignees: []string
+  assignees: []string,
+  open_count: int
 )
 
 type Project (
@@ -1480,6 +1564,8 @@ method Close(project_id: int, iid: int, kind: IssuableKind) -> ()
 method AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
 method UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
+
+method RecordOpen(project_id: int, iid: int, kind: IssuableKind) -> ()
 
 method ClearCache(scope: ?[]string) -> ()
 

@@ -29,6 +29,7 @@ use crate::history::HistoryCache;
 use crate::queue::RetryQueue;
 use crate::refresh_meta::RefreshMeta;
 use crate::search::SearchCache;
+use crate::usage::UsageStats;
 
 mod refresh;
 mod search_sync;
@@ -94,6 +95,8 @@ pub struct Handlers {
     /// Persisted last-run stamps the refresh tiers gate on, so a restart
     /// inside an interval serves the caches instead of re-polling GitLab.
     pub refresh_meta: Arc<RefreshMeta>,
+    /// Open statistics behind `RecordOpen`; `Search` ranks by them.
+    pub usage: Arc<UsageStats>,
     pub queue: RetryQueue,
     /// Live daemon config; history windows are read from `config.history` at use
     /// time so a hot reload takes effect without a restart.

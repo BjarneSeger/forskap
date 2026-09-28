@@ -29,9 +29,10 @@ type Issue (
   state:        string, # "opened" | "closed"
   parent:       string, # URL of the issue's epic; empty when it has none
   total_time:   string, # GitLab's human-readable total spent time ("2h"); empty when none
-  graph_status: string  # board column the issue sits in, derived from its labels
+  graph_status: string, # board column the issue sits in, derived from its labels
                         # matched against the project's issue board; empty when no
                         # board/label matches
+  open_count:   int     # opens recorded through RecordOpen (within usage.retention_hours)
 )
 ```
 
@@ -83,7 +84,8 @@ type MergeRequest (
   title:      string,
   web_url:    string,
   state:      string,   # "opened" | "closed" | "merged" | "locked"
-  assignees:  []string  # assignee usernames, captured at the last search sync
+  assignees:  []string, # assignee usernames, captured at the last search sync
+  open_count: int       # opens recorded through RecordOpen (within usage.retention_hours)
 )
 ```
 
@@ -166,9 +168,16 @@ searched.
 
 `kinds` restricts the reply to a subset of `issues`, `merge_requests`, `projects`,
 `groups` (omitted or empty = all four; an unknown kind is an eager `GitlabError`).
-`limit` caps each returned array separately (default 50; must be positive). Issues
-and MRs come newest-updated first, projects and groups sorted by path. An empty or
-whitespace-only `query` is an eager `GitlabError`.
+`limit` caps each returned array separately (default 50; must be positive).
+
+**Ranking**: issues and MRs are ordered by their `RecordOpen` statistics — most opens
+first, ties by most recent open, then newest-updated — so never-opened items keep
+the newest-first order among themselves below the frequently opened ones. Each row
+reports its count as `open_count`. Projects and groups are sorted by path. An empty or
+whitespace-only `query` selects the "frequently opened" view: only issues/MRs with
+at least one recorded open, ranked the same way; projects and groups are empty in
+that mode. The statistics are read once per call and a read failure degrades to the
+plain recency order.
 
 What the corpus contains depends on the `[search]` daemon config: issues and MRs
 from everything the token can see (`population = "all"`) or only from member
@@ -250,6 +259,19 @@ Deletes one dead-lettered task. `GitlabError` when `id` is unknown.
 
 Deletes all dead-lettered tasks.
 
+## Usage statistics
+
+### `RecordOpen(project_id: int, iid: int, kind: IssuableKind) -> ()`
+
+Counts one open of an issue or merge request — the client's "the user just went
+there" signal (`tt open`, a launcher activation). Purely local bookkeeping: no GitLab
+round-trip, no queueing, works while dormant. `Search` ranks by these counts and
+reports them as `open_count` (also on `GetAssignedIssues` /
+`GetAssignedMergeRequests` rows). An entry expires `usage.retention_hours` (default
+90 days) after its last open, and the record is capped at 1000 issuables (lowest
+counts dropped first); both are enforced on write. A non-positive `project_id` or
+`iid` is an eager `GitlabError`. Cleared only by `ClearCache` scope `usage`.
+
 ## Cache control
 
 ### `ClearCache(scope: ?[]string) -> ()`
@@ -265,6 +287,7 @@ each scope string selects a slice:
 | `quick`  | history inside the quick window (last `refresh.quick.window_hours`) | that window |
 | `slow`   | history between the quick and slow windows          | the slow window       |
 | `stale`  | history older than the slow window                  | the full retention window, then prunes |
+| `usage`  | the `RecordOpen` statistics — **only when listed explicitly**; the empty "everything" scope leaves them alone (user data, not a cache) | — |
 
 Replies success even when dormant — the cleared state then simply stays empty until
 the next successful sync.

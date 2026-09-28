@@ -1,0 +1,15 @@
+# noctalia plugin catalog: lets `noctalia msg plugins source add <name> git <this repo>`
+# list and compat-check the plugin without a full clone. Keep in sync with
+# gitlab-trackr/plugin.toml (id, version, plugin_api).
+[[plugin]]
+id           = "thehoster/gitlab-trackr"
+name         = "GitLab Trackr"
+version      = "0.1.0"
+author       = "thehoster"
+license      = "GPL-3.0-only"
+icon         = "brand-gitlab"
+description  = "Search GitLab issues, merge requests, projects and groups through gitlab-trackrd; frequently opened items rank first."
+deprecated   = false
+plugin_api   = 24
+tags         = ["gitlab", "launcher", "search"]
+dependencies = ["tt"]

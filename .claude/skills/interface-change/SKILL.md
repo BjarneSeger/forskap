@@ -42,6 +42,13 @@ the daemon are the to-do list.
 - New GitLab call needed? Add it to the `GitlabApi` trait in `gitlab.rs` **and to every
   mock**: `FakeGitlab` in `handlers/tests.rs`, `FakeGitlab` in `queue.rs`, `NoopGitlab`
   in `reconnect.rs` (the latter two usually just `unimplemented!()`).
+- **New method? Add its arm to the hand-written dispatcher** `handle_trackrd` in
+  `gitlab-trackrd/src/service.rs` (clone the arm of an argument-identical method) plus a
+  `dispatch_has_an_arm_for_<method>` test next to `dispatch_has_an_arm_for_search`. A
+  missing arm compiles fine and only fails at runtime as `MethodNotFound`.
+- New field on a wire type that a cache persists verbatim (`IssueCache` stores `Issue`)?
+  Old rows stop deserializing — bump the keyspace and the matching schema version in
+  `refresh_meta.rs` so the stamp-gated refresh refills at once.
 
 ## 4. CLI
 

@@ -55,6 +55,8 @@ tt log 42 1h30m          # log time on issue #42
 tt log '!42' 1h30m       # log time on merge request !42 (or: tt log 42 1h30m --mr)
 tt history               # what you tracked recently (including queued entries)
 tt queue                 # writes that failed permanently, with retry/dismiss
+tt search oauth          # cached search; issues/MRs you open often rank first
+tt open 42               # open issue #42 in the browser (and count the open)
 ```
 
 Issue-acting commands (`log`, `close`, `assign`, `unassign`) take GitLab-style
@@ -74,3 +76,17 @@ Script `tt` itself, or talk to the daemon's varlink socket directly — the inte
 is documented in [the interface docs](gitlab-trackrd/docs/varlink_interface.md) and
 available as the [`gitlab-trackr-api`](gitlab-trackr-api/README.md) Rust crate or the
 [Go binding](clients/go/README.md).
+
+## Noctalia launcher
+
+[`gitlab-trackr/`](gitlab-trackr/README.md) is a
+[noctalia-shell](https://noctalia.dev) launcher provider: type `/gl <query>` to search
+issues, merge requests, projects and groups through `tt search`, and activate a result
+to open it in the browser via `tt open` — which also counts the open, so the things you
+visit most float to the top (and `/gl` on its own lists them). This repository doubles
+as a noctalia plugin source (`catalog.toml`):
+
+```sh
+noctalia msg plugins source add gitlab-trackr git https://github.com/BjarneSeger/gitlab_trackr
+noctalia msg plugins enable thehoster/gitlab-trackr
+```

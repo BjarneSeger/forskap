@@ -11,7 +11,8 @@ use tokio::sync::{Notify, RwLock};
 
 use gitlab_trackr_api::{
     Call_ClearCache, Call_Close, Call_GetAssignedIssues, Call_GetAssignedMergeRequests,
-    Call_GetHistory, Call_PostTime, Call_UnassignSelf, IssuableKind, Issue, VarlinkInterface,
+    Call_GetHistory, Call_PostTime, Call_RecordOpen, Call_UnassignSelf, IssuableKind, Issue,
+    VarlinkInterface,
 };
 
 use crate::boards::BoardCache;
@@ -34,6 +35,7 @@ fn issue(project_id: i64, iid: i64, title: &str, web_url: &str) -> Issue {
         parent: String::new(),
         total_time: String::new(),
         graph_status: String::new(),
+        open_count: 0,
     }
 }
 
@@ -423,6 +425,7 @@ fn iwl(project_id: i64, state: &str, labels: &[&str]) -> IssueWithLabels {
             parent: String::new(),
             total_time: String::new(),
             graph_status: String::new(),
+            open_count: 0,
         },
         labels: labels.iter().map(|s| s.to_string()).collect(),
     }
@@ -533,6 +536,7 @@ fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
     let history = Arc::new(HistoryCache::open(&db).unwrap());
     let search = Arc::new(crate::search::SearchCache::open(&db).unwrap());
     let refresh_meta = Arc::new(crate::refresh_meta::RefreshMeta::open(&db).unwrap());
+    let usage = Arc::new(crate::usage::UsageStats::open(&db).unwrap());
     let config: SharedConfig = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
     let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config)).unwrap();
     (
@@ -543,6 +547,7 @@ fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
             history,
             search,
             refresh_meta,
+            usage,
             queue,
             config,
             reconnect_signal: Arc::new(Notify::new()),
@@ -1286,6 +1291,173 @@ async fn search_orders_by_recency_and_applies_per_kind_limit() {
     assert_eq!(r.issues[0].id, 2, "most recently updated wins");
 }
 
+// ── RecordOpen + usage ranking ─────────────────────────────────────────
+
+/// Drive `RecordOpen` and return the reply's error, if any.
+async fn run_record_open(
+    h: &Handlers,
+    project_id: i64,
+    iid: i64,
+    kind: IssuableKind,
+) -> Option<String> {
+    use gitlab_trackr_api::AsyncCall;
+    let mut call = AsyncCall::default();
+    h.record_open(&mut call as &mut dyn Call_RecordOpen, project_id, iid, kind)
+        .await
+        .unwrap();
+    call.take_reply()
+        .expect("a reply")
+        .error
+        .map(|e| e.to_string())
+}
+
+#[tokio::test]
+async fn record_open_rejects_bad_ref() {
+    let (h, _dir) = dormant_handlers();
+    assert!(
+        run_record_open(&h, 0, 42, IssuableKind::issue)
+            .await
+            .is_some(),
+        "project_id 0 → error reply"
+    );
+    assert!(h.usage.snapshot().unwrap().entries.is_empty());
+}
+
+#[tokio::test]
+async fn record_open_ranks_frequently_opened_first() {
+    // Dormant on purpose: opens are local bookkeeping, no session needed.
+    let (h, _dir) = dormant_handlers();
+    let mut old = search_issue(1, "match old"); // iid 10
+    old.updated_at_secs = 100;
+    let mut new = search_issue(2, "match new"); // iid 20
+    new.updated_at_secs = 200;
+    {
+        let g = h.search.try_begin_sync().unwrap();
+        g.upsert_issues(&[old, new]).unwrap();
+        g.upsert_mrs(&[search_mr(3, "match mr")]).unwrap(); // iid 30
+        g.set_stamps(&SyncStamps {
+            last_partial_sync_secs: 1,
+            last_full_sync_secs: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    for _ in 0..2 {
+        assert!(
+            run_record_open(&h, 1, 10, IssuableKind::issue)
+                .await
+                .is_none()
+        );
+    }
+    assert!(
+        run_record_open(&h, 1, 30, IssuableKind::merge_request)
+            .await
+            .is_none()
+    );
+
+    let r = run_search(&h, "match", None, None).await;
+    assert_eq!(
+        r.issues.iter().map(|i| i.id).collect::<Vec<_>>(),
+        vec![1, 2],
+        "the twice-opened older issue outranks the newer one"
+    );
+    assert_eq!(r.issues[0].open_count, 2);
+    assert_eq!(r.issues[1].open_count, 0);
+    assert_eq!(r.merge_requests[0].open_count, 1);
+    assert!(
+        h.usage
+            .snapshot()
+            .unwrap()
+            .get(Issuable::MergeRequest, 1, 10)
+            .is_none(),
+        "issue opens don't leak onto the MR with the same iid"
+    );
+}
+
+#[tokio::test]
+async fn search_empty_query_lists_only_opened_items() {
+    let (h, _dir) = dormant_handlers();
+    seed_search_cache(&h); // issues iid 10 + 20, MR iid 30, a project and a group
+    assert!(
+        run_record_open(&h, 1, 20, IssuableKind::issue)
+            .await
+            .is_none()
+    );
+
+    let r = run_search(&h, "", None, None).await;
+    assert_eq!(
+        r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(),
+        vec![20],
+        "only the opened issue, regardless of title"
+    );
+    assert!(r.merge_requests.is_empty(), "never-opened MR excluded");
+    assert!(
+        r.projects.is_empty() && r.groups.is_empty(),
+        "projects/groups carry no open counts"
+    );
+
+    let r = run_search(&h, "  ", Some(vec!["merge_requests".to_string()]), None).await;
+    assert!(r.issues.is_empty(), "kinds filter still applies");
+}
+
+#[tokio::test]
+async fn get_assigned_issues_overlays_open_count() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = dormant_handlers();
+    h.cache
+        .put(&[issue(7, 42, "Title", "https://gl/team/api/-/issues/42")])
+        .unwrap();
+    assert!(
+        run_record_open(&h, 7, 42, IssuableKind::issue)
+            .await
+            .is_none()
+    );
+
+    let mut call = AsyncCall::default();
+    h.get_assigned_issues(&mut call as &mut dyn Call_GetAssignedIssues, None)
+        .await
+        .unwrap();
+    let issues = reply_issues(&mut call);
+    assert_eq!(issues.len(), 1);
+    assert_eq!(
+        issues[0].open_count, 1,
+        "live count overlaid on the persisted row"
+    );
+}
+
+#[tokio::test]
+async fn clear_cache_usage_scope_only_when_listed() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = dormant_handlers();
+    assert!(
+        run_record_open(&h, 1, 10, IssuableKind::issue)
+            .await
+            .is_none()
+    );
+
+    let mut call = AsyncCall::default();
+    h.clear_cache(&mut call as &mut dyn Call_ClearCache, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.usage.snapshot().unwrap().entries.len(),
+        1,
+        "the everything-clear leaves open statistics alone"
+    );
+
+    let mut call = AsyncCall::default();
+    h.clear_cache(
+        &mut call as &mut dyn Call_ClearCache,
+        Some(vec!["usage".to_string()]),
+    )
+    .await
+    .unwrap();
+    assert!(
+        h.usage.snapshot().unwrap().entries.is_empty(),
+        "explicit usage scope wipes them"
+    );
+}
+
 #[tokio::test]
 async fn search_cold_cache_connected_is_empty() {
     let fake = Arc::new(canned_search_fake());
@@ -2019,8 +2191,8 @@ proptest! {
             .unwrap();
             let reply = call.take_reply().expect("always a reply");
 
-            let invalid = query.trim().is_empty()
-                || matches!(limit, Some(n) if n <= 0)
+            // An empty query is the "frequently opened" view, not an error.
+            let invalid = matches!(limit, Some(n) if n <= 0)
                 || kinds.iter().flatten().any(|k| {
                     !["issues", "merge_requests", "projects", "groups"].contains(&k.as_str())
                 });
@@ -2199,7 +2371,10 @@ async fn quick_refresh_throttled_while_stamp_fresh() {
     let fake = Arc::new(canned_refresh_fake());
     let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
     h.refresh_meta
-        .update(|s| s.last_quick_sync_secs = now_secs())
+        .update(|s| {
+            s.last_quick_sync_secs = now_secs();
+            s.issue_cache_schema_version = crate::refresh_meta::ISSUE_CACHE_SCHEMA_VERSION;
+        })
         .unwrap();
 
     h.refresh_cache().await;
@@ -2210,6 +2385,29 @@ async fn quick_refresh_throttled_while_stamp_fresh() {
         "fresh stamp → no GitLab traffic (the restart-storm guard)"
     );
     assert_eq!(fake.timelog_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn quick_refresh_runs_when_issue_cache_schema_is_stale() {
+    let fake = Arc::new(canned_refresh_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    // Fresh quick stamp, but written by a daemon whose issue rows predate
+    // `open_count` — the (now empty, v2-keyspace) cache must refill at once.
+    h.refresh_meta
+        .update(|s| {
+            s.last_quick_sync_secs = now_secs();
+            s.issue_cache_schema_version = 0;
+        })
+        .unwrap();
+
+    h.refresh_cache().await;
+
+    assert_eq!(fake.assigned_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.refresh_meta.stamps().unwrap().issue_cache_schema_version,
+        crate::refresh_meta::ISSUE_CACHE_SCHEMA_VERSION,
+        "successful refresh stamps the current issue-cache schema"
+    );
 }
 
 #[tokio::test]

@@ -9,7 +9,8 @@ type Issue (
   state: string,
   parent: string,
   total_time: string,
-  graph_status: string
+  graph_status: string,
+  open_count: int
 )
 
 type IssuableKind (issue, merge_request)
@@ -45,7 +46,8 @@ type MergeRequest (
   title: string,
   web_url: string,
   state: string,
-  assignees: []string
+  assignees: []string,
+  open_count: int
 )
 
 type Project (
@@ -81,6 +83,8 @@ method Close(project_id: int, iid: int, kind: IssuableKind) -> ()
 method AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
 method UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
+
+method RecordOpen(project_id: int, iid: int, kind: IssuableKind) -> ()
 
 method ClearCache(scope: ?[]string) -> ()
 

@@ -15,6 +15,7 @@ use gitlab_trackrd::queue::RetryQueue;
 use gitlab_trackrd::refresh_meta::RefreshMeta;
 use gitlab_trackrd::search::SearchCache;
 use gitlab_trackrd::service::ServiceHandler;
+use gitlab_trackrd::usage::UsageStats;
 use gitlab_trackrd::{config, reconnect, reload, secrets, server};
 
 #[tokio::main]
@@ -88,6 +89,7 @@ async fn main() -> Result<()> {
     let history = Arc::new(HistoryCache::open(&db)?);
     let search = Arc::new(SearchCache::open(&db)?);
     let refresh_meta = Arc::new(RefreshMeta::open(&db)?);
+    let usage = Arc::new(UsageStats::open(&db)?);
     let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config))?;
     // Woken when a runtime GitLab failure demotes the session to
     // `Dormant(Unreachable)`, so the reconnect supervisor re-engages mid-run and
@@ -100,6 +102,7 @@ async fn main() -> Result<()> {
         history,
         search,
         refresh_meta,
+        usage,
         queue,
         config: Arc::clone(&config),
         reconnect_signal,

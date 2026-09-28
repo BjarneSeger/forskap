@@ -24,7 +24,7 @@ use gitlab_trackr_api::Issue;
 use crate::boards::BoardCache;
 use crate::gitlab::{FetchedTimelog, GitlabApi, Issuable, IssueWithLabels};
 use crate::history::StoredTimelog;
-use crate::refresh_meta::{HISTORY_SCHEMA_VERSION, RefreshStamps};
+use crate::refresh_meta::{HISTORY_SCHEMA_VERSION, ISSUE_CACHE_SCHEMA_VERSION, RefreshStamps};
 use crate::search::SearchMr;
 
 use super::{Handlers, now_secs};
@@ -43,7 +43,9 @@ impl Handlers {
             .interval()
             .as_secs();
         if !self.refresh_due("quick refresh", |s, now| {
-            s.last_quick_sync_secs == 0 || now.saturating_sub(s.last_quick_sync_secs) >= quick_secs
+            s.last_quick_sync_secs == 0
+                || now.saturating_sub(s.last_quick_sync_secs) >= quick_secs
+                || s.issue_cache_schema_version < ISSUE_CACHE_SCHEMA_VERSION
         }) {
             return;
         }
@@ -76,7 +78,10 @@ impl Handlers {
 
         let quick_window = self.config.read().unwrap().refresh.quick.window();
         if self.refresh_history_window(&gitlab, quick_window).await {
-            self.stamp(|s| s.last_quick_sync_secs = started);
+            self.stamp(|s| {
+                s.last_quick_sync_secs = started;
+                s.issue_cache_schema_version = ISSUE_CACHE_SCHEMA_VERSION;
+            });
         }
     }
 

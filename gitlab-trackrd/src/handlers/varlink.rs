@@ -9,9 +9,9 @@ use tracing::{debug, info, instrument, warn};
 use gitlab_trackr_api::{
     Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close, Call_DismissFailure,
     Call_GetAssignedIssues, Call_GetAssignedMergeRequests, Call_GetFailures, Call_GetHistory,
-    Call_Login, Call_Logout, Call_PostTime, Call_RetryFailure, Call_Search, Call_UnassignSelf,
-    Call_WhoAmI, FailedTask, Group, HistoryEvent, IssuableKind, Issue, MergeRequest, Project,
-    VarlinkInterface,
+    Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure, Call_Search,
+    Call_UnassignSelf, Call_WhoAmI, FailedTask, Group, HistoryEvent, IssuableKind, Issue,
+    MergeRequest, Project, VarlinkInterface,
 };
 
 use crate::cache::{in_group, namespace_of};
@@ -20,6 +20,7 @@ use crate::gitlab::{GitlabClient, Issuable};
 use crate::history::HistoryCache;
 use crate::search::{SEARCH_SCHEMA_VERSION, SearchIssue, SearchMr, parse_iid_query, text_matches};
 use crate::secrets::{self, Credentials};
+use crate::usage::{UsageEntry, UsageRecord};
 
 use super::refresh::graph_status_from;
 use super::{
@@ -157,7 +158,7 @@ impl Handlers {
     /// best-effort from already-cached board labels only — `Search` is a pure
     /// cache reader, so projects the assigned-issues refresh never touched
     /// simply get an empty status.
-    fn wire_search_issue(&self, i: SearchIssue) -> Issue {
+    fn wire_search_issue(&self, i: SearchIssue, open_count: i64) -> Issue {
         let board = self.boards.get(i.project_id).ok().flatten();
         let graph_status = graph_status_from(board.as_deref(), &i.labels, &i.state);
         Issue {
@@ -170,8 +171,31 @@ impl Handlers {
             parent: i.parent,
             total_time: i.total_time,
             graph_status,
+            open_count,
         }
     }
+
+    /// The open statistics, degraded to empty on a read failure so ranking
+    /// merely falls back to recency (the standing cache-error convention).
+    fn usage_or_empty(&self) -> UsageRecord {
+        self.usage.snapshot().unwrap_or_else(|e| {
+            warn!(error = %e, "usage read failed, ranking without open counts");
+            UsageRecord::default()
+        })
+    }
+}
+
+/// Sort key for `Search` hits: most-opened first, then most recently opened,
+/// then most recently updated — so never-opened items keep the old
+/// newest-first order among themselves.
+fn rank_key(usage: Option<UsageEntry>, updated_at_secs: u64) -> std::cmp::Reverse<(u64, u64, u64)> {
+    let u = usage.unwrap_or_default();
+    std::cmp::Reverse((u.count, u.last_opened_secs, updated_at_secs))
+}
+
+/// `open_count` for the wire, from an optional usage entry.
+fn open_count_of(usage: Option<UsageEntry>) -> i64 {
+    usage.map_or(0, |u| u.count as i64)
 }
 
 /// A cache read for one `Search` kind, degraded to empty on failure so the
@@ -202,7 +226,7 @@ fn wire_kind(kind: Issuable) -> IssuableKind {
 
 /// Map a cached search MR onto the wire `MergeRequest`; assignee usernames
 /// come from the pairs captured at sync time.
-fn wire_mr(m: SearchMr) -> MergeRequest {
+fn wire_mr(m: SearchMr, open_count: i64) -> MergeRequest {
     MergeRequest {
         id: m.id,
         iid: m.iid,
@@ -211,6 +235,7 @@ fn wire_mr(m: SearchMr) -> MergeRequest {
         web_url: m.web_url,
         state: m.state,
         assignees: m.assignees.into_iter().map(|a| a.username).collect(),
+        open_count,
     }
 }
 
@@ -253,7 +278,7 @@ impl VarlinkInterface for Handlers {
             }
         };
 
-        let issues = match groups {
+        let mut issues = match groups {
             Some(groups) if !groups.is_empty() => {
                 let mut seen = std::collections::HashSet::new();
                 groups
@@ -264,6 +289,12 @@ impl VarlinkInterface for Handlers {
             }
             _ => all,
         };
+        // The persisted rows carry a placeholder; the live counts are overlaid
+        // at read time so a `RecordOpen` shows up before the next refresh.
+        let usage = self.usage_or_empty();
+        for i in &mut issues {
+            i.open_count = open_count_of(usage.get(Issuable::Issue, i.project_id, i.iid));
+        }
 
         debug!(count = issues.len(), "serving issues from cache");
         call.reply(issues)
@@ -314,7 +345,15 @@ impl VarlinkInterface for Handlers {
         mine.sort_by_key(|m| std::cmp::Reverse(m.updated_at_secs));
 
         debug!(count = mine.len(), "serving assigned MRs from search cache");
-        call.reply(mine.into_iter().map(wire_mr).collect())
+        let usage = self.usage_or_empty();
+        call.reply(
+            mine.into_iter()
+                .map(|m| {
+                    let u = usage.get(Issuable::MergeRequest, m.project_id, m.iid);
+                    wire_mr(m, open_count_of(u))
+                })
+                .collect(),
+        )
     }
 
     #[instrument(skip(self, call))]
@@ -325,10 +364,11 @@ impl VarlinkInterface for Handlers {
         kinds: Option<Vec<String>>,
         limit: Option<i64>,
     ) -> varlink::Result<()> {
+        // An empty query is the "frequently opened" view: only issues/MRs with
+        // recorded opens, ranked. Projects and groups have no open counts, so
+        // they come back empty in that mode.
         let needle = query.trim().to_lowercase();
-        if needle.is_empty() {
-            return call.reply_gitlab_error("empty search query".to_string());
-        }
+        let frequent_only = needle.is_empty();
         let limit = match limit {
             None => DEFAULT_SEARCH_LIMIT,
             Some(n) if n > 0 => n as usize,
@@ -364,32 +404,44 @@ impl VarlinkInterface for Handlers {
         }
 
         let iid_query = parse_iid_query(&query);
+        let usage = self.usage_or_empty();
 
         let mut issues: Vec<Issue> = Vec::new();
         if want("issues") {
-            let mut hits: Vec<SearchIssue> = read_or_empty(self.search.all_issues(), "issues")
-                .into_iter()
-                .filter(|i| search_item_matches(&needle, iid_query, &i.title, &i.labels, i.iid))
-                .collect();
-            hits.sort_by_key(|i| std::cmp::Reverse(i.updated_at_secs));
+            let mut hits: Vec<(Option<UsageEntry>, SearchIssue)> =
+                read_or_empty(self.search.all_issues(), "issues")
+                    .into_iter()
+                    .filter(|i| search_item_matches(&needle, iid_query, &i.title, &i.labels, i.iid))
+                    .map(|i| (usage.get(Issuable::Issue, i.project_id, i.iid), i))
+                    .filter(|(u, _)| !frequent_only || u.is_some())
+                    .collect();
+            hits.sort_by_key(|(u, i)| rank_key(*u, i.updated_at_secs));
             hits.truncate(limit);
             issues = hits
                 .into_iter()
-                .map(|i| self.wire_search_issue(i))
+                .map(|(u, i)| self.wire_search_issue(i, open_count_of(u)))
                 .collect();
         }
 
         let mut merge_requests: Vec<MergeRequest> = Vec::new();
         if want("merge_requests") {
-            let mut hits = read_or_empty(self.search.all_mrs(), "merge requests");
-            hits.retain(|m| search_item_matches(&needle, iid_query, &m.title, &m.labels, m.iid));
-            hits.sort_by_key(|m| std::cmp::Reverse(m.updated_at_secs));
+            let mut hits: Vec<(Option<UsageEntry>, SearchMr)> =
+                read_or_empty(self.search.all_mrs(), "merge requests")
+                    .into_iter()
+                    .filter(|m| search_item_matches(&needle, iid_query, &m.title, &m.labels, m.iid))
+                    .map(|m| (usage.get(Issuable::MergeRequest, m.project_id, m.iid), m))
+                    .filter(|(u, _)| !frequent_only || u.is_some())
+                    .collect();
+            hits.sort_by_key(|(u, m)| rank_key(*u, m.updated_at_secs));
             hits.truncate(limit);
-            merge_requests = hits.into_iter().map(wire_mr).collect();
+            merge_requests = hits
+                .into_iter()
+                .map(|(u, m)| wire_mr(m, open_count_of(u)))
+                .collect();
         }
 
         let mut projects: Vec<Project> = Vec::new();
-        if want("projects") {
+        if want("projects") && !frequent_only {
             let mut hits = read_or_empty(self.search.all_projects(), "projects");
             hits.retain(|p| text_matches(&needle, &p.name) || text_matches(&needle, &p.path));
             hits.sort_by(|a, b| a.path.cmp(&b.path));
@@ -406,7 +458,7 @@ impl VarlinkInterface for Handlers {
         }
 
         let mut groups: Vec<Group> = Vec::new();
-        if want("groups") {
+        if want("groups") && !frequent_only {
             let mut hits = read_or_empty(self.search.all_groups(), "groups");
             hits.retain(|g| text_matches(&needle, &g.name) || text_matches(&needle, &g.path));
             hits.sort_by(|a, b| a.path.cmp(&b.path));
@@ -517,6 +569,16 @@ impl VarlinkInterface for Handlers {
                 }) {
                     warn!("refresh stamp reset failed: {e}");
                 }
+            }
+        }
+
+        // Open statistics are user data, not a cache: only an explicit scope
+        // clears them, never the "everything" default.
+        if scopes.iter().any(|s| s == "usage") {
+            if let Err(e) = self.usage.clear() {
+                warn!("usage stats clear failed: {e}");
+            } else {
+                info!("usage stats cleared");
             }
         }
 
@@ -757,6 +819,32 @@ impl VarlinkInterface for Handlers {
             return call.reply_gitlab_error(e.to_string());
         }
         info!("cleared dead-letter queue");
+        call.reply()
+    }
+
+    #[instrument(skip(self, call))]
+    async fn record_open(
+        &self,
+        call: &mut dyn Call_RecordOpen,
+        project_id: i64,
+        iid: i64,
+        kind: IssuableKind,
+    ) -> varlink::Result<()> {
+        if let Some(msg) = issue_ref_error(project_id, iid) {
+            return call.reply_gitlab_error(msg);
+        }
+        // Local bookkeeping only — no GitLab, so it works while dormant.
+        let retention_secs = self.config.read().unwrap().usage.retention().as_secs();
+        let now = now_secs();
+        let key = crate::usage::usage_key(internal_kind(&kind), project_id, iid);
+        if let Err(e) = self
+            .usage
+            .record(&key, now, now.saturating_sub(retention_secs))
+        {
+            warn!(error = %e, key, "record_open failed");
+            return call.reply_gitlab_error(e.to_string());
+        }
+        debug!(key, "recorded open");
         call.reply()
     }
 
