@@ -50,13 +50,6 @@ pub enum Job {
 }
 
 impl Job {
-    /// What the foreground views read; refilled first and never delayed.
-    pub const FOREGROUND: [Job; 3] = [
-        Job::AssignedIssues,
-        Job::AssignedMergeRequests,
-        Job::RecentTimelogs,
-    ];
-
     /// Stable id: the job state's storage key and the log field.
     pub fn key(&self) -> String {
         match self {

@@ -290,11 +290,12 @@ clears everything synced. Otherwise each scope string selects a slice:
 | `stale`  | history older than `history.retention_hours` (normally already pruned) |
 | `usage`  | the `RecordOpen` statistics — **only when listed explicitly**; the empty "everything" scope leaves them alone (user data, not a cache) |
 
-When a session exists, the reply waits (up to 30 s) until the assigned lists and the
-recent timelogs are re-synced — plus the full history when any history was cleared;
-everything else refills in the background. Replies
-success even when dormant — the cleared state then stays empty until the next
-successful sync.
+When a session exists, the reply waits (up to 30 s) until what it cleared is
+re-synced: the assigned lists for `issues`, `search` and the empty scope (plus the
+board columns of their projects that never synced), the recent and full history
+for a history band and the empty scope. Everything else refills in the
+background; `usage` alone makes no GitLab call. Replies success even when
+dormant — the cleared state then stays empty until the next successful sync.
 
 ## Session
 

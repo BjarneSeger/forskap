@@ -65,6 +65,21 @@ impl Clear {
             Self::Timelogs { .. } => key.starts_with("timelogs/"),
         }
     }
+
+    /// The jobs refilling this slice that a `ClearCache` waits for; the
+    /// rest refill in the background.
+    pub fn refill(self) -> &'static [Job] {
+        match self {
+            Self::Everything => &[
+                Job::AssignedIssues,
+                Job::AssignedMergeRequests,
+                Job::RecentTimelogs,
+                Job::AllTimelogs,
+            ],
+            Self::Assigned | Self::Corpus => &[Job::AssignedIssues, Job::AssignedMergeRequests],
+            Self::Timelogs { .. } => &[Job::RecentTimelogs, Job::AllTimelogs],
+        }
+    }
 }
 
 enum Command {
@@ -178,8 +193,9 @@ impl SyncHandle {
 
     /// Run `jobs` ahead of the schedule. The requests are queued before this
     /// returns, in order with other commands; the future resolves once each
-    /// job ran or can't run (unplanned, dormant). Callers bound the wait with
-    /// a timeout: a job can queue behind a long one.
+    /// job ran or can't run (unplanned, dormant). The assigned issues also
+    /// wait for board columns they show that never synced. Callers bound the
+    /// wait with a timeout: a job can queue behind a long one.
     pub fn refresh_now(&self, jobs: &[Job]) -> impl Future<Output = ()> + Send + 'static {
         let waits: Vec<_> = jobs
             .iter()
@@ -465,7 +481,7 @@ impl Worker {
     /// Run one job to completion (or cancellation); false once all handles
     /// are gone.
     async fn run_job(&mut self, job: Job, session: &Session) -> bool {
-        let waiters = self.demand.remove(&job);
+        let mut waiters = self.demand.remove(&job);
         let key = job.key();
         let state = self.states.get(&key).copied().unwrap_or_default();
         let started = now_secs();
@@ -502,7 +518,8 @@ impl Worker {
             tokio::select! {
                 joined = &mut fetch => break Some(joined),
                 cmd = self.rx.recv() => match cmd {
-                    Some(Command::Clear(what, done)) => {
+                    // Only a fetch into the slice being dropped is void.
+                    Some(Command::Clear(what, done)) if what.resets(&key) => {
                         fetch.abort();
                         self.apply_clear(what);
                         let _ = done.send(());
@@ -517,9 +534,17 @@ impl Worker {
             }
         };
         match joined {
-            None => info!(job = %key, "sync job cancelled by a cache clear"),
+            None => {
+                info!(job = %key, "sync job cancelled by a cache clear");
+                // Its waiters still want it, now on the cleared store.
+                if let Some(w) = waiters.take() {
+                    self.demand.entry(job).or_default().extend(w);
+                }
+            }
             Some(Ok(Ok(staged))) => {
-                self.commit(job, &key, state, staged, started, full, fingerprint)
+                if self.commit(job, &key, state, staged, started, full, fingerprint) {
+                    self.after_commit(job, &mut waiters);
+                }
             }
             Some(Ok(Err(e))) => self.on_error(&key, state, e, session).await,
             Some(Err(e)) => {
@@ -542,7 +567,7 @@ impl Worker {
         started: u64,
         full: bool,
         fingerprint: u64,
-    ) {
+    ) -> bool {
         let fresh = JobState {
             last_ok: started,
             last_full: if full { started } else { state.last_full },
@@ -570,12 +595,60 @@ impl Worker {
                 if job.feeds_plan() {
                     self.replan = true;
                 }
+                true
             }
             Err(e) => {
                 warn!(job = %key, error = %e, "storing sync result failed");
                 self.back_off(key, state, SERVER_BACKOFF_CAP);
+                false
             }
         }
+    }
+
+    /// What a fresh `job` result sets off: the replan it may call for, and
+    /// for the assigned issues the board columns they show that never
+    /// synced, which `waiters` then wait for too.
+    fn after_commit(&mut self, job: Job, waiters: &mut Option<Vec<oneshot::Sender<()>>>) {
+        if self.replan {
+            self.replan_now();
+        }
+        if job != Job::AssignedIssues {
+            return;
+        }
+        let boards = self.missing_boards();
+        let Some(&last) = boards.last() else {
+            return;
+        };
+        for &board in &boards {
+            self.demand.entry(board).or_default();
+        }
+        // Demand runs in job order, so the last board runs last.
+        self.demand
+            .entry(last)
+            .or_default()
+            .extend(waiters.take().into_iter().flatten());
+    }
+
+    /// Planned board jobs of the assigned issues' projects that never
+    /// synced and aren't backed off, in job order.
+    fn missing_boards(&self) -> Vec<Job> {
+        let view = self.store.view(ASSIGNED_ISSUES).unwrap_or_else(|e| {
+            warn!(error = %e, "reading the assigned issues failed");
+            None
+        });
+        let now = now_secs();
+        let boards: BTreeSet<Job> = view
+            .unwrap_or_default()
+            .keys
+            .iter()
+            .map(|k| Job::ProjectBoards(k.0 as i64))
+            .filter(|job| self.plan.jobs.contains(job))
+            .filter(|job| {
+                let state = self.states.get(&job.key()).copied().unwrap_or_default();
+                state.last_ok == 0 && state.retry_at <= now
+            })
+            .collect();
+        boards.into_iter().collect()
     }
 
     async fn on_error(&mut self, key: &str, state: JobState, e: Error, session: &Session) {
@@ -1242,6 +1315,53 @@ mod tests {
         .await;
     }
 
+    /// A clear of another slice leaves the fetch in flight alone.
+    #[tokio::test]
+    async fn a_clear_elsewhere_lets_the_fetch_land() {
+        let (store, _dir) = open_store();
+        seed_assigned_project(&store);
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve("projects/7/issues", vec![issue_json(7, 3, "new")]);
+        let gate = fake.gate("projects/7/issues");
+        let env = start_on(store, connected(&fake, 1));
+
+        let refreshed = env.sync.refresh_now(&[Job::ProjectIssues(7)]);
+        tokio::time::timeout(Duration::from_secs(2), fake.gated.notified())
+            .await
+            .expect("the project fetch starts");
+        env.sync
+            .clear(Clear::Timelogs {
+                from: 0,
+                until: u64::MAX,
+            })
+            .await;
+        gate.notify_one();
+        refreshed.await;
+        assert!(env.store.issues.get((7, 3)).unwrap().is_some());
+    }
+
+    /// A demanded fetch the clear voids reruns on the cleared store before
+    /// its waiters are released.
+    #[tokio::test]
+    async fn a_cancelled_demand_reruns() {
+        let (store, _dir) = open_store();
+        seed_assigned_project(&store);
+        let fake = Arc::new(FakeGitlab::default());
+        let gate = fake.gate("projects/7/issues");
+        let env = start_on(store, connected(&fake, 1));
+
+        let refreshed = env.sync.refresh_now(&[Job::ProjectIssues(7)]);
+        tokio::time::timeout(Duration::from_secs(2), fake.gated.notified())
+            .await
+            .expect("the project fetch starts");
+        env.sync.clear(Clear::Corpus).await;
+        tokio::time::timeout(Duration::from_secs(2), refreshed)
+            .await
+            .expect("the rerun lands");
+        gate.notify_one();
+        assert!(fake.calls_to("projects/7/issues").len() >= 2);
+    }
+
     #[tokio::test]
     async fn another_account_wipes_the_previous_ones_data() {
         let (store, _dir) = open_store();
@@ -1277,7 +1397,7 @@ mod tests {
         let before = fake.calls_to("issues").len();
 
         let cleared = env.sync.clear(Clear::Everything);
-        let refilled = env.sync.refresh_now(&Job::FOREGROUND);
+        let refilled = env.sync.refresh_now(Clear::Everything.refill());
         cleared.await;
         refilled.await;
         tokio::time::sleep(Duration::from_millis(200)).await;

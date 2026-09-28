@@ -2,8 +2,8 @@
 //!
 //! With no flags this clears everything synced — use it after editing an issue
 //! in the GitLab UI when you don't want to wait out the daemon's sync interval.
-//! The per-slice flags clear only the named caches. The daemon replies once the
-//! assigned lists and recent history are re-synced.
+//! The per-slice flags clear only the named caches. The daemon replies once
+//! what it cleared of the assigned lists and the history is re-synced.
 //! `--usage` is the exception: open statistics are user data, so only that
 //! explicit flag drops them.
 

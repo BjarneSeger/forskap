@@ -934,6 +934,40 @@ async fn clear_cache_refills_the_foreground_before_replying() {
     assert_eq!(fake.timelog_calls().len(), 2, "recent and full history");
 }
 
+/// Only the refill of what a scope cleared is awaited: open statistics are
+/// not synced, so clearing them makes no call.
+#[tokio::test]
+async fn clear_cache_refills_only_what_it_cleared() {
+    let fake = Arc::new(FakeGitlab::default());
+    let (h, _dir) = connected_handlers(&fake);
+
+    clear_cache(&h, Some(vec!["usage".into()])).await;
+    assert_eq!(fake.read_calls(), 0);
+
+    clear_cache(&h, Some(vec!["issues".into()])).await;
+    assert_eq!(fake.calls_to("issues").len(), 1);
+    assert!(fake.timelog_calls().is_empty(), "history untouched");
+}
+
+/// Board columns of freshly assigned projects land before the refill
+/// replies, so `tt list` right after `tt refresh` shows them.
+#[tokio::test]
+async fn clear_cache_waits_for_new_board_columns() {
+    let fake = Arc::new(FakeGitlab::default());
+    let mut doing = issue_json(7, 1, "wip");
+    doing["labels"] = serde_json::json!(["Doing"]);
+    fake.serve("issues", vec![doing]);
+    fake.serve(
+        "projects/7/boards",
+        vec![serde_json::json!({"id": 3, "lists": [{"label": {"name": "Doing"}}]})],
+    );
+    let (h, _dir) = connected_handlers(&fake);
+
+    clear_cache(&h, Some(vec!["issues".into()])).await;
+    let issues = assigned_issues(&h, None).await;
+    assert_eq!(issues[0].graph_status, "Doing");
+}
+
 // ── Properties ─────────────────────────────────────────────────────────
 //
 // For arbitrary arguments a handler must always reply (never panic), reject

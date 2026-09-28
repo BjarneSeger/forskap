@@ -531,13 +531,12 @@ impl VarlinkInterface for Handlers {
                 }
             }
         }
-        let mut refill = Job::FOREGROUND.to_vec();
-        if all || ["quick", "slow", "stale"].iter().any(|b| want(b)) {
-            refill.push(Job::AllTimelogs);
-        }
+        let mut refill: Vec<Job> = clears.iter().flat_map(|c| c.refill()).copied().collect();
+        refill.sort_unstable();
+        refill.dedup();
         // Queued together, so no scheduled run slips in between.
         let cleared: Vec<_> = clears.into_iter().map(|c| self.sync.clear(c)).collect();
-        let refilled = self.sync.refresh_now(&refill);
+        let refilled = (!refill.is_empty()).then(|| self.sync.refresh_now(&refill));
         for c in cleared {
             c.await;
         }
@@ -553,9 +552,10 @@ impl VarlinkInterface for Handlers {
         }
 
         // Resolves at once while dormant: the worker drops demands then.
-        if tokio::time::timeout(CLEAR_REFILL_TIMEOUT, refilled)
-            .await
-            .is_err()
+        if let Some(refilled) = refilled
+            && tokio::time::timeout(CLEAR_REFILL_TIMEOUT, refilled)
+                .await
+                .is_err()
         {
             warn!("refill still running; replying before it lands");
         }
