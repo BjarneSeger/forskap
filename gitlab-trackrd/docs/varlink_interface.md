@@ -291,7 +291,8 @@ clears everything synced. Otherwise each scope string selects a slice:
 | `usage`  | the `RecordOpen` statistics — **only when listed explicitly**; the empty "everything" scope leaves them alone (user data, not a cache) |
 
 When a session exists, the reply waits (up to 30 s) until the assigned lists and the
-recent timelogs are re-synced; everything else refills in the background. Replies
+recent timelogs are re-synced — plus the full history when any history was cleared;
+everything else refills in the background. Replies
 success even when dormant — the cleared state then stays empty until the next
 successful sync.
 

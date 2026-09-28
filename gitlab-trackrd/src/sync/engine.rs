@@ -167,10 +167,11 @@ impl SyncHandle {
         let _ = self.tx.send(Command::Reconfigure);
     }
 
-    /// Run `jobs` ahead of the schedule and wait until each ran or can't run
-    /// (unplanned, dormant). Callers bound the wait with a timeout: a job
-    /// can queue behind a long one.
-    pub async fn refresh_now(&self, jobs: &[Job]) {
+    /// Run `jobs` ahead of the schedule. The requests are queued before this
+    /// returns, in order with other commands; the future resolves once each
+    /// job ran or can't run (unplanned, dormant). Callers bound the wait with
+    /// a timeout: a job can queue behind a long one.
+    pub fn refresh_now(&self, jobs: &[Job]) -> impl Future<Output = ()> + Send + 'static {
         let waits: Vec<_> = jobs
             .iter()
             .map(|&job| {
@@ -179,8 +180,10 @@ impl SyncHandle {
                 wait
             })
             .collect();
-        for wait in waits {
-            let _ = wait.await;
+        async move {
+            for wait in waits {
+                let _ = wait.await;
+            }
         }
     }
 
@@ -191,11 +194,14 @@ impl SyncHandle {
         }
     }
 
-    /// Drop a slice of synced state; an in-flight fetch into it is cancelled.
-    /// The affected jobs become due at once.
-    pub async fn clear(&self, what: Clear) {
+    /// Drop a slice of synced state; an in-flight fetch into it is cancelled
+    /// and the affected jobs become due at once. Queued in order like
+    /// [`Self::refresh_now`], so a refresh requested right after it runs on
+    /// the cleared store without a scheduled run slipping in between.
+    pub fn clear(&self, what: Clear) -> impl Future<Output = ()> + Send + 'static {
         let (done, wait) = oneshot::channel();
-        if self.tx.send(Command::Clear(what, done)).is_ok() {
+        let _ = self.tx.send(Command::Clear(what, done));
+        async move {
             let _ = wait.await;
         }
     }
@@ -963,6 +969,23 @@ mod tests {
         env.sync.refresh_now(&[Job::AssignedIssues]).await;
         assert_eq!(store.identity().unwrap().unwrap().user_id, 1);
         assert!(store.issues.get((1, 1)).unwrap().is_none());
+    }
+
+    /// A clear and the refill requested with it are queued together, so the
+    /// refill isn't preceded by a scheduled run of the same job.
+    #[tokio::test]
+    async fn a_clear_and_its_refill_run_each_job_once() {
+        let fake = Arc::new(FakeGitlab::default());
+        let env = start(connected(&fake, 1));
+        env.sync.refresh_now(&BASE).await;
+        let before = fake.calls_to("issues").len();
+
+        let cleared = env.sync.clear(Clear::Everything);
+        let refilled = env.sync.refresh_now(&Job::FOREGROUND);
+        cleared.await;
+        refilled.await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(fake.calls_to("issues").len(), before + 1);
     }
 
     #[tokio::test]

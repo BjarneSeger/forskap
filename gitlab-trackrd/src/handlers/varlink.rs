@@ -37,8 +37,9 @@ const SEARCH_KINDS: [&str; 4] = ["issues", "merge_requests", "projects", "groups
 /// Per-kind result cap when the caller doesn't pass a `limit`.
 const DEFAULT_SEARCH_LIMIT: usize = 50;
 
-/// How long `ClearCache` waits for the foreground views to refill before
-/// replying anyway; the rest refills in the background.
+/// How long `ClearCache` waits for the foreground views (and a cleared
+/// history) to refill before replying anyway; the rest refills in the
+/// background.
 const CLEAR_REFILL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why a read has nothing to serve: its source never synced.
@@ -510,14 +511,15 @@ impl VarlinkInterface for Handlers {
                 now.saturating_sub(c.history.retention().as_secs()),
             )
         };
+        let mut clears = Vec::new();
         if all {
-            self.sync.clear(Clear::Everything).await;
+            clears.push(Clear::Everything);
         } else {
             if want("issues") {
-                self.sync.clear(Clear::Assigned).await;
+                clears.push(Clear::Assigned);
             }
             if want("search") {
-                self.sync.clear(Clear::Corpus).await;
+                clears.push(Clear::Corpus);
             }
             for (band, from, until) in [
                 ("quick", quick_start, u64::MAX),
@@ -525,9 +527,19 @@ impl VarlinkInterface for Handlers {
                 ("stale", 0, retention_start),
             ] {
                 if want(band) {
-                    self.sync.clear(Clear::Timelogs { from, until }).await;
+                    clears.push(Clear::Timelogs { from, until });
                 }
             }
+        }
+        let mut refill = Job::FOREGROUND.to_vec();
+        if all || ["quick", "slow", "stale"].iter().any(|b| want(b)) {
+            refill.push(Job::AllTimelogs);
+        }
+        // Queued together, so no scheduled run slips in between.
+        let cleared: Vec<_> = clears.into_iter().map(|c| self.sync.clear(c)).collect();
+        let refilled = self.sync.refresh_now(&refill);
+        for c in cleared {
+            c.await;
         }
 
         // Open statistics are user data, not a cache: only an explicit scope
@@ -540,15 +552,12 @@ impl VarlinkInterface for Handlers {
             }
         }
 
-        if self.gitlab().await.is_ok()
-            && tokio::time::timeout(
-                CLEAR_REFILL_TIMEOUT,
-                self.sync.refresh_now(&Job::FOREGROUND),
-            )
+        // Resolves at once while dormant: the worker drops demands then.
+        if tokio::time::timeout(CLEAR_REFILL_TIMEOUT, refilled)
             .await
             .is_err()
         {
-            warn!("foreground refill still running; replying before it lands");
+            warn!("refill still running; replying before it lands");
         }
         call.reply()
     }

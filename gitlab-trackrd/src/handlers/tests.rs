@@ -917,8 +917,8 @@ async fn clear_cache_usage_only_when_listed() {
     assert!(h.usage.snapshot().unwrap().entries.is_empty());
 }
 
-/// Connected: the reply waits for the foreground views to refill, so a
-/// `tt refresh` followed by `tt list` shows fresh data.
+/// Connected: the reply waits for the foreground views and the history to
+/// refill, so a `tt refresh` followed by `tt list` shows fresh data.
 #[tokio::test]
 async fn clear_cache_refills_the_foreground_before_replying() {
     let fake = Arc::new(FakeGitlab::default());
@@ -931,7 +931,7 @@ async fn clear_cache_refills_the_foreground_before_replying() {
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0].title, "fresh");
     assert_eq!(fake.calls_to("merge_requests").len(), 1);
-    assert_eq!(fake.timelog_calls().len(), 1);
+    assert_eq!(fake.timelog_calls().len(), 2, "recent and full history");
 }
 
 // ── Properties ─────────────────────────────────────────────────────────

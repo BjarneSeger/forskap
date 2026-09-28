@@ -134,8 +134,8 @@ pub enum Command {
     },
     /// Drop the daemon's caches and re-fetch. With no flags it clears
     /// everything synced; pass flags to target only those slices. Waits until
-    /// the assigned lists and recent history are re-synced; the rest refills
-    /// in the background. Open statistics are user data and only go with an
+    /// the assigned lists and the history are re-synced; the search corpus
+    /// refills in the background. Open statistics are user data and only go with an
     /// explicit `--usage`.
     Refresh {
         /// Clear the quick history band (the last 24h).
