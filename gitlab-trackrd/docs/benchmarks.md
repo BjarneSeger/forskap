@@ -10,9 +10,9 @@ after every mutation, so a bench would measure the disk, not the code).
 
 | Target | Covers |
 |---|---|
-| `search` | The `Search` handler over a seeded corpus (1k/10k/50k entries — 50k is `LARGE_CORPUS_WARN`): needle-miss scans, ~1% hit scans with the per-hit board lookup, all-kinds scans, `#iid` reference queries. Plus the pure matchers `text_matches`/`parse_iid_query`. |
-| `storage` | Raw `KvStore` full scans (fjall iteration + per-entry JSON decode), the `IssueCache` whole-blob put/get round-trip, `HistoryCache::all_since`/`clear_between`, and the search cache's full-resync deletion diff (`retain_issues`) and `update_mr`. |
-| `handlers` | `GetAssignedMergeRequests` (with and without group filter), `GetHistory` (history scan + issue-cache join), and the pure `enrich_timelog` join. |
+| `search` | The `Search` handler over a seeded corpus (1k/10k/50k entries): needle-miss scans, ~1% hit scans with the per-hit board lookup, all-kinds scans, `#iid` reference queries. Plus the pure matchers `text_matches`/`parse_iid_query`. |
+| `storage` | Raw `KvStore` full scans (fjall iteration + per-entry JSON decode), the sync store's table scan and batch upsert, the timelog window scan and band clear, and full-run reconciles (whole table and one project's key range). |
+| `handlers` | `GetAssignedMergeRequests` (view → point reads, with and without group filter) and `GetHistory` (timelog window scan). |
 
 Handler benches drive the real varlink surface: the generated `AsyncCall`
 driver against a dormant `Handlers` on a temp-dir fjall database. Dormant is

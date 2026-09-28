@@ -53,7 +53,7 @@ pub fn plan(store: &SyncStore, population: SearchPopulation, tracked_since: u64)
             .into_iter()
             .map(|(id, _)| id as i64)
             .collect(),
-        SearchPopulation::Tracked | SearchPopulation::Auto => tracked.iter().copied().collect(),
+        SearchPopulation::Tracked => tracked.iter().copied().collect(),
     };
     for p in corpus {
         jobs.extend([Job::ProjectIssues(p), Job::ProjectMergeRequests(p)]);

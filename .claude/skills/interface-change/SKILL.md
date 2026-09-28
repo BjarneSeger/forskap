@@ -34,21 +34,26 @@ the daemon are the to-do list.
   fall back to GitLab, reply.
 - Error replies: GitLab rejection → `call.reply_gitlab_error(msg)`; dormant session →
   `call.reply_not_authenticated(reason, detail)` via `dormant_args(&e)`.
-- **Write methods** (anything mutating GitLab) must follow the defer pattern: on
-  `DormancyReason::Unreachable` or a transient (`Error::Transient`) failure, enqueue on
-  the `RetryQueue` and reply success (see `defer_post_time` and friends at the top of
-  `varlink.rs`); only a real GitLab rejection returns `GitlabError`. A transient write
-  failure never demotes the session — background refresh is the demotion authority.
-- New GitLab call needed? Add it to the `GitlabApi` trait in `gitlab.rs` **and to every
-  mock**: `FakeGitlab` in `handlers/tests.rs`, `FakeGitlab` in `queue.rs`, `NoopGitlab`
-  in `reconnect.rs` (the latter two usually just `unimplemented!()`).
+- **Write methods** (anything mutating GitLab) go through the shared cascade: add a
+  `WriteOp` variant in `write.rs` (its `apply` arm and `idempotent()` answer), then call
+  `perform_write` and `reply_write!` in `varlink.rs` like the existing writes. It tries
+  once, queues on `Unreachable` or a retryable error, and only a real GitLab rejection
+  returns `GitlabError`. A write never demotes the session — the sync worker is the
+  demotion authority. Extend `Job::affected_by` so the right views re-sync after it.
+- **Read methods** only read the sync store (`self.sync.store()`); never call GitLab.
+  New data to serve? Add a mirror type (`sync/model.rs`, `Resource` + `Stored`), a
+  `Listing` variant (`gitlab.rs`) and a `Job` (`sync/jobs.rs`, planned in
+  `sync/planner.rs`), then project it in `handlers/wire.rs`.
+- New GitLab call needed? Reads are a new `Listing` variant (no trait change). A new
+  write method goes on the `GitlabApi` trait in `gitlab.rs` **and** on the shared fake in
+  `testing.rs`.
 - **New method? Add its arm to the hand-written dispatcher** `handle_trackrd` in
   `gitlab-trackrd/src/service.rs` (clone the arm of an argument-identical method) plus a
   `dispatch_has_an_arm_for_<method>` test next to `dispatch_has_an_arm_for_search`. A
   missing arm compiles fine and only fails at runtime as `MethodNotFound`.
-- New field on a wire type that a cache persists verbatim (`IssueCache` stores `Issue`)?
-  Old rows stop deserializing — bump the keyspace and the matching schema version in
-  `refresh_meta.rs` so the stamp-gated refresh refills at once.
+- New field on a wire type? The store holds GitLab mirrors, not wire types: add the
+  field to the mirror in `sync/model.rs` (lenient `serde(default)`) and bump that
+  resource's `SCHEMA`, so every job syncing it runs full once and refills old rows.
 
 ## 4. CLI
 

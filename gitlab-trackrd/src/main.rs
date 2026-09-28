@@ -5,18 +5,32 @@ use tokio::sync::{Notify, RwLock};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use gitlab_trackrd::boards::BoardCache;
-use gitlab_trackrd::cache::IssueCache;
 use gitlab_trackrd::error::{DormancyReason, Result};
 use gitlab_trackrd::gitlab::GitlabClient;
 use gitlab_trackrd::handlers::{ConnState, Handlers, Session, SessionSlot};
-use gitlab_trackrd::history::HistoryCache;
-use gitlab_trackrd::queue::RetryQueue;
-use gitlab_trackrd::refresh_meta::RefreshMeta;
-use gitlab_trackrd::search::SearchCache;
+use gitlab_trackrd::queue::{RetryQueue, SettleHook};
 use gitlab_trackrd::service::ServiceHandler;
+use gitlab_trackrd::sync::store::SyncStore;
+use gitlab_trackrd::sync::{Job, SyncHandle};
 use gitlab_trackrd::usage::UsageStats;
-use gitlab_trackrd::{config, reconnect, reload, secrets, server};
+use gitlab_trackrd::write::Write;
+use gitlab_trackrd::{config, db, reconnect, reload, secrets, server};
+
+/// Cache keyspaces of the stores the sync layer replaced; re-fetchable, so
+/// dropped at startup. The retry queue, dead letters and open statistics
+/// are user data and are never listed here.
+const RETIRED_KEYSPACES: [&str; 10] = [
+    "issues_cache_v1",
+    "issues_cache_v2",
+    "project_board_labels_v1",
+    "timelog_history_v1",
+    "refresh_meta_v1",
+    "search_issues_v1",
+    "search_mrs_v1",
+    "search_projects_v1",
+    "search_groups_v1",
+    "search_meta_v1",
+];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -84,118 +98,50 @@ async fn main() -> Result<()> {
 
     std::fs::create_dir_all(&db_dir)?;
     let db = fjall::Database::builder(&db_dir).open()?;
-    let cache = Arc::new(IssueCache::open(&db)?);
-    let boards = Arc::new(BoardCache::open(&db)?);
-    let history = Arc::new(HistoryCache::open(&db)?);
-    let search = Arc::new(SearchCache::open(&db)?);
-    let refresh_meta = Arc::new(RefreshMeta::open(&db)?);
+    match db::drop_keyspaces(&db, &RETIRED_KEYSPACES) {
+        Ok(dropped) if !dropped.is_empty() => info!(?dropped, "dropped retired cache keyspaces"),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "dropping retired cache keyspaces failed"),
+    }
+    let store = Arc::new(SyncStore::open(&db)?);
     let usage = Arc::new(UsageStats::open(&db)?);
-    let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config))?;
-    // Woken when a runtime GitLab failure demotes the session to
-    // `Dormant(Unreachable)`, so the reconnect supervisor re-engages mid-run and
-    // not only at boot. See `reconnect::spawn`.
+    // Woken when the sync worker demotes the session to `Dormant(Unreachable)`,
+    // so the reconnect supervisor re-engages mid-run and not only at boot.
     let reconnect_signal = Arc::new(Notify::new());
+    // The only GitLab reader: fetches on its jittered schedule into `store`,
+    // which the handlers serve from.
+    let sync = SyncHandle::spawn(
+        store,
+        Arc::clone(&session),
+        Arc::clone(&config),
+        Arc::clone(&reconnect_signal),
+    );
+    let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config))?;
+    queue.on_settled(settle_hook(&sync));
     let handlers = Arc::new(Handlers {
         session,
-        cache,
-        boards,
-        history,
-        search,
-        refresh_meta,
+        sync: Arc::clone(&sync),
         usage,
         queue,
         config: Arc::clone(&config),
         reconnect_signal,
     });
 
-    reload::spawn(Arc::clone(&config));
+    reload::spawn(Arc::clone(&config), move || sync.reconfigure());
 
     // If the daemon booted dormant because GitLab was unreachable, retry the
     // connection in the background with exponential backoff. A successful
     // reconnect flips the shared session to `Connected`, which drains the retry
-    // queue and resumes the refresh loops. No-op when already connected or when
+    // queue and wakes the sync worker. No-op when already connected or when
     // dormancy needs the user (bad token / logged out).
     reconnect::spawn(Arc::clone(&handlers));
 
     let listener = server::make_listener(&socket)?;
 
-    let (quick_interval, slow_interval) = {
-        let c = config.read().unwrap();
-        (c.refresh.quick.interval_secs, c.refresh.slow.interval_secs)
-    };
     if server::is_socket_activated() {
-        info!(
-            quick_interval,
-            slow_interval, "starting gitlab-trackrd from socket"
-        );
+        info!("starting gitlab-trackrd from socket");
     } else {
-        info!(
-            socket = socket,
-            quick_interval, slow_interval, "starting gitlab-trackrd"
-        );
-    }
-
-    // One-shot startup warm-up: refresh issues/boards/active first so the
-    // issue cache is populated, then backfill the full stale history window so
-    // the older, never-refreshed tiers are filled. Order matters — history
-    // enrichment reads project IDs from the issue cache. Every step gates
-    // itself on persisted stamps, so a restart inside the intervals serves the
-    // persisted caches instead of re-polling GitLab.
-    {
-        let handlers_ref = Arc::clone(&handlers);
-        tokio::spawn(async move {
-            info!("startup cache warm-up triggered");
-            handlers_ref.warm_up().await;
-        });
-    }
-
-    // Quick tier: refresh issues, boards, and the recent history window every
-    // `refresh.quick.interval_secs`. The interval is re-read each tick so a
-    // config reload takes effect after the current sleep. The refresh gates
-    // itself on the persisted quick stamp, so a tick is cheap when nothing is
-    // due.
-    {
-        let handlers_ref = Arc::clone(&handlers);
-        let config = Arc::clone(&config);
-        tokio::spawn(async move {
-            loop {
-                let interval = config.read().unwrap().refresh.quick.interval();
-                tokio::time::sleep(interval).await;
-                info!("background cache refresh triggered");
-                handlers_ref.refresh_cache().await;
-            }
-        });
-    }
-
-    // Slow tier: re-poll the bulk history window once a day and prune anything
-    // past the retention horizon. Gates itself on the persisted slow stamp.
-    {
-        let handlers_ref = Arc::clone(&handlers);
-        let config = Arc::clone(&config);
-        tokio::spawn(async move {
-            loop {
-                let interval = config.read().unwrap().refresh.slow.interval();
-                tokio::time::sleep(interval).await;
-                info!("daily history refresh triggered");
-                handlers_ref.refresh_history_daily().await;
-            }
-        });
-    }
-
-    // Search cache: incremental sync on the partial cadence, escalating to a
-    // full resync when the full-interval stamp expires. The sync gates itself
-    // on the persisted stamps, so this tick is cheap when nothing is due.
-    {
-        let handlers_ref = Arc::clone(&handlers);
-        let config = Arc::clone(&config);
-        tokio::spawn(async move {
-            loop {
-                let interval = config.read().unwrap().search.partial_interval();
-                tokio::time::sleep(interval).await;
-                info!("search cache sync triggered");
-                handlers_ref.sync_search_cache().await;
-            }
-        });
+        info!(socket = socket, "starting gitlab-trackrd");
     }
 
     let serve = server::serve(Arc::new(ServiceHandler::new(handlers)), listener);
@@ -213,4 +159,16 @@ async fn main() -> Result<()> {
         let _ = std::fs::remove_file(&socket);
     }
     Ok(())
+}
+
+/// Once a queued write settles, show it: an applied one is noted for the
+/// read-time overlay, and either way the jobs displaying it rerun.
+fn settle_hook(sync: &Arc<SyncHandle>) -> SettleHook {
+    let sync = Arc::clone(sync);
+    Arc::new(move |write: &Write, applied: bool| {
+        if applied {
+            sync.note_write(write);
+        }
+        sync.refresh_soon(&Job::affected_by(write));
+    })
 }

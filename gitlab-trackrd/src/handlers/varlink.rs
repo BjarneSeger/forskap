@@ -1,8 +1,9 @@
-//! The [`VarlinkInterface`] method implementations plus the write-path helpers
-//! they lean on. Each method is a short cascade: consult the cache, fall back
-//! to GitLab, reply — see the crate module docs for the error conventions.
+//! The [`VarlinkInterface`] method implementations plus the write cascade they
+//! share. Reads serve the sync store only; see the module docs of
+//! [`super`] for the conventions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use tracing::{debug, info, instrument, warn};
 
@@ -16,15 +17,18 @@ use gitlab_trackr_api::{
 
 use crate::error::{DormancyReason, Error};
 use crate::gitlab::{GitlabClient, Issuable};
-use crate::history::HistoryCache;
-use crate::query::{graph_status_from, in_group, namespace_of, parse_iid_query, text_matches};
-use crate::search::{SEARCH_SCHEMA_VERSION, SearchIssue, SearchMr};
+use crate::query::{in_group, namespace_of, parse_iid_query, text_matches};
 use crate::secrets::{self, Credentials};
+use crate::sync::jobs::{ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS};
+use crate::sync::model::{self, RowKey};
+use crate::sync::store::{RowScope, Stored, SyncStore};
+use crate::sync::{Clear, Job};
 use crate::usage::{UsageEntry, UsageRecord};
 use crate::write::{Write, WriteOp};
 
 use super::{
     ConnState, Handlers, Session, dormant_args, issue_ref_error, looks_like_duration, now_secs,
+    wire,
 };
 
 /// The kind strings `Search` accepts, matching the `ClearCache` scope style.
@@ -33,17 +37,141 @@ const SEARCH_KINDS: [&str; 4] = ["issues", "merge_requests", "projects", "groups
 /// Per-kind result cap when the caller doesn't pass a `limit`.
 const DEFAULT_SEARCH_LIMIT: usize = 50;
 
-impl Handlers {
-    /// The global numeric issuable ID (the one GraphQL embeds in
-    /// `gid://gitlab/<Kind>/<id>`) for a cached `(project, iid)`, so a queued
-    /// retry can use the GraphQL path. Issues resolve via the assigned-issue
-    /// cache, MRs via the search corpus. `None` when not cached — the queue
-    /// then falls back to REST without a `spent_at`.
-    fn resolve_issuable_id(&self, kind: Issuable, project_id: i64, iid: i64) -> Option<i64> {
-        match kind {
-            Issuable::Issue => self.cache.issue_id(project_id, iid).ok().flatten(),
-            Issuable::MergeRequest => self.search.mr_id(project_id, iid).ok().flatten(),
+/// How long `ClearCache` waits for the foreground views to refill before
+/// replying anyway; the rest refills in the background.
+const CLEAR_REFILL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Why a read has nothing to serve: its source never synced.
+enum Cold {
+    /// Connected; the first sync is still pending.
+    Pending,
+    Dormant(DormancyReason),
+}
+
+/// How [`Handlers::perform_write`] ended.
+enum WriteOutcome {
+    /// Applied, or queued for the retry worker.
+    Accepted,
+    NotAuthenticated(DormancyReason),
+    Rejected(Error),
+}
+
+/// Reply to a read whose source never synced — an honest `NotAuthenticated`
+/// while dormant, an empty reply while the first sync is pending — and
+/// return; fall through when it has synced. A macro because every method
+/// has its own generated call trait.
+macro_rules! reply_if_cold {
+    ($self:ident, $call:ident, $job:expr, ($($empty:expr),*)) => {
+        match $self.cold($job).await {
+            Some(Cold::Pending) => return $call.reply($($empty),*),
+            Some(Cold::Dormant(r)) => {
+                let (reason, detail) = dormant_args(&r);
+                return $call.reply_not_authenticated(reason, detail);
+            }
+            None => {}
         }
+    };
+}
+
+/// Reply to a write call from its [`WriteOutcome`].
+macro_rules! reply_write {
+    ($call:expr, $outcome:expr) => {
+        match $outcome {
+            WriteOutcome::Accepted => $call.reply(),
+            WriteOutcome::NotAuthenticated(r) => {
+                let (reason, detail) = dormant_args(&r);
+                $call.reply_not_authenticated(reason, detail)
+            }
+            WriteOutcome::Rejected(e) => $call.reply_gitlab_error(e.to_string()),
+        }
+    };
+}
+
+impl Handlers {
+    fn store(&self) -> &SyncStore {
+        self.sync.store()
+    }
+
+    async fn cold(&self, job: Job) -> Option<Cold> {
+        if self.sync.has_synced(job) {
+            return None;
+        }
+        Some(match self.gitlab().await {
+            Ok(_) => Cold::Pending,
+            Err(r) => Cold::Dormant(r),
+        })
+    }
+
+    /// The rows the assigned view `name` lists, minus the items a write took
+    /// out of it that the view doesn't reflect yet: closes and unassigns
+    /// still in the retry queue, and ones applied after the view's fetch
+    /// began.
+    fn assigned<R: Stored>(&self, name: &str, kind: Issuable) -> Vec<R> {
+        let view = self.store().view(name).unwrap_or_else(|e| {
+            warn!(error = %e, view = name, "view read failed, treating as empty");
+            None
+        });
+        let Some(view) = view else {
+            return Vec::new();
+        };
+        let pending = self.queue.pending().unwrap_or_else(|e| {
+            warn!(error = %e, "queue scan failed; queued writes not reflected");
+            Vec::new()
+        });
+        let hidden: HashSet<RowKey> = pending
+            .into_iter()
+            .map(|p| p.write)
+            .chain(self.sync.writes_since(view.fetched_at))
+            .filter(|w| w.kind == kind && matches!(w.op, WriteOp::Close | WriteOp::UnassignSelf))
+            .map(|w| (w.project_id.max(0) as u64, w.iid.max(0) as u64))
+            .collect();
+        let table = self.store().table::<R>();
+        view.keys
+            .into_iter()
+            .filter(|k| !hidden.contains(k))
+            .filter_map(|k| {
+                table.get(k).unwrap_or_else(|e| {
+                    warn!(error = %e, kind = R::NAME, "row read failed, skipping");
+                    None
+                })
+            })
+            .collect()
+    }
+
+    /// Every stored row of `R`, empty on a read failure.
+    fn all<R: Stored>(&self) -> Vec<R> {
+        self.store()
+            .table::<R>()
+            .scan(RowScope::All)
+            .unwrap_or_else(|e| {
+                warn!(error = %e, kind = R::NAME, "store read failed, treating as empty");
+                Vec::new()
+            })
+    }
+
+    /// The global numeric id GraphQL embeds in `gid://gitlab/<Kind>/<id>`,
+    /// so a queued PostTime can keep its time. `None` when not stored — the
+    /// queue then falls back to REST without a `spent_at`.
+    fn resolve_issuable_id(&self, kind: Issuable, project_id: i64, iid: i64) -> Option<i64> {
+        let key = (project_id.max(0) as u64, iid.max(0) as u64);
+        let id = match kind {
+            Issuable::Issue => self.store().issues.get(key).map(|i| i.map(|i| i.id)),
+            Issuable::MergeRequest => self
+                .store()
+                .merge_requests
+                .get(key)
+                .map(|m| m.map(|m| m.id)),
+        };
+        id.ok().flatten()
+    }
+
+    /// The open statistics, degraded to empty on a read failure so ranking
+    /// merely falls back to recency (the standing cache-error convention).
+    fn usage_or_empty(&self) -> UsageRecord {
+        self.usage.snapshot().unwrap_or_else(|e| {
+            warn!(error = %e, "usage read failed, ranking without open counts");
+            UsageRecord::default()
+        })
     }
 
     /// The shared write cascade: try once while connected; queue the write
@@ -70,7 +198,8 @@ impl Handlers {
         match write.apply(&*gitlab, None).await {
             Ok(()) => {
                 info!(project_id, iid, ?kind, op, "write applied");
-                self.reflect(&write);
+                self.sync.note_write(&write);
+                self.sync.refresh_soon(&Job::affected_by(&write));
                 WriteOutcome::Accepted
             }
             Err(e) if e.is_retryable(write.op.idempotent()) => {
@@ -85,201 +214,75 @@ impl Handlers {
         }
     }
 
-    /// Queue `write` for the retry worker and reflect it in the caches. A
-    /// PostTime gets its issuable id resolved so the replay keeps its time.
+    /// Queue `write` for the retry worker. A PostTime gets its issuable id
+    /// resolved so the replay keeps its time.
     async fn defer(&self, mut write: Write) {
         if let WriteOp::PostTime { issuable_id, .. } = &mut write.op {
             *issuable_id = self.resolve_issuable_id(write.kind, write.project_id, write.iid);
         }
-        self.reflect(&write);
         self.queue.enqueue(write).await;
     }
+}
 
-    /// Mirror an accepted write in the caches so the assigned views show it
-    /// at once; the next sync reconciles.
-    fn reflect(&self, write: &Write) {
-        match write.op {
-            WriteOp::Close => self.reflect_close(write.kind, write.project_id, write.iid),
-            WriteOp::UnassignSelf => self.reflect_unassign(write.kind, write.project_id, write.iid),
-            WriteOp::PostTime { .. } | WriteOp::AssignSelf => {}
+/// Board list labels per project, read at most once per request. `None` for
+/// a project whose boards never synced, so its `graph_status` stays empty.
+struct BoardLabels<'a> {
+    handlers: &'a Handlers,
+    by_project: HashMap<i64, Option<Vec<String>>>,
+}
+
+impl<'a> BoardLabels<'a> {
+    fn new(handlers: &'a Handlers) -> Self {
+        Self {
+            handlers,
+            by_project: HashMap::new(),
         }
     }
 
-    /// Reflect a close in the caches immediately: drop the issue from the
-    /// assigned cache, or flip the cached MR's state so it leaves the
-    /// assigned-MR view. Best-effort — the next refresh/sync reconciles.
-    fn reflect_close(&self, kind: Issuable, project_id: i64, iid: i64) {
-        match kind {
-            Issuable::Issue => self.forget_cached_issue(project_id, iid),
-            Issuable::MergeRequest => self.update_cached_mr(project_id, iid, "close", |m| {
-                m.state = "closed".to_string();
-            }),
-        }
-    }
-
-    /// Reflect an unassign in the caches immediately: drop the issue, or
-    /// remove the synced user from the cached MR's assignees.
-    fn reflect_unassign(&self, kind: Issuable, project_id: i64, iid: i64) {
-        match kind {
-            Issuable::Issue => self.forget_cached_issue(project_id, iid),
-            Issuable::MergeRequest => {
-                let user = self
-                    .search
-                    .stamps()
-                    .map(|s| s.synced_user_id)
-                    .unwrap_or_default();
-                if user == 0 {
-                    return;
+    fn of(&mut self, project_id: i64) -> Option<&[String]> {
+        let h = self.handlers;
+        self.by_project
+            .entry(project_id)
+            .or_insert_with(|| {
+                if !h.sync.has_synced(Job::ProjectBoards(project_id)) {
+                    return None;
                 }
-                self.update_cached_mr(project_id, iid, "unassign", move |m| {
-                    m.assignees.retain(|a| a.id != user);
-                });
-            }
-        }
+                let boards = h
+                    .store()
+                    .boards
+                    .scan(RowScope::Prefix(project_id.max(0) as u64))
+                    .unwrap_or_else(|e| {
+                        warn!(error = %e, project_id, "board read failed");
+                        Vec::new()
+                    });
+                Some(
+                    boards
+                        .iter()
+                        .flat_map(|b| b.labels().map(str::to_string))
+                        .collect(),
+                )
+            })
+            .as_deref()
     }
 
-    /// Apply a mutation to one cached search MR under the sync gate. Uses
-    /// `try_begin_sync` — a write handler must never wait out an in-flight
-    /// full resync; when the gate is contended the update is skipped, since
-    /// the running sync is fetching fresh data anyway.
-    fn update_cached_mr(
-        &self,
-        project_id: i64,
-        iid: i64,
-        what: &str,
-        f: impl FnOnce(&mut SearchMr),
-    ) {
-        let Some(guard) = self.search.try_begin_sync() else {
-            debug!(
-                project_id,
-                iid, what, "search sync in flight; skipping MR cache update"
-            );
-            return;
-        };
-        match guard.update_mr(project_id, iid, f) {
-            Ok(true) => debug!(project_id, iid, what, "cached MR updated"),
-            Ok(false) => {}
-            Err(e) => warn!(error = %e, project_id, iid, what, "MR cache update failed"),
-        }
-    }
-
-    /// Drop an issue from the assigned-issues cache so a close/unassign is
-    /// reflected in `tt list` immediately. Best-effort — a failure is logged
-    /// and swallowed (the next refresh will reconcile the list anyway).
-    fn forget_cached_issue(&self, project_id: i64, iid: i64) {
-        match self.cache.remove_issue(project_id, iid) {
-            Ok(true) => debug!(project_id, iid, "removed issue from cache"),
-            Ok(false) => {}
-            Err(e) => warn!(error = %e, project_id, iid, "cache issue removal failed"),
-        }
-    }
-
-    /// Map a cached search issue onto the wire `Issue`. `graph_status` is
-    /// best-effort from already-cached board labels only — `Search` is a pure
-    /// cache reader, so projects the assigned-issues refresh never touched
-    /// simply get an empty status.
-    fn wire_search_issue(&self, i: SearchIssue, open_count: i64) -> Issue {
-        let board = self.boards.get(i.project_id).ok().flatten();
-        let graph_status = graph_status_from(board.as_deref(), &i.labels, &i.state);
-        Issue {
-            id: i.id,
-            iid: i.iid,
-            project_id: i.project_id,
-            title: i.title,
-            web_url: i.web_url,
-            state: i.state,
-            parent: i.parent,
-            total_time: i.total_time,
-            graph_status,
-            open_count,
-        }
-    }
-
-    /// The open statistics, degraded to empty on a read failure so ranking
-    /// merely falls back to recency (the standing cache-error convention).
-    fn usage_or_empty(&self) -> UsageRecord {
-        self.usage.snapshot().unwrap_or_else(|e| {
-            warn!(error = %e, "usage read failed, ranking without open counts");
-            UsageRecord::default()
-        })
+    /// The wire issue for `i`, with its `graph_status` from the board labels.
+    fn wire(&mut self, i: model::Issue, open_count: i64) -> Issue {
+        let labels = self.of(i.project_id).map(<[String]>::to_vec);
+        wire::issue(i, labels.as_deref(), open_count)
     }
 }
 
 /// Sort key for `Search` hits: most-opened first, then most recently opened,
 /// then most recently updated — so never-opened items keep the old
 /// newest-first order among themselves.
-fn rank_key(usage: Option<UsageEntry>, updated_at_secs: u64) -> std::cmp::Reverse<(u64, u64, u64)> {
+fn rank_key(usage: Option<UsageEntry>, updated_at: u64) -> std::cmp::Reverse<(u64, u64, u64)> {
     let u = usage.unwrap_or_default();
-    std::cmp::Reverse((u.count, u.last_opened_secs, updated_at_secs))
+    std::cmp::Reverse((u.count, u.last_opened_secs, updated_at))
 }
 
 /// `open_count` for the wire, from an optional usage entry.
 fn open_count_of(usage: Option<UsageEntry>) -> i64 {
     usage.map_or(0, |u| u.count as i64)
-}
-
-/// How [`Handlers::perform_write`] ended.
-enum WriteOutcome {
-    /// Applied, or queued for the retry worker.
-    Accepted,
-    NotAuthenticated(DormancyReason),
-    Rejected(Error),
-}
-
-/// Reply to a write call from its [`WriteOutcome`]. A macro because every
-/// method has its own generated call trait.
-macro_rules! reply_write {
-    ($call:expr, $outcome:expr) => {
-        match $outcome {
-            WriteOutcome::Accepted => $call.reply(),
-            WriteOutcome::NotAuthenticated(r) => {
-                let (reason, detail) = dormant_args(&r);
-                $call.reply_not_authenticated(reason, detail)
-            }
-            WriteOutcome::Rejected(e) => $call.reply_gitlab_error(e.to_string()),
-        }
-    };
-}
-
-/// A cache read for one `Search` kind, degraded to empty on failure so the
-/// daemon stays available (the standing cache-error convention).
-fn read_or_empty<T>(result: crate::error::Result<Vec<T>>, kind: &str) -> Vec<T> {
-    result.unwrap_or_else(|e| {
-        warn!(error = %e, kind, "search cache read failed, treating as empty");
-        Vec::new()
-    })
-}
-
-/// Wire → internal issuable kind. The only place the generated enum's
-/// lowercase variants are touched.
-fn internal_kind(kind: &IssuableKind) -> Issuable {
-    match kind {
-        IssuableKind::issue => Issuable::Issue,
-        IssuableKind::merge_request => Issuable::MergeRequest,
-    }
-}
-
-/// Internal → wire issuable kind.
-fn wire_kind(kind: Issuable) -> IssuableKind {
-    match kind {
-        Issuable::Issue => IssuableKind::issue,
-        Issuable::MergeRequest => IssuableKind::merge_request,
-    }
-}
-
-/// Map a cached search MR onto the wire `MergeRequest`; assignee usernames
-/// come from the pairs captured at sync time.
-fn wire_mr(m: SearchMr, open_count: i64) -> MergeRequest {
-    MergeRequest {
-        id: m.id,
-        iid: m.iid,
-        project_id: m.project_id,
-        title: m.title,
-        web_url: m.web_url,
-        state: m.state,
-        assignees: m.assignees.into_iter().map(|a| a.username).collect(),
-        open_count,
-    }
 }
 
 /// Whether an issue/MR matches the search: case-insensitive substring on the
@@ -296,6 +299,18 @@ fn search_item_matches(
         || iid_query == Some(iid)
 }
 
+/// Whether `web_url` lies in any of `groups` (subgroups included). No filter
+/// matches everything.
+fn in_groups(groups: &Option<Vec<String>>, web_url: &str) -> bool {
+    match groups {
+        Some(groups) if !groups.is_empty() => {
+            let ns = namespace_of(web_url);
+            groups.iter().any(|g| in_group(&ns, g))
+        }
+        _ => true,
+    }
+}
+
 #[async_trait::async_trait]
 impl VarlinkInterface for Handlers {
     #[instrument(skip(self, call))]
@@ -304,42 +319,23 @@ impl VarlinkInterface for Handlers {
         call: &mut dyn Call_GetAssignedIssues,
         groups: Option<Vec<String>>,
     ) -> varlink::Result<()> {
-        let all = match self.cache.get() {
-            Ok(Some(all)) => all,
-            Ok(None) => {
-                return match self.gitlab().await {
-                    Ok(_) => call.reply(Vec::new()),
-                    Err(e) => {
-                        let (reason, detail) = dormant_args(&e);
-                        call.reply_not_authenticated(reason, detail)
-                    }
-                };
-            }
-            Err(e) => {
-                warn!("cache read failed, treating as empty: {e}");
-                return call.reply(Vec::new());
-            }
-        };
+        reply_if_cold!(self, call, Job::AssignedIssues, (Vec::new()));
 
-        let mut issues = match groups {
-            Some(groups) if !groups.is_empty() => {
-                let mut seen = std::collections::HashSet::new();
-                groups
-                    .iter()
-                    .flat_map(|g| self.cache.get_group(g).unwrap_or_default())
-                    .filter(|i| seen.insert((i.project_id, i.iid)))
-                    .collect()
-            }
-            _ => all,
-        };
-        // The persisted rows carry a placeholder; the live counts are overlaid
-        // at read time so a `RecordOpen` shows up before the next refresh.
+        let mut rows: Vec<model::Issue> = self.assigned(ASSIGNED_ISSUES, Issuable::Issue);
+        rows.retain(|i| in_groups(&groups, &i.web_url));
+        // Grouped by namespace; GitLab's order within each.
+        rows.sort_by_cached_key(|i| namespace_of(&i.web_url));
+
         let usage = self.usage_or_empty();
-        for i in &mut issues {
-            i.open_count = open_count_of(usage.get(Issuable::Issue, i.project_id, i.iid));
-        }
-
-        debug!(count = issues.len(), "serving issues from cache");
+        let mut boards = BoardLabels::new(self);
+        let issues: Vec<Issue> = rows
+            .into_iter()
+            .map(|i| {
+                let open = open_count_of(usage.get(Issuable::Issue, i.project_id, i.iid));
+                boards.wire(i, open)
+            })
+            .collect();
+        debug!(count = issues.len(), "serving assigned issues");
         call.reply(issues)
     }
 
@@ -349,54 +345,24 @@ impl VarlinkInterface for Handlers {
         call: &mut dyn Call_GetAssignedMergeRequests,
         groups: Option<Vec<String>>,
     ) -> varlink::Result<()> {
-        // Cold cache — never synced, or synced under a pre-assignee schema
-        // (synced_user_id 0 covers both): mirror `get_assigned_issues` — an
-        // honest NotAuthenticated while dormant, an empty reply while the
-        // first (re)sync is pending.
-        let stamps = self.search.stamps().unwrap_or_else(|e| {
-            warn!("search stamp read failed, treating as never synced: {e}");
-            Default::default()
-        });
-        if stamps.last_partial_sync_secs == 0
-            || stamps.schema_version < SEARCH_SCHEMA_VERSION
-            || stamps.synced_user_id == 0
-        {
-            return match self.gitlab().await {
-                Ok(_) => call.reply(Vec::new()),
-                Err(e) => {
-                    let (reason, detail) = dormant_args(&e);
-                    call.reply_not_authenticated(reason, detail)
-                }
-            };
-        }
+        reply_if_cold!(self, call, Job::AssignedMergeRequests, (Vec::new()));
 
-        let mut mine: Vec<SearchMr> = read_or_empty(self.search.all_mrs(), "merge requests")
+        let mut rows: Vec<model::MergeRequest> =
+            self.assigned(ASSIGNED_MERGE_REQUESTS, Issuable::MergeRequest);
+        rows.retain(|m| in_groups(&groups, &m.web_url));
+        // The wire type carries no timestamp, so order for the picker here.
+        rows.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
+
+        let usage = self.usage_or_empty();
+        let mrs: Vec<MergeRequest> = rows
             .into_iter()
-            .filter(|m| {
-                m.state == "opened" && m.assignees.iter().any(|a| a.id == stamps.synced_user_id)
+            .map(|m| {
+                let open = open_count_of(usage.get(Issuable::MergeRequest, m.project_id, m.iid));
+                wire::merge_request(m, open)
             })
             .collect();
-        if let Some(groups) = groups
-            && !groups.is_empty()
-        {
-            mine.retain(|m| {
-                let ns = namespace_of(&m.web_url);
-                groups.iter().any(|g| in_group(&ns, g))
-            });
-        }
-        // The wire type carries no timestamp, so order for the picker here.
-        mine.sort_by_key(|m| std::cmp::Reverse(m.updated_at_secs));
-
-        debug!(count = mine.len(), "serving assigned MRs from search cache");
-        let usage = self.usage_or_empty();
-        call.reply(
-            mine.into_iter()
-                .map(|m| {
-                    let u = usage.get(Issuable::MergeRequest, m.project_id, m.iid);
-                    wire_mr(m, open_count_of(u))
-                })
-                .collect(),
-        )
+        debug!(count = mrs.len(), "serving assigned merge requests");
+        call.reply(mrs)
     }
 
     #[instrument(skip(self, call))]
@@ -426,95 +392,69 @@ impl VarlinkInterface for Handlers {
         }
         let want = |k: &str| kinds.is_empty() || kinds.iter().any(|x| x == k);
 
-        // Cold cache (never synced): mirror `get_assigned_issues` — an honest
-        // NotAuthenticated while dormant, an empty reply while the first sync
-        // is still pending.
-        let never_synced = match self.search.stamps() {
-            Ok(s) => s.last_partial_sync_secs == 0,
-            Err(e) => {
-                warn!("search stamp read failed, treating as never synced: {e}");
-                true
-            }
-        };
-        if never_synced {
-            return match self.gitlab().await {
-                Ok(_) => call.reply(Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-                Err(e) => {
-                    let (reason, detail) = dormant_args(&e);
-                    call.reply_not_authenticated(reason, detail)
-                }
-            };
-        }
+        reply_if_cold!(
+            self,
+            call,
+            Job::MemberProjects,
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        );
 
         let iid_query = parse_iid_query(&query);
         let usage = self.usage_or_empty();
 
         let mut issues: Vec<Issue> = Vec::new();
         if want("issues") {
-            let mut hits: Vec<(Option<UsageEntry>, SearchIssue)> =
-                read_or_empty(self.search.all_issues(), "issues")
-                    .into_iter()
-                    .filter(|i| search_item_matches(&needle, iid_query, &i.title, &i.labels, i.iid))
-                    .map(|i| (usage.get(Issuable::Issue, i.project_id, i.iid), i))
-                    .filter(|(u, _)| !frequent_only || u.is_some())
-                    .collect();
-            hits.sort_by_key(|(u, i)| rank_key(*u, i.updated_at_secs));
+            let mut hits: Vec<(Option<UsageEntry>, model::Issue)> = self
+                .all::<model::Issue>()
+                .into_iter()
+                .filter(|i| search_item_matches(&needle, iid_query, &i.title, &i.labels, i.iid))
+                .map(|i| (usage.get(Issuable::Issue, i.project_id, i.iid), i))
+                .filter(|(u, _)| !frequent_only || u.is_some())
+                .collect();
+            hits.sort_by_key(|(u, i)| rank_key(*u, i.updated_at));
             hits.truncate(limit);
+            let mut boards = BoardLabels::new(self);
             issues = hits
                 .into_iter()
-                .map(|(u, i)| self.wire_search_issue(i, open_count_of(u)))
+                .map(|(u, i)| boards.wire(i, open_count_of(u)))
                 .collect();
         }
 
         let mut merge_requests: Vec<MergeRequest> = Vec::new();
         if want("merge_requests") {
-            let mut hits: Vec<(Option<UsageEntry>, SearchMr)> =
-                read_or_empty(self.search.all_mrs(), "merge requests")
-                    .into_iter()
-                    .filter(|m| search_item_matches(&needle, iid_query, &m.title, &m.labels, m.iid))
-                    .map(|m| (usage.get(Issuable::MergeRequest, m.project_id, m.iid), m))
-                    .filter(|(u, _)| !frequent_only || u.is_some())
-                    .collect();
-            hits.sort_by_key(|(u, m)| rank_key(*u, m.updated_at_secs));
+            let mut hits: Vec<(Option<UsageEntry>, model::MergeRequest)> = self
+                .all::<model::MergeRequest>()
+                .into_iter()
+                .filter(|m| search_item_matches(&needle, iid_query, &m.title, &m.labels, m.iid))
+                .map(|m| (usage.get(Issuable::MergeRequest, m.project_id, m.iid), m))
+                .filter(|(u, _)| !frequent_only || u.is_some())
+                .collect();
+            hits.sort_by_key(|(u, m)| rank_key(*u, m.updated_at));
             hits.truncate(limit);
             merge_requests = hits
                 .into_iter()
-                .map(|(u, m)| wire_mr(m, open_count_of(u)))
+                .map(|(u, m)| wire::merge_request(m, open_count_of(u)))
                 .collect();
         }
 
         let mut projects: Vec<Project> = Vec::new();
         if want("projects") && !frequent_only {
-            let mut hits = read_or_empty(self.search.all_projects(), "projects");
-            hits.retain(|p| text_matches(&needle, &p.name) || text_matches(&needle, &p.path));
-            hits.sort_by(|a, b| a.path.cmp(&b.path));
+            let mut hits = self.all::<model::Project>();
+            hits.retain(|p| {
+                text_matches(&needle, &p.name) || text_matches(&needle, &p.path_with_namespace)
+            });
+            hits.sort_by(|a, b| a.path_with_namespace.cmp(&b.path_with_namespace));
             hits.truncate(limit);
-            projects = hits
-                .into_iter()
-                .map(|p| Project {
-                    id: p.id,
-                    name: p.name,
-                    path: p.path,
-                    web_url: p.web_url,
-                })
-                .collect();
+            projects = hits.into_iter().map(wire::project).collect();
         }
 
         let mut groups: Vec<Group> = Vec::new();
         if want("groups") && !frequent_only {
-            let mut hits = read_or_empty(self.search.all_groups(), "groups");
-            hits.retain(|g| text_matches(&needle, &g.name) || text_matches(&needle, &g.path));
-            hits.sort_by(|a, b| a.path.cmp(&b.path));
+            let mut hits = self.all::<model::Group>();
+            hits.retain(|g| text_matches(&needle, &g.name) || text_matches(&needle, &g.full_path));
+            hits.sort_by(|a, b| a.full_path.cmp(&b.full_path));
             hits.truncate(limit);
-            groups = hits
-                .into_iter()
-                .map(|g| Group {
-                    id: g.id,
-                    name: g.name,
-                    path: g.path,
-                    web_url: g.web_url,
-                })
-                .collect();
+            groups = hits.into_iter().map(wire::group).collect();
         }
 
         debug!(
@@ -522,7 +462,7 @@ impl VarlinkInterface for Handlers {
             merge_requests = merge_requests.len(),
             projects = projects.len(),
             groups = groups.len(),
-            "serving search results from cache"
+            "serving search results"
         );
         call.reply(issues, merge_requests, projects, groups)
     }
@@ -537,80 +477,30 @@ impl VarlinkInterface for Handlers {
         let all = scopes.is_empty();
         let want = |s: &str| all || scopes.iter().any(|x| x == s);
 
-        if want("issues") {
-            if let Err(e) = self.cache.clear() {
-                warn!("issue cache clear failed: {e}");
-            } else {
-                info!("issue cache cleared");
-            }
-            if let Err(e) = self.boards.clear() {
-                warn!("board cache clear failed: {e}");
-            } else {
-                info!("board cache cleared");
-            }
-            // Zeroed so the next quick tick actually refetches — a fresh stamp
-            // would serve the just-cleared cache as stale-empty until the
-            // interval elapses.
-            if let Err(e) = self.refresh_meta.update(|s| s.last_quick_sync_secs = 0) {
-                warn!("refresh stamp reset failed: {e}");
-            }
-        }
-
-        if want("search") {
-            // begin_sync waits out an in-flight sync, so its final
-            // set_stamps can't stamp "synced" over the half-wiped corpus.
-            // The guard must drop before the refill sync below, whose
-            // try_begin_sync would otherwise lose and silently skip.
-            let guard = self.search.begin_sync().await;
-            if let Err(e) = guard.clear() {
-                warn!("search cache clear failed: {e}");
-            } else {
-                info!("search cache cleared; next sync will be full");
-            }
-        }
-
         let now = now_secs();
-        let (quick_secs, slow_secs) = {
+        let (quick_start, retention_start) = {
             let c = self.config.read().unwrap();
             (
-                c.refresh.quick.window().as_secs(),
-                c.refresh.slow.window().as_secs(),
+                now.saturating_sub(c.refresh.quick.window().as_secs()),
+                now.saturating_sub(c.history.retention().as_secs()),
             )
         };
-        let quick_start = now.saturating_sub(quick_secs);
-        let slow_start = now.saturating_sub(slow_secs);
-
         if all {
-            if let Err(e) = self.history.clear() {
-                warn!("history clear failed: {e}");
-            } else {
-                info!("history cleared");
-            }
-            if let Err(e) = self.refresh_meta.clear() {
-                warn!("refresh stamp clear failed: {e}");
-            }
+            self.sync.clear(Clear::Everything).await;
         } else {
-            if want("quick") {
-                clear_band(&self.history, quick_start, u64::MAX, "quick");
+            if want("issues") {
+                self.sync.clear(Clear::Assigned).await;
             }
-            if want("slow") {
-                clear_band(&self.history, slow_start, quick_start, "slow");
+            if want("search") {
+                self.sync.clear(Clear::Corpus).await;
             }
-            if want("stale") {
-                clear_band(&self.history, 0, slow_start, "stale");
-            }
-            if want("quick") || want("slow") || want("stale") {
-                // The refill below repopulates immediately when connected; the
-                // zeroed slow stamp covers the dormant case, so the cleared
-                // band is refetched at the next opportunity instead of being
-                // stamped over as fresh.
-                if let Err(e) = self.refresh_meta.update(|s| {
-                    s.last_slow_sync_secs = 0;
-                    if want("stale") {
-                        s.backfilled_retention_hours = 0;
-                    }
-                }) {
-                    warn!("refresh stamp reset failed: {e}");
+            for (band, from, until) in [
+                ("quick", quick_start, u64::MAX),
+                ("slow", retention_start, quick_start),
+                ("stale", 0, retention_start),
+            ] {
+                if want(band) {
+                    self.sync.clear(Clear::Timelogs { from, until }).await;
                 }
             }
         }
@@ -625,28 +515,16 @@ impl VarlinkInterface for Handlers {
             }
         }
 
-        if let Ok(gitlab) = self.gitlab().await {
-            if all {
-                self.warm_up().await;
-            } else {
-                if want("search") {
-                    // The clear above zeroed the stamps, so this runs full.
-                    self.sync_search_cache().await;
-                }
-                if want("stale") {
-                    let retention = self.config.read().unwrap().history.retention();
-                    let _ = self.refresh_history_window(&gitlab, retention).await;
-                    self.prune_history();
-                } else if want("slow") {
-                    let slow_window = self.config.read().unwrap().refresh.slow.window();
-                    let _ = self.refresh_history_window(&gitlab, slow_window).await;
-                } else if want("quick") {
-                    let quick_window = self.config.read().unwrap().refresh.quick.window();
-                    let _ = self.refresh_history_window(&gitlab, quick_window).await;
-                }
-            }
+        if self.gitlab().await.is_ok()
+            && tokio::time::timeout(
+                CLEAR_REFILL_TIMEOUT,
+                self.sync.refresh_now(&Job::FOREGROUND),
+            )
+            .await
+            .is_err()
+        {
+            warn!("foreground refill still running; replying before it lands");
         }
-
         call.reply()
     }
 
@@ -667,7 +545,7 @@ impl VarlinkInterface for Handlers {
             return call.reply_gitlab_error(format!("invalid duration: {duration:?}"));
         }
         let write = Write {
-            kind: internal_kind(&kind),
+            kind: wire::internal_kind(&kind),
             project_id,
             iid,
             op: WriteOp::PostTime {
@@ -689,31 +567,10 @@ impl VarlinkInterface for Handlers {
         let days = days.unwrap_or(7).max(0) as u64;
         let cutoff = now.saturating_sub(days.saturating_mul(86_400));
 
-        let cached_issues = self.cache.get().ok().flatten().unwrap_or_default();
-        let by_key: HashMap<(i64, i64), &Issue> = cached_issues
-            .iter()
-            .map(|i| ((i.project_id, i.iid), i))
-            .collect();
-
         let mut events: Vec<HistoryEvent> = Vec::new();
-
         match self.queue.pending() {
             Ok(pending) => {
-                let posts: Vec<_> = pending
-                    .into_iter()
-                    .filter(|p| matches!(p.write.op, WriteOp::PostTime { .. }))
-                    .collect();
-                // Title/url joins for queued MR entries come from the search
-                // corpus; only scanned when an MR is actually pending.
-                let mrs = if posts.iter().any(|p| p.write.kind == Issuable::MergeRequest) {
-                    read_or_empty(self.search.all_mrs(), "merge requests")
-                } else {
-                    Vec::new()
-                };
-                let mr_by_key: HashMap<(i64, i64), &SearchMr> =
-                    mrs.iter().map(|m| ((m.project_id, m.iid), m)).collect();
-
-                for p in posts {
+                for p in pending {
                     let Write {
                         kind,
                         project_id,
@@ -726,26 +583,28 @@ impl VarlinkInterface for Handlers {
                     else {
                         continue;
                     };
+                    let key = (project_id.max(0) as u64, iid.max(0) as u64);
                     let (title, web_url) = match kind {
-                        Issuable::Issue => {
-                            let issue = by_key.get(&(project_id, iid));
-                            (
-                                issue.map(|i| i.title.clone()).unwrap_or_default(),
-                                issue.map(|i| i.web_url.clone()).unwrap_or_default(),
-                            )
-                        }
-                        Issuable::MergeRequest => {
-                            let mr = mr_by_key.get(&(project_id, iid));
-                            (
-                                mr.map(|m| m.title.clone()).unwrap_or_default(),
-                                mr.map(|m| m.web_url.clone()).unwrap_or_default(),
-                            )
-                        }
-                    };
+                        Issuable::Issue => self
+                            .store()
+                            .issues
+                            .get(key)
+                            .ok()
+                            .flatten()
+                            .map(|i| (i.title, i.web_url)),
+                        Issuable::MergeRequest => self
+                            .store()
+                            .merge_requests
+                            .get(key)
+                            .ok()
+                            .flatten()
+                            .map(|m| (m.title, m.web_url)),
+                    }
+                    .unwrap_or_default();
                     events.push(HistoryEvent {
                         timestamp: p.queued_at_secs as i64,
                         source: "queued".to_string(),
-                        kind: wire_kind(kind),
+                        kind: wire::kind(kind),
                         project_id,
                         iid,
                         title,
@@ -758,25 +617,11 @@ impl VarlinkInterface for Handlers {
             Err(e) => warn!(error = %e, "queue scan failed; queued events omitted"),
         }
 
-        match self.history.all_since(cutoff) {
-            Ok(entries) => {
-                for e in entries {
-                    events.push(HistoryEvent {
-                        timestamp: e.spent_at_secs as i64,
-                        source: "gitlab".to_string(),
-                        kind: wire_kind(e.kind),
-                        project_id: e.project_id,
-                        iid: e.iid,
-                        title: e.title,
-                        web_url: e.web_url,
-                        duration: e.duration,
-                        summary: e.summary,
-                    });
-                }
-            }
+        match self.store().timelogs.scan(RowScope::Since(cutoff)) {
+            // Stored oldest first; reply newest first.
+            Ok(logs) => events.extend(logs.into_iter().rev().map(wire::timelog)),
             Err(e) => warn!(error = %e, "history read failed; returning queued only"),
         }
-
         call.reply(events)
     }
 
@@ -794,7 +639,7 @@ impl VarlinkInterface for Handlers {
             .map(|f| FailedTask {
                 id: f.id as i64,
                 op: f.op_kind.to_string(),
-                kind: wire_kind(f.kind),
+                kind: wire::kind(f.kind),
                 project_id: f.project_id,
                 iid: f.iid,
                 detail: f.detail,
@@ -868,7 +713,7 @@ impl VarlinkInterface for Handlers {
         // Local bookkeeping only — no GitLab, so it works while dormant.
         let retention_secs = self.config.read().unwrap().usage.retention().as_secs();
         let now = now_secs();
-        let key = crate::usage::usage_key(internal_kind(&kind), project_id, iid);
+        let key = crate::usage::usage_key(wire::internal_kind(&kind), project_id, iid);
         if let Err(e) = self
             .usage
             .record(&key, now, now.saturating_sub(retention_secs))
@@ -892,7 +737,7 @@ impl VarlinkInterface for Handlers {
             return call.reply_gitlab_error(msg);
         }
         let write = Write {
-            kind: internal_kind(&kind),
+            kind: wire::internal_kind(&kind),
             project_id,
             iid,
             op: WriteOp::Close,
@@ -912,7 +757,7 @@ impl VarlinkInterface for Handlers {
             return call.reply_gitlab_error(msg);
         }
         let write = Write {
-            kind: internal_kind(&kind),
+            kind: wire::internal_kind(&kind),
             project_id,
             iid,
             op: WriteOp::AssignSelf,
@@ -932,7 +777,7 @@ impl VarlinkInterface for Handlers {
             return call.reply_gitlab_error(msg);
         }
         let write = Write {
-            kind: internal_kind(&kind),
+            kind: wire::internal_kind(&kind),
             project_id,
             iid,
             op: WriteOp::UnassignSelf,
@@ -966,6 +811,7 @@ impl VarlinkInterface for Handlers {
         info!(host, user_id = session.user_id, "logged in");
         *self.session.write().await = ConnState::Connected(session);
         self.queue.drain_waker().notify_one();
+        self.sync.wake();
         call.reply()
     }
 
@@ -989,13 +835,5 @@ impl VarlinkInterface for Handlers {
                 call.reply_not_authenticated(reason, detail)
             }
         }
-    }
-}
-
-/// Clear one history tier's `spent_at` band, logging the outcome.
-fn clear_band(history: &HistoryCache, min_secs: u64, max_secs: u64, tier: &str) {
-    match history.clear_between(min_secs, max_secs) {
-        Ok(n) => info!(removed = n, tier, "history tier cleared"),
-        Err(e) => warn!(error = %e, tier, "history tier clear failed"),
     }
 }

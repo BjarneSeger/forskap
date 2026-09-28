@@ -47,8 +47,7 @@ pub struct Config {
     #[config(nested)]
     pub server: ServerConfig,
 
-    /// Background refresh tiers — cadence plus timelog window for each of the
-    /// `quick` and `slow` tiers.
+    /// Sync cadences for the foreground (`quick`) and bulk (`slow`) data.
     #[config(nested)]
     pub refresh: RefreshConfig,
 
@@ -104,24 +103,20 @@ impl ServerConfig {
     }
 }
 
-/// Background refresh tiers (driven from `main.rs`). Work is split by cost and
+/// Sync cadences, consumed by the `sync` jobs. Work is split by cost and
 /// volatility:
 ///
-/// * `quick` — fast-changing and cheap to fetch: assigned issues, board
-///   columns, and your most recent timelogs. Polled frequently.
-/// * `slow` — the large, slow-moving body of timelog history. Polled rarely.
-///
-/// Each tier owns both its cadence (`interval_secs`) and how far back its
-/// timelog pull reaches (`window_hours`), so the two are configured together
-/// instead of split across tables. Keep the windows ordered
-/// `quick.window_hours` ≤ `slow.window_hours` ≤ `history.retention_hours`.
+/// * `quick` — fast-changing and cheap to fetch: the assigned issue/MR lists
+///   and your most recent timelogs. Synced frequently.
+/// * `slow` — the large, slow-moving rest: the full timelog history and the
+///   board columns. Synced rarely.
 #[derive(Debug, ConfiqueConfig)]
 pub struct RefreshConfig {
-    /// Quick tier: assigned issues, boards, and recent timelogs.
+    /// Quick tier: assigned issues/MRs and recent timelogs.
     #[config(nested)]
     pub quick: QuickRefreshConfig,
 
-    /// Slow tier: the bulk of your timelog history.
+    /// Slow tier: the full timelog history and board columns.
     #[config(nested)]
     pub slow: SlowRefreshConfig,
 }
@@ -131,14 +126,14 @@ pub struct RefreshConfig {
 /// the two tiers ship different defaults.
 #[derive(Debug, ConfiqueConfig)]
 pub struct QuickRefreshConfig {
-    /// Seconds between quick refreshes (assigned issues, boards, and the most
-    /// recent timelogs). Five minutes by default.
+    /// Seconds between quick syncs (assigned issues/MRs and the most recent
+    /// timelogs). Five minutes by default.
     #[config(default = 300)]
     pub interval_secs: u64,
 
-    /// How far back, in hours, the quick timelog pull reaches. Issues and boards
-    /// are always fetched in full; this bounds only the timelog query. (24h by
-    /// default.)
+    /// How far back, in hours, the quick timelog sync reaches. Timelogs
+    /// deleted in GitLab inside this window disappear at the next quick sync;
+    /// older ones at the next slow sync. (24h by default.)
     #[config(default = 24)]
     pub window_hours: u64,
 }
@@ -159,15 +154,10 @@ impl QuickRefreshConfig {
 /// [`QuickRefreshConfig`] only in its defaults (see that type's note).
 #[derive(Debug, ConfiqueConfig)]
 pub struct SlowRefreshConfig {
-    /// Seconds between slow refreshes of the bulk timelog history. Once a day by
-    /// default.
+    /// Seconds between slow syncs of the full timelog history (the whole
+    /// `history.retention_hours`) and the board columns. Once a day by default.
     #[config(default = 86400)]
     pub interval_secs: u64,
-
-    /// How far back, in hours, the slow timelog pull reaches. (30 days by
-    /// default.)
-    #[config(default = 720)]
-    pub window_hours: u64,
 }
 
 impl SlowRefreshConfig {
@@ -175,19 +165,13 @@ impl SlowRefreshConfig {
     pub fn interval(&self) -> Duration {
         Duration::from_secs(self.interval_secs)
     }
-
-    /// Timelog look-back span.
-    pub fn window(&self) -> Duration {
-        Duration::from_hours(self.window_hours)
-    }
 }
 
-/// Timelog history retention, consumed by `history.rs` via `Handlers`.
+/// Timelog history retention, consumed by the timelog sync jobs.
 #[derive(Debug, ConfiqueConfig)]
 pub struct HistoryConfig {
-    /// Total timelog history to keep, in hours: fetched once at startup, and
-    /// anything older is pruned. Should be ≥ `refresh.slow.window_hours`.
-    /// (90 days by default.)
+    /// Total timelog history to keep, in hours: synced in full on the slow
+    /// cadence, and anything older is pruned. (90 days by default.)
     #[config(default = 2160)]
     pub retention_hours: u64,
 }
@@ -307,25 +291,24 @@ impl ReconnectConfig {
     }
 }
 
-/// Search-cache sync tuning, consumed by `handlers/search_sync.rs`.
+/// Search-corpus sync tuning, consumed by the `sync` planner and jobs.
 ///
-/// The search cache holds issues, merge requests, projects, and groups as
-/// individual entries. It is synced incrementally (`updated_after` deltas)
+/// The corpus holds issues, merge requests, projects, and groups. Each
+/// project's issues and MRs are synced incrementally (`updated_after` deltas)
 /// on the partial cadence and fully resynced — which also reconciles
-/// deletions — on the full cadence. Both stamps persist across restarts, so
+/// deletions — on the full cadence. Job states persist across restarts, so
 /// restarting the daemon inside the partial interval does not re-poll GitLab.
 #[derive(Debug, ConfiqueConfig)]
 pub struct SearchConfig {
-    /// What the search cache holds for issues and merge requests: `"all"`
-    /// syncs everything your token can see (GitLab `scope=all`; on very large
-    /// instances the initial sync can be huge — prefer `"member"` there),
-    /// `"member"` only what is in projects you are a member of. The default
-    /// `"auto"` picks for you: `"member"` on gitlab.com (which rejects the
-    /// global fetch outright), `"all"` on self-hosted instances — falling back
-    /// to `"member"` until the next full resync if the instance rejects the
-    /// global fetch too. Projects and groups themselves are always
-    /// membership-scoped.
-    #[config(default = "auto")]
+    /// What the search corpus holds for issues and merge requests. The
+    /// default `"tracked"` covers the projects you are active in: assigned
+    /// issues/MRs, your pushes, issues, MRs and comments, and your timelogs
+    /// (see `tracked_retention_hours`). `"member"` covers every project you
+    /// are a member of, `"all"` everything your token can see (GitLab
+    /// `scope=all`; huge on large instances, and rejected by gitlab.com).
+    /// Projects and groups themselves are always membership-scoped. `"auto"`
+    /// is accepted as an alias of `"tracked"`.
+    #[config(default = "tracked")]
     pub population: SearchPopulation,
 
     /// Minimum seconds between incremental search-cache syncs. (30 min by
@@ -351,16 +334,13 @@ pub struct SearchConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchPopulation {
-    /// Resolve per host: `Member` on gitlab.com, otherwise `All` with an
-    /// automatic fallback to `Member` when the instance rejects the global
-    /// fetch (see `handlers/search_sync.rs`).
-    Auto,
     /// Everything the token can see (`scope=all` on the global endpoints).
     All,
     /// Only projects the user is a member of (one fetch per project).
     Member,
     /// Only projects with recent activity of the user's (see
     /// [`SearchConfig::tracked_retention_hours`]).
+    #[serde(alias = "auto")]
     Tracked,
 }
 
@@ -612,7 +592,7 @@ mod tests {
     #[test]
     fn search_defaults() {
         let c = defaults();
-        assert_eq!(c.search.population, SearchPopulation::Auto);
+        assert_eq!(c.search.population, SearchPopulation::Tracked);
         assert_eq!(c.search.partial_interval(), Duration::from_secs(1800));
         assert_eq!(c.search.full_interval(), Duration::from_secs(604800));
     }
@@ -627,9 +607,11 @@ mod tests {
     }
 
     #[test]
-    fn search_population_parses_tracked() {
-        let p: SearchPopulation = serde_json::from_str("\"tracked\"").unwrap();
-        assert_eq!(p, SearchPopulation::Tracked);
+    fn search_population_parses_tracked_and_its_auto_alias() {
+        for name in ["\"tracked\"", "\"auto\""] {
+            let p: SearchPopulation = serde_json::from_str(name).unwrap();
+            assert_eq!(p, SearchPopulation::Tracked);
+        }
     }
 
     proptest! {

@@ -98,6 +98,28 @@ impl SyncHandle {
         config: SharedConfig,
         reconnect_signal: Arc<Notify>,
     ) -> Arc<Self> {
+        Self::start(store, session, config, reconnect_signal, true)
+    }
+
+    /// A worker that runs only demanded jobs, so a test decides exactly
+    /// when GitLab is read.
+    #[cfg(test)]
+    pub(crate) fn spawn_on_demand(
+        store: Arc<SyncStore>,
+        session: SessionSlot,
+        config: SharedConfig,
+        reconnect_signal: Arc<Notify>,
+    ) -> Arc<Self> {
+        Self::start(store, session, config, reconnect_signal, false)
+    }
+
+    fn start(
+        store: Arc<SyncStore>,
+        session: SessionSlot,
+        config: SharedConfig,
+        reconnect_signal: Arc<Notify>,
+        scheduled: bool,
+    ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let worker = Worker {
             states: store
@@ -121,6 +143,7 @@ impl SyncHandle {
             rate_limits: 0,
             runs: 0,
             replan: true,
+            scheduled,
         };
         tokio::spawn(worker.run());
         Arc::new(Self {
@@ -237,6 +260,8 @@ struct Worker {
     rate_limits: u32,
     runs: u64,
     replan: bool,
+    /// Whether due jobs run on their own, not only when demanded.
+    scheduled: bool,
 }
 
 impl Worker {
@@ -344,6 +369,9 @@ impl Worker {
     fn next_job(&self, now: u64) -> Next {
         if let Some(&job) = self.demand.keys().min_by_key(|j| (j.priority(), **j)) {
             return Next::Run(job);
+        }
+        if !self.scheduled {
+            return Next::Idle(u64::MAX);
         }
         let cfg = self.config.read().unwrap();
         let (jitter, spread) = (cfg.sync.jitter, cfg.sync.startup_spread_secs);
@@ -560,12 +588,18 @@ impl Worker {
     }
 
     fn apply_clear(&mut self, what: Clear) {
-        let reset: Vec<String> = self
-            .states
-            .keys()
+        let persisted = self.store.job_states().unwrap_or_else(|e| {
+            warn!(error = %e, "reading job states for a clear failed");
+            Vec::new()
+        });
+        let mut reset: Vec<String> = persisted
+            .into_iter()
+            .map(|(key, _)| key)
+            .chain(self.states.keys().cloned())
             .filter(|k| what.resets(k))
-            .cloned()
             .collect();
+        reset.sort_unstable();
+        reset.dedup();
         let cleared = (|| -> Result<()> {
             let mut c = self.store.begin();
             match what {

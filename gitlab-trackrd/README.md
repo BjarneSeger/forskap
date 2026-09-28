@@ -27,11 +27,10 @@ Keys are grouped into TOML tables, one per concern:
 | Key | Default | Description |
 |---|---|---|
 | `[server]` `socket` | `$XDG_RUNTIME_DIR/gitlab-trackrd.socket` (falls back to `/tmp`) | Varlink Unix socket the daemon listens on. Ignored under systemd socket activation. |
-| `[refresh.quick]` `interval_secs` | `300` | Seconds between quick refreshes of issues, boards, and the recent timelog window. |
-| `[refresh.quick]` `window_hours` | `24` | How far back the quick timelog pull reaches (last 24h). Issues and boards are always fetched in full; this bounds only the timelog query. |
-| `[refresh.slow]` `interval_secs` | `86400` | Seconds between slow refreshes of the bulk timelog history (once a day). |
-| `[refresh.slow]` `window_hours` | `720` | How far back the slow timelog pull reaches (30 days). |
-| `[history]` `retention_hours` | `2160` | Total timelog history kept (90 days); fetched once at startup, anything older is pruned. Should be ≥ `refresh.slow.window_hours`. |
+| `[refresh.quick]` `interval_secs` | `300` | Seconds between quick syncs of the assigned issue/MR lists and the recent timelog window (floor 60). |
+| `[refresh.quick]` `window_hours` | `24` | How far back the quick timelog sync reaches (last 24h). |
+| `[refresh.slow]` `interval_secs` | `86400` | Seconds between slow syncs of the full timelog history and the board columns (once a day; floor 60). |
+| `[history]` `retention_hours` | `2160` | Total timelog history kept (90 days): synced in full on the slow cadence, anything older is pruned. |
 | `[queue]` `base_delay_secs` | `1` | Retry-queue backoff initial delay. |
 | `[queue]` `max_delay_secs` | `1800` | Retry-queue backoff cap (30 min). |
 | `[queue]` `max_lifetime_secs` | `604800` | How long a task retries before being dead-lettered (7 days). |
@@ -39,9 +38,9 @@ Keys are grouped into TOML tables, one per concern:
 | `[reconnect]` `enabled` | `true` | Auto-reconnect after an unreachable-GitLab dormancy (down at boot or dropped mid-run). When `false`, recovery is manual (`tt login` or restart). |
 | `[reconnect]` `base_delay_secs` | `2` | Auto-reconnect backoff initial delay. |
 | `[reconnect]` `max_delay_secs` | `60` | Auto-reconnect backoff cap (1 min); retries continue indefinitely at the cap. |
-| `[search]` `population` | `"auto"` | What the search cache holds for issues/MRs: `"all"` = everything the token can see (`scope=all`; big initial sync on large instances), `"member"` = only member projects, `"auto"` = `"member"` on gitlab.com (which rejects the global fetch), otherwise `"all"` with automatic fallback to `"member"` until the next full resync if the instance rejects it. Projects and groups are always membership-scoped. |
-| `[search]` `partial_interval_secs` | `1800` | Minimum seconds between incremental search-cache syncs (30 min). Restarting inside this window does not re-poll GitLab. |
-| `[search]` `full_interval_secs` | `604800` | Seconds between full search-cache resyncs (7 days), which also remove deleted items. |
+| `[search]` `population` | `"tracked"` | What the search corpus holds for issues/MRs: `"tracked"` = the projects you are active in (assignments, pushes, issues, MRs, comments, timelogs — see `tracked_retention_hours`), `"member"` = every member project, `"all"` = everything the token can see (`scope=all`; huge on large instances, rejected by gitlab.com). `"auto"` is an alias of `"tracked"`. Projects and groups are always membership-scoped. |
+| `[search]` `partial_interval_secs` | `1800` | Seconds between incremental syncs of each corpus project (30 min). Restarting inside this window does not re-poll GitLab. |
+| `[search]` `full_interval_secs` | `604800` | Seconds between full resyncs of each corpus project (7 days), which also remove deleted items. |
 | `[search]` `tracked_retention_hours` | `2160` | How long your activity in a project (an assignment, a push, an issue, MR or comment, a timelog) keeps it in the `"tracked"` population (90 days). |
 | `[sync]` `jitter` | `0.15` | Random spread applied to every sync interval, as a fraction (0–0.5), so jobs sharing an interval don't hit GitLab together. |
 | `[sync]` `job_gap_ms` | `250` | Pause between two sync jobs (jittered), so a backlog of due jobs trickles out. |

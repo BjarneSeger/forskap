@@ -6,8 +6,8 @@
 //! retries for up to 7 days; a GitLab rejection or an exhausted retry window
 //! moves the task to a persistent dead-letter store, surfaced via `tt queue`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -77,6 +77,10 @@ impl QueuedTask {
     }
 }
 
+/// Told when the worker settles a queued write: `true` once GitLab applied
+/// it, `false` when it was dead-lettered.
+pub type SettleHook = Arc<dyn Fn(&Write, bool) + Send + Sync>;
+
 pub struct RetryQueue {
     sender: mpsc::Sender<QueuedTask>,
     store: KvStore<u64, StoredTask>,
@@ -86,6 +90,7 @@ pub struct RetryQueue {
     /// session, so a freshly re-established connection drains the queue at once
     /// instead of waiting out `session_wait`. See [`RetryQueue::drain_waker`].
     drain_wake: Arc<Notify>,
+    settle_hook: Arc<OnceLock<SettleHook>>,
 }
 
 /// A write still waiting in the retry queue.
@@ -161,6 +166,7 @@ impl RetryQueue {
         }
 
         let drain_wake = Arc::new(Notify::new());
+        let settle_hook = Arc::new(OnceLock::new());
 
         tokio::spawn(worker(
             session,
@@ -169,6 +175,7 @@ impl RetryQueue {
             rx,
             config,
             Arc::clone(&drain_wake),
+            Arc::clone(&settle_hook),
         ));
 
         Ok(Self {
@@ -177,7 +184,14 @@ impl RetryQueue {
             dead_letter,
             next_id: AtomicU64::new(max_id + 1),
             drain_wake,
+            settle_hook,
         })
+    }
+
+    /// Install the hook told about every settled write; only the first call
+    /// takes effect.
+    pub fn on_settled(&self, hook: SettleHook) {
+        let _ = self.settle_hook.set(hook);
     }
 
     /// A handle to nudge the worker awake while it is deferring for lack of a
@@ -314,6 +328,7 @@ async fn worker(
     mut rx: mpsc::Receiver<QueuedTask>,
     config: SharedConfig,
     drain_wake: Arc<Notify>,
+    settle_hook: Arc<OnceLock<SettleHook>>,
 ) {
     while let Some(task) = rx.recv().await {
         let mut delay = config.read().unwrap().queue.base_delay();
@@ -423,6 +438,7 @@ async fn worker(
         // The task left the live queue either way. If it failed permanently,
         // record it in the dead-letter store (keyed by its id) so the user can
         // see, retry, or dismiss it via `tt queue`.
+        let applied = failure.is_none();
         if let Some(error) = failure {
             let stored = StoredFailure {
                 project_id: task.project_id,
@@ -449,6 +465,9 @@ async fn worker(
                 "failed to remove completed task from queue db"
             );
         }
+        if let Some(hook) = settle_hook.get() {
+            hook(&task.write(), applied);
+        }
     }
 }
 
@@ -461,14 +480,10 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::Result as TrackrResult;
-    use crate::error::{DormancyReason, Error};
-    use crate::gitlab::{FetchedTimelog, GitlabApi, IssueWithLabels};
+    use crate::error::DormancyReason;
+    use crate::gitlab::GitlabApi;
     use crate::handlers::{ConnState, Session};
-    use std::collections::VecDeque;
-    use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicUsize;
+    use crate::testing::{FakeErr, FakeGitlab};
 
     // The max lifetime cutoff and exponential backoff are not exercised
     // here. Both depend on `SystemTime::now()` rather than tokio's mock clock,
@@ -569,138 +584,9 @@ mod tests {
 
     // ── Worker behavior with a fake GitLab ──────────────────────────────────
 
-    /// Pre-cans responses for the three methods the worker calls and counts
-    /// invocations. Other `GitlabApi` methods panic so unexpected use is loud.
-    #[derive(Default)]
-    struct FakeGitlab {
-        add_spent_time: Mutex<VecDeque<TrackrResult<()>>>,
-        create_timelog: Mutex<VecDeque<TrackrResult<()>>>,
-        close: Mutex<VecDeque<TrackrResult<()>>>,
-        assign_self: Mutex<VecDeque<TrackrResult<()>>>,
-        unassign_self: Mutex<VecDeque<TrackrResult<()>>>,
-        add_spent_time_calls: AtomicUsize,
-        create_timelog_calls: AtomicUsize,
-        close_calls: AtomicUsize,
-        assign_self_calls: AtomicUsize,
-        unassign_self_calls: AtomicUsize,
-        /// `(method, kind)` log so tests can assert the worker threads the
-        /// task's issuable kind through to the GitLab call.
-        kinds: Mutex<Vec<(&'static str, Issuable)>>,
-    }
-
-    impl FakeGitlab {
-        fn push_add_spent_time(&self, r: TrackrResult<()>) {
-            self.add_spent_time.lock().unwrap().push_back(r);
-        }
-        fn push_close(&self, r: TrackrResult<()>) {
-            self.close.lock().unwrap().push_back(r);
-        }
-        fn push_assign_self(&self, r: TrackrResult<()>) {
-            self.assign_self.lock().unwrap().push_back(r);
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl GitlabApi for FakeGitlab {
-        async fn fetch_assigned_issues(
-            &self,
-            _g: Option<String>,
-        ) -> TrackrResult<Vec<IssueWithLabels>> {
-            unimplemented!()
-        }
-        async fn add_spent_time(
-            &self,
-            kind: Issuable,
-            _p: i64,
-            _i: i64,
-            _d: &str,
-            _s: Option<&str>,
-        ) -> TrackrResult<()> {
-            self.kinds.lock().unwrap().push(("add_spent_time", kind));
-            self.add_spent_time_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.add_spent_time
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("FakeGitlab: no canned add_spent_time response")
-        }
-        async fn create_timelog(
-            &self,
-            kind: Issuable,
-            _id: i64,
-            _d: &str,
-            _s: &str,
-            _at: chrono::DateTime<chrono::Utc>,
-        ) -> TrackrResult<()> {
-            self.kinds.lock().unwrap().push(("create_timelog", kind));
-            self.create_timelog_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.create_timelog
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("FakeGitlab: no canned create_timelog response")
-        }
-        async fn fetch_my_timelogs(
-            &self,
-            _since: chrono::DateTime<chrono::Utc>,
-        ) -> TrackrResult<Vec<FetchedTimelog>> {
-            unimplemented!()
-        }
-        async fn close(&self, kind: Issuable, _p: i64, _i: i64) -> TrackrResult<()> {
-            self.kinds.lock().unwrap().push(("close", kind));
-            self.close_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.close
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("FakeGitlab: no canned close response")
-        }
-        async fn assign_self(&self, kind: Issuable, _p: i64, _i: i64) -> TrackrResult<()> {
-            self.kinds.lock().unwrap().push(("assign_self", kind));
-            self.assign_self_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.assign_self
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("FakeGitlab: no canned assign_self response")
-        }
-        async fn unassign_self(&self, kind: Issuable, _p: i64, _i: i64) -> TrackrResult<()> {
-            self.kinds.lock().unwrap().push(("unassign_self", kind));
-            self.unassign_self_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.unassign_self
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("FakeGitlab: no canned unassign_self response")
-        }
-        async fn fetch_board_list_labels(&self, _p: i64) -> TrackrResult<Vec<String>> {
-            unimplemented!()
-        }
-        async fn fetch_issues_for_search(
-            &self,
-            _p: Option<i64>,
-            _after: Option<chrono::DateTime<chrono::Utc>>,
-        ) -> TrackrResult<Vec<crate::search::SearchIssue>> {
-            unimplemented!()
-        }
-        async fn fetch_merge_requests_for_search(
-            &self,
-            _p: Option<i64>,
-            _after: Option<chrono::DateTime<chrono::Utc>>,
-        ) -> TrackrResult<Vec<crate::search::SearchMr>> {
-            unimplemented!()
-        }
-        async fn fetch_member_projects(&self) -> TrackrResult<Vec<crate::search::SearchProject>> {
-            unimplemented!()
-        }
-        async fn fetch_member_groups(&self) -> TrackrResult<Vec<crate::search::SearchGroup>> {
-            unimplemented!()
-        }
+    /// Writes of `op` the fake received.
+    fn calls(gitlab: &FakeGitlab, op: &str) -> usize {
+        gitlab.writes().iter().filter(|w| w.0 == op).count()
     }
 
     /// Spawn the worker with one task on the channel, close the sender so the
@@ -738,6 +624,7 @@ mod tests {
             rx,
             config,
             drain_wake,
+            Arc::new(OnceLock::new()),
         ));
         tx.send(task).await.unwrap();
         drop(tx);
@@ -768,7 +655,6 @@ mod tests {
         s.put(1, &post_task(7, 100)).unwrap();
 
         let gitlab = Arc::new(FakeGitlab::default());
-        gitlab.push_add_spent_time(Ok(()));
 
         let task = QueuedTask {
             id: 1,
@@ -784,12 +670,7 @@ mod tests {
         };
         run_worker_one_task(gitlab.clone(), s.clone(), task).await;
 
-        assert_eq!(
-            gitlab
-                .add_spent_time_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(calls(&gitlab, "add_spent_time"), 1);
         assert!(
             snapshot_pending(&s).unwrap().is_empty(),
             "task removed after success"
@@ -817,7 +698,6 @@ mod tests {
         let drain_wake = Arc::new(Notify::new());
 
         let gitlab = Arc::new(FakeGitlab::default());
-        gitlab.push_add_spent_time(Ok(()));
 
         let (tx, rx) = mpsc::channel(8);
         let handle = tokio::spawn(worker(
@@ -827,6 +707,7 @@ mod tests {
             rx,
             config,
             Arc::clone(&drain_wake),
+            Arc::new(OnceLock::new()),
         ));
 
         tx.send(QueuedTask {
@@ -863,15 +744,64 @@ mod tests {
             .expect("worker drained via the reconnect nudge, not the session_wait timeout")
             .unwrap();
 
-        assert_eq!(
-            gitlab
-                .add_spent_time_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(calls(&gitlab, "add_spent_time"), 1);
         assert!(
             snapshot_pending(&s).unwrap().is_empty(),
             "deferred task drained after reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_tells_the_hook_how_each_task_settled() {
+        let (s, _td) = store();
+        let dir = tempfile::tempdir().unwrap();
+        let dead_letter = KvStore::open_durable(&test_db(&dir), DEAD_LETTER_KEYSPACE).unwrap();
+        let gitlab = Arc::new(FakeGitlab::default());
+        let session: SessionSlot =
+            Arc::new(tokio::sync::RwLock::new(ConnState::Connected(Session {
+                gitlab: gitlab.clone(),
+                host: "test".into(),
+                user_id: 0,
+            })));
+        let settled = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook_cell = Arc::new(OnceLock::new());
+        let seen = Arc::clone(&settled);
+        let hook: SettleHook = Arc::new(move |w: &Write, applied| {
+            seen.lock().unwrap().push((w.op.name(), w.iid, applied));
+        });
+        let _ = hook_cell.set(hook);
+
+        let (tx, rx) = mpsc::channel(8);
+        let config = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
+        let handle = tokio::spawn(worker(
+            session,
+            s,
+            dead_letter,
+            rx,
+            config,
+            Arc::new(Notify::new()),
+            hook_cell,
+        ));
+        gitlab.fail_next_write(FakeErr::Rejected);
+        for iid in [1, 2] {
+            tx.send(QueuedTask {
+                id: iid as u64,
+                project_id: 7,
+                iid,
+                kind: Issuable::Issue,
+                op: WriteOp::Close,
+                queued_at_secs: now_secs(),
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        assert_eq!(
+            *settled.lock().unwrap(),
+            [("Close", 1, false), ("Close", 2, true)],
+            "the rejected task is reported dead-lettered, the next one applied"
         );
     }
 
@@ -903,23 +833,15 @@ mod tests {
         .unwrap();
 
         let gitlab = Arc::new(FakeGitlab::default());
-        gitlab.create_timelog.lock().unwrap().push_back(Ok(()));
 
         run_worker_one_task(gitlab.clone(), s.clone(), task).await;
 
         assert_eq!(
-            gitlab
-                .create_timelog_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
+            calls(&gitlab, "create_timelog"),
             1,
             "issue_id present → GraphQL timelogCreate"
         );
-        assert_eq!(
-            gitlab
-                .add_spent_time_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
-            0
-        );
+        assert_eq!(calls(&gitlab, "add_spent_time"), 0);
     }
 
     #[tokio::test]
@@ -928,7 +850,7 @@ mod tests {
         s.put(1, &post_task(7, 100)).unwrap();
 
         let gitlab = Arc::new(FakeGitlab::default());
-        gitlab.push_add_spent_time(Err(Error::Gitlab("403".into())));
+        gitlab.fail_next_write(FakeErr::Rejected);
 
         let task = QueuedTask {
             id: 1,
@@ -945,9 +867,7 @@ mod tests {
         run_worker_one_task(gitlab.clone(), s.clone(), task).await;
 
         assert_eq!(
-            gitlab
-                .add_spent_time_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
+            calls(&gitlab, "add_spent_time"),
             1,
             "no retry on permanent error"
         );
@@ -955,14 +875,6 @@ mod tests {
             snapshot_pending(&s).unwrap().is_empty(),
             "task dropped after permanent rejection"
         );
-    }
-
-    fn throttled(status: u16) -> Error {
-        Error::Throttled {
-            status,
-            retry_after: None,
-            detail: String::new(),
-        }
     }
 
     /// Backoff delays at zero so a retry costs no wall time.
@@ -979,9 +891,8 @@ mod tests {
         s.put(1, &close_task(7, now_secs())).unwrap();
 
         let gitlab = Arc::new(FakeGitlab::default());
-        gitlab.push_close(Err(throttled(429)));
-        gitlab.push_close(Err(throttled(503)));
-        gitlab.push_close(Ok(()));
+        gitlab.fail_next_write(FakeErr::Throttled(429));
+        gitlab.fail_next_write(FakeErr::Throttled(503));
 
         let task = QueuedTask {
             id: 1,
@@ -994,10 +905,7 @@ mod tests {
         let failures =
             run_worker_one_task_with(instant_retry_config(), gitlab.clone(), s.clone(), task).await;
 
-        assert_eq!(
-            gitlab.close_calls.load(std::sync::atomic::Ordering::SeqCst),
-            3
-        );
+        assert_eq!(calls(&gitlab, "close"), 3);
         assert!(failures.is_empty(), "idempotent close retried through 5xx");
     }
 
@@ -1009,7 +917,7 @@ mod tests {
         s.put(1, &post_task(7, now_secs())).unwrap();
 
         let gitlab = Arc::new(FakeGitlab::default());
-        gitlab.push_add_spent_time(Err(throttled(502)));
+        gitlab.fail_next_write(FakeErr::Throttled(502));
 
         let task = QueuedTask {
             id: 1,
@@ -1026,12 +934,7 @@ mod tests {
         let failures =
             run_worker_one_task_with(instant_retry_config(), gitlab.clone(), s.clone(), task).await;
 
-        assert_eq!(
-            gitlab
-                .add_spent_time_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(calls(&gitlab, "add_spent_time"), 1);
         assert_eq!(failures.len(), 1);
     }
 
@@ -1041,8 +944,7 @@ mod tests {
         s.put(1, &post_task(7, now_secs())).unwrap();
 
         let gitlab = Arc::new(FakeGitlab::default());
-        gitlab.push_add_spent_time(Err(throttled(429)));
-        gitlab.push_add_spent_time(Ok(()));
+        gitlab.fail_next_write(FakeErr::Throttled(429));
 
         let task = QueuedTask {
             id: 1,
@@ -1060,9 +962,7 @@ mod tests {
             run_worker_one_task_with(instant_retry_config(), gitlab.clone(), s.clone(), task).await;
 
         assert_eq!(
-            gitlab
-                .add_spent_time_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
+            calls(&gitlab, "add_spent_time"),
             2,
             "a 429 is rejected before any work, so PostTime retries it"
         );
@@ -1075,7 +975,6 @@ mod tests {
         s.put(1, &close_task(7, 100)).unwrap();
 
         let gitlab = Arc::new(FakeGitlab::default());
-        gitlab.push_close(Ok(()));
 
         let task = QueuedTask {
             id: 1,
@@ -1087,10 +986,7 @@ mod tests {
         };
         run_worker_one_task(gitlab.clone(), s.clone(), task).await;
 
-        assert_eq!(
-            gitlab.close_calls.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(calls(&gitlab, "close"), 1);
     }
 
     /// The worker must thread a task's `MergeRequest` kind into every GitLab
@@ -1100,9 +996,6 @@ mod tests {
         let (s, _td) = store();
 
         let gitlab = Arc::new(FakeGitlab::default());
-        gitlab.push_close(Ok(()));
-        gitlab.push_add_spent_time(Ok(()));
-        gitlab.create_timelog.lock().unwrap().push_back(Ok(()));
 
         for (id, op) in [
             (1u64, WriteOp::Close),
@@ -1135,7 +1028,11 @@ mod tests {
         }
 
         assert_eq!(
-            *gitlab.kinds.lock().unwrap(),
+            gitlab
+                .writes()
+                .into_iter()
+                .map(|(op, kind, _, _)| (op, kind))
+                .collect::<Vec<_>>(),
             vec![
                 ("close", Issuable::MergeRequest),
                 ("add_spent_time", Issuable::MergeRequest),
@@ -1160,7 +1057,6 @@ mod tests {
         .unwrap();
 
         let gitlab = Arc::new(FakeGitlab::default());
-        gitlab.push_assign_self(Ok(()));
 
         let task = QueuedTask {
             id: 1,
@@ -1172,12 +1068,7 @@ mod tests {
         };
         run_worker_one_task(gitlab.clone(), s.clone(), task).await;
 
-        assert_eq!(
-            gitlab
-                .assign_self_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(calls(&gitlab, "assign_self"), 1);
         assert!(
             snapshot_pending(&s).unwrap().is_empty(),
             "task removed after success"
@@ -1216,7 +1107,7 @@ mod tests {
         s.put(1, &post_task(7, 100)).unwrap();
 
         let gitlab = Arc::new(FakeGitlab::default());
-        gitlab.push_add_spent_time(Err(Error::Gitlab("403 Forbidden".into())));
+        gitlab.fail_next_write(FakeErr::Rejected);
 
         let task = QueuedTask {
             id: 1,

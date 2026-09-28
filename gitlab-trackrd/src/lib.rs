@@ -6,20 +6,15 @@
 //! API. Everything here is an implementation detail with no stability
 //! guarantees — the crate is consumed as binaries only.
 
-pub mod boards;
-pub mod cache;
 pub mod config;
 pub mod db;
 pub mod error;
 pub mod gitlab;
 pub mod handlers;
-pub mod history;
 pub mod query;
 pub mod queue;
 pub mod reconnect;
-pub mod refresh_meta;
 pub mod reload;
-pub mod search;
 pub mod secrets;
 pub mod server;
 pub mod service;

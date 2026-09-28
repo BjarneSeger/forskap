@@ -133,24 +133,25 @@ pub enum Command {
         shell: Shell,
     },
     /// Drop the daemon's caches and re-fetch. With no flags it clears
-    /// everything (issues, boards, and all history bands); pass band flags to
-    /// target only those. Cleared history bands are re-fetched immediately.
-    /// Open statistics are user data and only go with an explicit `--usage`.
+    /// everything synced; pass flags to target only those slices. Waits until
+    /// the assigned lists and recent history are re-synced; the rest refills
+    /// in the background. Open statistics are user data and only go with an
+    /// explicit `--usage`.
     Refresh {
         /// Clear the quick history band (the last 24h).
         #[arg(long)]
         quick: bool,
-        /// Clear the slow history band (24h–30d).
+        /// Clear the slow history band (24h up to the 90-day retention).
         #[arg(long)]
         slow: bool,
-        /// Clear the stale history band (30d–90d).
+        /// Clear history past the retention horizon (normally already pruned).
         #[arg(long)]
         stale: bool,
-        /// Clear the assigned-issue and board caches.
+        /// Clear the assigned issue/MR lists and the board columns.
         #[arg(long)]
         issues: bool,
-        /// Clear the search cache (issues, MRs, projects, groups) and run a
-        /// full search resync.
+        /// Clear the search corpus (issues, MRs, projects, groups); it
+        /// refills in the background.
         #[arg(long)]
         search: bool,
         /// Forget the open counts behind `tt search` ranking (never cleared
