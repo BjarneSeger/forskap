@@ -24,6 +24,8 @@ pub enum FakeErr {
     Throttled(u16),
     /// A permanent rejection: `Error::Gitlab`.
     Rejected,
+    /// A dead token: `Error::Unauthorized`.
+    Unauthorized,
 }
 
 impl FakeErr {
@@ -36,6 +38,7 @@ impl FakeErr {
                 detail: "busy".into(),
             },
             Self::Rejected => Error::Gitlab("403 Forbidden".into()),
+            Self::Unauthorized => Error::Unauthorized("401 Unauthorized".into()),
         }
     }
 }

@@ -511,9 +511,12 @@ where
     throttled_or_rejected(status, retry_after, detail)
 }
 
-/// [`Error::Throttled`] for 429/5xx, [`Error::Gitlab`] for any other status.
+/// [`Error::Throttled`] for 429/5xx, [`Error::Unauthorized`] for 401,
+/// [`Error::Gitlab`] for any other status.
 fn throttled_or_rejected(status: u16, retry_after: Option<Duration>, detail: String) -> Error {
-    if status == 429 || (500..600).contains(&status) {
+    if status == 401 {
+        Error::Unauthorized(detail)
+    } else if status == 429 || (500..600).contains(&status) {
         Error::Throttled {
             status,
             retry_after: retry_after.filter(|d| !d.is_zero()),
@@ -991,10 +994,16 @@ mod tests {
                 );
             }
         }
-        for s in [400, 401, 403, 404] {
+        for s in [400, 403, 404] {
             for e in every_status_shape(s) {
                 assert!(matches!(classify(e), Error::Gitlab(_)), "{s} is permanent");
             }
+        }
+        for e in every_status_shape(401) {
+            assert!(
+                matches!(classify(e), Error::Unauthorized(_)),
+                "a dead token"
+            );
         }
 
         let limited = |secs| A::<Boom>::GitlabRateLimited {

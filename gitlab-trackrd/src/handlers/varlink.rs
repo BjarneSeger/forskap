@@ -845,7 +845,7 @@ impl VarlinkInterface for Handlers {
         info!(host, user_id = session.user_id, "logged in");
         *self.session.write().await = ConnState::Connected(session);
         self.queue.drain_waker().notify_one();
-        self.sync.wake();
+        self.sync.logged_in();
         call.reply()
     }
 

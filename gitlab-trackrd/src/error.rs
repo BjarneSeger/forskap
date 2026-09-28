@@ -10,6 +10,10 @@ pub enum Error {
     #[error("GitLab error: {0}")]
     Gitlab(String),
 
+    /// GitLab answered 401: the token is dead, and only `tt login` helps.
+    #[error("GitLab rejected the token: {0}")]
+    Unauthorized(String),
+
     /// Transient network error — safe to retry.
     #[error("network error: {0}")]
     Transient(String),

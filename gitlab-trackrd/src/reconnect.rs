@@ -335,6 +335,25 @@ pub(crate) async fn commit_unreachable(
     }
 }
 
+/// Demote a live session after `failed_client` got a 401: the token is dead
+/// and only `tt login` helps, so the supervisor isn't woken. The same
+/// identity CAS as [`commit_unreachable`].
+pub(crate) async fn commit_token_rejected(
+    session: &SessionSlot,
+    failed_client: &Arc<dyn GitlabApi>,
+    detail: String,
+) {
+    let mut slot = session.write().await;
+    if let ConnState::Connected(s) = &*slot {
+        if !Arc::ptr_eq(&s.gitlab, failed_client) {
+            return;
+        }
+        let host = s.host.clone();
+        warn!(host = %host, error = %detail, "GitLab rejected the token; run `tt login`");
+        *slot = ConnState::Dormant(DormancyReason::TokenRejected { host, detail });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

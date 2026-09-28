@@ -5,8 +5,9 @@
 //! planned job that is due, lowest priority class first. Per-job jittered
 //! due times plus a jittered pause between jobs keep requests spread out. A
 //! 429 pauses the whole worker; a 5xx or a rejection backs off only its job;
-//! a network error demotes the session and parks the worker until the
-//! reconnect supervisor wakes it.
+//! a network error backs off its job and demotes the session, parking the
+//! worker until the reconnect supervisor wakes it; a 401 parks the session
+//! until `tt login`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -75,6 +76,8 @@ enum Command {
     Reconfigure,
     /// The session may have changed.
     Wake,
+    /// A new login: retry the jobs that were backed off.
+    LoggedIn,
 }
 
 struct NotedWrite {
@@ -161,6 +164,11 @@ impl SyncHandle {
     /// The session may have changed (login, reconnect).
     pub fn wake(&self) {
         let _ = self.tx.send(Command::Wake);
+    }
+
+    /// A new login: whatever backed jobs off may be fixed, so they run now.
+    pub fn logged_in(&self) {
+        let _ = self.tx.send(Command::LoggedIn);
     }
 
     /// The config was reloaded.
@@ -373,7 +381,44 @@ impl Worker {
             }
             Command::Reconfigure => self.replan = true,
             Command::Wake => {}
+            Command::LoggedIn => self.unpark(),
         }
+    }
+
+    /// Clear every job's backoff, so all of them are due by their schedule
+    /// again.
+    fn unpark(&mut self) {
+        let parked: Vec<(String, JobState)> = self
+            .states
+            .iter()
+            .filter(|(_, s)| s.failures > 0 || s.retry_at > 0)
+            .map(|(k, s)| {
+                let state = JobState {
+                    failures: 0,
+                    retry_at: 0,
+                    ..*s
+                };
+                (k.clone(), state)
+            })
+            .collect();
+        if parked.is_empty() {
+            return;
+        }
+        let persisted = (|| -> Result<()> {
+            let mut c = self.store.begin();
+            for (key, state) in &parked {
+                c.set_job(key, state)?;
+            }
+            c.commit()
+        })();
+        if let Err(e) = persisted {
+            warn!(error = %e, "storing cleared backoffs failed");
+        }
+        info!(
+            jobs = parked.len(),
+            "new login; retrying backed-off sync jobs"
+        );
+        self.states.extend(parked);
     }
 
     fn next_job(&self, now: u64) -> Next {
@@ -535,9 +580,21 @@ impl Worker {
         match &e {
             Error::Transient(detail) => {
                 warn!(job = %key, error = %e, "sync fetch failed; GitLab unreachable");
+                // Backed off too: if only this job's requests fail, rerunning
+                // it right after each reconnect would flap the session.
+                self.back_off(key, state, SERVER_BACKOFF_CAP);
                 crate::reconnect::commit_unreachable(
                     &self.session,
                     &self.reconnect_signal,
+                    &session.gitlab,
+                    detail.clone(),
+                )
+                .await;
+            }
+            // The token, not the job: park the session until `tt login`.
+            Error::Unauthorized(detail) => {
+                crate::reconnect::commit_token_rejected(
+                    &self.session,
                     &session.gitlab,
                     detail.clone(),
                 )
@@ -966,7 +1023,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_network_error_demotes_the_session_and_keeps_the_job_due() {
+    async fn a_network_error_demotes_the_session_and_backs_off_the_job() {
         let fake = Arc::new(FakeGitlab::default());
         fake.fail_next("issues", FakeErr::Transient);
         let env = start(connected(&fake, 1));
@@ -978,7 +1035,42 @@ mod tests {
             &*env.session.read().await,
             ConnState::Dormant(DormancyReason::Unreachable { .. })
         ));
-        assert_eq!(state(&env, Job::AssignedIssues), JobState::default());
+        let failed = state(&env, Job::AssignedIssues);
+        assert_eq!((failed.last_ok, failed.failures), (0, 1));
+        assert!(failed.retry_at > now_secs(), "{failed:?}");
+    }
+
+    /// A 401 is the token's fault, not the job's: the session parks as
+    /// rejected, and a login then runs everything that was backed off.
+    #[tokio::test]
+    async fn a_dead_token_parks_the_session_and_a_login_unparks_the_jobs() {
+        let fake = Arc::new(FakeGitlab::default());
+        fake.fail_next("issues", FakeErr::Rejected);
+        fake.fail_next("merge_requests", FakeErr::Unauthorized);
+        let env = start(connected(&fake, 1));
+
+        eventually("the token rejection", || {
+            matches!(
+                env.session.try_read().as_deref(),
+                Ok(ConnState::Dormant(DormancyReason::TokenRejected { .. }))
+            )
+        })
+        .await;
+        assert_eq!(state(&env, Job::AssignedMergeRequests), JobState::default());
+        assert!(state(&env, Job::AssignedIssues).retry_at > now_secs());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), env.reconnect.notified())
+                .await
+                .is_err(),
+            "nothing to retry without a new login"
+        );
+
+        env.sync.logged_in();
+        eventually("the backoff to clear", || {
+            state(&env, Job::AssignedIssues).retry_at == 0
+        })
+        .await;
+        assert_eq!(state(&env, Job::AssignedIssues).failures, 0);
     }
 
     #[tokio::test]
