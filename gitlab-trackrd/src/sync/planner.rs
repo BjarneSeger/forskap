@@ -4,7 +4,9 @@
 //! The per-project corpus follows the *tracked* projects: those where the
 //! user has recent activity (an assignment, a contribution event, a
 //! timelog). Evidence is read from the store each time, so nothing extra is
-//! persisted: the event and timelog windows are the memory.
+//! persisted: the event and timelog windows are the memory. Only tracked
+//! projects the user is a member of get a corpus: an assigned MR in an
+//! upstream like gitlab-org/gitlab must not pull in its whole history.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -19,6 +21,8 @@ pub struct Plan {
     pub jobs: BTreeSet<Job>,
     pub tracked: BTreeSet<i64>,
     pub evidence: Evidence,
+    /// Projects whose issues and MRs are synced.
+    pub corpus: usize,
 }
 
 /// How many tracked projects each source contributed first, for the log.
@@ -42,26 +46,28 @@ pub fn plan(store: &SyncStore, population: SearchPopulation, tracked_since: u64)
         Job::MemberGroups,
     ]);
     jobs.extend(tracked.iter().map(|&p| Job::ProjectBoards(p)));
+    let members: BTreeSet<i64> = store
+        .projects
+        .keys(RowScope::All)?
+        .into_iter()
+        .map(|(id, _)| id as i64)
+        .collect();
     let corpus: Vec<i64> = match population {
         SearchPopulation::All => {
             jobs.extend([Job::AllIssues, Job::AllMergeRequests]);
             Vec::new()
         }
-        SearchPopulation::Member => store
-            .projects
-            .keys(RowScope::All)?
-            .into_iter()
-            .map(|(id, _)| id as i64)
-            .collect(),
-        SearchPopulation::Tracked => tracked.iter().copied().collect(),
+        SearchPopulation::Member => members.into_iter().collect(),
+        SearchPopulation::Tracked => tracked.intersection(&members).copied().collect(),
     };
-    for p in corpus {
+    for &p in &corpus {
         jobs.extend([Job::ProjectIssues(p), Job::ProjectMergeRequests(p)]);
     }
     Ok(Plan {
         jobs,
         tracked,
         evidence,
+        corpus: corpus.len(),
     })
 }
 
@@ -173,10 +179,19 @@ mod tests {
             .collect()
     }
 
+    fn member(id: i64) -> Project {
+        Project {
+            id,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn activity_alone_tracks_a_project() {
         let (s, _d) = store();
         let mut c = s.begin();
+        c.upsert(&[member(10), member(11), member(12), member(13)])
+            .unwrap();
         c.upsert(&[
             event(1, 10, "pushed to", 500),
             event(2, 11, "opened", 500),
@@ -196,6 +211,31 @@ mod tests {
         assert_eq!(projects_of(&plan), BTreeSet::from([10, 11]));
         assert!(plan.jobs.contains(&Job::ProjectBoards(10)));
         assert!(plan.jobs.contains(&Job::ProjectMergeRequests(11)));
+    }
+
+    /// An assigned MR in an upstream you aren't a member of keeps its row
+    /// (via the view) and gets boards, but no corpus.
+    #[test]
+    fn only_member_projects_get_a_corpus() {
+        let (s, _d) = store();
+        let mut c = s.begin();
+        c.upsert(&[member(3)]).unwrap();
+        c.upsert(&[event(1, 3, "opened", 500)]).unwrap();
+        c.set_view(
+            ASSIGNED_MERGE_REQUESTS,
+            &View {
+                keys: vec![(278964, 1)],
+                fetched_at: 0,
+            },
+        )
+        .unwrap();
+        c.commit().unwrap();
+
+        let plan = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        assert_eq!(plan.tracked, BTreeSet::from([3, 278964]));
+        assert_eq!(projects_of(&plan), BTreeSet::from([3]));
+        assert_eq!(plan.corpus, 1);
+        assert!(plan.jobs.contains(&Job::ProjectBoards(278964)));
     }
 
     #[test]
@@ -293,6 +333,7 @@ mod tests {
         )
         .unwrap();
         c.upsert(&[event(1, 1, "opened", 500)]).unwrap();
+        c.upsert(&[member(1), member(3)]).unwrap();
         c.commit().unwrap();
 
         // Tracked: project 1 (event) and 3 (assigned view).

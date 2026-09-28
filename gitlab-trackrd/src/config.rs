@@ -301,9 +301,11 @@ impl ReconnectConfig {
 #[derive(Debug, ConfiqueConfig)]
 pub struct SearchConfig {
     /// What the search corpus holds for issues and merge requests. The
-    /// default `"tracked"` covers the projects you are active in: assigned
-    /// issues/MRs, your pushes, issues, MRs and comments, and your timelogs
-    /// (see `tracked_retention_hours`). `"member"` covers every project you
+    /// default `"tracked"` covers the member projects you are active in:
+    /// assigned issues/MRs, your pushes, issues, MRs and comments, and your
+    /// timelogs (see `tracked_retention_hours`). Activity in a project you
+    /// aren't a member of (an upstream you contribute to) only keeps your
+    /// assigned items there. `"member"` covers every project you
     /// are a member of, `"all"` everything your token can see (GitLab
     /// `scope=all`; huge on large instances, and rejected by gitlab.com).
     /// Projects and groups themselves are always membership-scoped. `"auto"`
@@ -327,6 +329,12 @@ pub struct SearchConfig {
     /// default.)
     #[config(default = 2160)]
     pub tracked_retention_hours: u64,
+
+    /// Most issues and most merge requests kept per corpus project: the most
+    /// recently updated ones. Bounds the sync of very large projects.
+    /// (5000 by default, at least 100.)
+    #[config(default = 5000)]
+    pub max_items_per_project: u64,
 }
 
 /// Which issues/MRs the search cache is populated with — see
@@ -515,6 +523,13 @@ fn normalize_search(search: &mut SearchConfig) {
         );
         search.tracked_retention_hours = 24;
     }
+    if search.max_items_per_project < 100 {
+        warn!(
+            configured = search.max_items_per_project,
+            "search.max_items_per_project below 100 would hide most of a project; flooring to 100"
+        );
+        search.max_items_per_project = 100;
+    }
     if search.full_interval_secs < search.partial_interval_secs {
         warn!(
             partial = search.partial_interval_secs,
@@ -605,6 +620,7 @@ mod tests {
         assert_eq!(c.sync.job_gap(), Duration::from_millis(250));
         assert_eq!(c.sync.startup_spread_secs, 60);
         assert_eq!(c.search.tracked_retention(), Duration::from_hours(2160));
+        assert_eq!(c.search.max_items_per_project, 5000);
     }
 
     #[test]

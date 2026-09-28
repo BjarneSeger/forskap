@@ -50,6 +50,8 @@ pub struct FakeGitlab {
     gates: Mutex<HashMap<String, Arc<Notify>>>,
     timelogs: Mutex<Vec<Timelog>>,
     calls: Mutex<Vec<Listing>>,
+    /// The row limit of each call in `calls`.
+    limits: Mutex<Vec<Option<usize>>>,
     timelog_calls: Mutex<Vec<chrono::DateTime<chrono::Utc>>>,
     write_failures: Mutex<VecDeque<FakeErr>>,
     writes: Mutex<Vec<WriteCall>>,
@@ -102,6 +104,18 @@ impl FakeGitlab {
             .collect()
     }
 
+    /// The row limits the calls to `path` asked for.
+    pub fn limits_to(&self, path: &str) -> Vec<Option<usize>> {
+        let calls = self.calls.lock().unwrap();
+        let limits = self.limits.lock().unwrap();
+        calls
+            .iter()
+            .zip(limits.iter())
+            .filter(|(l, _)| l.path() == path)
+            .map(|(_, limit)| *limit)
+            .collect()
+    }
+
     pub fn timelog_calls(&self) -> Vec<chrono::DateTime<chrono::Utc>> {
         self.timelog_calls.lock().unwrap().clone()
     }
@@ -129,9 +143,10 @@ impl FakeGitlab {
 
 #[async_trait::async_trait]
 impl GitlabApi for FakeGitlab {
-    async fn list(&self, listing: &Listing) -> Result<Vec<Value>> {
+    async fn list(&self, listing: &Listing, limit: Option<usize>) -> Result<Vec<Value>> {
         let path = listing.path();
         self.calls.lock().unwrap().push(listing.clone());
+        self.limits.lock().unwrap().push(limit);
         let gate = self.gates.lock().unwrap().remove(&path);
         if let Some(gate) = gate {
             self.gated.notify_one();
@@ -146,13 +161,15 @@ impl GitlabApi for FakeGitlab {
         if let Some(err) = failure {
             return Err(err.error());
         }
-        Ok(self
+        let mut rows = self
             .rows
             .lock()
             .unwrap()
             .get(&path)
             .cloned()
-            .unwrap_or_default())
+            .unwrap_or_default();
+        rows.truncate(limit.unwrap_or(usize::MAX));
+        Ok(rows)
     }
 
     async fn list_timelogs(&self, since: chrono::DateTime<chrono::Utc>) -> Result<Vec<Timelog>> {
@@ -218,6 +235,16 @@ pub fn issue_json(project_id: i64, iid: i64, title: &str) -> Value {
         "state": "opened",
         "labels": [],
         "updated_at": "2026-07-01T10:00:00Z",
+    })
+}
+
+/// A member project as GitLab's `simple=true` listing returns it.
+pub fn project_json(id: i64) -> Value {
+    serde_json::json!({
+        "id": id,
+        "name": format!("p{id}"),
+        "path_with_namespace": format!("g/p{id}"),
+        "web_url": format!("https://gitlab.test/g/p{id}"),
     })
 }
 

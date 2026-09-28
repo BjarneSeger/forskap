@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::model::{Board, Event, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog};
 use super::schedule::{Cadence, JobState, fingerprint};
@@ -139,6 +139,9 @@ impl Job {
             Self::MemberGroups => Group::SCHEMA,
         });
         match self {
+            Self::ProjectIssues(_) | Self::ProjectMergeRequests(_) => {
+                fingerprint(&[schema, c.search.max_items_per_project])
+            }
             Self::RecentTimelogs => fingerprint(&[schema, c.refresh.quick.window_hours]),
             Self::AllTimelogs => fingerprint(&[schema, c.history.retention_hours]),
             Self::Events => fingerprint(&[schema, c.search.tracked_retention_hours]),
@@ -159,12 +162,14 @@ impl Job {
     }
 }
 
-/// The window lengths a run needs, snapshotted from the config.
+/// The windows and limits a run needs, snapshotted from the config.
 #[derive(Debug, Clone, Copy)]
 pub struct Windows {
     pub quick: u64,
     pub retention: u64,
     pub tracked: u64,
+    /// Most issues (and most MRs) fetched per project.
+    pub project_cap: usize,
 }
 
 impl Windows {
@@ -173,6 +178,7 @@ impl Windows {
             quick: c.refresh.quick.window().as_secs(),
             retention: c.history.retention().as_secs(),
             tracked: c.search.tracked_retention().as_secs(),
+            project_cap: usize::try_from(c.search.max_items_per_project).unwrap_or(usize::MAX),
         }
     }
 }
@@ -240,14 +246,14 @@ pub async fn fetch(job: Job, ctx: FetchCtx) -> Result<Staged> {
                 project_id,
                 updated_after: ctx.updated_after(),
             };
-            rows::<Issue>(gitlab, listing, project_scope(&ctx, project_id)).await
+            project_rows::<Issue>(&ctx, listing, project_id).await
         }
         Job::ProjectMergeRequests(project_id) => {
             let listing = Listing::ProjectMergeRequests {
                 project_id,
                 updated_after: ctx.updated_after(),
             };
-            rows::<MergeRequest>(gitlab, listing, project_scope(&ctx, project_id)).await
+            project_rows::<MergeRequest>(&ctx, listing, project_id).await
         }
         Job::AllIssues => {
             let listing = Listing::AllIssues {
@@ -271,6 +277,7 @@ pub async fn fetch(job: Job, ctx: FetchCtx) -> Result<Staged> {
             let fetched = fetch_rows(
                 gitlab,
                 &Listing::ProjectBoards { project_id },
+                None,
                 |b: &mut Board| b.project_id = project_id,
             )
             .await?;
@@ -287,9 +294,34 @@ pub async fn fetch(job: Job, ctx: FetchCtx) -> Result<Staged> {
     }
 }
 
-fn project_scope(ctx: &FetchCtx, project_id: i64) -> Option<RowScope> {
-    ctx.full
-        .then_some(RowScope::Prefix(project_id.max(0) as u64))
+/// One project's issues or MRs, newest first and capped: a huge project
+/// keeps only its most recently updated items, and a full run's reconcile
+/// drops the rest.
+async fn project_rows<R: Stored>(
+    ctx: &FetchCtx,
+    listing: Listing,
+    project_id: i64,
+) -> Result<Staged> {
+    let cap = ctx.windows.project_cap;
+    let fetched: Vec<R> = fetch_rows(&*ctx.gitlab, &listing, Some(cap), |_| {}).await?;
+    if fetched.len() >= cap {
+        info!(
+            project_id,
+            kind = R::NAME,
+            cap,
+            "project exceeds search.max_items_per_project; keeping the most recently updated"
+        );
+    }
+    let reconcile = ctx
+        .full
+        .then_some(RowScope::Prefix(project_id.max(0) as u64));
+    Ok(Staged::new(move |c| {
+        c.upsert(&fetched)?;
+        if let Some(scope) = reconcile {
+            c.reconcile(scope, &fetched)?;
+        }
+        Ok(fetched.len())
+    }))
 }
 
 /// Fetch `listing` as `R` rows; a full run (`reconcile = Some`) also drops
@@ -299,7 +331,7 @@ async fn rows<R: Stored>(
     listing: Listing,
     reconcile: Option<RowScope>,
 ) -> Result<Staged> {
-    let fetched: Vec<R> = fetch_rows(gitlab, &listing, |_| {}).await?;
+    let fetched: Vec<R> = fetch_rows(gitlab, &listing, None, |_| {}).await?;
     Ok(Staged::new(move |c| {
         c.upsert(&fetched)?;
         if let Some(scope) = reconcile {
@@ -316,7 +348,7 @@ async fn view<R: Stored>(
     name: &'static str,
     started: u64,
 ) -> Result<Staged> {
-    let fetched: Vec<R> = fetch_rows(gitlab, &listing, |_| {}).await?;
+    let fetched: Vec<R> = fetch_rows(gitlab, &listing, None, |_| {}).await?;
     Ok(Staged::new(move |c| {
         c.upsert(&fetched)?;
         let keys: Vec<RowKey> = fetched.iter().map(Resource::key).collect();
@@ -345,12 +377,16 @@ async fn events(ctx: &FetchCtx) -> Result<Staged> {
         .unwrap_or_default()
         .date_naive()
         .pred_opt();
-    let fetched: Vec<Event> =
-        fetch_rows(&*ctx.gitlab, &Listing::Events { after }, |_: &mut Event| {})
-            .await?
-            .into_iter()
-            .filter(|e| e.created_at >= window_start)
-            .collect();
+    let fetched: Vec<Event> = fetch_rows(
+        &*ctx.gitlab,
+        &Listing::Events { after },
+        None,
+        |_: &mut Event| {},
+    )
+    .await?
+    .into_iter()
+    .filter(|e| e.created_at >= window_start)
+    .collect();
     Ok(Staged::new(move |c| {
         c.upsert(&fetched)?;
         c.remove_where::<Event>(RowScope::Before(window_start), |_| false)?;
@@ -386,9 +422,10 @@ async fn timelogs(ctx: &FetchCtx, window: u64, prune: bool) -> Result<Staged> {
 pub async fn fetch_rows<R: Resource>(
     gitlab: &dyn GitlabApi,
     listing: &Listing,
+    limit: Option<usize>,
     stamp: impl Fn(&mut R),
 ) -> Result<Vec<R>> {
-    let raw = gitlab.list(listing).await?;
+    let raw = gitlab.list(listing, limit).await?;
     let total = raw.len();
     let rows: Vec<R> = raw
         .into_iter()
@@ -441,6 +478,7 @@ mod tests {
                 quick: DAY,
                 retention: 90 * DAY,
                 tracked: 30 * DAY,
+                project_cap: 2,
             },
         }
     }
@@ -513,6 +551,24 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn a_large_project_keeps_only_its_newest_items() {
+        let (s, _d) = store();
+        let fake = Arc::new(FakeGitlab::default());
+        // GitLab returns newest first; the test cap is 2.
+        fake.serve(
+            "projects/7/issues",
+            vec![
+                issue_json(7, 3, "new"),
+                issue_json(7, 2, "mid"),
+                issue_json(7, 1, "old"),
+            ],
+        );
+        run(&s, Job::ProjectIssues(7), ctx(&fake, true, 0)).await;
+        assert_eq!(s.issues.keys(RowScope::All).unwrap(), [(7, 2), (7, 3)]);
+        assert_eq!(fake.limits_to("projects/7/issues"), [Some(2)]);
     }
 
     #[tokio::test]

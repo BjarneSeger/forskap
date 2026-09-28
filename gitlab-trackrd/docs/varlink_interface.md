@@ -180,9 +180,12 @@ that mode. The statistics are read once per call and a read failure degrades to 
 plain recency order.
 
 What the corpus contains depends on the `[search]` daemon config. The default
-`population = "tracked"` holds the issues and MRs of the projects you are active in:
-where you have assigned issues/MRs, pushed, opened or commented on an issue or MR, or
-logged time within `search.tracked_retention_hours` (default 90 days). `"member"`
+`population = "tracked"` holds the issues and MRs of the member projects you are
+active in: where you have assigned issues/MRs, pushed, opened or commented on an issue
+or MR, or logged time within `search.tracked_retention_hours` (default 90 days).
+Activity in a project you aren't a member of only keeps your assigned items there.
+Each project contributes at most its `search.max_items_per_project` most recently
+updated issues and MRs. `"member"`
 holds every member project's, `"all"` everything the token can see (`"auto"` is an
 alias of `"tracked"`). Projects and groups are always membership-scoped.
 Issue `graph_status` comes from the synced board columns of the issue's project and

@@ -707,6 +707,7 @@ impl Worker {
         info!(
             jobs = plan.jobs.len(),
             tracked = plan.tracked.len(),
+            corpus = plan.corpus,
             from_assignments = plan.evidence.assigned,
             from_events = plan.evidence.events,
             from_timelogs = plan.evidence.timelogs,
@@ -724,7 +725,7 @@ mod tests {
     use super::*;
     use crate::error::DormancyReason;
     use crate::gitlab::{GitlabApi, Issuable, Listing};
-    use crate::testing::{FakeErr, FakeGitlab, event_json, eventually, issue_json};
+    use crate::testing::{FakeErr, FakeGitlab, event_json, eventually, issue_json, project_json};
     use crate::write::WriteOp;
 
     /// What an empty store plans before any evidence arrives.
@@ -804,10 +805,13 @@ mod tests {
     async fn a_projects_first_run_is_full_and_later_ones_delta() {
         let fake = Arc::new(FakeGitlab::default());
         fake.serve("events", vec![event_json(1, 7, "pushed to", now_secs())]);
+        fake.serve("projects", vec![project_json(7)]);
         fake.serve("projects/7/issues", vec![issue_json(7, 1, "one")]);
         let env = start(connected(&fake, 1));
 
-        env.sync.refresh_now(&[Job::Events]).await;
+        env.sync
+            .refresh_now(&[Job::Events, Job::MemberProjects])
+            .await;
         env.sync.refresh_now(&[Job::ProjectIssues(7)]).await;
         env.sync.refresh_now(&[Job::ProjectIssues(7)]).await;
 
@@ -893,6 +897,7 @@ mod tests {
                 event_json(2, 8, "opened", now),
             ],
         );
+        fake.serve("projects", vec![project_json(7), project_json(8)]);
         fake.fail_next("projects/7/issues", FakeErr::Rejected);
         let env = start(connected(&fake, 1));
 
@@ -914,6 +919,7 @@ mod tests {
     async fn a_clear_cancels_the_fetch_in_flight() {
         let fake = Arc::new(FakeGitlab::default());
         fake.serve("events", vec![event_json(1, 7, "opened", now_secs())]);
+        fake.serve("projects", vec![project_json(7)]);
         fake.serve("projects/7/issues", vec![issue_json(7, 1, "late")]);
         let gate = fake.gate("projects/7/issues");
         let env = start(connected(&fake, 1));
@@ -921,8 +927,9 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), fake.gated.notified())
             .await
             .expect("the project fetch starts");
-        // Nothing re-tracks project 7 after the wipe.
+        // Nothing re-plans project 7 after the wipe.
         fake.serve("events", Vec::new());
+        fake.serve("projects", Vec::new());
         tokio::time::timeout(Duration::from_secs(2), env.sync.clear(Clear::Everything))
             .await
             .expect("the clear doesn't wait for the fetch");

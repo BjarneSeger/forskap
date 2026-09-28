@@ -132,9 +132,12 @@ impl Listing {
                 ("scope", "assigned_to_me".into()),
                 ("state", "opened".into()),
             ],
+            // Newest first, so a capped fetch keeps the most recent items.
             Self::ProjectIssues { updated_after, .. }
             | Self::ProjectMergeRequests { updated_after, .. } => {
-                after(updated_after).into_iter().collect()
+                let mut p = vec![("order_by", "updated_at".into()), ("sort", "desc".into())];
+                p.extend(after(updated_after));
+                p
             }
             Self::AllIssues { updated_after } | Self::AllMergeRequests { updated_after } => {
                 let mut p = vec![("scope", "all".into())];
@@ -184,20 +187,14 @@ pub trait GitlabApi: Send + Sync {
 
     async fn unassign_self(&self, kind: Issuable, project_id: i64, iid: i64) -> Result<()>;
 
-    /// Every row of a paginated REST listing, as raw JSON.
-    async fn list(&self, listing: &Listing) -> Result<Vec<serde_json::Value>> {
-        Err(Error::Gitlab(format!("{listing:?} not supported")))
-    }
+    /// The rows of a paginated REST listing, as raw JSON; paging stops once
+    /// `limit` rows arrived.
+    async fn list(&self, listing: &Listing, limit: Option<usize>)
+    -> Result<Vec<serde_json::Value>>;
 
-    /// The user's timelogs with `spent_at >= since`, newest first.
-    async fn list_timelogs(
-        &self,
-        since: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<crate::sync::model::Timelog>> {
-        Err(Error::Gitlab(format!(
-            "timelogs since {since} not supported"
-        )))
-    }
+    /// The user's timelogs with `spent_at >= since`, newest first. GitLab has
+    /// no REST listing for them, so this is the one GraphQL read.
+    async fn list_timelogs(&self, since: chrono::DateTime<chrono::Utc>) -> Result<Vec<Timelog>>;
 }
 
 impl GitlabClient {
@@ -407,14 +404,14 @@ impl GitlabApi for GitlabClient {
     }
 
     #[instrument(skip(self))]
-    async fn list(&self, listing: &Listing) -> Result<Vec<serde_json::Value>> {
+    async fn list(
+        &self,
+        listing: &Listing,
+        limit: Option<usize>,
+    ) -> Result<Vec<serde_json::Value>> {
         use gitlab::api::{Pagination, paged};
-        run_paged_query(
-            &self.inner,
-            "list",
-            paged(RestList(listing), Pagination::All),
-        )
-        .await
+        let pagination = limit.map_or(Pagination::All, Pagination::Limit);
+        run_paged_query(&self.inner, "list", paged(RestList(listing), pagination)).await
     }
 
     /// Returns entries with `spent_at >= since`, newest first. Catches time
@@ -1049,7 +1046,7 @@ mod tests {
                     updated_after: None,
                 },
                 "projects/7/issues",
-                "",
+                "order_by=updated_at&sort=desc",
             ),
             (
                 Listing::ProjectMergeRequests {
@@ -1057,7 +1054,7 @@ mod tests {
                     updated_after: t,
                 },
                 "projects/7/merge_requests",
-                "updated_after=2026-07-01T10:00:00Z",
+                "order_by=updated_at&sort=desc&updated_after=2026-07-01T10:00:00Z",
             ),
             (
                 Listing::AllIssues { updated_after: t },
