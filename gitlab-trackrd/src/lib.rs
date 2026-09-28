@@ -23,5 +23,6 @@ pub mod search;
 pub mod secrets;
 pub mod server;
 pub mod service;
+pub mod sync;
 pub mod usage;
 pub mod write;

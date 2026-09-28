@@ -93,6 +93,96 @@ pub struct FetchedTimelog {
     pub summary: String,
 }
 
+/// A paginated REST listing the sync layer fetches. Path and query are
+/// rendered in one place ([`Listing::path`], [`Listing::params`]), so test
+/// fakes match on the variant instead of on strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Listing {
+    /// Open issues assigned to the user.
+    AssignedIssues,
+    /// Open merge requests assigned to the user.
+    AssignedMergeRequests,
+    /// Every issue of a project, all states; `updated_after` for a delta.
+    ProjectIssues {
+        project_id: i64,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    ProjectMergeRequests {
+        project_id: i64,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// Every issue the token can see (`scope=all`).
+    AllIssues {
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    AllMergeRequests {
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// Projects the user is a member of.
+    MemberProjects,
+    /// Groups the user is a member of (a bare `GET /groups` would include
+    /// public non-member groups).
+    MemberGroups,
+    /// A project's boards, lists embedded.
+    ProjectBoards { project_id: i64 },
+    /// The user's own contribution events created after `after` (a date;
+    /// GitLab compares exclusively).
+    Events { after: Option<chrono::NaiveDate> },
+}
+
+impl Listing {
+    pub fn path(&self) -> String {
+        match self {
+            Self::AssignedIssues | Self::AllIssues { .. } => "issues".into(),
+            Self::AssignedMergeRequests | Self::AllMergeRequests { .. } => "merge_requests".into(),
+            Self::ProjectIssues { project_id, .. } => format!("projects/{project_id}/issues"),
+            Self::ProjectMergeRequests { project_id, .. } => {
+                format!("projects/{project_id}/merge_requests")
+            }
+            Self::MemberProjects => "projects".into(),
+            Self::MemberGroups => "groups".into(),
+            Self::ProjectBoards { project_id } => format!("projects/{project_id}/boards"),
+            Self::Events { .. } => "events".into(),
+        }
+    }
+
+    pub fn params(&self) -> Vec<(&'static str, String)> {
+        let after = |t: &Option<chrono::DateTime<chrono::Utc>>| {
+            t.map(|t| {
+                (
+                    "updated_after",
+                    t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                )
+            })
+        };
+        let mut params = match self {
+            Self::AssignedIssues | Self::AssignedMergeRequests => vec![
+                ("scope", "assigned_to_me".into()),
+                ("state", "opened".into()),
+            ],
+            Self::ProjectIssues { updated_after, .. }
+            | Self::ProjectMergeRequests { updated_after, .. } => {
+                after(updated_after).into_iter().collect()
+            }
+            Self::AllIssues { updated_after } | Self::AllMergeRequests { updated_after } => {
+                let mut p = vec![("scope", "all".into())];
+                p.extend(after(updated_after));
+                p
+            }
+            Self::MemberProjects => vec![("membership", "true".into()), ("simple", "true".into())],
+            // 10 = Guest, the lowest membership level.
+            Self::MemberGroups => vec![("min_access_level", "10".into())],
+            Self::ProjectBoards { .. } => Vec::new(),
+            Self::Events { after } => after
+                .map(|d| ("after", d.format("%Y-%m-%d").to_string()))
+                .into_iter()
+                .collect(),
+        };
+        params.sort();
+        params
+    }
+}
+
 /// Daemon-facing GitLab surface. Lets tests substitute a fake without touching
 /// the real `gitlab` crate. Production code path goes through the impl on
 /// [`GitlabClient`].
@@ -157,6 +247,21 @@ pub trait GitlabApi: Send + Sync {
     /// All groups the user is a member of (`min_access_level=guest`; a bare
     /// `GET /groups` would also include public non-member groups).
     async fn fetch_member_groups(&self) -> Result<Vec<SearchGroup>>;
+
+    /// Every row of a paginated REST listing, as raw JSON.
+    async fn list(&self, listing: &Listing) -> Result<Vec<serde_json::Value>> {
+        Err(Error::Gitlab(format!("{listing:?} not supported")))
+    }
+
+    /// The user's timelogs with `spent_at >= since`, newest first.
+    async fn list_timelogs(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::sync::model::Timelog>> {
+        Err(Error::Gitlab(format!(
+            "timelogs since {since} not supported"
+        )))
+    }
 }
 
 impl GitlabClient {
@@ -360,44 +465,29 @@ impl GitlabApi for GitlabClient {
         Ok(())
     }
 
-    /// Fetch the authenticated user's recent timelogs via GraphQL.
-    ///
-    /// Returns entries with `spent_at >= since`, newest first. Used by the
-    /// history refresh cycle to catch time logged via the web UI or other
-    /// clients. `time_spent` is converted from seconds into the same
-    /// "1h 30m"-style string GitLab returns elsewhere, so stored values look
-    /// like what users typed.
+    /// Fetch the authenticated user's recent timelogs via GraphQL, in the
+    /// legacy shape the history refresh still consumes.
     #[instrument(skip(self))]
     async fn fetch_my_timelogs(
         &self,
         since: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<FetchedTimelog>> {
-        let mut out: Vec<FetchedTimelog> = Vec::new();
-        let mut after: Option<String> = None;
-        loop {
-            let endpoint = MyTimelogs {
-                start_time: since.to_rfc3339(),
-                after: after.clone(),
-            };
-            // Retry transient (network) failures like the issues fetch does: a
-            // read is idempotent, so a momentary blip is absorbed here instead
-            // of demoting the whole session (see `handlers::note_gitlab_error`).
-            let raw: serde_json::Value = retry_transient("fetch timelogs", || async {
-                endpoint.query_async(&self.inner).await.map_err(classify)
+        Ok(self
+            .list_timelogs(since)
+            .await?
+            .into_iter()
+            .map(|t| FetchedTimelog {
+                timelog_id: t.id,
+                spent_at_secs: t.spent_at,
+                kind: t.kind,
+                project_id: t.project_id,
+                iid: t.iid,
+                title: t.title,
+                web_url: t.web_url,
+                duration: format_duration(t.time_spent),
+                summary: t.summary,
             })
-            .await?;
-            let (page, next) = timelogs_page(&raw)?;
-            out.extend(page);
-            match next {
-                // A repeated cursor would loop forever.
-                Some(cursor) if after.as_ref() != Some(&cursor) => after = Some(cursor),
-                _ => break,
-            }
-        }
-
-        out.sort_by_key(|t| std::cmp::Reverse(t.spent_at_secs));
-        info!(count = out.len(), "fetched timelogs from GitLab");
-        Ok(out)
+            .collect())
     }
 
     /// Close a GitLab issuable (`PUT /projects/:id/<kind>/:iid` with
@@ -611,7 +701,74 @@ impl GitlabApi for GitlabClient {
         info!(count = groups.len(), "fetched member groups from GitLab");
         Ok(groups)
     }
+
+    #[instrument(skip(self))]
+    async fn list(&self, listing: &Listing) -> Result<Vec<serde_json::Value>> {
+        use gitlab::api::{Pagination, paged};
+        run_paged_query(
+            &self.inner,
+            "list",
+            paged(RestList(listing), Pagination::All),
+        )
+        .await
+    }
+
+    /// Returns entries with `spent_at >= since`, newest first. Catches time
+    /// logged via the web UI or other clients.
+    #[instrument(skip(self))]
+    async fn list_timelogs(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::sync::model::Timelog>> {
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let endpoint = MyTimelogs {
+                start_time: since.to_rfc3339(),
+                after: after.clone(),
+            };
+            // A read is idempotent, so a momentary network blip is absorbed
+            // here instead of demoting the whole session.
+            let raw: serde_json::Value = retry_transient("fetch timelogs", || async {
+                endpoint.query_async(&self.inner).await.map_err(classify)
+            })
+            .await?;
+            let (page, next) = timelogs_page(&raw)?;
+            out.extend(page);
+            match next {
+                // A repeated cursor would loop forever.
+                Some(cursor) if after.as_ref() != Some(&cursor) => after = Some(cursor),
+                _ => break,
+            }
+        }
+        out.sort_by_key(|t| std::cmp::Reverse(t.spent_at));
+        info!(count = out.len(), "fetched timelogs from GitLab");
+        Ok(out)
+    }
 }
+
+/// `GET <listing path>` — the one endpoint behind every [`Listing`].
+struct RestList<'a>(&'a Listing);
+
+impl gitlab::api::Endpoint for RestList<'_> {
+    fn method(&self) -> http::Method {
+        http::Method::GET
+    }
+
+    fn endpoint(&self) -> Cow<'static, str> {
+        self.0.path().into()
+    }
+
+    fn parameters(&self) -> gitlab::api::QueryParams<'_> {
+        let mut params = gitlab::api::QueryParams::default();
+        for (k, v) in self.0.params() {
+            params.push(k, v);
+        }
+        params
+    }
+}
+
+impl gitlab::api::Pageable for RestList<'_> {}
 
 /// Run `query` against `client`, retrying transient errors with exponential
 /// back-off (see [`retry_transient`]).
@@ -1086,7 +1243,9 @@ impl gitlab::api::Endpoint for MyTimelogs {
 
 /// Parse one `currentUser.timelogs` response page into its timelogs and the
 /// cursor of the next page (`None` on the last one).
-fn timelogs_page(raw: &serde_json::Value) -> Result<(Vec<FetchedTimelog>, Option<String>)> {
+fn timelogs_page(
+    raw: &serde_json::Value,
+) -> Result<(Vec<crate::sync::model::Timelog>, Option<String>)> {
     if let Some(errs) = raw["errors"].as_array()
         && !errs.is_empty()
     {
@@ -1119,8 +1278,8 @@ fn timelogs_page(raw: &serde_json::Value) -> Result<(Vec<FetchedTimelog>, Option
 /// Parse one `currentUser.timelogs` node. `None` skips the node: an
 /// unparsable timelog GID, or a timelog attached to neither an issue nor a
 /// merge request (e.g. the issuable is no longer visible to the user).
-fn timelog_from_node(n: &serde_json::Value) -> Option<FetchedTimelog> {
-    let timelog_id = parse_gid(n["id"].as_str().unwrap_or(""))?;
+fn timelog_from_node(n: &serde_json::Value) -> Option<crate::sync::model::Timelog> {
+    let id = parse_gid(n["id"].as_str().unwrap_or(""))?;
 
     let (kind, issuable) = if !n["issue"].is_null() {
         (Issuable::Issue, &n["issue"])
@@ -1131,14 +1290,11 @@ fn timelog_from_node(n: &serde_json::Value) -> Option<FetchedTimelog> {
     };
 
     let spent_at = n["spentAt"].as_str().unwrap_or("");
-    let spent_at_secs = chrono::DateTime::parse_from_rfc3339(spent_at)
-        .map(|d| d.timestamp().max(0) as u64)
-        .unwrap_or(0);
-    let time_spent_secs = n["timeSpent"].as_i64().unwrap_or(0).max(0) as u64;
-
-    Some(FetchedTimelog {
-        timelog_id,
-        spent_at_secs,
+    Some(crate::sync::model::Timelog {
+        id,
+        spent_at: chrono::DateTime::parse_from_rfc3339(spent_at)
+            .map(|d| d.timestamp().max(0) as u64)
+            .unwrap_or(0),
         kind,
         project_id: parse_gid(n["project"]["id"].as_str().unwrap_or(""))
             .map(|id| id as i64)
@@ -1151,7 +1307,7 @@ fn timelog_from_node(n: &serde_json::Value) -> Option<FetchedTimelog> {
             .unwrap_or(0),
         title: issuable["title"].as_str().unwrap_or("").to_string(),
         web_url: issuable["webUrl"].as_str().unwrap_or("").to_string(),
-        duration: format_duration(time_spent_secs),
+        time_spent: n["timeSpent"].as_i64().unwrap_or(0).max(0) as u64,
         summary: n["summary"].as_str().unwrap_or("").to_string(),
     })
 }
@@ -1163,7 +1319,7 @@ fn parse_gid(gid: &str) -> Option<u64> {
 
 /// Format a duration in seconds as `"1h 30m"` (or `"45s"` when sub-minute).
 /// Matches the style GitLab itself uses for `human_total_time_spent`.
-fn format_duration(secs: u64) -> String {
+pub fn format_duration(secs: u64) -> String {
     if secs == 0 {
         return "0m".to_string();
     }
@@ -1336,6 +1492,82 @@ mod tests {
         );
     }
 
+    /// Pins what each listing asks GitLab for; a wrong scope or state here
+    /// silently changes which rows the store holds.
+    #[test]
+    fn listings_render_path_and_query() {
+        let t = chrono::DateTime::<chrono::Utc>::from_timestamp(1_782_900_000, 0);
+        let q = |l: &Listing| {
+            l.params()
+                .into_iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        };
+        let cases = [
+            (
+                Listing::AssignedIssues,
+                "issues",
+                "scope=assigned_to_me&state=opened",
+            ),
+            (
+                Listing::AssignedMergeRequests,
+                "merge_requests",
+                "scope=assigned_to_me&state=opened",
+            ),
+            (
+                Listing::ProjectIssues {
+                    project_id: 7,
+                    updated_after: None,
+                },
+                "projects/7/issues",
+                "",
+            ),
+            (
+                Listing::ProjectMergeRequests {
+                    project_id: 7,
+                    updated_after: t,
+                },
+                "projects/7/merge_requests",
+                "updated_after=2026-07-01T10:00:00Z",
+            ),
+            (
+                Listing::AllIssues { updated_after: t },
+                "issues",
+                "scope=all&updated_after=2026-07-01T10:00:00Z",
+            ),
+            (
+                Listing::AllMergeRequests {
+                    updated_after: None,
+                },
+                "merge_requests",
+                "scope=all",
+            ),
+            (
+                Listing::MemberProjects,
+                "projects",
+                "membership=true&simple=true",
+            ),
+            (Listing::MemberGroups, "groups", "min_access_level=10"),
+            (
+                Listing::ProjectBoards { project_id: 7 },
+                "projects/7/boards",
+                "",
+            ),
+            (
+                Listing::Events {
+                    after: chrono::NaiveDate::from_ymd_opt(2026, 6, 30),
+                },
+                "events",
+                "after=2026-06-30",
+            ),
+        ];
+        for (listing, path, query) in cases {
+            assert_eq!(listing.path(), path, "{listing:?}");
+            assert_eq!(q(&listing), query, "{listing:?}");
+        }
+    }
+
     #[test]
     fn issuable_maps_to_rest_segment_and_gid_type() {
         assert_eq!(Issuable::Issue.path_segment(), "issues");
@@ -1493,7 +1725,7 @@ mod tests {
         assert_eq!(t.project_id, 7);
         assert_eq!(t.iid, 42);
         assert_eq!(t.title, "I");
-        assert_eq!(t.duration, "1h 30m");
+        assert_eq!(t.time_spent, 5400);
 
         let mr_node = serde_json::json!({
             "id": "gid://gitlab/Timelog/12",
