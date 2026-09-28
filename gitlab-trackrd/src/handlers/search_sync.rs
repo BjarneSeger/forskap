@@ -59,6 +59,16 @@ enum Outcome {
     GlobalRejected,
 }
 
+/// Whether a global `scope=all` fetch failed because the instance refuses it
+/// (gitlab.com answers 500), as opposed to a rate limit or network blip.
+fn is_global_rejection(e: &Error) -> bool {
+    match e {
+        Error::Gitlab(_) => true,
+        Error::Throttled { status, .. } => *status != 429,
+        _ => false,
+    }
+}
+
 /// gitlab.com rejects the unfiltered global `scope=all` fetch outright, so
 /// `population = "auto"` never attempts it there.
 fn is_gitlab_com(host: &str) -> bool {
@@ -248,7 +258,7 @@ impl Handlers {
             Population::All => match gitlab.fetch_issues_for_search(None, updated_after).await {
                 Ok(i) => i,
                 Err(e) => {
-                    let rejected = matches!(e, Error::Gitlab(_));
+                    let rejected = is_global_rejection(&e);
                     self.fail_search_fetch(gitlab, "issues", &e).await;
                     return if rejected {
                         Outcome::GlobalRejected
@@ -285,7 +295,7 @@ impl Handlers {
                 {
                     Ok(m) => m,
                     Err(e) => {
-                        let rejected = matches!(e, Error::Gitlab(_));
+                        let rejected = is_global_rejection(&e);
                         self.fail_search_fetch(gitlab, "merge requests", &e).await;
                         return if rejected {
                             Outcome::GlobalRejected

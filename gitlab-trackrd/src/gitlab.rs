@@ -652,18 +652,39 @@ where
     .await
 }
 
-/// Map a GitLab API error to [`Error::Transient`] for network failures and
-/// [`Error::Gitlab`] for permanent rejections (auth, 4xx, bad JSON, …).
+/// Map a GitLab API error to [`Error::Transient`] for network failures,
+/// [`Error::Throttled`] for 429/5xx, and [`Error::Gitlab`] for permanent
+/// rejections (auth, other 4xx, bad JSON, …).
 fn classify<E>(e: gitlab::api::ApiError<E>) -> Error
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    let is_network = matches!(e, gitlab::api::ApiError::Client { .. });
-    let msg = e.to_string();
-    if is_network {
-        Error::Transient(msg)
+    use gitlab::api::ApiError as A;
+    let detail = e.to_string();
+    let (status, retry_after) = match &e {
+        A::Client { .. } => return Error::Transient(detail),
+        // Only the single-request path parses the rate-limit headers; the
+        // paged path reports a 429 as one of the plain status variants.
+        A::GitlabRateLimited { retry_after, .. } => (429, Some(*retry_after)),
+        A::GitlabService { status, .. }
+        | A::GitlabWithStatus { status, .. }
+        | A::GitlabObjectWithStatus { status, .. }
+        | A::GitlabUnrecognizedWithStatus { status, .. } => (status.as_u16(), None),
+        _ => return Error::Gitlab(detail),
+    };
+    throttled_or_rejected(status, retry_after, detail)
+}
+
+/// [`Error::Throttled`] for 429/5xx, [`Error::Gitlab`] for any other status.
+fn throttled_or_rejected(status: u16, retry_after: Option<Duration>, detail: String) -> Error {
+    if status == 429 || (500..600).contains(&status) {
+        Error::Throttled {
+            status,
+            retry_after: retry_after.filter(|d| !d.is_zero()),
+            detail,
+        }
     } else {
-        Error::Gitlab(msg)
+        Error::Gitlab(detail)
     }
 }
 
@@ -682,7 +703,10 @@ fn classify_build(e: gitlab::GitlabError) -> Error {
         e @ (GitlabError::Communication { .. } | GitlabError::NoResponse { .. }) => {
             Error::Transient(e.to_string())
         }
-        // URL/auth-header/HTTP-status/GraphQL/JSON failures are permanent.
+        GitlabError::Http { status } => {
+            throttled_or_rejected(status.as_u16(), None, format!("HTTP {status}"))
+        }
+        // URL/auth-header/GraphQL/JSON failures are permanent.
         other => Error::Gitlab(other.to_string()),
     }
 }
@@ -1215,6 +1239,77 @@ mod tests {
             prop_assert_eq!(parse_gid(&format!("gid://gitlab/Timelog/{tail}")), None);
             prop_assert_eq!(parse_gid(&tail), None);
         }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("boom")]
+    struct Boom;
+
+    #[test]
+    fn classify_splits_network_throttle_and_rejection() {
+        use gitlab::api::ApiError as A;
+        let code = |s: u16| http::StatusCode::from_u16(s).unwrap();
+        let every_status_shape = |s: u16| -> Vec<A<Boom>> {
+            vec![
+                A::GitlabService {
+                    status: code(s),
+                    data: Vec::new(),
+                },
+                A::GitlabWithStatus {
+                    status: code(s),
+                    msg: "m".into(),
+                },
+                A::GitlabObjectWithStatus {
+                    status: code(s),
+                    obj: serde_json::json!({}),
+                },
+                A::GitlabUnrecognizedWithStatus {
+                    status: code(s),
+                    obj: serde_json::json!({}),
+                },
+            ]
+        };
+
+        assert!(matches!(
+            classify(A::<Boom>::Client { source: Boom }),
+            Error::Transient(_)
+        ));
+        for s in [429, 500, 502, 503] {
+            for e in every_status_shape(s) {
+                assert!(
+                    matches!(classify(e), Error::Throttled { status, retry_after: None, .. } if status == s),
+                    "{s} is throttled"
+                );
+            }
+        }
+        for s in [400, 401, 403, 404] {
+            for e in every_status_shape(s) {
+                assert!(matches!(classify(e), Error::Gitlab(_)), "{s} is permanent");
+            }
+        }
+
+        let limited = |secs| A::<Boom>::GitlabRateLimited {
+            rl_limit: 0,
+            rl_name: String::new(),
+            rl_observed: 0,
+            rl_remaining: 0,
+            rl_reset: chrono::DateTime::UNIX_EPOCH,
+            retry_after: Duration::from_secs(secs),
+        };
+        assert!(matches!(
+            classify(limited(30)),
+            Error::Throttled { status: 429, retry_after: Some(d), .. } if d == Duration::from_secs(30)
+        ));
+        assert!(
+            matches!(
+                classify(limited(0)),
+                Error::Throttled {
+                    retry_after: None,
+                    ..
+                }
+            ),
+            "a missing Retry-After header parses as 0 and means unknown"
+        );
     }
 
     #[test]

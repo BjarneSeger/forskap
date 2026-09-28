@@ -15,7 +15,7 @@ use gitlab_trackr_api::{
 };
 
 use crate::cache::{in_group, namespace_of};
-use crate::error::{DormancyReason, Error};
+use crate::error::DormancyReason;
 use crate::gitlab::{GitlabClient, Issuable};
 use crate::history::HistoryCache;
 use crate::search::{SEARCH_SCHEMA_VERSION, SearchIssue, SearchMr, parse_iid_query, text_matches};
@@ -650,8 +650,8 @@ impl VarlinkInterface for Handlers {
                 info!(project_id, iid, kind = ?kind, duration, "posted time");
                 call.reply()
             }
-            Err(err @ Error::Transient(_)) => {
-                warn!(error = %err, project_id, iid, "PostTime network error, queuing for retry");
+            Err(err) if err.is_retryable(false) => {
+                warn!(error = %err, project_id, iid, "PostTime failed transiently, queuing for retry");
                 self.defer_post_time(kind, project_id, iid, duration, summary)
                     .await;
                 call.reply()
@@ -883,8 +883,8 @@ impl VarlinkInterface for Handlers {
                 self.reflect_close(kind, project_id, iid);
                 call.reply()
             }
-            Err(err @ Error::Transient(_)) => {
-                warn!(error = %err, project_id, iid, "Close network error, queuing for retry");
+            Err(err) if err.is_retryable(true) => {
+                warn!(error = %err, project_id, iid, "Close failed transiently, queuing for retry");
                 self.defer_close(kind, project_id, iid).await;
                 call.reply()
             }
@@ -929,8 +929,8 @@ impl VarlinkInterface for Handlers {
                 info!(project_id, iid, kind = ?kind, "assigned self");
                 call.reply()
             }
-            Err(err @ Error::Transient(_)) => {
-                warn!(error = %err, project_id, iid, "AssignSelf network error, queuing for retry");
+            Err(err) if err.is_retryable(true) => {
+                warn!(error = %err, project_id, iid, "AssignSelf failed transiently, queuing for retry");
                 self.defer_assign_self(kind, project_id, iid).await;
                 call.reply()
             }
@@ -976,8 +976,8 @@ impl VarlinkInterface for Handlers {
                 self.reflect_unassign(kind, project_id, iid);
                 call.reply()
             }
-            Err(err @ Error::Transient(_)) => {
-                warn!(error = %err, project_id, iid, "UnassignSelf network error, queuing for retry");
+            Err(err) if err.is_retryable(true) => {
+                warn!(error = %err, project_id, iid, "UnassignSelf failed transiently, queuing for retry");
                 self.defer_unassign_self(kind, project_id, iid).await;
                 call.reply()
             }
@@ -998,7 +998,7 @@ impl VarlinkInterface for Handlers {
         let client = match GitlabClient::connect_with_retry(&host, &token).await {
             Ok(c) => c,
             Err(e) => {
-                warn!(error = %e, host, "Login: GitLab rejected the token");
+                warn!(error = %e, host, "Login: connecting to GitLab failed");
                 return call.reply_gitlab_error(e.to_string());
             }
         };

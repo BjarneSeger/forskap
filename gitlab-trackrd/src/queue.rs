@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::config::{SharedConfig, next_backoff};
 use crate::db::KvStore;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::gitlab::Issuable;
 use crate::handlers::SessionSlot;
 
@@ -479,7 +479,7 @@ async fn worker(
                     }
                     break 'retry None;
                 }
-                Err(e) if matches!(e, Error::Transient(_)) => {
+                Err(e) if e.is_retryable(task.op.idempotent()) => {
                     let elapsed =
                         Duration::from_secs(now_secs().saturating_sub(task.queued_at_secs));
                     let max_lifetime = config.read().unwrap().queue.max_lifetime();
@@ -500,14 +500,16 @@ async fn worker(
                             e
                         ));
                     }
-                    let sleep = delay.min(max_lifetime.checked_sub(elapsed).unwrap());
+                    let sleep = delay
+                        .max(e.retry_after().unwrap_or_default())
+                        .min(max_lifetime.checked_sub(elapsed).unwrap());
                     warn!(
                         attempt,
                         error = %e,
                         delay_secs = sleep.as_secs(),
                         project_id = task.project_id,
                         op = task.op.kind(),
-                        "task network error, retrying"
+                        "task failed transiently, retrying"
                     );
                     tokio::time::sleep(sleep).await;
                     let max = config.read().unwrap().queue.max_delay();
@@ -560,6 +562,12 @@ async fn worker(
 }
 
 impl QueueOp {
+    /// Whether repeating the op after an ambiguous failure is harmless.
+    /// PostTime adds a new timelog per call; the others converge on a state.
+    fn idempotent(&self) -> bool {
+        !matches!(self, QueueOp::PostTime { .. })
+    }
+
     fn kind(&self) -> &'static str {
         match self {
             QueueOp::PostTime { .. } => "PostTime",
@@ -593,8 +601,8 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::DormancyReason;
     use crate::error::Result as TrackrResult;
+    use crate::error::{DormancyReason, Error};
     use crate::gitlab::{FetchedTimelog, GitlabApi, IssueWithLabels};
     use crate::handlers::{ConnState, Session};
     use std::collections::VecDeque;
@@ -862,6 +870,15 @@ mod tests {
         store: KvStore<u64, StoredTask>,
         task: QueuedTask,
     ) -> Vec<FailedTaskView> {
+        run_worker_one_task_with(crate::config::defaults(), gitlab, store, task).await
+    }
+
+    async fn run_worker_one_task_with(
+        cfg: crate::config::Config,
+        gitlab: Arc<dyn GitlabApi>,
+        store: KvStore<u64, StoredTask>,
+        task: QueuedTask,
+    ) -> Vec<FailedTaskView> {
         let dir = tempfile::tempdir().unwrap();
         let dead_letter = KvStore::open_durable(&test_db(&dir), DEAD_LETTER_KEYSPACE).unwrap();
         let session: SessionSlot =
@@ -871,7 +888,7 @@ mod tests {
                 user_id: 0,
             })));
         let (tx, rx) = mpsc::channel(8);
-        let config = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
+        let config = Arc::new(std::sync::RwLock::new(cfg));
         let drain_wake = Arc::new(Notify::new());
         let handle = tokio::spawn(worker(
             session,
@@ -1097,6 +1114,118 @@ mod tests {
             snapshot_pending(&s).unwrap().is_empty(),
             "task dropped after permanent rejection"
         );
+    }
+
+    fn throttled(status: u16) -> Error {
+        Error::Throttled {
+            status,
+            retry_after: None,
+            detail: String::new(),
+        }
+    }
+
+    /// Backoff delays at zero so a retry costs no wall time.
+    fn instant_retry_config() -> crate::config::Config {
+        let mut cfg = crate::config::defaults();
+        cfg.queue.base_delay_secs = 0;
+        cfg.queue.max_delay_secs = 0;
+        cfg
+    }
+
+    #[tokio::test]
+    async fn worker_retries_throttled_close_until_it_lands() {
+        let (s, _td) = store();
+        s.put(1, &close_task(7, now_secs())).unwrap();
+
+        let gitlab = Arc::new(FakeGitlab::default());
+        gitlab.push_close(Err(throttled(429)));
+        gitlab.push_close(Err(throttled(503)));
+        gitlab.push_close(Ok(()));
+
+        let task = QueuedTask {
+            id: 1,
+            project_id: 7,
+            iid: 7,
+            kind: Issuable::Issue,
+            op: QueueOp::Close,
+            queued_at_secs: now_secs(),
+        };
+        let failures =
+            run_worker_one_task_with(instant_retry_config(), gitlab.clone(), s.clone(), task).await;
+
+        assert_eq!(
+            gitlab.close_calls.load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+        assert!(failures.is_empty(), "idempotent close retried through 5xx");
+    }
+
+    /// A 5xx may come after GitLab already stored the timelog; retrying could
+    /// book the time twice, so it is dead-lettered for the user to judge.
+    #[tokio::test]
+    async fn worker_dead_letters_post_time_on_server_error() {
+        let (s, _td) = store();
+        s.put(1, &post_task(7, now_secs())).unwrap();
+
+        let gitlab = Arc::new(FakeGitlab::default());
+        gitlab.push_add_spent_time(Err(throttled(502)));
+
+        let task = QueuedTask {
+            id: 1,
+            project_id: 7,
+            iid: 7,
+            kind: Issuable::Issue,
+            op: QueueOp::PostTime {
+                duration: "1h".into(),
+                summary: None,
+                issuable_id: None,
+            },
+            queued_at_secs: now_secs(),
+        };
+        let failures =
+            run_worker_one_task_with(instant_retry_config(), gitlab.clone(), s.clone(), task).await;
+
+        assert_eq!(
+            gitlab
+                .add_spent_time_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(failures.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_retries_rate_limited_post_time() {
+        let (s, _td) = store();
+        s.put(1, &post_task(7, now_secs())).unwrap();
+
+        let gitlab = Arc::new(FakeGitlab::default());
+        gitlab.push_add_spent_time(Err(throttled(429)));
+        gitlab.push_add_spent_time(Ok(()));
+
+        let task = QueuedTask {
+            id: 1,
+            project_id: 7,
+            iid: 7,
+            kind: Issuable::Issue,
+            op: QueueOp::PostTime {
+                duration: "1h".into(),
+                summary: None,
+                issuable_id: None,
+            },
+            queued_at_secs: now_secs(),
+        };
+        let failures =
+            run_worker_one_task_with(instant_retry_config(), gitlab.clone(), s.clone(), task).await;
+
+        assert_eq!(
+            gitlab
+                .add_spent_time_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a 429 is rejected before any work, so PostTime retries it"
+        );
+        assert!(failures.is_empty());
     }
 
     #[tokio::test]

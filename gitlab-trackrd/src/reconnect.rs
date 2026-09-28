@@ -30,7 +30,7 @@ use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::config::{SharedConfig, next_backoff};
-use crate::error::{DormancyReason, Error};
+use crate::error::DormancyReason;
 use crate::gitlab::{GitlabApi, GitlabClient};
 use crate::handlers::{ConnState, Handlers, Session, SessionSlot};
 use crate::secrets::{self, Credentials};
@@ -196,16 +196,15 @@ async fn resolve_credentials(
 
 /// One connection attempt with pre-loaded credentials, mapped to an [`Attempt`]
 /// for `reconnect_loop`. No keychain read — the credentials are loaded once by
-/// the caller. A non-transient error is a rejected token (the only remaining
-/// possibility once the network-error case is peeled off), so build it directly.
+/// the caller. The retryable/permanent split is the boot-time one
+/// ([`DormancyReason::from_connect_error`]), so a 5xx keeps retrying here too.
 async fn connect_once(creds: &Credentials) -> Attempt {
     match GitlabClient::connect(&creds.host, &creds.token).await {
         Ok(client) => Attempt::Connected(Session::from_client(client)),
-        Err(Error::Transient(detail)) => Attempt::Transient(detail),
-        Err(e) => Attempt::Permanent(DormancyReason::TokenRejected {
-            host: creds.host.clone(),
-            detail: e.to_string(),
-        }),
+        Err(e) => match DormancyReason::from_connect_error(&creds.host, &e) {
+            r if r.is_auto_retryable() => Attempt::Transient(e.to_string()),
+            r => Attempt::Permanent(r),
+        },
     }
 }
 
@@ -330,6 +329,7 @@ mod tests {
 
     use tokio::sync::RwLock;
 
+    use crate::error::Error;
     use crate::gitlab::{FetchedTimelog, GitlabApi, Issuable, IssueWithLabels};
 
     struct NoopGitlab;
