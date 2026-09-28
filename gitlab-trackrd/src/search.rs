@@ -328,26 +328,9 @@ fn retain<T: Serialize + DeserializeOwned>(
     Ok(count)
 }
 
-/// Parse an issue/MR-reference query: `"#123"` → `Some(123)`. Anything else —
-/// no leading `#`, non-digits, empty — is not a reference query.
-pub fn parse_iid_query(query: &str) -> Option<i64> {
-    let digits = query.trim().strip_prefix('#')?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
-}
-
-/// Case-insensitive substring match. The needle must already be lowercased —
-/// callers lowercase the query once, not per entry.
-pub fn text_matches(needle_lower: &str, hay: &str) -> bool {
-    hay.to_lowercase().contains(needle_lower)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
 
     fn issue(id: i64, title: &str) -> SearchIssue {
         SearchIssue {
@@ -606,56 +589,5 @@ mod tests {
         let c = SearchCache::open(&db).unwrap();
         assert_eq!(c.all_issues().unwrap()[0].title, "persisted");
         assert_eq!(c.stamps().unwrap().last_full_sync_secs, 7);
-    }
-
-    #[test]
-    fn parse_iid_query_rejects_a_bare_hash() {
-        assert_eq!(parse_iid_query("#"), None);
-    }
-
-    proptest! {
-        #[test]
-        fn parse_iid_query_roundtrips_any_padded_reference(
-            n in 0..=i64::MAX,
-            pad_left in " {0,3}",
-            pad_right in " {0,3}",
-        ) {
-            prop_assert_eq!(parse_iid_query(&format!("{pad_left}#{n}{pad_right}")), Some(n));
-        }
-
-        #[test]
-        fn parse_iid_query_rejects_anything_without_a_leading_hash(s in "[^#]*") {
-            prop_assert_eq!(parse_iid_query(&s), None);
-        }
-
-        #[test]
-        fn parse_iid_query_rejects_non_digit_tails(
-            digits in "[0-9]{0,4}",
-            junk in "[a-z#-]{1,3}",
-            more in "[0-9]{0,3}",
-        ) {
-            prop_assert_eq!(parse_iid_query(&format!("#{digits}{junk}{more}")), None);
-        }
-
-        #[test]
-        fn text_matches_finds_an_inserted_needle_in_any_case(
-            needle in "[a-zA-Z]{1,6}",
-            prefix in "[a-zA-Z0-9 ]{0,8}",
-            suffix in "[a-zA-Z0-9 ]{0,8}",
-        ) {
-            let needle_lower = needle.to_lowercase();
-            let hay = format!("{prefix}{needle}{suffix}");
-            prop_assert!(text_matches(&needle_lower, &hay));
-            prop_assert!(text_matches(&needle_lower, &hay.to_uppercase()));
-            prop_assert!(text_matches(&needle_lower, &hay.to_lowercase()));
-        }
-
-        #[test]
-        fn text_matches_rejects_a_needle_absent_from_the_haystack(
-            needle in "[a-z]{2,6}",
-            hay in "[0-9 ]{0,10}",
-        ) {
-            prop_assert!(!text_matches(&needle, &hay));
-        }
     }
 }

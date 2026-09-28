@@ -14,16 +14,15 @@ use gitlab_trackr_api::{
     MergeRequest, Project, VarlinkInterface,
 };
 
-use crate::cache::{in_group, namespace_of};
 use crate::error::{DormancyReason, Error};
 use crate::gitlab::{GitlabClient, Issuable};
 use crate::history::HistoryCache;
-use crate::search::{SEARCH_SCHEMA_VERSION, SearchIssue, SearchMr, parse_iid_query, text_matches};
+use crate::query::{graph_status_from, in_group, namespace_of, parse_iid_query, text_matches};
+use crate::search::{SEARCH_SCHEMA_VERSION, SearchIssue, SearchMr};
 use crate::secrets::{self, Credentials};
 use crate::usage::{UsageEntry, UsageRecord};
 use crate::write::{Write, WriteOp};
 
-use super::refresh::graph_status_from;
 use super::{
     ConnState, Handlers, Session, dormant_args, issue_ref_error, looks_like_duration, now_secs,
 };

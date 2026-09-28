@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::KvStore;
 use crate::error::Result;
+use crate::query::{in_group, namespace_of};
 use gitlab_trackr_api::Issue;
 
 /// On-disk cache: assigned issues bucketed by their group namespace.
@@ -122,36 +123,9 @@ impl IssueCache {
     }
 }
 
-/// The group namespace an issue belongs to, parsed from its `web_url`
-/// (`https://host/<namespace>/-/issues/<iid>`). Returns `""` when there is no
-/// namespace to parse — such issues still show in `tt list`, they just don't
-/// match any `tt list <group>` filter.
-pub fn namespace_of(web_url: &str) -> String {
-    web_url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(web_url)
-        .split_once('/')
-        .map(|(_, path)| path)
-        .unwrap_or("")
-        .split("/-/")
-        .next()
-        .unwrap_or("")
-        .trim_matches('/')
-        .to_string()
-}
-
-/// Whether `namespace` falls under `group`, matching GitLab's subgroup-inclusive
-/// `.group(g)` filter: an exact match or a `group/…` descendant.
-pub(crate) fn in_group(namespace: &str, group: &str) -> bool {
-    let group = group.trim_matches('/');
-    !group.is_empty() && (namespace == group || namespace.starts_with(&format!("{group}/")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
 
     fn issue_at(web_url: &str, iid: i64, title: &str) -> Issue {
         Issue {
@@ -179,36 +153,6 @@ mod tests {
             .open()
             .unwrap();
         (IssueCache::open(&db).unwrap(), dir)
-    }
-
-    #[test]
-    fn namespace_of_empty_without_path() {
-        assert_eq!(namespace_of("https://gl"), "");
-        assert_eq!(namespace_of(""), "");
-    }
-
-    proptest! {
-        #[test]
-        fn namespace_of_roundtrips_any_constructed_issue_url(
-            ns in "[a-z0-9]{1,8}(/[a-z0-9]{1,8}){0,3}",
-            iid in 1u64..100_000,
-        ) {
-            prop_assert_eq!(namespace_of(&format!("https://gl/{ns}/-/issues/{iid}")), ns);
-        }
-
-        #[test]
-        fn in_group_matches_the_group_and_descendants_on_segment_boundaries(
-            group in "[a-z]{1,6}(/[a-z]{1,6}){0,2}",
-            child in "[a-z]{1,6}",
-        ) {
-            prop_assert!(in_group(&group, &group), "exact match");
-            prop_assert!(in_group(&format!("{group}/{child}"), &group), "descendant");
-            prop_assert!(
-                !in_group(&format!("{group}{child}"), &group),
-                "shared prefix without a segment boundary is not a descendant"
-            );
-            prop_assert!(!in_group(&group, ""), "empty filter matches nothing");
-        }
     }
 
     #[test]

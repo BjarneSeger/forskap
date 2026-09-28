@@ -28,6 +28,7 @@ use crate::refresh_meta::{HISTORY_SCHEMA_VERSION, ISSUE_CACHE_SCHEMA_VERSION, Re
 use crate::search::SearchMr;
 
 use super::{Handlers, now_secs};
+use crate::query::graph_status_from;
 
 impl Handlers {
     /// Fetch issues and boards from GitLab and update both caches, if the
@@ -314,25 +315,6 @@ pub(crate) async fn enrich_graph_status(
     }
 
     out
-}
-
-/// The board-derived `graph_status` for an issue: the first of its labels that
-/// appears in the project's board lists, the issue's state when none matches,
-/// or empty when the board labels are unknown. Shared by the assigned-issues
-/// enrichment above and the `Search` reply mapping.
-pub(crate) fn graph_status_from(
-    board_labels: Option<&[String]>,
-    labels: &[String],
-    state: &str,
-) -> String {
-    match board_labels {
-        Some(board) => labels
-            .iter()
-            .find(|l| board.iter().any(|b| b == *l))
-            .cloned()
-            .unwrap_or_else(|| state.to_string()),
-        None => String::new(),
-    }
 }
 
 /// Fill the gaps on a fetched timelog from the caches.

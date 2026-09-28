@@ -14,6 +14,7 @@ pub mod error;
 pub mod gitlab;
 pub mod handlers;
 pub mod history;
+pub mod query;
 pub mod queue;
 pub mod reconnect;
 pub mod refresh_meta;
