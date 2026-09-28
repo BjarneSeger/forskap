@@ -411,7 +411,11 @@ impl GitlabApi for GitlabClient {
     ) -> Result<Vec<serde_json::Value>> {
         use gitlab::api::{Pagination, paged};
         let pagination = limit.map_or(Pagination::All, Pagination::Limit);
-        run_paged_query(&self.inner, "list", paged(RestList(listing), pagination)).await
+        let mut rows =
+            run_paged_query(&self.inner, "list", paged(RestList(listing), pagination)).await?;
+        // The crate stops after the page that reached the limit, not at it.
+        rows.truncate(limit.unwrap_or(usize::MAX));
+        Ok(rows)
     }
 
     /// Returns entries with `spent_at >= since`, newest first. Catches time

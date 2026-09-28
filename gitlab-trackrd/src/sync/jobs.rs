@@ -6,6 +6,7 @@
 //! with the job's new state. Dropping a fetch mid-flight therefore never
 //! leaves partial data behind.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use tracing::{info, warn};
@@ -245,18 +246,18 @@ pub async fn fetch(job: Job, ctx: FetchCtx) -> Result<Staged> {
             .await
         }
         Job::ProjectIssues(project_id) => {
-            let listing = Listing::ProjectIssues {
+            let listing = |updated_after| Listing::ProjectIssues {
                 project_id,
-                updated_after: ctx.updated_after(),
+                updated_after,
             };
-            project_rows::<Issue>(&ctx, listing, project_id).await
+            project_rows::<Issue>(&ctx, listing, project_id, ASSIGNED_ISSUES).await
         }
         Job::ProjectMergeRequests(project_id) => {
-            let listing = Listing::ProjectMergeRequests {
+            let listing = |updated_after| Listing::ProjectMergeRequests {
                 project_id,
-                updated_after: ctx.updated_after(),
+                updated_after,
             };
-            project_rows::<MergeRequest>(&ctx, listing, project_id).await
+            project_rows::<MergeRequest>(&ctx, listing, project_id, ASSIGNED_MERGE_REQUESTS).await
         }
         Job::AllIssues => {
             let listing = Listing::AllIssues {
@@ -299,14 +300,20 @@ pub async fn fetch(job: Job, ctx: FetchCtx) -> Result<Staged> {
 
 /// One project's issues or MRs, newest first and capped: a huge project
 /// keeps only its most recently updated items, and a full run's reconcile
-/// drops the rest.
+/// drops the rest, except for items the assigned view `view` lists.
 async fn project_rows<R: Stored>(
     ctx: &FetchCtx,
-    listing: Listing,
+    listing: impl Fn(Option<chrono::DateTime<chrono::Utc>>) -> Listing,
     project_id: i64,
+    view: &'static str,
 ) -> Result<Staged> {
     let cap = ctx.windows.project_cap;
-    let fetched: Vec<R> = fetch_rows(&*ctx.gitlab, &listing, Some(cap), |_| {}).await?;
+    let gitlab = &*ctx.gitlab;
+    let mut fetched: Vec<R> =
+        fetch_rows(gitlab, &listing(ctx.updated_after()), Some(cap), |_| {}).await?;
+    // A delta that fills the cap holds the newest `cap` items, just like a
+    // full run, so it can reconcile too.
+    let whole = ctx.full || fetched.len() >= cap;
     if fetched.len() >= cap {
         info!(
             project_id,
@@ -315,13 +322,36 @@ async fn project_rows<R: Stored>(
             "project exceeds search.max_items_per_project; keeping the most recently updated"
         );
     }
-    let reconcile = ctx
-        .full
-        .then_some(RowScope::Prefix(project_id.max(0) as u64));
+    if whole {
+        // Offset pages over `updated_at` skip an item updated mid-walk: it
+        // jumps to a page already read. A delta from the walk's start finds
+        // it before the reconcile would drop it.
+        let since = ctx.started.saturating_sub(DELTA_OVERLAP_SECS);
+        let late: Vec<R> = fetch_rows(
+            gitlab,
+            &listing(chrono::DateTime::from_timestamp(since as i64, 0)),
+            Some(cap),
+            |_| {},
+        )
+        .await?;
+        let seen: HashSet<RowKey> = late.iter().map(Resource::key).collect();
+        fetched.retain(|r| !seen.contains(&r.key()));
+        fetched.extend(late);
+    }
+    let prefix = project_id.max(0) as u64;
     Ok(Staged::new(move |c| {
         c.upsert(&fetched)?;
-        if let Some(scope) = reconcile {
-            c.reconcile(scope, &fetched)?;
+        if whole {
+            // An assigned item older than the cap is still on the list.
+            let mut keep: HashSet<RowKey> = fetched.iter().map(Resource::key).collect();
+            keep.extend(
+                c.view(view)?
+                    .unwrap_or_default()
+                    .keys
+                    .into_iter()
+                    .filter(|k| k.0 == prefix),
+            );
+            c.remove_where::<R>(RowScope::Prefix(prefix), |k| keep.contains(&k))?;
         }
         Ok(fetched.len())
     }))
@@ -538,22 +568,27 @@ mod tests {
         run(&s, Job::ProjectIssues(7), ctx(&fake, true, NOW - 3600)).await;
         assert_eq!(s.issues.keys(RowScope::All).unwrap(), [(7, 1)]);
 
-        let calls = fake.calls_to("projects/7/issues");
+        let after = |secs: u64| chrono::DateTime::from_timestamp(secs as i64, 0);
+        let cursors: Vec<_> = fake
+            .calls_to("projects/7/issues")
+            .into_iter()
+            .map(|l| match l {
+                Listing::ProjectIssues { updated_after, .. } => updated_after,
+                other => panic!("{other:?}"),
+            })
+            .collect();
         assert_eq!(
-            calls[1],
-            Listing::ProjectIssues {
-                project_id: 7,
-                updated_after: chrono::DateTime::from_timestamp((NOW - 3600 - 300) as i64, 0),
-            },
-            "the delta cursor overlaps the previous run"
+            cursors,
+            [
+                None,
+                after(NOW - 300),
+                after(NOW - 3600 - 300),
+                None,
+                after(NOW - 300),
+            ],
+            "a full walk is followed by a delta from its start; a delta's \
+             cursor overlaps the previous run"
         );
-        assert!(matches!(
-            calls[2],
-            Listing::ProjectIssues {
-                updated_after: None,
-                ..
-            }
-        ));
     }
 
     #[tokio::test]
@@ -571,7 +606,74 @@ mod tests {
         );
         run(&s, Job::ProjectIssues(7), ctx(&fake, true, 0)).await;
         assert_eq!(s.issues.keys(RowScope::All).unwrap(), [(7, 2), (7, 3)]);
-        assert_eq!(fake.limits_to("projects/7/issues"), [Some(2)]);
+        assert_eq!(fake.limits_to("projects/7/issues"), [Some(2), Some(2)]);
+    }
+
+    /// Stored #1..#3 in project 7, #1 in the assigned view; the test cap is 2.
+    fn seed_three(s: &SyncStore) {
+        let mut c = s.begin();
+        let rows: Vec<Issue> = (1..=3)
+            .map(|iid| serde_json::from_value(issue_json(7, iid, "")).unwrap())
+            .collect();
+        c.upsert(&rows).unwrap();
+        c.set_view(
+            ASSIGNED_ISSUES,
+            &View {
+                keys: vec![(7, 1)],
+                fetched_at: NOW,
+            },
+        )
+        .unwrap();
+        c.commit().unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_cap_never_drops_an_assigned_item() {
+        let (s, _d) = store();
+        seed_three(&s);
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve(
+            "projects/7/issues",
+            vec![issue_json(7, 3, "new"), issue_json(7, 2, "mid")],
+        );
+        run(&s, Job::ProjectIssues(7), ctx(&fake, true, 0)).await;
+        assert_eq!(
+            s.issues.keys(RowScope::All).unwrap(),
+            [(7, 1), (7, 2), (7, 3)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delta_that_fills_the_cap_reconciles_like_a_full_run() {
+        let (s, _d) = store();
+        seed_three(&s);
+        let mut c = s.begin();
+        c.remove_view(ASSIGNED_ISSUES);
+        c.commit().unwrap();
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve(
+            "projects/7/issues",
+            vec![issue_json(7, 3, "new"), issue_json(7, 2, "mid")],
+        );
+        run(&s, Job::ProjectIssues(7), ctx(&fake, false, NOW - 3600)).await;
+        assert_eq!(s.issues.keys(RowScope::All).unwrap(), [(7, 2), (7, 3)]);
+    }
+
+    /// #1 was updated while the walk was on page 2: it moved to page 1,
+    /// already read, and only the follow-up delta sees it.
+    #[tokio::test]
+    async fn an_item_updated_mid_walk_survives_the_reconcile() {
+        let (s, _d) = store();
+        seed_three(&s);
+        let mut c = s.begin();
+        c.remove_view(ASSIGNED_ISSUES);
+        c.commit().unwrap();
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve_next("projects/7/issues", vec![issue_json(7, 3, "")]);
+        fake.serve("projects/7/issues", vec![issue_json(7, 1, "moved")]);
+        run(&s, Job::ProjectIssues(7), ctx(&fake, true, 0)).await;
+        assert_eq!(s.issues.keys(RowScope::All).unwrap(), [(7, 1), (7, 3)]);
+        assert_eq!(s.issues.get((7, 1)).unwrap().unwrap().title, "moved");
     }
 
     #[tokio::test]

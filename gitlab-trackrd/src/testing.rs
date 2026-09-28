@@ -46,6 +46,8 @@ pub type WriteCall = (&'static str, Issuable, i64, i64);
 #[derive(Default)]
 pub struct FakeGitlab {
     rows: Mutex<HashMap<String, Vec<Value>>>,
+    /// One-shot responses served ahead of `rows`.
+    next_rows: Mutex<HashMap<String, VecDeque<Vec<Value>>>>,
     failures: Mutex<HashMap<String, VecDeque<FakeErr>>>,
     gates: Mutex<HashMap<String, Arc<Notify>>>,
     timelogs: Mutex<Vec<Timelog>>,
@@ -63,6 +65,17 @@ impl FakeGitlab {
     /// Serve `rows` on every call to `path` from now on.
     pub fn serve(&self, path: &str, rows: Vec<Value>) {
         self.rows.lock().unwrap().insert(path.into(), rows);
+    }
+
+    /// Serve `rows` on the next call to `path` only, ahead of the standing
+    /// rows.
+    pub fn serve_next(&self, path: &str, rows: Vec<Value>) {
+        self.next_rows
+            .lock()
+            .unwrap()
+            .entry(path.into())
+            .or_default()
+            .push_back(rows);
     }
 
     /// Fail the next call to `path`.
@@ -161,13 +174,20 @@ impl GitlabApi for FakeGitlab {
         if let Some(err) = failure {
             return Err(err.error());
         }
-        let mut rows = self
-            .rows
+        let next = self
+            .next_rows
             .lock()
             .unwrap()
-            .get(&path)
-            .cloned()
-            .unwrap_or_default();
+            .get_mut(&path)
+            .and_then(VecDeque::pop_front);
+        let mut rows = next.unwrap_or_else(|| {
+            self.rows
+                .lock()
+                .unwrap()
+                .get(&path)
+                .cloned()
+                .unwrap_or_default()
+        });
         rows.truncate(limit.unwrap_or(usize::MAX));
         Ok(rows)
     }

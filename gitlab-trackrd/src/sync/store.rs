@@ -274,6 +274,11 @@ impl Commit<'_> {
         self.remove_where::<R>(scope, |k| keep.contains(&k))
     }
 
+    /// The view `name` as committed, without this batch's changes.
+    pub fn view(&self, name: &str) -> Result<Option<View>> {
+        self.store.view(name)
+    }
+
     pub fn set_view(&mut self, name: &str, view: &View) -> Result<()> {
         self.batch
             .insert(&self.store.views, name, serde_json::to_vec(view)?);
