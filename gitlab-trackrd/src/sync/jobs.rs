@@ -106,8 +106,11 @@ impl Job {
             Self::AssignedIssues | Self::AssignedMergeRequests | Self::RecentTimelogs => {
                 full_only(c.refresh.quick.interval_secs)
             }
-            Self::ProjectBoards(_) | Self::AllTimelogs => full_only(c.refresh.slow.interval_secs),
-            Self::MemberProjects | Self::MemberGroups => full_only(c.search.partial_interval_secs),
+            // Memberships rarely change, and a large one pages for a while.
+            Self::ProjectBoards(_)
+            | Self::AllTimelogs
+            | Self::MemberProjects
+            | Self::MemberGroups => full_only(c.refresh.slow.interval_secs),
             Self::ProjectIssues(_)
             | Self::ProjectMergeRequests(_)
             | Self::AllIssues

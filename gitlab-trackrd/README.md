@@ -29,7 +29,7 @@ Keys are grouped into TOML tables, one per concern:
 | `[server]` `socket` | `$XDG_RUNTIME_DIR/gitlab-trackrd.socket` (falls back to `/tmp`) | Varlink Unix socket the daemon listens on. Ignored under systemd socket activation. |
 | `[refresh.quick]` `interval_secs` | `300` | Seconds between quick syncs of the assigned issue/MR lists and the recent timelog window (floor 60). |
 | `[refresh.quick]` `window_hours` | `24` | How far back the quick timelog sync reaches (last 24h). |
-| `[refresh.slow]` `interval_secs` | `86400` | Seconds between slow syncs of the full timelog history and the board columns (once a day; floor 60). |
+| `[refresh.slow]` `interval_secs` | `86400` | Seconds between slow syncs of the full timelog history, the board columns and your project/group memberships (once a day; floor 60). |
 | `[history]` `retention_hours` | `2160` | Total timelog history kept (90 days): synced in full on the slow cadence, anything older is pruned. |
 | `[queue]` `base_delay_secs` | `1` | Retry-queue backoff initial delay. |
 | `[queue]` `max_delay_secs` | `1800` | Retry-queue backoff cap (30 min). |
@@ -42,7 +42,7 @@ Keys are grouped into TOML tables, one per concern:
 | `[search]` `partial_interval_secs` | `1800` | Seconds between incremental syncs of each corpus project (30 min). Restarting inside this window does not re-poll GitLab. |
 | `[search]` `full_interval_secs` | `604800` | Seconds between full resyncs of each corpus project (7 days), which also remove deleted items. |
 | `[search]` `tracked_retention_hours` | `2160` | How long your activity in a project (an assignment, a push, an issue, MR or comment, a timelog) keeps it in the `"tracked"` population (90 days). |
-| `[search]` `max_items_per_project` | `5000` | Most issues and most MRs kept per corpus project — the most recently updated ones (floor 100). Bounds the sync of very large projects. |
+| `[search]` `max_items_per_project` | `1000` | Most issues and most MRs kept per corpus project — the most recently updated ones (floor 100). Bounds the sync of very large projects. |
 | `[sync]` `jitter` | `0.15` | Random spread applied to every sync interval, as a fraction (0–0.5), so jobs sharing an interval don't hit GitLab together. |
 | `[sync]` `job_gap_ms` | `250` | Pause between two sync jobs (jittered), so a backlog of due jobs trickles out. |
 | `[sync]` `startup_spread_secs` | `60` | Window over which jobs already overdue at startup are spread; the assigned lists and recent timelogs always run at once. |

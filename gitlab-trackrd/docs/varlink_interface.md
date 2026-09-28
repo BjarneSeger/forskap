@@ -9,7 +9,8 @@ issue/MR lists and the recent timelog window every few minutes
 (`refresh.quick.interval_secs`), each tracked project's issues and MRs as
 `updated_after` deltas every `search.partial_interval_secs` (default 30 min) with a
 full resync that also reconciles deletions every `search.full_interval_secs`
-(default weekly), and the full timelog history plus board columns daily. Read
+(default weekly), and the full timelog history, board columns and project/group
+memberships daily. Read
 methods serve whatever was last synced from the local store
 (`$XDG_DATA_HOME/gitlab-trackrd/db/`). Reads never trigger a GitLab round-trip.
 

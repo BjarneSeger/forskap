@@ -108,8 +108,8 @@ impl ServerConfig {
 ///
 /// * `quick` — fast-changing and cheap to fetch: the assigned issue/MR lists
 ///   and your most recent timelogs. Synced frequently.
-/// * `slow` — the large, slow-moving rest: the full timelog history and the
-///   board columns. Synced rarely.
+/// * `slow` — the large, slow-moving rest: the full timelog history, the
+///   board columns and the memberships. Synced rarely.
 #[derive(Debug, ConfiqueConfig)]
 pub struct RefreshConfig {
     /// Quick tier: assigned issues/MRs and recent timelogs.
@@ -155,7 +155,8 @@ impl QuickRefreshConfig {
 #[derive(Debug, ConfiqueConfig)]
 pub struct SlowRefreshConfig {
     /// Seconds between slow syncs of the full timelog history (the whole
-    /// `history.retention_hours`) and the board columns. Once a day by default.
+    /// `history.retention_hours`), the board columns, and your project and
+    /// group memberships. Once a day by default.
     #[config(default = 86400)]
     pub interval_secs: u64,
 }
@@ -332,8 +333,8 @@ pub struct SearchConfig {
 
     /// Most issues and most merge requests kept per corpus project: the most
     /// recently updated ones. Bounds the sync of very large projects.
-    /// (5000 by default, at least 100.)
-    #[config(default = 5000)]
+    /// (1000 by default, at least 100.)
+    #[config(default = 1000)]
     pub max_items_per_project: u64,
 }
 
@@ -620,7 +621,7 @@ mod tests {
         assert_eq!(c.sync.job_gap(), Duration::from_millis(250));
         assert_eq!(c.sync.startup_spread_secs, 60);
         assert_eq!(c.search.tracked_retention(), Duration::from_hours(2160));
-        assert_eq!(c.search.max_items_per_project, 5000);
+        assert_eq!(c.search.max_items_per_project, 1000);
     }
 
     #[test]
