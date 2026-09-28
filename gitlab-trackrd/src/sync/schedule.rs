@@ -92,6 +92,17 @@ pub fn backoff(failures: u32, cap: u64) -> u64 {
     BACKOFF_BASE.saturating_mul(1u64 << doublings).min(cap)
 }
 
+/// The priority class a due job competes in: its own, but past class 1 a
+/// job overdue by more than its interval ranks with the events, so a
+/// saturated corpus can't starve it.
+pub fn aged(priority: u8, overdue: u64, every: u64) -> u8 {
+    if priority > 1 && overdue > every {
+        1
+    } else {
+        priority
+    }
+}
+
 /// How long after boot an overdue background job waits, spread over
 /// `window` so a restart doesn't fire every job at once.
 pub fn startup_offset(key: &str, window: u64) -> u64 {
@@ -219,6 +230,15 @@ mod tests {
             prop_assert!(!run_is_full(&key, &synced(at, 1), never, 1, jitter, at + 1));
             prop_assert!(due_at(&key, &synced(at, 1), never, 1, jitter) > at);
         }
+    }
+
+    #[test]
+    fn a_job_overdue_past_its_interval_ranks_with_the_events() {
+        assert_eq!(aged(3, 86_400, 86_400), 3);
+        assert_eq!(aged(3, 86_401, 86_400), 1);
+        assert_eq!(aged(2, 1_801, 1_800), 1);
+        assert_eq!(aged(0, u64::MAX, 60), 0, "never demoted");
+        assert_eq!(aged(1, u64::MAX, 60), 1);
     }
 
     #[test]

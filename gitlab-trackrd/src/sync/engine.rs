@@ -435,18 +435,20 @@ impl Worker {
         for &job in &self.plan.jobs {
             let key = job.key();
             let state = self.states.get(&key).copied().unwrap_or_default();
-            let mut at = schedule::due_at(
-                &key,
-                &state,
-                job.cadence(&cfg),
-                job.fingerprint(&cfg),
-                jitter,
-            );
+            let cadence = job.cadence(&cfg);
+            let mut at = schedule::due_at(&key, &state, cadence, job.fingerprint(&cfg), jitter);
             if job.priority() > 0 {
                 at = at.max(self.boot + schedule::startup_offset(&key, spread));
             }
             if at <= now {
-                let candidate = (job.priority(), at, job);
+                // Until the full history first synced, `tt history` shows
+                // just the recent window: it ranks with the events till then.
+                let class = if job == Job::AllTimelogs && state.last_ok == 0 {
+                    1
+                } else {
+                    schedule::aged(job.priority(), now - at, cadence.every)
+                };
+                let candidate = (class, at, job);
                 if best.is_none_or(|b| candidate < b) {
                     best = Some(candidate);
                 }
@@ -1207,6 +1209,37 @@ mod tests {
         })
         .await;
         assert!(env.store.issues.get((9, 1)).unwrap().is_none());
+    }
+
+    /// A history that never synced runs before the corpus backlog, not
+    /// after it.
+    #[tokio::test]
+    async fn the_first_full_history_runs_ahead_of_the_corpus() {
+        let (store, _dir) = open_store();
+        let mut synced: Vec<Job> = BASE.to_vec();
+        synced.retain(|j| *j != Job::AllTimelogs);
+        mark_synced(&store, &synced);
+        let mut c = store.begin();
+        c.upsert(&[Project {
+            id: 7,
+            ..Default::default()
+        }])
+        .unwrap();
+        c.commit().unwrap();
+        let fake = Arc::new(FakeGitlab::default());
+        let mut c = store.begin();
+        let events: Vec<crate::sync::model::Event> =
+            vec![serde_json::from_value(event_json(1, 7, "opened", now_secs())).unwrap()];
+        c.upsert(&events).unwrap();
+        c.commit().unwrap();
+        // The corpus stalls on its first job.
+        let _gate = fake.gate("projects/7/boards");
+        let _env = start_on(store, connected(&fake, 1));
+
+        eventually("the full history fetch", || {
+            !fake.timelog_calls().is_empty()
+        })
+        .await;
     }
 
     #[tokio::test]
