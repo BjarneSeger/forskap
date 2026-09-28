@@ -64,12 +64,12 @@ pub enum Command {
         #[arg(long)]
         mrs: bool,
     },
-    /// Search the daemon's cached issues, merge requests, projects, and
-    /// groups. Matches titles, labels, and project/group paths
-    /// case-insensitively; a query like `#123` finds issues/MRs by number.
-    /// Issues/MRs you open often (`tt open`) rank first; with no query at all
-    /// it lists just those. Pure cache read — freshness comes from the
-    /// background search sync.
+    /// Search issues, merge requests, projects, and groups. Cached results
+    /// print instantly; while the daemon is connected it also asks GitLab
+    /// live (matching descriptions too) and appends anything new. Matches
+    /// titles, labels, and project/group paths case-insensitively; a query
+    /// like `#123` finds issues/MRs by number. Issues/MRs you open often
+    /// (`tt open`) rank first; with no query at all it lists just those.
     Search {
         /// Search text. Omit it to list the frequently opened issues/MRs.
         query: Option<String>,
