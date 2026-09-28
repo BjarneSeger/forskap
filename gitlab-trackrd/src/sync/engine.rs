@@ -8,7 +8,7 @@
 //! a network error demotes the session and parks the worker until the
 //! reconnect supervisor wakes it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -143,6 +143,7 @@ impl SyncHandle {
             rate_limits: 0,
             runs: 0,
             replan: true,
+            incomplete: BTreeSet::new(),
             scheduled,
         };
         tokio::spawn(worker.run());
@@ -266,6 +267,9 @@ struct Worker {
     rate_limits: u32,
     runs: u64,
     replan: bool,
+    /// Plan-feeding jobs a clear reset that haven't synced since. Until they
+    /// have, their evidence is missing, so a replan only adds jobs.
+    incomplete: BTreeSet<Job>,
     /// Whether due jobs run on their own, not only when demanded.
     scheduled: bool,
 }
@@ -509,6 +513,7 @@ impl Worker {
         match committed {
             Ok(rows) => {
                 self.states.insert(key.to_string(), fresh);
+                self.incomplete.remove(&job);
                 self.rate_limits = 0;
                 if full {
                     info!(job = %key, rows, "synced (full)");
@@ -639,6 +644,15 @@ impl Worker {
         for key in &reset {
             self.states.remove(key);
         }
+        // A full wipe leaves no corpus a replan could throw away.
+        if what != Clear::Everything {
+            self.incomplete.extend(
+                self.plan
+                    .jobs
+                    .iter()
+                    .filter(|j| j.feeds_plan() && what.resets(&j.key())),
+            );
+        }
         self.replan = true;
     }
 
@@ -663,6 +677,9 @@ impl Worker {
             );
             c.wipe()?;
             self.states.clear();
+            // Nothing of the other account's plan may survive the replan.
+            self.plan = Plan::default();
+            self.incomplete.clear();
             self.replan = true;
         }
         c.set_identity(&me)?;
@@ -681,35 +698,33 @@ impl Worker {
             )
         };
         let since = now_secs().saturating_sub(window);
-        let plan = match planner::plan(&self.store, population, since) {
+        let mut plan = match planner::plan(&self.store, population, since) {
             Ok(p) => p,
             Err(e) => {
                 warn!(error = %e, "sync planning failed; keeping the previous plan");
+                self.replan = true;
+                if self.plan.jobs.is_empty() {
+                    self.plan = Plan::base();
+                }
                 return;
             }
         };
+        if !self.incomplete.is_empty() {
+            // The dropped evidence is about to come back; dropping jobs now
+            // would throw away corpora that must then be refetched in full.
+            plan.jobs.extend(self.plan.jobs.iter().copied());
+        }
         if plan.jobs == self.plan.jobs {
             self.plan = plan;
             return;
         }
-        let dropped: Vec<Job> = self.plan.jobs.difference(&plan.jobs).copied().collect();
         let added = plan.jobs.difference(&self.plan.jobs).count();
-        let collected = (|| -> Result<usize> {
-            let mut c = self.store.begin();
-            for job in &dropped {
-                c.remove_job(&job.key());
-            }
-            let removed = planner::collect_garbage(&mut c, &self.store, &plan)?;
-            c.commit()?;
-            Ok(removed)
-        })();
-        for job in &dropped {
-            self.states.remove(&job.key());
-        }
-        let removed_rows = collected.unwrap_or_else(|e| {
-            warn!(error = %e, "dropping rows of unplanned jobs failed");
-            0
-        });
+        let dropped = self.plan.jobs.difference(&plan.jobs).count();
+        let (states_removed, rows_removed) = if self.incomplete.is_empty() {
+            self.prune(&plan)
+        } else {
+            (0, 0)
+        };
         info!(
             jobs = plan.jobs.len(),
             tracked = plan.tracked.len(),
@@ -718,11 +733,48 @@ impl Worker {
             from_events = plan.evidence.events,
             from_timelogs = plan.evidence.timelogs,
             added,
-            dropped = dropped.len(),
-            removed_rows,
+            dropped,
+            states_removed,
+            rows_removed,
             "sync plan updated"
         );
         self.plan = plan;
+        let planned = &self.plan.jobs;
+        self.demand.retain(|job, _| planned.contains(job));
+    }
+
+    /// Drop what no job in `plan` keeps fresh: the states of unplanned jobs,
+    /// whether they left the plan now or before a restart, and their rows.
+    /// Returns how many states and rows went.
+    fn prune(&mut self, plan: &Plan) -> (usize, usize) {
+        let planned: HashSet<String> = plan.jobs.iter().map(Job::key).collect();
+        let stale: Vec<String> = self
+            .states
+            .keys()
+            .filter(|k| !planned.contains(*k))
+            .cloned()
+            .collect();
+        let collected = (|| -> Result<usize> {
+            let mut c = self.store.begin();
+            for key in &stale {
+                c.remove_job(key);
+            }
+            let removed = planner::collect_garbage(&mut c, &self.store, plan)?;
+            c.commit()?;
+            Ok(removed)
+        })();
+        match collected {
+            Ok(rows) => {
+                for key in &stale {
+                    self.states.remove(key);
+                }
+                (stale.len(), rows)
+            }
+            Err(e) => {
+                warn!(error = %e, "dropping rows of unplanned jobs failed");
+                (0, 0)
+            }
+        }
     }
 }
 
@@ -731,6 +783,7 @@ mod tests {
     use super::*;
     use crate::error::DormancyReason;
     use crate::gitlab::{GitlabApi, Issuable, Listing};
+    use crate::sync::model::{Issue, Project};
     use crate::testing::{FakeErr, FakeGitlab, event_json, eventually, issue_json, project_json};
     use crate::write::WriteOp;
 
@@ -805,6 +858,60 @@ mod tests {
 
     fn state(env: &Env, job: Job) -> JobState {
         env.store.job_state(&job.key()).unwrap()
+    }
+
+    /// Mark `jobs` as synced just now, so none of them is due.
+    fn mark_synced(store: &SyncStore, jobs: &[Job]) {
+        let now = now_secs();
+        let mut c = store.begin();
+        for job in jobs {
+            let state = JobState {
+                last_ok: now,
+                last_full: now,
+                fingerprint: job.fingerprint(&crate::config::defaults()),
+                ..Default::default()
+            };
+            c.set_job(&job.key(), &state).unwrap();
+        }
+        c.commit().unwrap();
+    }
+
+    fn issue_row(project_id: i64, iid: i64) -> Issue {
+        Issue {
+            id: project_id * 1000 + iid,
+            iid,
+            project_id,
+            state: "opened".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Project 7 with issues #1 and #2, tracked only through the assigned
+    /// #1, everything synced just now.
+    fn seed_assigned_project(store: &SyncStore) {
+        let mut c = store.begin();
+        c.upsert(&[Project {
+            id: 7,
+            ..Default::default()
+        }])
+        .unwrap();
+        c.upsert(&[issue_row(7, 1), issue_row(7, 2)]).unwrap();
+        c.set_view(
+            ASSIGNED_ISSUES,
+            &crate::sync::store::View {
+                keys: vec![(7, 1)],
+                fetched_at: now_secs(),
+            },
+        )
+        .unwrap();
+        c.commit().unwrap();
+        let mut jobs = BASE.to_vec();
+        jobs.extend([
+            Job::ProjectIssues(7),
+            Job::ProjectMergeRequests(7),
+            Job::ProjectBoards(7),
+        ]);
+        mark_synced(store, &jobs);
     }
 
     #[tokio::test]
@@ -944,6 +1051,70 @@ mod tests {
 
         assert!(env.store.issues.get((7, 1)).unwrap().is_none());
         assert!(env.store.events.scan(RowScope::All).unwrap().is_empty());
+    }
+
+    /// Clearing the assigned lists drops the evidence tracking project 7
+    /// until the refill lands; its corpus must not go with it.
+    #[tokio::test]
+    async fn a_scoped_clear_keeps_the_corpus_while_its_evidence_refills() {
+        let (store, _dir) = open_store();
+        seed_assigned_project(&store);
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve("issues", vec![issue_json(7, 1, "one")]);
+        let env = start_on(store, connected(&fake, 1));
+
+        let cleared = env.sync.clear(Clear::Assigned);
+        let refilled = env
+            .sync
+            .refresh_now(&[Job::AssignedIssues, Job::AssignedMergeRequests]);
+        cleared.await;
+        refilled.await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(env.store.issues.get((7, 2)).unwrap().is_some());
+        assert!(state(&env, Job::ProjectIssues(7)).last_ok > 0);
+        assert!(fake.calls_to("projects/7/issues").is_empty(), "no refetch");
+    }
+
+    /// A job demanded before a replan dropped it doesn't run: its state
+    /// would outlive the plan.
+    #[tokio::test]
+    async fn a_demand_the_plan_dropped_never_runs() {
+        let (store, _dir) = open_store();
+        seed_assigned_project(&store);
+        let fake = Arc::new(FakeGitlab::default());
+        let env = start_on(store, connected(&fake, 1));
+
+        // The refreshed view no longer lists project 7, which untracks it.
+        env.sync
+            .refresh_now(&[Job::AssignedIssues, Job::ProjectIssues(7)])
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(fake.calls_to("projects/7/issues").is_empty());
+        assert_eq!(state(&env, Job::ProjectIssues(7)), JobState::default());
+        assert!(env.store.issues.get((7, 2)).unwrap().is_none());
+    }
+
+    /// States of jobs that left the plan while the daemon was down go with
+    /// their rows, so a project tracked again starts with a full fetch.
+    #[tokio::test]
+    async fn a_boot_drops_the_states_of_unplanned_jobs() {
+        let (store, _dir) = open_store();
+        mark_synced(&store, &BASE);
+        mark_synced(&store, &[Job::ProjectIssues(9), Job::ProjectBoards(9)]);
+        let mut c = store.begin();
+        c.upsert(&[issue_row(9, 1)]).unwrap();
+        c.commit().unwrap();
+
+        let fake = Arc::new(FakeGitlab::default());
+        let env = start_on(store, connected(&fake, 1));
+        eventually("the orphaned states to go", || {
+            state(&env, Job::ProjectIssues(9)) == JobState::default()
+                && state(&env, Job::ProjectBoards(9)) == JobState::default()
+        })
+        .await;
+        assert!(env.store.issues.get((9, 1)).unwrap().is_none());
     }
 
     #[tokio::test]

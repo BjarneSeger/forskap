@@ -33,18 +33,31 @@ pub struct Evidence {
     pub timelogs: usize,
 }
 
+/// The jobs planned whatever the store holds.
+const BASE: [Job; 7] = [
+    Job::AssignedIssues,
+    Job::AssignedMergeRequests,
+    Job::RecentTimelogs,
+    Job::AllTimelogs,
+    Job::Events,
+    Job::MemberProjects,
+    Job::MemberGroups,
+];
+
+impl Plan {
+    /// Just the jobs every plan has; what runs while planning fails.
+    pub fn base() -> Self {
+        Self {
+            jobs: BTreeSet::from(BASE),
+            ..Default::default()
+        }
+    }
+}
+
 /// Plan the jobs for `population`, counting activity since `tracked_since`.
 pub fn plan(store: &SyncStore, population: SearchPopulation, tracked_since: u64) -> Result<Plan> {
     let (tracked, evidence) = tracked_projects(store, tracked_since)?;
-    let mut jobs = BTreeSet::from([
-        Job::AssignedIssues,
-        Job::AssignedMergeRequests,
-        Job::RecentTimelogs,
-        Job::AllTimelogs,
-        Job::Events,
-        Job::MemberProjects,
-        Job::MemberGroups,
-    ]);
+    let mut jobs = BTreeSet::from(BASE);
     jobs.extend(tracked.iter().map(|&p| Job::ProjectBoards(p)));
     let members: BTreeSet<i64> = store
         .projects
