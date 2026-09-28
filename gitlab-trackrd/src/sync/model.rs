@@ -322,6 +322,9 @@ impl Resource for Board {
 
 /// Lenient field deserializers shared by the mirror types.
 mod de {
+    use std::fmt;
+
+    use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
     use serde::{Deserialize, Deserializer};
     use serde_json::Value;
 
@@ -334,16 +337,78 @@ mod de {
         Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
     }
 
-    /// A label array; non-string entries are skipped.
+    /// A label array; non-string entries are skipped. Hand-rolled because
+    /// search decodes every stored row, and going through `Value` allocated
+    /// per label.
     pub fn labels<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
-        Ok(Option::<Vec<Value>>::deserialize(d)?
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| match v {
-                Value::String(s) => Some(s),
-                _ => None,
-            })
-            .collect())
+        Ok(Option::<Labels>::deserialize(d)?.map_or_else(Vec::new, |l| l.0))
+    }
+
+    struct Labels(Vec<String>);
+
+    impl<'de> Deserialize<'de> for Labels {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct Seq;
+            impl<'de> Visitor<'de> for Seq {
+                type Value = Labels;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a label array")
+                }
+                fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Labels, A::Error> {
+                    let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                    while let Some(label) = seq.next_element::<Label>()? {
+                        out.extend(label.0);
+                    }
+                    Ok(Labels(out))
+                }
+            }
+            d.deserialize_seq(Seq)
+        }
+    }
+
+    /// One label entry: the string, or `None` for anything else.
+    struct Label(Option<String>);
+
+    impl<'de> Deserialize<'de> for Label {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct Any;
+            impl<'de> Visitor<'de> for Any {
+                type Value = Label;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a label")
+                }
+                fn visit_str<E>(self, v: &str) -> Result<Label, E> {
+                    Ok(Label(Some(v.to_string())))
+                }
+                fn visit_string<E>(self, v: String) -> Result<Label, E> {
+                    Ok(Label(Some(v)))
+                }
+                fn visit_bool<E>(self, _: bool) -> Result<Label, E> {
+                    Ok(Label(None))
+                }
+                fn visit_i64<E>(self, _: i64) -> Result<Label, E> {
+                    Ok(Label(None))
+                }
+                fn visit_u64<E>(self, _: u64) -> Result<Label, E> {
+                    Ok(Label(None))
+                }
+                fn visit_f64<E>(self, _: f64) -> Result<Label, E> {
+                    Ok(Label(None))
+                }
+                fn visit_unit<E>(self) -> Result<Label, E> {
+                    Ok(Label(None))
+                }
+                fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Label, A::Error> {
+                    while seq.next_element::<IgnoredAny>()?.is_some() {}
+                    Ok(Label(None))
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Label, A::Error> {
+                    while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                    Ok(Label(None))
+                }
+            }
+            d.deserialize_any(Any)
+        }
     }
 
     /// Unix seconds from an RFC 3339 string (GitLab) or an integer (stored
@@ -371,7 +436,7 @@ mod tests {
             "title": "Fix it", "web_url": "https://gl/g/p/-/issues/7", "state": "opened",
             "epic": { "url": "https://gl/epics/1", "id": 3 },
             "time_stats": { "human_total_time_spent": "2h", "time_estimate": 0 },
-            "labels": ["bug", 42, null, "high"],
+            "labels": ["bug", 42, null, "high", {"name": "x"}, ["y"], true],
             "assignees": [{ "id": 5, "username": "me", "name": "Me" }],
             "updated_at": "2026-07-01T10:00:00.000Z",
             "description": "ignored",
