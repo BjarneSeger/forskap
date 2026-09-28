@@ -150,11 +150,15 @@ pub trait GitlabApi: Send + Sync {
     ) -> Result<Vec<SearchMr>>;
 
     /// Merge requests assigned to the authenticated user
-    /// (`scope=assigned_to_me`), always the full list. Fetched directly so the
-    /// assigned-MR view never depends on how broadly the search corpus is
-    /// populated. No state filter — a close must overwrite the cached row, and
-    /// the assigned set is small enough that the full fetch stays cheap.
-    async fn fetch_assigned_merge_requests(&self) -> Result<Vec<SearchMr>>;
+    /// (`scope=assigned_to_me`), fetched directly so the assigned-MR view never
+    /// depends on how broadly the search corpus is populated. No state filter —
+    /// a close must overwrite the cached row. That makes the full list every MR
+    /// ever assigned, so incremental syncs pass `updated_after` like the
+    /// corpus fetches; `None` is the full list.
+    async fn fetch_assigned_merge_requests(
+        &self,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<SearchMr>>;
 
     /// All projects the user is a member of (`membership=true`), always the
     /// full list — the membership set is small and has no reliable delta
@@ -599,12 +603,18 @@ impl GitlabApi for GitlabClient {
     }
 
     #[instrument(skip(self))]
-    async fn fetch_assigned_merge_requests(&self) -> Result<Vec<SearchMr>> {
+    async fn fetch_assigned_merge_requests(
+        &self,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<SearchMr>> {
         use gitlab::api::merge_requests::{MergeRequestScope, MergeRequests};
         use gitlab::api::{Pagination, paged};
 
         let mut builder = MergeRequests::builder();
         builder.scope(MergeRequestScope::AssignedToMe);
+        if let Some(after) = updated_after {
+            builder.updated_after(after);
+        }
         let query = builder.build().map_err(|e| Error::Gitlab(e.to_string()))?;
         let raw = run_paged_query(
             &self.inner,

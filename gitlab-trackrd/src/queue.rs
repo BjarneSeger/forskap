@@ -848,6 +848,7 @@ mod tests {
         }
         async fn fetch_assigned_merge_requests(
             &self,
+            _updated_after: Option<chrono::DateTime<chrono::Utc>>,
         ) -> TrackrResult<Vec<crate::search::SearchMr>> {
             unimplemented!()
         }

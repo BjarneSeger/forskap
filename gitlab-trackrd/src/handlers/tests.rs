@@ -220,7 +220,8 @@ struct FakeGitlab {
     /// Canned result for `fetch_assigned_merge_requests` (default: none
     /// assigned, so sync tests that don't care get an empty fetch).
     assigned_mrs: Mutex<Vec<SearchMr>>,
-    assigned_mr_calls: AtomicUsize,
+    /// Per-call `updated_after` of `fetch_assigned_merge_requests`.
+    assigned_mr_calls: Mutex<Vec<Option<chrono::DateTime<chrono::Utc>>>>,
     /// When set, only `fetch_assigned_merge_requests` fails this way — the
     /// other search fetches still serve their canned data.
     assigned_mr_err: Option<FetchErr>,
@@ -442,8 +443,11 @@ impl GitlabApi for FakeGitlab {
         }
         Ok(self.search_mrs.lock().unwrap().clone())
     }
-    async fn fetch_assigned_merge_requests(&self) -> TrackrResult<Vec<SearchMr>> {
-        self.assigned_mr_calls.fetch_add(1, Ordering::SeqCst);
+    async fn fetch_assigned_merge_requests(
+        &self,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> TrackrResult<Vec<SearchMr>> {
+        self.assigned_mr_calls.lock().unwrap().push(updated_after);
         if self.fetch_err.is_some() {
             return self.fetch_result();
         }
@@ -1284,7 +1288,11 @@ async fn search_sync_assigned_mrs_feed_corpus_and_assigned_view() {
 
     h.sync_search_cache().await;
 
-    assert_eq!(fake.assigned_mr_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *fake.assigned_mr_calls.lock().unwrap(),
+        vec![None],
+        "the first sync is a full one: the whole assigned list"
+    );
     let ids: Vec<i64> = h.search.all_mrs().unwrap().iter().map(|m| m.id).collect();
     assert_eq!(ids, vec![50], "assigned MR reached the corpus directly");
 
@@ -1784,7 +1792,7 @@ async fn search_sync_auto_resolves_to_tracked_on_every_host() {
             "auto → tracked with no evidence fetches no MRs on {host}"
         );
         assert_eq!(
-            fake.assigned_mr_calls.load(Ordering::SeqCst),
+            fake.assigned_mr_calls.lock().unwrap().len(),
             1,
             "the direct assigned-MR fetch still runs on {host}"
         );
@@ -1871,6 +1879,11 @@ async fn search_sync_tracked_partial_uses_cursor_per_project() {
         cursor.expect("partial sync passes a cursor").timestamp() as u64,
         stamps.last_partial_sync_secs - 300,
         "cursor is the last partial sync minus the overlap margin"
+    );
+    assert_eq!(
+        *fake.assigned_mr_calls.lock().unwrap(),
+        vec![cursor],
+        "the assigned-MR fetch shares the partial cursor"
     );
 }
 

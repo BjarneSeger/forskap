@@ -190,8 +190,8 @@ impl Handlers {
     /// otherwise). `Some(cursor)` is the incremental sync: issues and MRs are
     /// delta-fetched and upserted only. Projects and groups are always the
     /// full membership lists — they are small and have no reliable delta
-    /// filter — so they stay exact on every sync, as do the directly-fetched
-    /// assigned MRs.
+    /// filter — so they stay exact on every sync. The directly-fetched
+    /// assigned MRs follow the issue/MR cursor.
     ///
     /// A permanent rejection of a *global* (`Population::All`) issue/MR fetch
     /// returns [`Outcome::GlobalRejected`]; any other fetch failure is
@@ -223,10 +223,12 @@ impl Handlers {
 
         // Assigned MRs are fetched directly (`scope=assigned_to_me`) so the
         // assigned-MR view never depends on how broadly the population below
-        // covers the instance. Runs for every population mode — one cheap
-        // call — and its ids join the full-sync keep-sets so a population
-        // fetch that misses them can't prune them right back out.
-        let assigned_mrs = match gitlab.fetch_assigned_merge_requests().await {
+        // covers the instance. Runs for every population mode, delta-fetched
+        // like the corpus; on a full sync its ids join the keep-sets so a
+        // population fetch that misses them can't prune them right back out.
+        // A close or unassignment bumps `updated_at`, so the delta (or the
+        // tracked project's own delta) still overwrites the cached row.
+        let assigned_mrs = match gitlab.fetch_assigned_merge_requests(updated_after).await {
             Ok(m) => m,
             Err(e) => {
                 return self
