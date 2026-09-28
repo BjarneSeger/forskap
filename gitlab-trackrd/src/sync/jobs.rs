@@ -78,6 +78,15 @@ impl Job {
         }
     }
 
+    /// The assigned view the job fills, if it is a view job.
+    pub fn view(&self) -> Option<&'static str> {
+        match self {
+            Self::AssignedIssues => Some(ASSIGNED_ISSUES),
+            Self::AssignedMergeRequests => Some(ASSIGNED_MERGE_REQUESTS),
+            _ => None,
+        }
+    }
+
     /// Whether a successful run can change which jobs are planned.
     pub fn feeds_plan(&self) -> bool {
         matches!(
@@ -390,8 +399,7 @@ async fn view<R: Stored>(
 }
 
 /// Events inside the tracked window: the whole window on a full run, else
-/// since the day before the last run (GitLab's `after` is a date and
-/// exclusive). Older rows are pruned.
+/// since the last run. Older rows are pruned.
 async fn events(ctx: &FetchCtx) -> Result<Staged> {
     let window_start = ctx.started.saturating_sub(ctx.windows.tracked);
     let from = if ctx.full {
@@ -399,7 +407,9 @@ async fn events(ctx: &FetchCtx) -> Result<Staged> {
     } else {
         ctx.state.last_ok.max(window_start)
     };
-    let after = chrono::DateTime::from_timestamp(from as i64, 0)
+    // `after` is an exclusive date in the instance's time zone: two days
+    // back cover any zone, and the upserts dedupe the overlap.
+    let after = chrono::DateTime::from_timestamp(from.saturating_sub(86_400) as i64, 0)
         .unwrap_or_default()
         .date_naive()
         .pred_opt();
@@ -705,23 +715,23 @@ mod tests {
         assert_eq!(kept, [1], "outside the 30-day window");
 
         run(&s, Job::Events, ctx(&fake, false, NOW - 3600)).await;
-        let day = |secs: u64| {
+        let two_days_before = |secs: u64| {
             chrono::DateTime::from_timestamp(secs as i64, 0)
                 .unwrap()
                 .date_naive()
-                .pred_opt()
+                .checked_sub_days(chrono::Days::new(2))
         };
         assert_eq!(
             fake.calls_to("events"),
             [
                 Listing::Events {
-                    after: day(NOW - 30 * DAY)
+                    after: two_days_before(NOW - 30 * DAY)
                 },
                 Listing::Events {
-                    after: day(NOW - 3600)
+                    after: two_days_before(NOW - 3600)
                 },
             ],
-            "`after` is exclusive, so each fetch starts the day before"
+            "`after` is exclusive and zoned, so each fetch starts two days before"
         );
     }
 

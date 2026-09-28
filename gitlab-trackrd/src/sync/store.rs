@@ -251,6 +251,10 @@ impl Commit<'_> {
         Ok(())
     }
 
+    pub fn remove<R: Stored>(&mut self, key: RowKey) {
+        self.batch.remove(&self.store.table::<R>().ks, encode(key));
+    }
+
     /// Remove every row in `scope` whose key `keep` rejects; returns how many.
     pub fn remove_where<R: Stored>(
         &mut self,

@@ -146,7 +146,7 @@ impl QuickRefreshConfig {
 
     /// Timelog look-back span.
     pub fn window(&self) -> Duration {
-        Duration::from_hours(self.window_hours)
+        hours(self.window_hours)
     }
 }
 
@@ -180,7 +180,7 @@ pub struct HistoryConfig {
 impl HistoryConfig {
     /// Retention horizon: the oldest timelog kept on disk.
     pub fn retention(&self) -> Duration {
-        Duration::from_hours(self.retention_hours)
+        hours(self.retention_hours)
     }
 }
 
@@ -198,7 +198,7 @@ pub struct UsageConfig {
 impl UsageConfig {
     /// Retention horizon: the oldest last-open kept.
     pub fn retention(&self) -> Duration {
-        Duration::from_hours(self.retention_hours)
+        hours(self.retention_hours)
     }
 }
 
@@ -366,7 +366,7 @@ impl SearchConfig {
 
     /// How long activity keeps a project tracked.
     pub fn tracked_retention(&self) -> Duration {
-        Duration::from_hours(self.tracked_retention_hours)
+        hours(self.tracked_retention_hours)
     }
 }
 
@@ -396,6 +396,12 @@ impl SyncConfig {
     pub fn job_gap(&self) -> Duration {
         Duration::from_millis(self.job_gap_ms)
     }
+}
+
+/// `h` hours, saturating: `Duration::from_hours` panics past `u64::MAX`
+/// seconds, and a huge window must mean "everything", not a dead task.
+fn hours(h: u64) -> Duration {
+    Duration::from_secs(h.saturating_mul(3600))
 }
 
 /// `$XDG_CONFIG_HOME/gitlab-trackrd/config.toml` (falls back to `./`).
@@ -622,6 +628,13 @@ mod tests {
         assert_eq!(c.sync.startup_spread_secs, 60);
         assert_eq!(c.search.tracked_retention(), Duration::from_hours(2160));
         assert_eq!(c.search.max_items_per_project, 1000);
+    }
+
+    #[test]
+    fn huge_hour_windows_saturate_instead_of_panicking() {
+        let mut c = defaults();
+        c.search.tracked_retention_hours = u64::MAX;
+        assert_eq!(c.search.tracked_retention(), Duration::from_secs(u64::MAX));
     }
 
     #[test]

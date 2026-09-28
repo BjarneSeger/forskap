@@ -171,6 +171,18 @@ impl Event {
     pub fn is_activity(&self) -> bool {
         self.project_id > 0 && !matches!(self.action_name.as_str(), "joined" | "left" | "expired")
     }
+
+    /// Whether the event shows the user is a member of its project: joining
+    /// is membership, creating a project makes its owner, and only members
+    /// push.
+    pub fn implies_membership(&self) -> bool {
+        self.project_id > 0
+            && match self.action_name.as_str() {
+                "joined" | "pushed to" | "pushed new" => true,
+                "created" => self.target_type.is_empty(),
+                _ => false,
+            }
+    }
 }
 
 /// A timelog of the authenticated user, from GraphQL `currentUser.timelogs`

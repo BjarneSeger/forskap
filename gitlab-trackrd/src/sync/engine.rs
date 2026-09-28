@@ -17,7 +17,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use super::jobs::{self, ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, FetchCtx, Job, Staged, Windows};
-use super::model::{Board, Group, Issue, MergeRequest, Project, Timelog};
+use super::model::{Board, Group, Issue, MergeRequest, Project, RowKey, Timelog};
 use super::now_secs;
 use super::planner::{self, Plan};
 use super::schedule::{
@@ -162,6 +162,7 @@ impl SyncHandle {
             runs: 0,
             replan: true,
             incomplete: BTreeSet::new(),
+            relisted: BTreeSet::new(),
             scheduled,
         };
         tokio::spawn(worker.run());
@@ -294,6 +295,8 @@ struct Worker {
     /// Plan-feeding jobs a clear reset that haven't synced since. Until they
     /// have, their evidence is missing, so a replan only adds jobs.
     incomplete: BTreeSet<Job>,
+    /// Unlisted member projects the member listing already reran for.
+    relisted: BTreeSet<i64>,
     /// Whether due jobs run on their own, not only when demanded.
     scheduled: bool,
 }
@@ -542,8 +545,9 @@ impl Worker {
                 }
             }
             Some(Ok(Ok(staged))) => {
+                let before = job.view().map(|name| self.view_keys(name));
                 if self.commit(job, &key, state, staged, started, full, fingerprint) {
-                    self.after_commit(job, &mut waiters);
+                    self.after_commit(job, before, &mut waiters);
                 }
             }
             Some(Ok(Err(e))) => self.on_error(&key, state, e, session).await,
@@ -605,12 +609,32 @@ impl Worker {
         }
     }
 
+    /// The keys the view `name` lists, empty on a read failure.
+    fn view_keys(&self, name: &str) -> Vec<RowKey> {
+        match self.store.view(name) {
+            Ok(view) => view.unwrap_or_default().keys,
+            Err(e) => {
+                warn!(error = %e, view = name, "reading a view failed");
+                Vec::new()
+            }
+        }
+    }
+
     /// What a fresh `job` result sets off: the replan it may call for, and
-    /// for the assigned issues the board columns they show that never
+    /// for an assigned view (listing `before` until now) dropping the rows
+    /// that left it and fetching the board columns it shows that never
     /// synced, which `waiters` then wait for too.
-    fn after_commit(&mut self, job: Job, waiters: &mut Option<Vec<oneshot::Sender<()>>>) {
+    fn after_commit(
+        &mut self,
+        job: Job,
+        before: Option<Vec<RowKey>>,
+        waiters: &mut Option<Vec<oneshot::Sender<()>>>,
+    ) {
         if self.replan {
             self.replan_now();
+        }
+        if let (Some(name), Some(before)) = (job.view(), before) {
+            self.drop_unviewed(name, &before);
         }
         if job != Job::AssignedIssues {
             return;
@@ -629,17 +653,28 @@ impl Worker {
             .extend(waiters.take().into_iter().flatten());
     }
 
+    fn drop_unviewed(&mut self, name: &str, before: &[RowKey]) {
+        let dropped = (|| -> Result<usize> {
+            let mut c = self.store.begin();
+            let n = planner::drop_unviewed(&mut c, &self.store, &self.plan, name, before)?;
+            if n > 0 {
+                c.commit()?;
+            }
+            Ok(n)
+        })();
+        match dropped {
+            Ok(0) => {}
+            Ok(rows) => debug!(view = name, rows, "dropped rows that left the view"),
+            Err(e) => warn!(error = %e, view = name, "dropping rows that left the view failed"),
+        }
+    }
+
     /// Planned board jobs of the assigned issues' projects that never
     /// synced and aren't backed off, in job order.
     fn missing_boards(&self) -> Vec<Job> {
-        let view = self.store.view(ASSIGNED_ISSUES).unwrap_or_else(|e| {
-            warn!(error = %e, "reading the assigned issues failed");
-            None
-        });
         let now = now_secs();
-        let boards: BTreeSet<Job> = view
-            .unwrap_or_default()
-            .keys
+        let boards: BTreeSet<Job> = self
+            .view_keys(ASSIGNED_ISSUES)
             .iter()
             .map(|k| Job::ProjectBoards(k.0 as i64))
             .filter(|job| self.plan.jobs.contains(job))
@@ -812,6 +847,7 @@ impl Worker {
             // Nothing of the other account's plan may survive the replan.
             self.plan = Plan::default();
             self.incomplete.clear();
+            self.relisted.clear();
             self.replan = true;
         }
         c.set_identity(&me)?;
@@ -841,6 +877,14 @@ impl Worker {
                 return;
             }
         };
+        let unseen: Vec<i64> = plan.unlisted.difference(&self.relisted).copied().collect();
+        if !unseen.is_empty() {
+            // Joined or created since the daily member listing: rerun it now
+            // rather than leave them out of search for up to a day.
+            info!(projects = ?unseen, "activity in projects the member listing lacks; re-listing");
+            self.relisted.extend(unseen);
+            self.demand.entry(Job::MemberProjects).or_default();
+        }
         if !self.incomplete.is_empty() {
             // The dropped evidence is about to come back; dropping jobs now
             // would throw away corpora that must then be refetched in full.
@@ -1360,6 +1404,52 @@ mod tests {
             .expect("the rerun lands");
         gate.notify_one();
         assert!(fake.calls_to("projects/7/issues").len() >= 2);
+    }
+
+    /// A project joined since the daily member listing reruns it, so the
+    /// project shows up in search without waiting a day.
+    #[tokio::test]
+    async fn joining_a_project_relists_the_memberships() {
+        let (store, _dir) = open_store();
+        let mut synced: Vec<Job> = BASE.to_vec();
+        synced.retain(|j| *j != Job::Events);
+        mark_synced(&store, &synced);
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve("events", vec![event_json(1, 5, "joined", now_secs())]);
+        fake.serve("projects", vec![project_json(5)]);
+        let env = start_on(store, connected(&fake, 1));
+
+        eventually("the new membership", || {
+            env.store.projects.get((5, 0)).unwrap().is_some()
+        })
+        .await;
+    }
+
+    /// An assigned issue that left the view in a project without a corpus
+    /// goes, instead of lingering in search with its old state.
+    #[tokio::test]
+    async fn a_row_leaving_the_view_goes_without_a_corpus() {
+        let (store, _dir) = open_store();
+        mark_synced(&store, &BASE);
+        let mut c = store.begin();
+        c.upsert(&[issue_row(9, 1), issue_row(9, 2)]).unwrap();
+        c.set_view(
+            ASSIGNED_ISSUES,
+            &crate::sync::store::View {
+                keys: vec![(9, 1), (9, 2)],
+                fetched_at: now_secs(),
+            },
+        )
+        .unwrap();
+        c.commit().unwrap();
+        let fake = Arc::new(FakeGitlab::default());
+        // #2 keeps project 9 assigned, so the plan doesn't change.
+        fake.serve("issues", vec![issue_json(9, 2, "two")]);
+        let env = start_on(store, connected(&fake, 1));
+
+        env.sync.refresh_now(&[Job::AssignedIssues]).await;
+        assert!(env.store.issues.get((9, 1)).unwrap().is_none());
+        assert!(env.store.issues.get((9, 2)).unwrap().is_some());
     }
 
     #[tokio::test]

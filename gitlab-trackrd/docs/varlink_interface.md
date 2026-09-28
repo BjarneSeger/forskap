@@ -190,7 +190,8 @@ updated issues and MRs. `"member"`
 holds every member project's, `"all"` everything the token can see (`"auto"` is an
 alias of `"tracked"`). Projects and groups are always membership-scoped.
 Issue `graph_status` comes from the synced board columns of the issue's project and
-is empty for projects whose boards were never synced (only tracked projects' are).
+is empty for projects whose boards were never synced (only those of assigned issues'
+projects and of tracked member projects are).
 When the member projects have never been synced: replies with empty arrays if a
 session exists (first sync pending), `NotAuthenticated` otherwise.
 

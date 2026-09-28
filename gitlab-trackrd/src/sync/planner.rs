@@ -11,7 +11,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use super::jobs::{ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, Job};
-use super::model::{Board, Issue, MergeRequest, RowKey};
+use super::model::{Board, Event, Issue, MergeRequest, RowKey};
 use super::store::{Commit, RowScope, SyncStore};
 use crate::config::SearchPopulation;
 use crate::error::Result;
@@ -21,6 +21,9 @@ pub struct Plan {
     pub jobs: BTreeSet<Job>,
     pub tracked: BTreeSet<i64>,
     pub evidence: Evidence,
+    /// Projects whose events show a membership the member listing lacks
+    /// (joined or created since it ran).
+    pub unlisted: BTreeSet<i64>,
     /// Projects whose issues and MRs are synced.
     pub corpus: usize,
 }
@@ -56,14 +59,34 @@ impl Plan {
 
 /// Plan the jobs for `population`, counting activity since `tracked_since`.
 pub fn plan(store: &SyncStore, population: SearchPopulation, tracked_since: u64) -> Result<Plan> {
-    let (tracked, evidence) = tracked_projects(store, tracked_since)?;
-    let mut jobs = BTreeSet::from(BASE);
-    jobs.extend(tracked.iter().map(|&p| Job::ProjectBoards(p)));
+    let assigned_issues = view_projects(store, ASSIGNED_ISSUES)?;
+    let assigned_mrs = view_projects(store, ASSIGNED_MERGE_REQUESTS)?;
+    let events = store.events.scan(RowScope::Since(tracked_since))?;
+    let (tracked, evidence) = tracked_projects(
+        store,
+        [&assigned_issues, &assigned_mrs],
+        &events,
+        tracked_since,
+    )?;
     let members: BTreeSet<i64> = store
         .projects
         .keys(RowScope::All)?
         .into_iter()
         .map(|(id, _)| id as i64)
+        .collect();
+    let mut jobs = BTreeSet::from(BASE);
+    // Board columns are read for the assigned issues and the corpus. A
+    // tracked project the user isn't a member of may be gone or closed.
+    jobs.extend(
+        assigned_issues
+            .iter()
+            .chain(tracked.intersection(&members))
+            .map(|&p| Job::ProjectBoards(p)),
+    );
+    let unlisted = events
+        .iter()
+        .filter(|e| e.implies_membership() && !members.contains(&e.project_id))
+        .map(|e| e.project_id)
         .collect();
     let corpus: Vec<i64> = match population {
         SearchPopulation::All => {
@@ -80,21 +103,36 @@ pub fn plan(store: &SyncStore, population: SearchPopulation, tracked_since: u64)
         jobs,
         tracked,
         evidence,
+        unlisted,
         corpus: corpus.len(),
     })
 }
 
-/// Projects in the assigned views, plus those with activity events or
+/// The projects the view `name` lists.
+fn view_projects(store: &SyncStore, name: &str) -> Result<BTreeSet<i64>> {
+    Ok(store
+        .view(name)?
+        .unwrap_or_default()
+        .keys
+        .into_iter()
+        .map(|(project, _)| project as i64)
+        .collect())
+}
+
+/// Projects in the assigned views, plus those with activity `events` or
 /// timelogs at or after `since`.
-fn tracked_projects(store: &SyncStore, since: u64) -> Result<(BTreeSet<i64>, Evidence)> {
+fn tracked_projects(
+    store: &SyncStore,
+    assigned: [&BTreeSet<i64>; 2],
+    events: &[Event],
+    since: u64,
+) -> Result<(BTreeSet<i64>, Evidence)> {
     let mut tracked = BTreeSet::new();
     let mut evidence = Evidence::default();
-    for name in [ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS] {
-        for (project, _) in store.view(name)?.unwrap_or_default().keys {
-            evidence.assigned += usize::from(tracked.insert(project as i64));
-        }
+    for &project in assigned.into_iter().flatten() {
+        evidence.assigned += usize::from(tracked.insert(project));
     }
-    for e in store.events.scan(RowScope::Since(since))? {
+    for e in events {
         if e.is_activity() {
             evidence.events += usize::from(tracked.insert(e.project_id));
         }
@@ -107,35 +145,74 @@ fn tracked_projects(store: &SyncStore, since: u64) -> Result<(BTreeSet<i64>, Evi
     Ok((tracked, evidence))
 }
 
+/// Whether a corpus job in `plan` keeps the issue (or, for `!issue`, MR)
+/// row `key` fresh.
+fn in_corpus(plan: &Plan, issue: bool, key: RowKey) -> bool {
+    let project = key.0 as i64;
+    if issue {
+        plan.jobs.contains(&Job::AllIssues) || plan.jobs.contains(&Job::ProjectIssues(project))
+    } else {
+        plan.jobs.contains(&Job::AllMergeRequests)
+            || plan.jobs.contains(&Job::ProjectMergeRequests(project))
+    }
+}
+
+fn viewed(store: &SyncStore, name: &str) -> Result<HashSet<RowKey>> {
+    Ok(store
+        .view(name)?
+        .unwrap_or_default()
+        .keys
+        .into_iter()
+        .collect())
+}
+
 /// Stage the removal of rows no job in `plan` keeps fresh any more: issues
 /// and MRs of unplanned projects (unless an assigned view lists them) and
 /// boards of untracked projects. Returns how many.
 pub fn collect_garbage(commit: &mut Commit<'_>, store: &SyncStore, plan: &Plan) -> Result<usize> {
-    let viewed = |name| -> Result<HashSet<RowKey>> {
-        Ok(store
-            .view(name)?
-            .unwrap_or_default()
-            .keys
-            .into_iter()
-            .collect())
-    };
     let mut removed = 0;
-
     if !plan.jobs.contains(&Job::AllIssues) {
-        let kept = viewed(ASSIGNED_ISSUES)?;
+        let kept = viewed(store, ASSIGNED_ISSUES)?;
         removed += commit.remove_where::<Issue>(RowScope::All, |k| {
-            kept.contains(&k) || plan.jobs.contains(&Job::ProjectIssues(k.0 as i64))
+            kept.contains(&k) || in_corpus(plan, true, k)
         })?;
     }
     if !plan.jobs.contains(&Job::AllMergeRequests) {
-        let kept = viewed(ASSIGNED_MERGE_REQUESTS)?;
+        let kept = viewed(store, ASSIGNED_MERGE_REQUESTS)?;
         removed += commit.remove_where::<MergeRequest>(RowScope::All, |k| {
-            kept.contains(&k) || plan.jobs.contains(&Job::ProjectMergeRequests(k.0 as i64))
+            kept.contains(&k) || in_corpus(plan, false, k)
         })?;
     }
     removed += commit.remove_where::<Board>(RowScope::All, |k| {
         plan.jobs.contains(&Job::ProjectBoards(k.0 as i64))
     })?;
+    Ok(removed)
+}
+
+/// Stage the removal of rows that left the assigned view `name` since it
+/// listed `before` and that no corpus job in `plan` keeps fresh: nothing
+/// else would update them. Returns how many.
+pub fn drop_unviewed(
+    commit: &mut Commit<'_>,
+    store: &SyncStore,
+    plan: &Plan,
+    name: &str,
+    before: &[RowKey],
+) -> Result<usize> {
+    let now = viewed(store, name)?;
+    let issue = name == ASSIGNED_ISSUES;
+    let mut removed = 0;
+    for &key in before {
+        if now.contains(&key) || in_corpus(plan, issue, key) {
+            continue;
+        }
+        if issue {
+            commit.remove::<Issue>(key);
+        } else {
+            commit.remove::<MergeRequest>(key);
+        }
+        removed += 1;
+    }
     Ok(removed)
 }
 
@@ -227,7 +304,7 @@ mod tests {
     }
 
     /// An assigned MR in an upstream you aren't a member of keeps its row
-    /// (via the view) and gets boards, but no corpus.
+    /// (via the view), but gets no corpus and no boards (an MR shows none).
     #[test]
     fn only_member_projects_get_a_corpus() {
         let (s, _d) = store();
@@ -248,7 +325,86 @@ mod tests {
         assert_eq!(plan.tracked, BTreeSet::from([3, 278964]));
         assert_eq!(projects_of(&plan), BTreeSet::from([3]));
         assert_eq!(plan.corpus, 1);
-        assert!(plan.jobs.contains(&Job::ProjectBoards(278964)));
+        assert!(!plan.jobs.contains(&Job::ProjectBoards(278964)));
+    }
+
+    /// Boards are fetched where they are read: the assigned issues' projects
+    /// and tracked member projects. Activity alone in a project that may
+    /// be gone or closed fetches nothing.
+    #[test]
+    fn boards_follow_the_assigned_issues_and_tracked_members() {
+        let (s, _d) = store();
+        let mut c = s.begin();
+        c.upsert(&[member(3)]).unwrap();
+        c.upsert(&[event(1, 3, "opened", 500), event(2, 4, "opened", 500)])
+            .unwrap();
+        c.set_view(
+            ASSIGNED_ISSUES,
+            &View {
+                keys: vec![(5, 1)],
+                fetched_at: 0,
+            },
+        )
+        .unwrap();
+        c.commit().unwrap();
+
+        let plan = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        let boards: BTreeSet<i64> = plan
+            .jobs
+            .iter()
+            .filter_map(|j| match j {
+                Job::ProjectBoards(p) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(boards, BTreeSet::from([3, 5]));
+    }
+
+    #[test]
+    fn membership_events_outside_the_listing_are_unlisted() {
+        let (s, _d) = store();
+        let mut c = s.begin();
+        c.upsert(&[member(3)]).unwrap();
+        c.upsert(&[
+            event(1, 3, "pushed to", 500),
+            event(2, 4, "joined", 500),
+            event(3, 5, "pushed new", 500),
+            event(4, 6, "commented on", 500),
+            event(5, 7, "created", 500),
+            event(6, 8, "created", 50),
+        ])
+        .unwrap();
+        c.commit().unwrap();
+
+        let plan = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        assert_eq!(plan.unlisted, BTreeSet::from([4, 5, 7]));
+    }
+
+    #[test]
+    fn rows_leaving_a_view_go_unless_a_corpus_covers_them() {
+        let (s, _d) = store();
+        let mut c = s.begin();
+        c.upsert(&[issue(1, 1), issue(2, 1), issue(2, 2)]).unwrap();
+        c.upsert(&[member(2)]).unwrap();
+        c.upsert(&[event(1, 2, "opened", 500)]).unwrap();
+        c.set_view(
+            ASSIGNED_ISSUES,
+            &View {
+                keys: vec![(2, 2)],
+                fetched_at: 0,
+            },
+        )
+        .unwrap();
+        c.commit().unwrap();
+
+        // #1 of project 1 (no corpus) and #1 of project 2 left the view.
+        let p = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        let mut c = s.begin();
+        let before = [(1, 1), (2, 1), (2, 2)];
+        let removed = drop_unviewed(&mut c, &s, &p, ASSIGNED_ISSUES, &before).unwrap();
+        c.commit().unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(s.issues.keys(RowScope::All).unwrap(), [(2, 1), (2, 2)]);
     }
 
     #[test]
@@ -309,8 +465,11 @@ mod tests {
         let member = plan(&s, SearchPopulation::Member, 100).unwrap();
         assert_eq!(projects_of(&member), BTreeSet::from([7, 8]));
         assert!(
-            member.jobs.contains(&Job::ProjectBoards(3)),
-            "boards follow tracking"
+            !member
+                .jobs
+                .iter()
+                .any(|j| matches!(j, Job::ProjectBoards(_))),
+            "boards follow tracked members, and 3 is no member"
         );
 
         let all = plan(&s, SearchPopulation::All, 100).unwrap();
