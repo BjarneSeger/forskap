@@ -19,30 +19,10 @@ use crate::db::KvStore;
 use crate::error::Result;
 use crate::gitlab::Issuable;
 use crate::handlers::SessionSlot;
+use crate::write::{Write, WriteOp};
 
 const QUEUE_KEYSPACE: &str = "retry_queue_v1";
 const DEAD_LETTER_KEYSPACE: &str = "dead_letter_v1";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum QueueOp {
-    PostTime {
-        duration: String,
-        summary: Option<String>,
-        /// Global numeric issuable ID (issue or MR, per the task's `kind`),
-        /// resolved from the caches at enqueue time. When present, the worker
-        /// uses GraphQL `timelogCreate` so it can submit the original
-        /// `queued_at_secs` as `spentAt`. `None` means the caches didn't know
-        /// the issuable (or the entry survived a daemon upgrade), and the
-        /// worker falls back to REST without `spent_at`. The alias keeps
-        /// tasks persisted before MR support readable.
-        #[serde(alias = "issue_id")]
-        issuable_id: Option<i64>,
-    },
-    #[serde(alias = "CloseIssue")]
-    Close,
-    AssignSelf,
-    UnassignSelf,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredTask {
@@ -53,7 +33,7 @@ struct StoredTask {
     iid: i64,
     #[serde(default)]
     kind: Issuable,
-    op: QueueOp,
+    op: WriteOp,
     /// UNIX timestamp (seconds) when the task was first enqueued.
     queued_at_secs: u64,
 }
@@ -68,7 +48,7 @@ struct StoredFailure {
     iid: i64,
     #[serde(default)]
     kind: Issuable,
-    op: QueueOp,
+    op: WriteOp,
     /// When the task was originally enqueued.
     queued_at_secs: u64,
     /// When the worker gave up.
@@ -82,8 +62,19 @@ struct QueuedTask {
     project_id: i64,
     iid: i64,
     kind: Issuable,
-    op: QueueOp,
+    op: WriteOp,
     queued_at_secs: u64,
+}
+
+impl QueuedTask {
+    fn write(&self) -> Write {
+        Write {
+            kind: self.kind,
+            project_id: self.project_id,
+            iid: self.iid,
+            op: self.op.clone(),
+        }
+    }
 }
 
 pub struct RetryQueue {
@@ -97,13 +88,9 @@ pub struct RetryQueue {
     drain_wake: Arc<Notify>,
 }
 
-/// A PostTime task currently in the retry queue, projected for the history view.
-pub struct PendingPostTime {
-    pub project_id: i64,
-    pub iid: i64,
-    pub kind: Issuable,
-    pub duration: String,
-    pub summary: Option<String>,
+/// A write still waiting in the retry queue.
+pub struct PendingWrite {
+    pub write: Write,
     pub queued_at_secs: u64,
 }
 
@@ -201,73 +188,28 @@ impl RetryQueue {
         Arc::clone(&self.drain_wake)
     }
 
-    /// Persist a `PostTime` task to disk and hand it to the background worker.
-    /// Returns immediately; the caller does not wait for the network operation.
+    /// Persist `write` to disk and hand it to the background worker. Returns
+    /// immediately; the caller does not wait for the network operation.
     ///
-    /// `issuable_id` is the global numeric ID (the one GraphQL embeds in
-    /// `gid://gitlab/<Kind>/<id>`). When `Some`, the worker uses GraphQL
-    /// `timelogCreate` and submits the original `queued_at` as `spentAt`, so a
-    /// task held for hours/days still shows up in GitLab at the time it was
-    /// actually logged. When `None`, it falls back to REST without `spent_at`.
-    pub async fn post_time(
-        &self,
-        kind: Issuable,
-        project_id: i64,
-        iid: i64,
-        duration: String,
-        summary: Option<String>,
-        issuable_id: Option<i64>,
-    ) {
-        self.enqueue(
-            kind,
-            project_id,
-            iid,
-            QueueOp::PostTime {
-                duration,
-                summary,
-                issuable_id,
-            },
-        )
-        .await
-    }
-
-    /// Persist a `Close` task to disk and hand it to the background worker.
-    /// Returns immediately; the caller does not wait for the network operation.
-    pub async fn close(&self, kind: Issuable, project_id: i64, iid: i64) {
-        self.enqueue(kind, project_id, iid, QueueOp::Close).await
-    }
-
-    /// Persist an `AssignSelf` task to disk and hand it to the background worker.
-    pub async fn assign_self(&self, kind: Issuable, project_id: i64, iid: i64) {
-        self.enqueue(kind, project_id, iid, QueueOp::AssignSelf)
-            .await
-    }
-
-    /// Persist an `UnassignSelf` task to disk and hand it to the background worker.
-    pub async fn unassign_self(&self, kind: Issuable, project_id: i64, iid: i64) {
-        self.enqueue(kind, project_id, iid, QueueOp::UnassignSelf)
-            .await
-    }
-
-    /// Snapshot of PostTime tasks currently sitting in the queue.
-    ///
-    /// Used by the history view to prepend not-yet-flushed entries so the
-    /// user sees their just-logged time before the round-trip completes.
-    /// Once the worker succeeds and removes the task, the next history poll
-    /// surfaces the canonical GitLab record in its place.
-    pub fn pending_post_time(&self) -> Result<Vec<PendingPostTime>> {
-        snapshot_pending(&self.store)
-    }
-
-    async fn enqueue(&self, kind: Issuable, project_id: i64, iid: i64, op: QueueOp) {
+    /// A PostTime's `issuable_id` (the global id GraphQL embeds in
+    /// `gid://gitlab/<Kind>/<id>`) lets the worker submit the enqueue time as
+    /// `spentAt`, so a task held for hours still shows up in GitLab at the
+    /// time it was actually logged.
+    pub async fn enqueue(&self, write: Write) {
         self.enqueue_stored(StoredTask {
-            project_id,
-            iid,
-            kind,
-            op,
+            project_id: write.project_id,
+            iid: write.iid,
+            kind: write.kind,
+            op: write.op,
             queued_at_secs: now_secs(),
         })
         .await
+    }
+
+    /// Snapshot of the writes still waiting in the queue, newest first. The
+    /// history view shows queued PostTimes from it before GitLab has them.
+    pub fn pending(&self) -> Result<Vec<PendingWrite>> {
+        snapshot_pending(&self.store)
     }
 
     /// Persist `stored` under a fresh ID and hand it to the worker, keeping its
@@ -300,7 +242,7 @@ impl RetryQueue {
         let mut out = self.dead_letter.scan(|id, f| {
             Ok(FailedTaskView {
                 id,
-                op_kind: f.op.kind(),
+                op_kind: f.op.name(),
                 project_id: f.project_id,
                 iid: f.iid,
                 kind: f.kind,
@@ -349,27 +291,18 @@ impl RetryQueue {
     }
 }
 
-fn snapshot_pending(store: &KvStore<u64, StoredTask>) -> Result<Vec<PendingPostTime>> {
-    let mut out = store
-        .scan(|_, stored| {
-            Ok(match stored.op {
-                QueueOp::PostTime {
-                    duration, summary, ..
-                } => Some(PendingPostTime {
-                    project_id: stored.project_id,
-                    iid: stored.iid,
-                    kind: stored.kind,
-                    duration,
-                    summary,
-                    queued_at_secs: stored.queued_at_secs,
-                }),
-                QueueOp::Close | QueueOp::AssignSelf | QueueOp::UnassignSelf => None,
-            })
-        })?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-
+fn snapshot_pending(store: &KvStore<u64, StoredTask>) -> Result<Vec<PendingWrite>> {
+    let mut out = store.scan(|_, stored| {
+        Ok(PendingWrite {
+            write: Write {
+                kind: stored.kind,
+                project_id: stored.project_id,
+                iid: stored.iid,
+                op: stored.op,
+            },
+            queued_at_secs: stored.queued_at_secs,
+        })
+    })?;
     out.sort_by_key(|p| std::cmp::Reverse(p.queued_at_secs));
     Ok(out)
 }
@@ -402,7 +335,7 @@ async fn worker(
                         project_id = task.project_id,
                         iid = task.iid,
                         kind = ?task.kind,
-                        op = task.op.kind(),
+                        op = task.op.name(),
                         "no active session; deferring task"
                     );
                     let session_wait = config.read().unwrap().queue.session_wait();
@@ -418,52 +351,10 @@ async fn worker(
                     continue 'retry;
                 }
             };
-            let outcome = match &task.op {
-                QueueOp::PostTime {
-                    duration,
-                    summary,
-                    issuable_id,
-                } => match issuable_id {
-                    Some(id) => {
-                        let spent_at = chrono::DateTime::<chrono::Utc>::from_timestamp(
-                            task.queued_at_secs as i64,
-                            0,
-                        )
-                        .unwrap_or_else(chrono::Utc::now);
-                        gitlab
-                            .create_timelog(
-                                task.kind,
-                                *id,
-                                duration,
-                                summary.as_deref().unwrap_or(""),
-                                spent_at,
-                            )
-                            .await
-                    }
-                    None => {
-                        gitlab
-                            .add_spent_time(
-                                task.kind,
-                                task.project_id,
-                                task.iid,
-                                duration,
-                                summary.as_deref(),
-                            )
-                            .await
-                    }
-                },
-                QueueOp::Close => gitlab.close(task.kind, task.project_id, task.iid).await,
-                QueueOp::AssignSelf => {
-                    gitlab
-                        .assign_self(task.kind, task.project_id, task.iid)
-                        .await
-                }
-                QueueOp::UnassignSelf => {
-                    gitlab
-                        .unassign_self(task.kind, task.project_id, task.iid)
-                        .await
-                }
-            };
+            let outcome = task
+                .write()
+                .apply(&*gitlab, Some(task.queued_at_secs))
+                .await;
 
             match outcome {
                 Ok(()) => {
@@ -473,7 +364,7 @@ async fn worker(
                             project_id = task.project_id,
                             iid = task.iid,
                             kind = ?task.kind,
-                            op = task.op.kind(),
+                            op = task.op.name(),
                             "task succeeded after retry"
                         );
                     }
@@ -490,7 +381,7 @@ async fn worker(
                             project_id = task.project_id,
                             iid = task.iid,
                             kind = ?task.kind,
-                            op = task.op.kind(),
+                            op = task.op.name(),
                             retry_window = max_lifetime.as_secs(),
                             "dropping task after retry window"
                         );
@@ -508,7 +399,7 @@ async fn worker(
                         error = %e,
                         delay_secs = sleep.as_secs(),
                         project_id = task.project_id,
-                        op = task.op.kind(),
+                        op = task.op.name(),
                         "task failed transiently, retrying"
                     );
                     tokio::time::sleep(sleep).await;
@@ -521,7 +412,7 @@ async fn worker(
                         project_id = task.project_id,
                         iid = task.iid,
                         kind = ?task.kind,
-                        op = task.op.kind(),
+                        op = task.op.name(),
                         "task rejected by GitLab; dropping"
                     );
                     break 'retry Some(e.to_string());
@@ -561,37 +452,6 @@ async fn worker(
     }
 }
 
-impl QueueOp {
-    /// Whether repeating the op after an ambiguous failure is harmless.
-    /// PostTime adds a new timelog per call; the others converge on a state.
-    fn idempotent(&self) -> bool {
-        !matches!(self, QueueOp::PostTime { .. })
-    }
-
-    fn kind(&self) -> &'static str {
-        match self {
-            QueueOp::PostTime { .. } => "PostTime",
-            QueueOp::Close => "Close",
-            QueueOp::AssignSelf => "AssignSelf",
-            QueueOp::UnassignSelf => "UnassignSelf",
-        }
-    }
-
-    /// Human-readable op detail for the `tt queue` view. PostTime shows its
-    /// duration (and summary, if any); the other ops carry no extra detail.
-    fn detail(&self) -> String {
-        match self {
-            QueueOp::PostTime {
-                duration, summary, ..
-            } => match summary {
-                Some(s) if !s.is_empty() => format!("{duration} – {s}"),
-                _ => duration.clone(),
-            },
-            QueueOp::Close | QueueOp::AssignSelf | QueueOp::UnassignSelf => String::new(),
-        }
-    }
-}
-
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -615,22 +475,6 @@ mod tests {
     // so deterministically driving them would require a clock-injection
     // abstraction that isn't warranted for the gain.
 
-    // ── QueueOp::kind ───────────────────────────────────────────────────────
-
-    #[test]
-    fn queue_op_kind() {
-        assert_eq!(QueueOp::Close.kind(), "Close");
-        assert_eq!(
-            QueueOp::PostTime {
-                duration: "1h".into(),
-                summary: None,
-                issuable_id: None,
-            }
-            .kind(),
-            "PostTime"
-        );
-    }
-
     // ── Persisted-record compatibility ──────────────────────────────────────
 
     /// Records written before MR support carried `issue_iid`/`issue_id`, no
@@ -643,13 +487,13 @@ mod tests {
         assert_eq!(t.iid, 9);
         assert_eq!(t.kind, Issuable::Issue, "missing kind defaults to Issue");
         match t.op {
-            QueueOp::PostTime { issuable_id, .. } => assert_eq!(issuable_id, Some(42)),
+            WriteOp::PostTime { issuable_id, .. } => assert_eq!(issuable_id, Some(42)),
             other => panic!("expected PostTime, got {other:?}"),
         }
 
         let old_close = r#"{"project_id":7,"issue_iid":9,"op":"CloseIssue","queued_at_secs":100}"#;
         let t: StoredTask = serde_json::from_str(old_close).unwrap();
-        assert!(matches!(t.op, QueueOp::Close), "CloseIssue alias parses");
+        assert!(matches!(t.op, WriteOp::Close), "CloseIssue alias parses");
     }
 
     #[test]
@@ -658,7 +502,7 @@ mod tests {
         let f: StoredFailure = serde_json::from_str(old).unwrap();
         assert_eq!(f.iid, 9);
         assert_eq!(f.kind, Issuable::Issue);
-        assert!(matches!(f.op, QueueOp::Close));
+        assert!(matches!(f.op, WriteOp::Close));
     }
 
     // ── snapshot_pending ────────────────────────────────────────────────────
@@ -680,7 +524,7 @@ mod tests {
             project_id: id,
             iid: id,
             kind: Issuable::Issue,
-            op: QueueOp::PostTime {
+            op: WriteOp::PostTime {
                 duration: "1h".into(),
                 summary: None,
                 issuable_id: None,
@@ -694,13 +538,13 @@ mod tests {
             project_id: id,
             iid: id,
             kind: Issuable::Issue,
-            op: QueueOp::Close,
+            op: WriteOp::Close,
             queued_at_secs: queued_at,
         }
     }
 
     #[test]
-    fn snapshot_pending_filters_close_and_sorts_newest_first() {
+    fn snapshot_pending_keeps_every_op_newest_first() {
         let (s, _td) = store();
         s.put(1, &post_task(1, 100)).unwrap();
         s.put(2, &close_task(2, 150)).unwrap();
@@ -708,14 +552,11 @@ mod tests {
         s.put(4, &post_task(4, 50)).unwrap();
 
         let snap = snapshot_pending(&s).unwrap();
-        let project_ids: Vec<i64> = snap.iter().map(|p| p.project_id).collect();
-        assert_eq!(
-            project_ids,
-            vec![3, 1, 4],
-            "PostTime only, sorted by queued_at desc"
-        );
+        let project_ids: Vec<i64> = snap.iter().map(|p| p.write.project_id).collect();
+        assert_eq!(project_ids, vec![3, 2, 1, 4], "sorted by queued_at desc");
+        assert_eq!(snap[1].write.op, WriteOp::Close);
         assert!(
-            snap.iter().all(|p| p.kind == Issuable::Issue),
+            snap.iter().all(|p| p.write.kind == Issuable::Issue),
             "kind carried into the projection"
         );
     }
@@ -906,7 +747,7 @@ mod tests {
             .scan(|id, f| {
                 Ok(FailedTaskView {
                     id,
-                    op_kind: f.op.kind(),
+                    op_kind: f.op.name(),
                     project_id: f.project_id,
                     iid: f.iid,
                     kind: f.kind,
@@ -934,7 +775,7 @@ mod tests {
             project_id: 7,
             iid: 7,
             kind: Issuable::Issue,
-            op: QueueOp::PostTime {
+            op: WriteOp::PostTime {
                 duration: "1h".into(),
                 summary: None,
                 issuable_id: None,
@@ -993,7 +834,7 @@ mod tests {
             project_id: 7,
             iid: 7,
             kind: Issuable::Issue,
-            op: QueueOp::PostTime {
+            op: WriteOp::PostTime {
                 duration: "1h".into(),
                 summary: None,
                 issuable_id: None,
@@ -1042,7 +883,7 @@ mod tests {
             project_id: 7,
             iid: 7,
             kind: Issuable::Issue,
-            op: QueueOp::PostTime {
+            op: WriteOp::PostTime {
                 duration: "1h".into(),
                 summary: Some("note".into()),
                 issuable_id: Some(999),
@@ -1094,7 +935,7 @@ mod tests {
             project_id: 7,
             iid: 7,
             kind: Issuable::Issue,
-            op: QueueOp::PostTime {
+            op: WriteOp::PostTime {
                 duration: "1h".into(),
                 summary: None,
                 issuable_id: None,
@@ -1147,7 +988,7 @@ mod tests {
             project_id: 7,
             iid: 7,
             kind: Issuable::Issue,
-            op: QueueOp::Close,
+            op: WriteOp::Close,
             queued_at_secs: now_secs(),
         };
         let failures =
@@ -1175,7 +1016,7 @@ mod tests {
             project_id: 7,
             iid: 7,
             kind: Issuable::Issue,
-            op: QueueOp::PostTime {
+            op: WriteOp::PostTime {
                 duration: "1h".into(),
                 summary: None,
                 issuable_id: None,
@@ -1208,7 +1049,7 @@ mod tests {
             project_id: 7,
             iid: 7,
             kind: Issuable::Issue,
-            op: QueueOp::PostTime {
+            op: WriteOp::PostTime {
                 duration: "1h".into(),
                 summary: None,
                 issuable_id: None,
@@ -1241,7 +1082,7 @@ mod tests {
             project_id: 7,
             iid: 7,
             kind: Issuable::Issue,
-            op: QueueOp::Close,
+            op: WriteOp::Close,
             queued_at_secs: 100,
         };
         run_worker_one_task(gitlab.clone(), s.clone(), task).await;
@@ -1264,10 +1105,10 @@ mod tests {
         gitlab.create_timelog.lock().unwrap().push_back(Ok(()));
 
         for (id, op) in [
-            (1u64, QueueOp::Close),
+            (1u64, WriteOp::Close),
             (
                 2,
-                QueueOp::PostTime {
+                WriteOp::PostTime {
                     duration: "1h".into(),
                     summary: None,
                     issuable_id: None,
@@ -1275,7 +1116,7 @@ mod tests {
             ),
             (
                 3,
-                QueueOp::PostTime {
+                WriteOp::PostTime {
                     duration: "1h".into(),
                     summary: None,
                     issuable_id: Some(999),
@@ -1312,7 +1153,7 @@ mod tests {
                 project_id: 7,
                 iid: 7,
                 kind: Issuable::Issue,
-                op: QueueOp::AssignSelf,
+                op: WriteOp::AssignSelf,
                 queued_at_secs: 100,
             },
         )
@@ -1326,7 +1167,7 @@ mod tests {
             project_id: 7,
             iid: 7,
             kind: Issuable::Issue,
-            op: QueueOp::AssignSelf,
+            op: WriteOp::AssignSelf,
             queued_at_secs: 100,
         };
         run_worker_one_task(gitlab.clone(), s.clone(), task).await;
@@ -1339,7 +1180,7 @@ mod tests {
         );
         assert!(
             snapshot_pending(&s).unwrap().is_empty(),
-            "assign_self is not a PostTime; snapshot ignores it"
+            "task removed after success"
         );
     }
 
@@ -1350,7 +1191,7 @@ mod tests {
             project_id: id,
             iid: id,
             kind: Issuable::Issue,
-            op: QueueOp::Close,
+            op: WriteOp::Close,
             queued_at_secs: 100,
             failed_at_secs: 200,
             error: "boom".into(),
@@ -1382,7 +1223,7 @@ mod tests {
             project_id: 7,
             iid: 7,
             kind: Issuable::Issue,
-            op: QueueOp::PostTime {
+            op: WriteOp::PostTime {
                 duration: "1h".into(),
                 summary: None,
                 issuable_id: None,
@@ -1416,7 +1257,7 @@ mod tests {
                     project_id: 7,
                     iid: 9,
                     kind: Issuable::Issue,
-                    op: QueueOp::Close,
+                    op: WriteOp::Close,
                     queued_at_secs: 1_000,
                     failed_at_secs: 2_000,
                     error: "403".into(),

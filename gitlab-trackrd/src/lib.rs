@@ -23,3 +23,4 @@ pub mod secrets;
 pub mod server;
 pub mod service;
 pub mod usage;
+pub mod write;

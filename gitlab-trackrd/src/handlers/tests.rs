@@ -180,6 +180,8 @@ enum FetchErr {
     Transient,
     /// GitLab-side failure → `Error::Gitlab` (must NOT demote).
     Permanent,
+    /// 429/5xx → `Error::Throttled` with this status.
+    Throttled(u16),
 }
 
 /// Minimal `GitlabApi` impl that returns pre-canned `fetch_board_list_labels`
@@ -267,8 +269,8 @@ impl FakeGitlab {
 
     fn write_result(&self) -> TrackrResult<()> {
         match self.write_err {
-            Some(FetchErr::Transient) => Err(crate::error::Error::Transient("offline".into())),
             Some(FetchErr::Permanent) => Err(crate::error::Error::Gitlab("400 Bad Request".into())),
+            Some(err) => err_result::<()>(err).map(|_| ()),
             None => Ok(()),
         }
     }
@@ -278,6 +280,11 @@ fn err_result<T>(err: FetchErr) -> TrackrResult<Vec<T>> {
     match err {
         FetchErr::Transient => Err(crate::error::Error::Transient("offline".into())),
         FetchErr::Permanent => Err(crate::error::Error::Gitlab("500 Server Error".into())),
+        FetchErr::Throttled(status) => Err(crate::error::Error::Throttled {
+            status,
+            retry_after: None,
+            detail: "busy".into(),
+        }),
     }
 }
 
@@ -330,10 +337,10 @@ impl GitlabApi for FakeGitlab {
         }
     }
     async fn close(&self, _kind: Issuable, _project_id: i64, _iid: i64) -> TrackrResult<()> {
-        unimplemented!()
+        self.write_result()
     }
     async fn assign_self(&self, _kind: Issuable, _project_id: i64, _iid: i64) -> TrackrResult<()> {
-        unimplemented!()
+        self.write_result()
     }
     async fn unassign_self(
         &self,
@@ -341,7 +348,7 @@ impl GitlabApi for FakeGitlab {
         _project_id: i64,
         _iid: i64,
     ) -> TrackrResult<()> {
-        unimplemented!()
+        self.write_result()
     }
     async fn fetch_board_list_labels(&self, project_id: i64) -> TrackrResult<Vec<String>> {
         self.board_calls.fetch_add(1, Ordering::SeqCst);
@@ -723,10 +730,54 @@ async fn post_time_queues_through_an_unreachable_outage() {
         "unreachable → queued and reported success, not rejected"
     );
     assert_eq!(
-        h.queue.pending_post_time().unwrap().len(),
+        h.queue.pending().unwrap().len(),
         1,
         "the write is queued to drain on reconnect"
     );
+}
+
+/// A 429 is refused before GitLab does any work, so even a PostTime is safe
+/// to queue; a 5xx may already have booked the time, so it is reported.
+#[tokio::test]
+async fn post_time_queues_rate_limits_but_reports_server_errors() {
+    use gitlab_trackr_api::AsyncCall;
+    for (status, queued) in [(429, true), (502, false)] {
+        let (h, _dir) = connected_handlers(FakeGitlab::failing_write(FetchErr::Throttled(status)));
+        let mut call = AsyncCall::default();
+        h.post_time(
+            &mut call as &mut dyn Call_PostTime,
+            7,
+            42,
+            IssuableKind::issue,
+            "30m".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let reply = call.take_reply().expect("a reply");
+        assert_eq!(reply.error.is_none(), queued, "{status}");
+        assert_eq!(
+            h.queue.pending().unwrap().len(),
+            usize::from(queued),
+            "{status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn close_queues_through_a_server_error() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = connected_handlers(FakeGitlab::failing_write(FetchErr::Throttled(503)));
+    let mut call = AsyncCall::default();
+    h.close(&mut call as &mut dyn Call_Close, 7, 42, IssuableKind::issue)
+        .await
+        .unwrap();
+
+    assert!(call.take_reply().unwrap().error.is_none());
+    let pending = h.queue.pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].write.op, crate::write::WriteOp::Close);
 }
 
 #[tokio::test]
@@ -752,7 +803,7 @@ async fn post_time_rejects_when_dormant_but_not_unreachable() {
         "no credentials → reject; queuing wouldn't help"
     );
     assert!(
-        h.queue.pending_post_time().unwrap().is_empty(),
+        h.queue.pending().unwrap().is_empty(),
         "nothing queued for a non-unreachable dormancy"
     );
 }
@@ -784,7 +835,7 @@ async fn post_time_transient_queues_without_demoting() {
         "transient write → queued and reported success"
     );
     assert_eq!(
-        h.queue.pending_post_time().unwrap().len(),
+        h.queue.pending().unwrap().len(),
         1,
         "the write is queued to drain on reconnect"
     );
@@ -1956,9 +2007,9 @@ async fn post_time_on_mr_defers_with_the_global_mr_id() {
     .unwrap();
     assert!(call.take_reply().unwrap().error.is_none());
 
-    let pending = h.queue.pending_post_time().unwrap();
+    let pending = h.queue.pending().unwrap();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].kind, crate::gitlab::Issuable::MergeRequest);
+    assert_eq!(pending[0].write.kind, crate::gitlab::Issuable::MergeRequest);
 }
 
 #[tokio::test]
@@ -2336,7 +2387,7 @@ proptest! {
                 );
             }
             assert!(
-                h.queue.pending_post_time().unwrap().is_empty(),
+                h.queue.pending().unwrap().is_empty(),
                 "nothing may be enqueued from a no-credentials session"
             );
         });

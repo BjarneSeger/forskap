@@ -15,12 +15,13 @@ use gitlab_trackr_api::{
 };
 
 use crate::cache::{in_group, namespace_of};
-use crate::error::DormancyReason;
+use crate::error::{DormancyReason, Error};
 use crate::gitlab::{GitlabClient, Issuable};
 use crate::history::HistoryCache;
 use crate::search::{SEARCH_SCHEMA_VERSION, SearchIssue, SearchMr, parse_iid_query, text_matches};
 use crate::secrets::{self, Credentials};
 use crate::usage::{UsageEntry, UsageRecord};
+use crate::write::{Write, WriteOp};
 
 use super::refresh::graph_status_from;
 use super::{
@@ -46,43 +47,63 @@ impl Handlers {
         }
     }
 
-    /// Queue a `PostTime` write for retry when GitLab can't be reached right now
-    /// (a known outage or a transient failure mid-call); the retry queue drains
-    /// it on reconnect. Shared by the `Unreachable`-dormancy and transient-error
-    /// arms of [`Self::post_time`].
-    async fn defer_post_time(
-        &self,
-        kind: Issuable,
-        project_id: i64,
-        iid: i64,
-        duration: String,
-        summary: Option<String>,
-    ) {
-        let issuable_id = self.resolve_issuable_id(kind, project_id, iid);
-        self.queue
-            .post_time(kind, project_id, iid, duration, summary, issuable_id)
-            .await;
+    /// The shared write cascade: try once while connected; queue the write
+    /// when GitLab is unreachable or the failure is retryable; otherwise hand
+    /// the rejection back.
+    async fn perform_write(&self, write: Write) -> WriteOutcome {
+        let (kind, project_id, iid, op) =
+            (write.kind, write.project_id, write.iid, write.op.name());
+        let gitlab = match self.gitlab().await {
+            Ok(g) => g,
+            Err(DormancyReason::Unreachable { .. }) => {
+                info!(
+                    project_id,
+                    iid,
+                    ?kind,
+                    op,
+                    "GitLab unreachable, queuing write for retry"
+                );
+                self.defer(write).await;
+                return WriteOutcome::Accepted;
+            }
+            Err(r) => return WriteOutcome::NotAuthenticated(r),
+        };
+        match write.apply(&*gitlab, None).await {
+            Ok(()) => {
+                info!(project_id, iid, ?kind, op, "write applied");
+                self.reflect(&write);
+                WriteOutcome::Accepted
+            }
+            Err(e) if e.is_retryable(write.op.idempotent()) => {
+                warn!(error = %e, project_id, iid, op, "write failed transiently, queuing for retry");
+                self.defer(write).await;
+                WriteOutcome::Accepted
+            }
+            Err(e) => {
+                warn!(error = %e, project_id, iid, op, "write rejected by GitLab");
+                WriteOutcome::Rejected(e)
+            }
+        }
     }
 
-    /// Queue a `Close` write for retry and reflect it in the caches so the
-    /// assigned views do at once. Shared by both deferral arms of
-    /// [`Self::close`].
-    async fn defer_close(&self, kind: Issuable, project_id: i64, iid: i64) {
-        self.queue.close(kind, project_id, iid).await;
-        self.reflect_close(kind, project_id, iid);
+    /// Queue `write` for the retry worker and reflect it in the caches. A
+    /// PostTime gets its issuable id resolved so the replay keeps its time.
+    async fn defer(&self, mut write: Write) {
+        if let WriteOp::PostTime { issuable_id, .. } = &mut write.op {
+            *issuable_id = self.resolve_issuable_id(write.kind, write.project_id, write.iid);
+        }
+        self.reflect(&write);
+        self.queue.enqueue(write).await;
     }
 
-    /// Queue an `AssignSelf` write for retry. Shared by both deferral arms of
-    /// [`Self::assign_self`].
-    async fn defer_assign_self(&self, kind: Issuable, project_id: i64, iid: i64) {
-        self.queue.assign_self(kind, project_id, iid).await;
-    }
-
-    /// Queue an `UnassignSelf` write for retry and reflect it in the caches.
-    /// Shared by both deferral arms of [`Self::unassign_self`].
-    async fn defer_unassign_self(&self, kind: Issuable, project_id: i64, iid: i64) {
-        self.queue.unassign_self(kind, project_id, iid).await;
-        self.reflect_unassign(kind, project_id, iid);
+    /// Mirror an accepted write in the caches so the assigned views show it
+    /// at once; the next sync reconciles.
+    fn reflect(&self, write: &Write) {
+        match write.op {
+            WriteOp::Close => self.reflect_close(write.kind, write.project_id, write.iid),
+            WriteOp::UnassignSelf => self.reflect_unassign(write.kind, write.project_id, write.iid),
+            WriteOp::PostTime { .. } | WriteOp::AssignSelf => {}
+        }
     }
 
     /// Reflect a close in the caches immediately: drop the issue from the
@@ -196,6 +217,29 @@ fn rank_key(usage: Option<UsageEntry>, updated_at_secs: u64) -> std::cmp::Revers
 /// `open_count` for the wire, from an optional usage entry.
 fn open_count_of(usage: Option<UsageEntry>) -> i64 {
     usage.map_or(0, |u| u.count as i64)
+}
+
+/// How [`Handlers::perform_write`] ended.
+enum WriteOutcome {
+    /// Applied, or queued for the retry worker.
+    Accepted,
+    NotAuthenticated(DormancyReason),
+    Rejected(Error),
+}
+
+/// Reply to a write call from its [`WriteOutcome`]. A macro because every
+/// method has its own generated call trait.
+macro_rules! reply_write {
+    ($call:expr, $outcome:expr) => {
+        match $outcome {
+            WriteOutcome::Accepted => $call.reply(),
+            WriteOutcome::NotAuthenticated(r) => {
+                let (reason, detail) = dormant_args(&r);
+                $call.reply_not_authenticated(reason, detail)
+            }
+            WriteOutcome::Rejected(e) => $call.reply_gitlab_error(e.to_string()),
+        }
+    };
 }
 
 /// A cache read for one `Search` kind, degraded to empty on failure so the
@@ -623,44 +667,17 @@ impl VarlinkInterface for Handlers {
         if !looks_like_duration(&duration) {
             return call.reply_gitlab_error(format!("invalid duration: {duration:?}"));
         }
-        let kind = internal_kind(&kind);
-        let gitlab = match self.gitlab().await {
-            Ok(g) => g,
-            Err(DormancyReason::Unreachable { .. }) => {
-                info!(
-                    project_id,
-                    iid,
-                    kind = ?kind,
-                    "PostTime while unreachable, queuing for retry"
-                );
-                self.defer_post_time(kind, project_id, iid, duration, summary)
-                    .await;
-                return call.reply();
-            }
-            Err(e) => {
-                let (reason, detail) = dormant_args(&e);
-                return call.reply_not_authenticated(reason, detail);
-            }
+        let write = Write {
+            kind: internal_kind(&kind),
+            project_id,
+            iid,
+            op: WriteOp::PostTime {
+                duration,
+                summary,
+                issuable_id: None,
+            },
         };
-        match gitlab
-            .add_spent_time(kind, project_id, iid, &duration, summary.as_deref())
-            .await
-        {
-            Ok(()) => {
-                info!(project_id, iid, kind = ?kind, duration, "posted time");
-                call.reply()
-            }
-            Err(err) if err.is_retryable(false) => {
-                warn!(error = %err, project_id, iid, "PostTime failed transiently, queuing for retry");
-                self.defer_post_time(kind, project_id, iid, duration, summary)
-                    .await;
-                call.reply()
-            }
-            Err(e) => {
-                warn!(error = %e, "PostTime rejected by GitLab");
-                call.reply_gitlab_error(e.to_string())
-            }
-        }
+        reply_write!(call, self.perform_write(write).await)
     }
 
     #[instrument(skip(self, call))]
@@ -681,11 +698,15 @@ impl VarlinkInterface for Handlers {
 
         let mut events: Vec<HistoryEvent> = Vec::new();
 
-        match self.queue.pending_post_time() {
+        match self.queue.pending() {
             Ok(pending) => {
+                let posts: Vec<_> = pending
+                    .into_iter()
+                    .filter(|p| matches!(p.write.op, WriteOp::PostTime { .. }))
+                    .collect();
                 // Title/url joins for queued MR entries come from the search
                 // corpus; only scanned when an MR is actually pending.
-                let mrs = if pending.iter().any(|p| p.kind == Issuable::MergeRequest) {
+                let mrs = if posts.iter().any(|p| p.write.kind == Issuable::MergeRequest) {
                     read_or_empty(self.search.all_mrs(), "merge requests")
                 } else {
                     Vec::new()
@@ -693,17 +714,29 @@ impl VarlinkInterface for Handlers {
                 let mr_by_key: HashMap<(i64, i64), &SearchMr> =
                     mrs.iter().map(|m| ((m.project_id, m.iid), m)).collect();
 
-                for p in pending {
-                    let (title, web_url) = match p.kind {
+                for p in posts {
+                    let Write {
+                        kind,
+                        project_id,
+                        iid,
+                        op:
+                            WriteOp::PostTime {
+                                duration, summary, ..
+                            },
+                    } = p.write
+                    else {
+                        continue;
+                    };
+                    let (title, web_url) = match kind {
                         Issuable::Issue => {
-                            let issue = by_key.get(&(p.project_id, p.iid));
+                            let issue = by_key.get(&(project_id, iid));
                             (
                                 issue.map(|i| i.title.clone()).unwrap_or_default(),
                                 issue.map(|i| i.web_url.clone()).unwrap_or_default(),
                             )
                         }
                         Issuable::MergeRequest => {
-                            let mr = mr_by_key.get(&(p.project_id, p.iid));
+                            let mr = mr_by_key.get(&(project_id, iid));
                             (
                                 mr.map(|m| m.title.clone()).unwrap_or_default(),
                                 mr.map(|m| m.web_url.clone()).unwrap_or_default(),
@@ -713,13 +746,13 @@ impl VarlinkInterface for Handlers {
                     events.push(HistoryEvent {
                         timestamp: p.queued_at_secs as i64,
                         source: "queued".to_string(),
-                        kind: wire_kind(p.kind),
-                        project_id: p.project_id,
-                        iid: p.iid,
+                        kind: wire_kind(kind),
+                        project_id,
+                        iid,
                         title,
                         web_url,
-                        duration: p.duration,
-                        summary: p.summary.unwrap_or_default(),
+                        duration,
+                        summary: summary.unwrap_or_default(),
                     });
                 }
             }
@@ -859,40 +892,13 @@ impl VarlinkInterface for Handlers {
         if let Some(msg) = issue_ref_error(project_id, iid) {
             return call.reply_gitlab_error(msg);
         }
-        let kind = internal_kind(&kind);
-        let gitlab = match self.gitlab().await {
-            Ok(g) => g,
-            Err(DormancyReason::Unreachable { .. }) => {
-                info!(
-                    project_id,
-                    iid,
-                    kind = ?kind,
-                    "Close while unreachable, queuing for retry"
-                );
-                self.defer_close(kind, project_id, iid).await;
-                return call.reply();
-            }
-            Err(e) => {
-                let (reason, detail) = dormant_args(&e);
-                return call.reply_not_authenticated(reason, detail);
-            }
+        let write = Write {
+            kind: internal_kind(&kind),
+            project_id,
+            iid,
+            op: WriteOp::Close,
         };
-        match gitlab.close(kind, project_id, iid).await {
-            Ok(()) => {
-                info!(project_id, iid, kind = ?kind, "closed issuable");
-                self.reflect_close(kind, project_id, iid);
-                call.reply()
-            }
-            Err(err) if err.is_retryable(true) => {
-                warn!(error = %err, project_id, iid, "Close failed transiently, queuing for retry");
-                self.defer_close(kind, project_id, iid).await;
-                call.reply()
-            }
-            Err(e) => {
-                warn!(error = %e, "Close rejected by GitLab");
-                call.reply_gitlab_error(e.to_string())
-            }
-        }
+        reply_write!(call, self.perform_write(write).await)
     }
 
     #[instrument(skip(self, call))]
@@ -906,39 +912,13 @@ impl VarlinkInterface for Handlers {
         if let Some(msg) = issue_ref_error(project_id, iid) {
             return call.reply_gitlab_error(msg);
         }
-        let kind = internal_kind(&kind);
-        let gitlab = match self.gitlab().await {
-            Ok(g) => g,
-            Err(DormancyReason::Unreachable { .. }) => {
-                info!(
-                    project_id,
-                    iid,
-                    kind = ?kind,
-                    "AssignSelf while unreachable, queuing for retry"
-                );
-                self.defer_assign_self(kind, project_id, iid).await;
-                return call.reply();
-            }
-            Err(e) => {
-                let (reason, detail) = dormant_args(&e);
-                return call.reply_not_authenticated(reason, detail);
-            }
+        let write = Write {
+            kind: internal_kind(&kind),
+            project_id,
+            iid,
+            op: WriteOp::AssignSelf,
         };
-        match gitlab.assign_self(kind, project_id, iid).await {
-            Ok(()) => {
-                info!(project_id, iid, kind = ?kind, "assigned self");
-                call.reply()
-            }
-            Err(err) if err.is_retryable(true) => {
-                warn!(error = %err, project_id, iid, "AssignSelf failed transiently, queuing for retry");
-                self.defer_assign_self(kind, project_id, iid).await;
-                call.reply()
-            }
-            Err(e) => {
-                warn!(error = %e, "AssignSelf rejected by GitLab");
-                call.reply_gitlab_error(e.to_string())
-            }
-        }
+        reply_write!(call, self.perform_write(write).await)
     }
 
     #[instrument(skip(self, call))]
@@ -952,40 +932,13 @@ impl VarlinkInterface for Handlers {
         if let Some(msg) = issue_ref_error(project_id, iid) {
             return call.reply_gitlab_error(msg);
         }
-        let kind = internal_kind(&kind);
-        let gitlab = match self.gitlab().await {
-            Ok(g) => g,
-            Err(DormancyReason::Unreachable { .. }) => {
-                info!(
-                    project_id,
-                    iid,
-                    kind = ?kind,
-                    "UnassignSelf while unreachable, queuing for retry"
-                );
-                self.defer_unassign_self(kind, project_id, iid).await;
-                return call.reply();
-            }
-            Err(e) => {
-                let (reason, detail) = dormant_args(&e);
-                return call.reply_not_authenticated(reason, detail);
-            }
+        let write = Write {
+            kind: internal_kind(&kind),
+            project_id,
+            iid,
+            op: WriteOp::UnassignSelf,
         };
-        match gitlab.unassign_self(kind, project_id, iid).await {
-            Ok(()) => {
-                info!(project_id, iid, kind = ?kind, "unassigned self");
-                self.reflect_unassign(kind, project_id, iid);
-                call.reply()
-            }
-            Err(err) if err.is_retryable(true) => {
-                warn!(error = %err, project_id, iid, "UnassignSelf failed transiently, queuing for retry");
-                self.defer_unassign_self(kind, project_id, iid).await;
-                call.reply()
-            }
-            Err(e) => {
-                warn!(error = %e, "UnassignSelf rejected by GitLab");
-                call.reply_gitlab_error(e.to_string())
-            }
-        }
+        reply_write!(call, self.perform_write(write).await)
     }
 
     #[instrument(skip(self, call, token))]
