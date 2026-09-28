@@ -16,10 +16,11 @@ use gitlab_trackrd::usage::UsageStats;
 use gitlab_trackrd::write::Write;
 use gitlab_trackrd::{config, db, reconnect, reload, secrets, server};
 
-/// Cache keyspaces of the stores the sync layer replaced; re-fetchable, so
-/// dropped at startup. The retry queue, dead letters and open statistics
-/// are user data and are never listed here.
-const RETIRED_KEYSPACES: [&str; 10] = [
+/// Cache keyspaces of the stores the sync layer replaced (plus the unmerged
+/// tracked-search branch's); re-fetchable, so dropped at startup. The retry
+/// queue, dead letters and open statistics are user data and are never
+/// listed here.
+const RETIRED_KEYSPACES: [&str; 11] = [
     "issues_cache_v1",
     "issues_cache_v2",
     "project_board_labels_v1",
@@ -30,6 +31,7 @@ const RETIRED_KEYSPACES: [&str; 10] = [
     "search_projects_v1",
     "search_groups_v1",
     "search_meta_v1",
+    "search_tracked_v1",
 ];
 
 #[tokio::main]
