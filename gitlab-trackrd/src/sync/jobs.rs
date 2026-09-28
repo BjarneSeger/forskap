@@ -166,6 +166,18 @@ impl Job {
             }
         }
     }
+
+    /// Like [`Self::affected_by`], for a write replayed from the queue: a
+    /// PostTime is booked at `queued_at`, and one older than the recent
+    /// window only shows in the full history.
+    pub fn affected_by_replay(write: &Write, queued_at: u64, c: &Config, now: u64) -> Vec<Job> {
+        let mut jobs = Self::affected_by(write);
+        let recent_since = now.saturating_sub(c.refresh.quick.window().as_secs());
+        if matches!(write.op, WriteOp::PostTime { .. }) && queued_at < recent_since {
+            jobs.push(Self::AllTimelogs);
+        }
+        jobs
+    }
 }
 
 /// The windows and limits a run needs, snapshotted from the config.
@@ -817,8 +829,20 @@ mod tests {
             issuable_id: None,
         };
         assert_eq!(
-            Job::affected_by(&w(Issuable::Issue, post)),
+            Job::affected_by(&w(Issuable::Issue, post.clone())),
             [Job::RecentTimelogs]
+        );
+
+        // Replayed, it is booked when it was queued: past the recent window
+        // only the full history shows it.
+        let cfg = crate::config::defaults();
+        let replayed = |queued_at| {
+            Job::affected_by_replay(&w(Issuable::Issue, post.clone()), queued_at, &cfg, NOW)
+        };
+        assert_eq!(replayed(NOW - 3600), [Job::RecentTimelogs]);
+        assert_eq!(
+            replayed(NOW - 2 * DAY),
+            [Job::RecentTimelogs, Job::AllTimelogs]
         );
     }
 }

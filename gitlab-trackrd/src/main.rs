@@ -119,7 +119,7 @@ async fn main() -> Result<()> {
         Arc::clone(&reconnect_signal),
     );
     let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config))?;
-    queue.on_settled(settle_hook(&sync));
+    queue.on_settled(settle_hook(&sync, &config));
     let handlers = Arc::new(Handlers {
         session,
         sync: Arc::clone(&sync),
@@ -165,12 +165,17 @@ async fn main() -> Result<()> {
 
 /// Once a queued write settles, show it: an applied one is noted for the
 /// read-time overlay, and either way the jobs displaying it rerun.
-fn settle_hook(sync: &Arc<SyncHandle>) -> SettleHook {
+fn settle_hook(sync: &Arc<SyncHandle>, config: &config::SharedConfig) -> SettleHook {
     let sync = Arc::clone(sync);
-    Arc::new(move |write: &Write, applied: bool| {
+    let config = Arc::clone(config);
+    Arc::new(move |write: &Write, queued_at: u64, applied: bool| {
         if applied {
             sync.note_write(write);
         }
-        sync.refresh_soon(&Job::affected_by(write));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let jobs = Job::affected_by_replay(write, queued_at, &config.read().unwrap(), now);
+        sync.refresh_soon(&jobs);
     })
 }

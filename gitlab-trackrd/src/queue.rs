@@ -78,9 +78,10 @@ impl QueuedTask {
     }
 }
 
-/// Told when the worker settles a queued write: `true` once GitLab applied
-/// it, `false` when it was dead-lettered.
-pub type SettleHook = Arc<dyn Fn(&Write, bool) + Send + Sync>;
+/// Told when the worker settles a queued write, with the unix seconds it was
+/// queued at: `true` once GitLab applied it, `false` when it was
+/// dead-lettered.
+pub type SettleHook = Arc<dyn Fn(&Write, u64, bool) + Send + Sync>;
 
 pub struct RetryQueue {
     sender: mpsc::Sender<QueuedTask>,
@@ -467,7 +468,7 @@ async fn worker(
             );
         }
         if let Some(hook) = settle_hook.get() {
-            hook(&task.write(), applied);
+            hook(&task.write(), task.queued_at_secs, applied);
         }
     }
 }
@@ -767,7 +768,7 @@ mod tests {
         let settled = Arc::new(std::sync::Mutex::new(Vec::new()));
         let hook_cell = Arc::new(OnceLock::new());
         let seen = Arc::clone(&settled);
-        let hook: SettleHook = Arc::new(move |w: &Write, applied| {
+        let hook: SettleHook = Arc::new(move |w: &Write, _queued_at, applied| {
             seen.lock().unwrap().push((w.op.name(), w.iid, applied));
         });
         let _ = hook_cell.set(hook);
