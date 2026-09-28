@@ -527,6 +527,37 @@ async fn a_queued_mr_unassign_hides_the_merge_request() {
     assert_eq!(iids, [10]);
 }
 
+/// A project sync may update a viewed row before the assigned list re-syncs:
+/// a row that is closed or no longer assigned to the user drops out at once.
+#[tokio::test]
+async fn assigned_views_follow_the_rows_current_state() {
+    let (h, _dir) = dormant_handlers();
+    seed_assigned_issues(&h);
+    let mut c = h.sync.store().begin();
+    c.set_identity(&crate::sync::store::Identity {
+        host: "gitlab.test".into(),
+        user_id: 1,
+    })
+    .unwrap();
+    c.commit().unwrap();
+
+    let mut closed = issue(1, 1, "api", "https://gl/team/api/-/issues/1");
+    closed.state = "closed".into();
+    let mut reassigned = issue(1, 2, "web", "https://gl/team/sub/web/-/issues/2");
+    reassigned.assignees = vec![UserRef {
+        id: 2,
+        username: "someone".into(),
+    }];
+    seed(&h, &[closed, reassigned]);
+
+    let iids: Vec<i64> = assigned_issues(&h, None)
+        .await
+        .iter()
+        .map(|i| i.iid)
+        .collect();
+    assert_eq!(iids, [3]);
+}
+
 // ── Assigned issues ────────────────────────────────────────────────────
 
 /// Served under a dormant session: proves the read never fetches — a fetch

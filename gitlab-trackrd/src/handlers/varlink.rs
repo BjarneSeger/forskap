@@ -138,6 +138,17 @@ impl Handlers {
             .collect()
     }
 
+    /// The user id whose data the store holds, if known.
+    fn synced_user(&self) -> Option<i64> {
+        self.store()
+            .identity()
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "identity read failed");
+                None
+            })
+            .map(|i| i.user_id)
+    }
+
     /// Every stored row of `R`, empty on a read failure.
     fn all<R: Stored>(&self) -> Vec<R> {
         self.store()
@@ -299,6 +310,14 @@ fn search_item_matches(
         || iid_query == Some(iid)
 }
 
+/// Whether an item from an assigned view still is open and assigned to `me`
+/// by its current row: a project sync may have updated the row since the
+/// view was fetched. Rows without assignee data aren't second-guessed.
+fn still_assigned(state: &str, assignees: &[model::UserRef], me: Option<i64>) -> bool {
+    state == "opened"
+        && (assignees.is_empty() || me.is_none_or(|me| assignees.iter().any(|a| a.id == me)))
+}
+
 /// Whether `web_url` lies in any of `groups` (subgroups included). No filter
 /// matches everything.
 fn in_groups(groups: &Option<Vec<String>>, web_url: &str) -> bool {
@@ -321,8 +340,11 @@ impl VarlinkInterface for Handlers {
     ) -> varlink::Result<()> {
         reply_if_cold!(self, call, Job::AssignedIssues, (Vec::new()));
 
+        let me = self.synced_user();
         let mut rows: Vec<model::Issue> = self.assigned(ASSIGNED_ISSUES, Issuable::Issue);
-        rows.retain(|i| in_groups(&groups, &i.web_url));
+        rows.retain(|i| {
+            still_assigned(&i.state, &i.assignees, me) && in_groups(&groups, &i.web_url)
+        });
         // Grouped by namespace; GitLab's order within each.
         rows.sort_by_cached_key(|i| namespace_of(&i.web_url));
 
@@ -347,9 +369,12 @@ impl VarlinkInterface for Handlers {
     ) -> varlink::Result<()> {
         reply_if_cold!(self, call, Job::AssignedMergeRequests, (Vec::new()));
 
+        let me = self.synced_user();
         let mut rows: Vec<model::MergeRequest> =
             self.assigned(ASSIGNED_MERGE_REQUESTS, Issuable::MergeRequest);
-        rows.retain(|m| in_groups(&groups, &m.web_url));
+        rows.retain(|m| {
+            still_assigned(&m.state, &m.assignees, me) && in_groups(&groups, &m.web_url)
+        });
         // The wire type carries no timestamp, so order for the picker here.
         rows.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
 
