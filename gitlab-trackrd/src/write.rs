@@ -3,8 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use tracing::warn;
+
 use crate::error::Result;
-use crate::gitlab::{GitlabApi, Issuable};
+use crate::gitlab::{GitlabApi, Issuable, Listing};
 
 /// What a write does. Persisted inside queued and dead-lettered tasks, so the
 /// variant names and field aliases are an on-disk format.
@@ -14,11 +16,11 @@ pub enum WriteOp {
         duration: String,
         summary: Option<String>,
         /// Global numeric issuable ID (issue or MR, per the task's `kind`),
-        /// resolved from the caches at enqueue time. When present, a replay
-        /// uses GraphQL `timelogCreate` so it can submit the original enqueue
-        /// time as `spentAt`. `None` means the caches didn't know the issuable
-        /// (or the entry survived a daemon upgrade), and the replay falls back
-        /// to REST without `spent_at`. The alias keeps tasks persisted before
+        /// resolved from the sync store at enqueue time. A replay uses
+        /// GraphQL `timelogCreate` with it, so it can submit the original
+        /// enqueue time as `spentAt`. `None` means the store didn't know the
+        /// issuable: the replay looks it up, and falls back to REST without
+        /// `spent_at` if that fails. The alias keeps tasks persisted before
         /// MR support readable.
         #[serde(alias = "issue_id")]
         issuable_id: Option<i64>,
@@ -72,8 +74,8 @@ pub struct Write {
 
 impl Write {
     /// Perform the write once. `queued_at_secs` is set for a replay of a
-    /// queued write: a PostTime with a known issuable id then goes through
-    /// GraphQL so GitLab records the original time rather than now.
+    /// queued write: a PostTime then goes through GraphQL so GitLab records
+    /// the original time rather than now.
     pub async fn apply(&self, gitlab: &dyn GitlabApi, queued_at_secs: Option<u64>) -> Result<()> {
         let (kind, project_id, iid) = (self.kind, self.project_id, self.iid);
         match &self.op {
@@ -81,30 +83,53 @@ impl Write {
                 duration,
                 summary,
                 issuable_id,
-            } => match (issuable_id, queued_at_secs) {
-                (Some(id), Some(queued_at)) => {
-                    let spent_at =
-                        chrono::DateTime::<chrono::Utc>::from_timestamp(queued_at as i64, 0)
-                            .unwrap_or_else(chrono::Utc::now);
-                    gitlab
-                        .create_timelog(
-                            kind,
-                            *id,
-                            duration,
-                            summary.as_deref().unwrap_or(""),
-                            spent_at,
-                        )
-                        .await
+            } => {
+                let replay = match (queued_at_secs, issuable_id) {
+                    (Some(at), Some(id)) => Some((at, *id)),
+                    (Some(at), None) => self.global_id(gitlab).await.map(|id| (at, id)),
+                    (None, _) => None,
+                };
+                match replay {
+                    Some((queued_at, id)) => {
+                        let spent_at =
+                            chrono::DateTime::<chrono::Utc>::from_timestamp(queued_at as i64, 0)
+                                .unwrap_or_else(chrono::Utc::now);
+                        let summary = summary.as_deref().unwrap_or("");
+                        gitlab
+                            .create_timelog(kind, id, duration, summary, spent_at)
+                            .await
+                    }
+                    None => {
+                        gitlab
+                            .add_spent_time(kind, project_id, iid, duration, summary.as_deref())
+                            .await
+                    }
                 }
-                _ => {
-                    gitlab
-                        .add_spent_time(kind, project_id, iid, duration, summary.as_deref())
-                        .await
-                }
-            },
+            }
             WriteOp::Close => gitlab.close(kind, project_id, iid).await,
             WriteOp::AssignSelf => gitlab.assign_self(kind, project_id, iid).await,
             WriteOp::UnassignSelf => gitlab.unassign_self(kind, project_id, iid).await,
+        }
+    }
+
+    /// The issuable's global id, for a replay whose enqueue didn't know it.
+    /// `None` when GitLab can't tell: the time then lands dated now rather
+    /// than not at all.
+    async fn global_id(&self, gitlab: &dyn GitlabApi) -> Option<i64> {
+        let listing = Listing::Issuable {
+            kind: self.kind,
+            project_id: self.project_id,
+            iid: self.iid,
+        };
+        match gitlab.list(&listing, None).await {
+            Ok(rows) => rows
+                .iter()
+                .find(|r| r["iid"].as_i64() == Some(self.iid))
+                .and_then(|r| r["id"].as_i64()),
+            Err(e) => {
+                warn!(error = %e, project_id = self.project_id, iid = self.iid, "looking up the issuable id failed");
+                None
+            }
         }
     }
 }

@@ -100,6 +100,12 @@ pub enum Listing {
     /// The user's own contribution events created after `after` (a date;
     /// GitLab compares exclusively).
     Events { after: Option<chrono::NaiveDate> },
+    /// One issue or MR by its iid, for its global id.
+    Issuable {
+        kind: Issuable,
+        project_id: i64,
+        iid: i64,
+    },
 }
 
 impl Listing {
@@ -115,6 +121,9 @@ impl Listing {
             Self::MemberGroups => "groups".into(),
             Self::ProjectBoards { project_id } => format!("projects/{project_id}/boards"),
             Self::Events { .. } => "events".into(),
+            Self::Issuable {
+                kind, project_id, ..
+            } => format!("projects/{project_id}/{}", kind.path_segment()),
         }
     }
 
@@ -152,6 +161,7 @@ impl Listing {
                 .map(|d| ("after", d.format("%Y-%m-%d").to_string()))
                 .into_iter()
                 .collect(),
+            Self::Issuable { iid, .. } => vec![("iids[]", iid.to_string())],
         };
         params.sort();
         params
@@ -1098,6 +1108,15 @@ mod tests {
                 },
                 "events",
                 "after=2026-06-30",
+            ),
+            (
+                Listing::Issuable {
+                    kind: Issuable::MergeRequest,
+                    project_id: 7,
+                    iid: 3,
+                },
+                "projects/7/merge_requests",
+                "iids[]=3",
             ),
         ];
         for (listing, path, query) in cases {

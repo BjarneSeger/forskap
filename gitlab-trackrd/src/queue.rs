@@ -845,6 +845,38 @@ mod tests {
         assert_eq!(calls(&gitlab, "add_spent_time"), 0);
     }
 
+    /// A PostTime queued without the issuable's global id (not in the
+    /// store at enqueue) looks it up, so the replay keeps its time.
+    #[tokio::test]
+    async fn worker_looks_up_a_missing_issuable_id_for_the_replay() {
+        let (s, _td) = store();
+        s.put(1, &post_task(7, 100)).unwrap();
+        let gitlab = Arc::new(FakeGitlab::default());
+        gitlab.serve(
+            "projects/7/issues",
+            vec![crate::testing::issue_json(7, 7, "t")],
+        );
+
+        let task = QueuedTask {
+            id: 1,
+            project_id: 7,
+            iid: 7,
+            kind: Issuable::Issue,
+            op: WriteOp::PostTime {
+                duration: "1h".into(),
+                summary: None,
+                issuable_id: None,
+            },
+            queued_at_secs: 100,
+        };
+        run_worker_one_task(gitlab.clone(), s.clone(), task).await;
+
+        assert_eq!(
+            gitlab.writes(),
+            [("create_timelog", Issuable::Issue, 0, 7007)]
+        );
+    }
+
     #[tokio::test]
     async fn worker_drops_task_on_permanent_error() {
         let (s, _td) = store();

@@ -163,7 +163,7 @@ impl Handlers {
 
     /// The global numeric id GraphQL embeds in `gid://gitlab/<Kind>/<id>`,
     /// so a queued PostTime can keep its time. `None` when not stored — the
-    /// queue then falls back to REST without a `spent_at`.
+    /// replay then looks it up.
     fn resolve_issuable_id(&self, kind: Issuable, project_id: i64, iid: i64) -> Option<i64> {
         let key = (project_id.max(0) as u64, iid.max(0) as u64);
         let id = match kind {
