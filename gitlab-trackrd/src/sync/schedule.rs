@@ -37,7 +37,7 @@ pub struct Cadence {
 pub const SERVER_BACKOFF_CAP: u64 = 3600;
 /// Backoff cap after a permanent rejection (403 on a lost project, …).
 pub const REJECTED_BACKOFF_CAP: u64 = 6 * 3600;
-/// Worker-wide pause cap after a 429 without `Retry-After`.
+/// Cap on the worker-wide pause after a 429, `Retry-After` included.
 pub const RATE_LIMIT_PAUSE_CAP: u64 = 3600;
 const BACKOFF_BASE: u64 = 60;
 
@@ -47,7 +47,9 @@ pub fn due_at(key: &str, state: &JobState, cadence: Cadence, fingerprint: u64, j
     if state.last_ok == 0 || state.fingerprint != fingerprint {
         return state.retry_at;
     }
-    let next = state.last_ok + jittered(cadence.every, key, state.last_ok, jitter);
+    let next = state
+        .last_ok
+        .saturating_add(jittered(cadence.every, key, state.last_ok, jitter));
     next.max(state.retry_at)
 }
 
@@ -65,7 +67,10 @@ pub fn run_is_full(
     };
     state.last_full == 0
         || state.fingerprint != fingerprint
-        || now >= state.last_full + jittered(full_every, key, !state.last_full, jitter)
+        || now
+            >= state
+                .last_full
+                .saturating_add(jittered(full_every, key, !state.last_full, jitter))
 }
 
 /// `secs` scaled by a factor in `[1 - jitter, 1 + jitter]`, deterministic in
@@ -199,6 +204,21 @@ mod tests {
             full_every: None,
         };
         assert!(run_is_full("k", &s, full_only, 1, 0.0, 1_001));
+    }
+
+    proptest! {
+        /// Events use `u64::MAX` for "never full again"; jitter must not
+        /// overflow it into a panic.
+        #[test]
+        fn a_never_full_cadence_never_overflows(
+            key in "[a-z]{1,8}",
+            at in 1u64..4_000_000_000,
+            jitter in 0.0f64..0.5,
+        ) {
+            let never = Cadence { every: u64::MAX, full_every: Some(u64::MAX) };
+            prop_assert!(!run_is_full(&key, &synced(at, 1), never, 1, jitter, at + 1));
+            prop_assert!(due_at(&key, &synced(at, 1), never, 1, jitter) > at);
+        }
     }
 
     #[test]

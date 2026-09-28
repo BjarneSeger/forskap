@@ -538,11 +538,13 @@ impl Worker {
                 ..
             } => {
                 self.rate_limits += 1;
-                let pause = retry_after.map_or_else(
-                    || schedule::backoff(self.rate_limits, RATE_LIMIT_PAUSE_CAP),
-                    |d| d.as_secs(),
-                );
-                self.paused_until = now_secs() + pause.max(1);
+                let pause = retry_after
+                    .map_or_else(
+                        || schedule::backoff(self.rate_limits, RATE_LIMIT_PAUSE_CAP),
+                        |d| d.as_secs(),
+                    )
+                    .clamp(1, RATE_LIMIT_PAUSE_CAP);
+                self.paused_until = now_secs().saturating_add(pause);
                 warn!(job = %key, pause_secs = pause, "GitLab rate limit hit; pausing the sync");
             }
             Error::Throttled { .. } => {
@@ -567,7 +569,7 @@ impl Worker {
         );
         let next = JobState {
             failures,
-            retry_at: now_secs() + delay.max(1),
+            retry_at: now_secs().saturating_add(delay.max(1)),
             ..state
         };
         let persisted = (|| -> Result<()> {
