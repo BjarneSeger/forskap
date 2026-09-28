@@ -72,6 +72,7 @@ async fn lookup_url(
             format!("#{iid}"),
             Some(vec![wire_kind.to_string()]),
             Some(LOOKUP_LIMIT),
+            Some(false),
         )
         .call()
         .await

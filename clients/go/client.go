@@ -99,13 +99,15 @@ type SearchResults struct {
 	Groups        []Group
 }
 
-// Search searches the daemon's locally cached corpus (no GitLab round-trip).
+// Search searches the daemon's corpus; while connected the daemon also runs a
+// bounded live GitLab lookup and merges it in, unless live points to false
+// (nil = live, so a call may take up to the daemon's live deadline).
 // kinds optionally restricts the reply to a subset of "issues", "merge_requests",
 // "projects", "groups" (nil = all four); limit caps each result set separately
 // (nil = daemon default of 50). Issues and MRs come most-opened first (see
 // RecordOpen); an empty query lists only items with recorded opens.
-func (c *Client) Search(ctx context.Context, query string, kinds *[]string, limit *int64) (SearchResults, error) {
-	issues, mrs, projects, groups, err := Search().Call(ctx, c.conn, query, kinds, limit)
+func (c *Client) Search(ctx context.Context, query string, kinds *[]string, limit *int64, live *bool) (SearchResults, error) {
+	issues, mrs, projects, groups, err := Search().Call(ctx, c.conn, query, kinds, limit, live)
 	return SearchResults{issues, mrs, projects, groups}, err
 }
 

@@ -6,7 +6,8 @@
 //! GitLab" marker. The daemon's contract is deterministic: an error is one
 //! terminal reply, a success is exactly two. `--output json` sticks to the
 //! plain single-reply call so scripts get one complete document (the daemon
-//! folds the live results in before answering).
+//! folds the live results in before answering). `--no-live` asks for the
+//! cache alone, so both formats reply instantly.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -27,6 +28,7 @@ pub async fn run(
     query: Option<String>,
     kinds: Vec<SearchKind>,
     limit: Option<i64>,
+    no_live: bool,
     output: OutputFormat,
 ) -> Result<()> {
     let cfg = config::load()?;
@@ -37,18 +39,19 @@ pub async fn run(
     // No query → the daemon's "frequently opened" view (only items with opens).
     let frequent_only = query.as_deref().is_none_or(|q| q.trim().is_empty());
     let query = query.unwrap_or_default();
+    let live = no_live.then_some(false);
 
     match output {
         OutputFormat::Json => {
             let reply = client
-                .search(query, filter, limit)
+                .search(query, filter, limit, live)
                 .call()
                 .await
                 .map_err(|e| crate::friendly::friendly("Search", e))?;
             println!("{}", serde_json::to_string_pretty(&reply)?);
         }
         OutputFormat::Text => {
-            let mut call = client.search(query, filter, limit);
+            let mut call = client.search(query, filter, limit, live);
             let call = call
                 .more()
                 .await

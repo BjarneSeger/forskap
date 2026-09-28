@@ -74,7 +74,7 @@ method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
 
 method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)
 
-method Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
+method Search(query: string, kinds: ?[]string, limit: ?int, live: ?bool) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
 
 method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
 

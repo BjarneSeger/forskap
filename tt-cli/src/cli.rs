@@ -79,6 +79,10 @@ pub enum Command {
         /// Maximum results per kind (daemon default: 50).
         #[arg(long)]
         limit: Option<i64>,
+        /// Answer from the daemon's cache only, skipping the live GitLab
+        /// lookup: instant, and spares GitLab's search rate limit.
+        #[arg(long)]
+        no_live: bool,
     },
     /// Open an issue or merge request in the browser and count the open, so
     /// it ranks higher in `tt search` (and launchers built on it).

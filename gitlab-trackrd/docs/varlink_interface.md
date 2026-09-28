@@ -163,7 +163,7 @@ daemon predating assignee capture): empty list if a session exists,
 `NotAuthenticated` otherwise. `ClearCache` scope `search` clears and refills this
 view.
 
-### `Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group)`
+### `Search(query: string, kinds: ?[]string, limit: ?int, live: ?bool) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group)`
 
 Searches the corpus, transparently refreshed: under the default tracked population
 a connected daemon also asks GitLab live — the dedicated `/search` API for issues
@@ -176,6 +176,9 @@ is bounded by `search.live_limit` (default 100) and its own
 kinds that answered; on timeout, per-kind failure, dormancy, an eager population,
 or a repeat of an identical query within `search.live_debounce_secs`, the affected
 kinds degrade to the pure local read. A live failure never disturbs the session.
+`live: false` skips the live phase outright (omitted = `true`) — for callers that
+search per keystroke, like the launcher, where the lookup's latency and GitLab's
+search rate limit don't fit.
 
 Local matching is a case-insensitive substring test on issue/MR titles and labels
 and on project/group names and paths; a query of the exact form `#123` additionally
@@ -201,8 +204,8 @@ plain recency order.
 instant local corpus results with `"continues": true`, then, after the live lookup,
 the merged results as the terminal reply. The frame count is deterministic: an
 error is always a single terminal frame, a success always exactly two (while
-dormant the second frame just repeats the cache read), so clients may count frames
-instead of parsing `continues`. `tt search` uses this; `varlinkctl call --more`
+dormant or with `live: false` the second frame just repeats the cache read), so
+clients may count frames instead of parsing `continues`. `tt search` uses this; `varlinkctl call --more`
 shows both frames.
 
 What the corpus contains depends on `[search] population`: `"tracked"` (what the

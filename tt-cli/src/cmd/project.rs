@@ -84,6 +84,9 @@ pub async fn resolve(iid: i64, kind: RefKind, socket: &str) -> Result<i64> {
             format!("#{iid}"),
             Some(vec!["merge_requests".to_string()]),
             Some(SEARCH_FALLBACK_LIMIT),
+            // Cache only: instance-wide live hits for `#iid` would make the
+            // fallback falsely ambiguous.
+            Some(false),
         )
         .call()
         .await

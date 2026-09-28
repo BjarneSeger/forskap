@@ -42,7 +42,7 @@ func Example() {
 		fmt.Printf("!%d %s %v\n", mr.Iid, mr.Title, mr.Assignees)
 	}
 
-	res, err := c.Search(ctx, "billing", nil, nil)
+	res, err := c.Search(ctx, "billing", nil, nil, nil)
 	if err != nil {
 		log.Fatal(err)
 	}

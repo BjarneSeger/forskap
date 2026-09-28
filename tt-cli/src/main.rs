@@ -41,7 +41,8 @@ async fn main() -> Result<()> {
             query,
             kinds,
             limit,
-        } => cmd::search::run(query, kinds, limit, output).await,
+            no_live,
+        } => cmd::search::run(query, kinds, limit, no_live, output).await,
         Command::Open {
             issuable,
             mr,

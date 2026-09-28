@@ -1369,6 +1369,7 @@ async fn run_search(
         query.to_string(),
         kinds,
         limit,
+        None,
     )
     .await
     .unwrap();
@@ -2158,6 +2159,30 @@ async fn search_ranks_live_hits_by_opens_and_frequent_view_stays_local() {
 }
 
 #[tokio::test]
+async fn search_live_false_stays_a_cache_read_while_connected() {
+    use gitlab_trackr_api::AsyncCall;
+    let fake = Arc::new(canned_search_fake());
+    *fake.live_issues.lock().unwrap() = vec![search_issue(70, "oauth live")];
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    seed_search_cache(&h);
+
+    let mut call = AsyncCall::default();
+    h.search(
+        &mut call as &mut dyn Call_Search,
+        "oauth".to_string(),
+        Some(vec!["issues".into()]),
+        None,
+        Some(false),
+    )
+    .await
+    .unwrap();
+
+    let r = reply_search(&mut call);
+    assert_eq!(r.issues.iter().map(|i| i.id).collect::<Vec<_>>(), vec![1]);
+    assert_eq!(fake.live_calls(), 0, "live: false never asks GitLab");
+}
+
+#[tokio::test]
 async fn search_live_hit_updates_and_dedupes_with_cached_row() {
     let fake = Arc::new(canned_search_fake());
     let mut fresher = search_issue(1, "OAuth token refresh (edited)");
@@ -2232,6 +2257,7 @@ async fn search_cold_cache_dormant_is_not_authenticated() {
     h.search(
         &mut call as &mut dyn Call_Search,
         "anything".to_string(),
+        None,
         None,
         None,
     )
@@ -2834,6 +2860,7 @@ proptest! {
                 query.clone(),
                 kinds.clone(),
                 limit,
+                None,
             )
             .await
             .unwrap();
@@ -2890,8 +2917,14 @@ proptest! {
         prop_rt().block_on(async {
             let (h, _dir) = dormant_handlers();
             let mut call = AsyncCall::default();
-            h.search(&mut call as &mut dyn Call_Search, query.clone(), None, limit)
-                .await
+            h.search(
+                &mut call as &mut dyn Call_Search,
+                query.clone(),
+                None,
+                limit,
+                None,
+            )
+            .await
                 .unwrap();
             let reply = call.take_reply().expect("a reply");
             assert_eq!(

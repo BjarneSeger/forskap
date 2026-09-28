@@ -254,8 +254,8 @@ type Search_methods struct{}
 
 func Search() Search_methods { return Search_methods{} }
 
-func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]string, limit_in_ *int64) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, err_ error) {
-	receive, err_ := m.Send(ctx, c, 0, query_in_, kinds_in_, limit_in_)
+func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]string, limit_in_ *int64, live_in_ *bool) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, query_in_, kinds_in_, limit_in_, live_in_)
 	if err_ != nil {
 		return
 	}
@@ -263,15 +263,17 @@ func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_i
 	return
 }
 
-func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, query_in_ string, kinds_in_ *[]string, limit_in_ *int64) (func(ctx context.Context) ([]Issue, []MergeRequest, []Project, []Group, uint64, error), error) {
+func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, query_in_ string, kinds_in_ *[]string, limit_in_ *int64, live_in_ *bool) (func(ctx context.Context) ([]Issue, []MergeRequest, []Project, []Group, uint64, error), error) {
 	var in struct {
 		Query string    `json:"query"`
 		Kinds *[]string `json:"kinds,omitempty"`
 		Limit *int64    `json:"limit,omitempty"`
+		Live  *bool     `json:"live,omitempty"`
 	}
 	in.Query = query_in_
 	in.Kinds = kinds_in_
 	in.Limit = limit_in_
+	in.Live = live_in_
 	receive, err := c.Send(ctx, "org.thehoster.gitlab.trackrd.Search", in, flags)
 	if err != nil {
 		return nil, err
@@ -296,15 +298,17 @@ func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags u
 	}, nil
 }
 
-func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]string, limit_in_ *int64) (func(ctx context.Context) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]string, limit_in_ *int64, live_in_ *bool) (func(ctx context.Context) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
 		Query string    `json:"query"`
 		Kinds *[]string `json:"kinds,omitempty"`
 		Limit *int64    `json:"limit,omitempty"`
+		Live  *bool     `json:"live,omitempty"`
 	}
 	in.Query = query_in_
 	in.Kinds = kinds_in_
 	in.Limit = limit_in_
+	in.Live = live_in_
 	receive, err := c.Upgrade(ctx, "org.thehoster.gitlab.trackrd.Search", in)
 	if err != nil {
 		return nil, err
@@ -1096,7 +1100,7 @@ func (m WhoAmI_methods) Upgrade(ctx context.Context, c *varlink.Connection) (fun
 type orgthehostergitlabtrackrdInterface interface {
 	GetAssignedIssues(ctx context.Context, c VarlinkCall, groups_ *[]string) error
 	GetAssignedMergeRequests(ctx context.Context, c VarlinkCall, groups_ *[]string) error
-	Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]string, limit_ *int64) error
+	Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]string, limit_ *int64, live_ *bool) error
 	PostTime(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind, duration_ string, summary_ *string) error
 	Close(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	AssignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
@@ -1244,7 +1248,7 @@ func (s *VarlinkInterface) GetAssignedMergeRequests(ctx context.Context, c Varli
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.gitlab.trackrd.GetAssignedMergeRequests")
 }
 
-func (s *VarlinkInterface) Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]string, limit_ *int64) error {
+func (s *VarlinkInterface) Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]string, limit_ *int64, live_ *bool) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.gitlab.trackrd.Search")
 }
 
@@ -1333,12 +1337,13 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 			Query string    `json:"query"`
 			Kinds *[]string `json:"kinds,omitempty"`
 			Limit *int64    `json:"limit,omitempty"`
+			Live  *bool     `json:"live,omitempty"`
 		}
 		err := call.GetParameters(&in)
 		if err != nil {
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
-		return s.orgthehostergitlabtrackrdInterface.Search(ctx, VarlinkCall{call}, in.Query, in.Kinds, in.Limit)
+		return s.orgthehostergitlabtrackrdInterface.Search(ctx, VarlinkCall{call}, in.Query, in.Kinds, in.Limit, in.Live)
 
 	case "PostTime":
 		var in struct {
@@ -1555,7 +1560,7 @@ method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
 
 method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)
 
-method Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
+method Search(query: string, kinds: ?[]string, limit: ?int, live: ?bool) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
 
 method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
 

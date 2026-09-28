@@ -1,11 +1,13 @@
 -- Noctalia launcher provider for gitlab-trackrd: `/gl <query>`.
 --
 -- Thin by design, like `tt` itself: every query is one `tt search --output
--- json` run, every activation one `tt open` (issues/MRs — which also records
--- the open so the daemon ranks it higher next time) or `xdg-open`
--- (projects/groups). The daemon owns ranking; results are emitted in its
--- order with `score = open_count`, so frequently opened issues and MRs
--- interleave across kinds instead of one kind always sitting on top.
+-- json --no-live` run, every activation one `tt open` (issues/MRs — which
+-- also records the open so the daemon ranks it higher next time) or
+-- `xdg-open` (projects/groups). `--no-live` because queries fire per
+-- keystroke — far too often for the daemon's live GitLab lookup. The daemon
+-- owns ranking; results are emitted in its order with `score = open_count`,
+-- so frequently opened issues and MRs interleave across kinds instead of one
+-- kind always sitting on top.
 
 local CATEGORY = {
   issues = "Issues",
@@ -142,7 +144,7 @@ end
 
 function onQuery(text)
   local kind, query = parseQuery(text)
-  local argv = { ttPath(), "search", "--output", "json" }
+  local argv = { ttPath(), "search", "--output", "json", "--no-live" }
   local limit = noctalia.getConfig("limit")
   if limit ~= nil then
     table.insert(argv, "--limit")

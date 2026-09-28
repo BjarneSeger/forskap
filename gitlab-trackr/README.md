@@ -1,7 +1,8 @@
 # GitLab Trackr — noctalia launcher provider
 
 A [noctalia-shell](https://noctalia.dev) plugin that puts `tt search` behind the
-launcher prefix `/gl`. Results come from the daemon's cache (instant, works offline),
+launcher prefix `/gl`. Results come from the daemon's cache (instant, works offline;
+the plugin passes `--no-live`, so for GitLab's live search run `tt search` itself),
 activating an issue or merge request opens it in the browser through `tt open` — which
 also counts the open, so what you visit most ranks first. Projects and groups open via
 `xdg-open`.

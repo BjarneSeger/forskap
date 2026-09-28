@@ -810,8 +810,10 @@ impl VarlinkInterface for Handlers {
         query: String,
         kinds: Option<Vec<String>>,
         limit: Option<i64>,
+        live: Option<bool>,
     ) -> varlink::Result<()> {
-        self.search_impl(call, query, kinds, limit, true).await
+        self.search_impl(call, query, kinds, limit, live.unwrap_or(true))
+            .await
     }
 
     #[instrument(skip(self, call))]

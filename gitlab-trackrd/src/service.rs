@@ -103,7 +103,8 @@ impl crate::server::ConnectionHandler for ServiceHandler {
 ///
 /// The frame count is deliberately deterministic: an error is one terminal
 /// frame (varlink errors always end an exchange), a success is exactly two —
-/// even while dormant, where phase 2 degrades to a cache re-read. varlink
+/// even while dormant or with `live: false`, where phase 2 degrades to a
+/// cache re-read. varlink
 /// 13's async client does not expose the `continues` flag, so `tt` counts
 /// frames instead of reading it; this contract is documented in
 /// `docs/varlink_interface.md`.
@@ -157,6 +158,7 @@ async fn handle_search_streamed(
             args.query,
             args.kinds,
             args.limit,
+            args.live,
         )
         .await?;
     if let Some(reply) = call.take_reply() {
@@ -348,6 +350,7 @@ async fn handle_trackrd(
                     args.query,
                     args.kinds,
                     args.limit,
+                    args.live,
                 )
                 .await?;
         }
@@ -581,6 +584,24 @@ mod tests {
             issue_ids(&frames[1]).contains(&70),
             "phase 2 folds in the live hit"
         );
+    }
+
+    #[tokio::test]
+    async fn search_with_more_and_live_false_sends_two_cached_frames() {
+        let (h, _dir) = crate::handlers::tests::connected_with_live_hit(None);
+        let handler = ServiceHandler::new(Arc::new(h));
+        let request = frame(
+            "org.thehoster.gitlab.trackrd.Search",
+            serde_json::json!({"query": "oauth", "kinds": ["issues"], "live": false}),
+            true,
+        );
+
+        let frames = drive_frames(&handler, &request).await;
+
+        assert_eq!(frames.len(), 2, "deterministic frame count: {frames:?}");
+        assert!(continues(&frames[0]));
+        assert!(!continues(&frames[1]));
+        assert_eq!(issue_ids(&frames[1]), vec![1], "no live merge");
     }
 
     #[tokio::test]
