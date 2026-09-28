@@ -63,7 +63,7 @@ pub struct Config {
     #[config(nested)]
     pub reconnect: ReconnectConfig,
 
-    /// Search-cache population and sync cadence.
+    /// Search-corpus population and per-project sync cadence.
     #[config(nested)]
     pub search: SearchConfig,
 
@@ -496,7 +496,8 @@ fn normalize_sync(sync: &mut SyncConfig) {
     }
 }
 
-/// Clamp the search sync cadences into a sane range and warn on any change.
+/// Clamp the corpus sync cadences and the tracked retention into a sane
+/// range and warn on any change.
 /// A partial interval of 0 would busy-spin the sync loop; a full interval
 /// below the partial one would make every sync a full resync.
 fn normalize_search(search: &mut SearchConfig) {

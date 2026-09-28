@@ -59,8 +59,8 @@ pub enum Command {
         /// query several groups; the daemon merges their results.
         #[arg(long = "group", value_name = "GROUP")]
         groups: Vec<String>,
-        /// List your open merge requests instead of issues. Served from the
-        /// search corpus, so freshness follows the search sync cadence.
+        /// List your open merge requests instead of issues. Synced on the
+        /// same cadence as the assigned issues.
         #[arg(long)]
         mrs: bool,
     },
@@ -69,7 +69,7 @@ pub enum Command {
     /// case-insensitively; a query like `#123` finds issues/MRs by number.
     /// Issues/MRs you open often (`tt open`) rank first; with no query at all
     /// it lists just those. Pure cache read — freshness comes from the
-    /// background search sync.
+    /// daemon's background sync.
     Search {
         /// Search text. Omit it to list the frequently opened issues/MRs.
         query: Option<String>,

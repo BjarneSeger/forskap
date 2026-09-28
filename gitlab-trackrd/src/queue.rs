@@ -2,9 +2,10 @@
 //!
 //! Tasks are persisted via `KvStore` before being processed, so they survive
 //! daemon restarts.  A background tokio task works through the queue with
-//! exponential backoff (1 s base, 30 min cap).  Network errors trigger
-//! retries for up to 7 days; a GitLab rejection or an exhausted retry window
-//! moves the task to a persistent dead-letter store, surfaced via `tt queue`.
+//! exponential backoff (1 s base, 30 min cap).  Network errors, 429s, and 5xx
+//! on idempotent ops trigger retries for up to 7 days; a GitLab rejection or
+//! an exhausted retry window moves the task to a persistent dead-letter
+//! store, surfaced via `tt queue`. Either way the settle hook hears about it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
