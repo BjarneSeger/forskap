@@ -40,6 +40,11 @@ const SEARCH_KINDS: [&str; 4] = ["issues", "merge_requests", "projects", "groups
 /// Per-kind result cap when the caller doesn't pass a `limit`.
 const DEFAULT_SEARCH_LIMIT: usize = 50;
 
+/// Shortest query the live lookup runs for. GitLab logs sub-2-char `/search`
+/// terms as abusive, and its issue search has no partial matching, so short
+/// prefixes only spend the search rate limit.
+const LIVE_MIN_QUERY_CHARS: usize = 3;
+
 impl Handlers {
     /// The global numeric issuable ID (the one GraphQL embeds in
     /// `gid://gitlab/<Kind>/<id>`) for a cached `(project, iid)`, so a queued
@@ -377,8 +382,9 @@ impl Handlers {
     }
 
     /// Run the bounded live micro-sync for one `Search` call, if eligible.
-    /// `None` means the live phase was not in play (eager population or
-    /// dormant session) and the cold-cache guard applies as it always did;
+    /// `None` means the live phase was not in play (query too short, eager
+    /// population, or dormant session) and the cold-cache guard applies as it
+    /// always did;
     /// `Some` means the transparent path handled the call — possibly with
     /// empty hits, since debounced repeats, per-kind failures, and deadline
     /// expiry all degrade to "just the cache". A live problem is never a
@@ -390,6 +396,9 @@ impl Handlers {
         kinds: &[String],
         want: &impl Fn(&str) -> bool,
     ) -> Option<LiveHits> {
+        if needle.chars().count() < LIVE_MIN_QUERY_CHARS {
+            return None;
+        }
         let (tracked_mode, deadline, live_limit, debounce) = {
             let c = self.config.read().unwrap();
             (

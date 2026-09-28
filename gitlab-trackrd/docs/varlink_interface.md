@@ -178,7 +178,9 @@ or a repeat of an identical query within `search.live_debounce_secs`, the affect
 kinds degrade to the pure local read. A live failure never disturbs the session.
 `live: false` skips the live phase outright (omitted = `true`) — for callers that
 search per keystroke, like the launcher, where the lookup's latency and GitLab's
-search rate limit don't fit.
+search rate limit don't fit. Queries shorter than 3 characters (after trimming)
+never run it either: GitLab rejects sub-2-character search terms as abusive and
+matches issues by whole words only.
 
 Local matching is a case-insensitive substring test on issue/MR titles and labels
 and on project/group names and paths; a query of the exact form `#123` additionally

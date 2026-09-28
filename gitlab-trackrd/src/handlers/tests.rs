@@ -2183,6 +2183,20 @@ async fn search_live_false_stays_a_cache_read_while_connected() {
 }
 
 #[tokio::test]
+async fn search_short_query_skips_the_live_lookup() {
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    seed_search_cache(&h);
+
+    let r = run_search(&h, " oA ", None, None).await;
+    assert_eq!(r.issues.len(), 1, "still served from the cache");
+    assert_eq!(fake.live_calls(), 0, "two chars never reach GitLab");
+
+    run_search(&h, "#12", None, None).await;
+    assert!(fake.live_calls() > 0, "three chars (an iid ref) do");
+}
+
+#[tokio::test]
 async fn search_live_hit_updates_and_dedupes_with_cached_row() {
     let fake = Arc::new(canned_search_fake());
     let mut fresher = search_issue(1, "OAuth token refresh (edited)");
