@@ -203,7 +203,9 @@ pub trait GitlabApi: Send + Sync {
     -> Result<Vec<serde_json::Value>>;
 
     /// The user's timelogs with `spent_at >= since`, newest first. GitLab has
-    /// no REST listing for them, so this is the one GraphQL read.
+    /// no REST listing for them, so this is the one GraphQL read. A timelog
+    /// whose issue or MR the user can no longer read comes with `iid` 0: it
+    /// exists, but its details are gone.
     async fn list_timelogs(&self, since: chrono::DateTime<chrono::Utc>) -> Result<Vec<Timelog>>;
 }
 
@@ -837,9 +839,9 @@ fn timelogs_page(raw: &serde_json::Value) -> Result<(Vec<Timelog>, Option<String
     Ok((nodes.iter().filter_map(timelog_from_node).collect(), next))
 }
 
-/// Parse one `currentUser.timelogs` node. `None` skips the node: an
-/// unparsable timelog GID, or a timelog attached to neither an issue nor a
-/// merge request (e.g. the issuable is no longer visible to the user).
+/// Parse one `currentUser.timelogs` node; `None` for an unparsable timelog
+/// GID. A timelog attached to neither an issue nor a merge request (the
+/// issuable is no longer visible to the user) comes back with `iid` 0.
 fn timelog_from_node(n: &serde_json::Value) -> Option<Timelog> {
     let id = parse_gid(n["id"].as_str().unwrap_or(""))?;
 
@@ -848,7 +850,7 @@ fn timelog_from_node(n: &serde_json::Value) -> Option<Timelog> {
     } else if !n["mergeRequest"].is_null() {
         (Issuable::MergeRequest, &n["mergeRequest"])
     } else {
-        return None;
+        (Issuable::default(), &serde_json::Value::Null)
     };
 
     let spent_at = n["spentAt"].as_str().unwrap_or("");
@@ -1254,8 +1256,8 @@ mod tests {
         assert_eq!(t.iid, 5);
         assert_eq!(t.title, "M");
 
-        // A timelog whose issuable is no longer visible: today's iid-0 junk
-        // rows — now skipped outright.
+        // A timelog whose issuable is no longer visible: it exists, but
+        // without an iid (so it's never stored as a row of its own).
         let orphan = serde_json::json!({
             "id": "gid://gitlab/Timelog/13",
             "timeSpent": 60,
@@ -1263,7 +1265,9 @@ mod tests {
             "issue": null,
             "mergeRequest": null,
         });
-        assert!(timelog_from_node(&orphan).is_none());
+        let t = timelog_from_node(&orphan).unwrap();
+        assert_eq!((t.id, t.iid), (13, 0));
+        assert!(!crate::sync::model::Resource::is_valid(&t));
 
         // Missing project field → 0, the enrichment fallback marker.
         let no_project = serde_json::json!({

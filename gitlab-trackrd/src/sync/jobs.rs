@@ -435,16 +435,23 @@ async fn events(ctx: &FetchCtx) -> Result<Staged> {
 async fn timelogs(ctx: &FetchCtx, window: u64, prune: bool) -> Result<Staged> {
     let since = ctx.started.saturating_sub(window);
     let since_dt = chrono::DateTime::from_timestamp(since as i64, 0).unwrap_or_default();
-    let fetched: Vec<Timelog> = ctx
+    let (fetched, unreadable): (Vec<Timelog>, Vec<Timelog>) = ctx
         .gitlab
         .list_timelogs(since_dt)
         .await?
         .into_iter()
-        .filter(|t| t.is_valid() && t.spent_at >= since)
+        .filter(|t| t.id > 0 && t.spent_at >= since)
+        .partition(Resource::is_valid);
+    // Time logged on an issue the user can no longer read still counts:
+    // keep what was stored for it.
+    let keep: HashSet<RowKey> = fetched
+        .iter()
+        .chain(&unreadable)
+        .map(Resource::key)
         .collect();
     Ok(Staged::new(move |c| {
         c.upsert(&fetched)?;
-        c.reconcile(RowScope::Since(since), &fetched)?;
+        c.remove_where::<Timelog>(RowScope::Since(since), |k| keep.contains(&k))?;
         if prune {
             c.remove_where::<Timelog>(RowScope::Before(since), |_| false)?;
         }
@@ -770,6 +777,17 @@ mod tests {
         // is outside that window and stays.
         fake.serve_timelogs(vec![log(2, NOW - 2 * DAY)]);
         run(&s, Job::RecentTimelogs, ctx(&fake, true, 0)).await;
+        assert_eq!(ids(&s), [2]);
+
+        // #2's issue became unreadable: it is still listed, without details,
+        // and keeps its stored row.
+        let hidden = Timelog {
+            iid: 0,
+            title: String::new(),
+            ..log(2, NOW - 2 * DAY)
+        };
+        fake.serve_timelogs(vec![hidden]);
+        run(&s, Job::AllTimelogs, ctx(&fake, true, 0)).await;
         assert_eq!(ids(&s), [2]);
         assert_eq!(
             fake.timelog_calls()[1],
