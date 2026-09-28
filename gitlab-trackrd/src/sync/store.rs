@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::model::{Board, Event, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog};
-use super::schedule::JobState;
+use super::schedule::{JobState, fingerprint};
 use crate::error::Result;
+use crate::write::{Write, WriteOp};
 
 const VIEWS_KEYSPACE: &str = "sync_views_v1";
 const JOBS_KEYSPACE: &str = "sync_jobs_v1";
@@ -135,7 +136,38 @@ stored!(
     Board => boards,
     Event => events,
     Timelog => timelogs,
+    NotedWrite => noted,
 );
+
+/// A write GitLab applied at `at`. Kept so views fetched before it are
+/// corrected at read time, after a restart too.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotedWrite {
+    pub write: Write,
+    pub at: u64,
+}
+
+impl Resource for NotedWrite {
+    const NAME: &'static str = "noted writes";
+    const KEYSPACE: &'static str = "sync_noted_v1";
+    const SCHEMA: u32 = 1;
+    /// By time, then by what was written, so one write noted twice in a
+    /// second is one row.
+    fn key(&self) -> RowKey {
+        let w = &self.write;
+        let op = match w.op {
+            WriteOp::PostTime { .. } => 0,
+            WriteOp::Close => 1,
+            WriteOp::AssignSelf => 2,
+            WriteOp::UnassignSelf => 3,
+        };
+        let what = fingerprint(&[w.kind as u64, w.project_id as u64, w.iid as u64, op]);
+        (self.at, what)
+    }
+    fn is_valid(&self) -> bool {
+        true
+    }
+}
 
 /// The ordered keys a listing returned whose rows can't be told apart by
 /// their own fields (e.g. "assigned to me"), plus when that fetch started.
@@ -163,6 +195,7 @@ pub struct SyncStore {
     pub boards: Table<Board>,
     pub events: Table<Event>,
     pub timelogs: Table<Timelog>,
+    pub noted: Table<NotedWrite>,
     views: Keyspace,
     jobs: Keyspace,
     meta: Keyspace,
@@ -181,6 +214,7 @@ impl SyncStore {
             boards: Table::open(db)?,
             events: Table::open(db)?,
             timelogs: Table::open(db)?,
+            noted: Table::open(db)?,
             views: ks(VIEWS_KEYSPACE)?,
             jobs: ks(JOBS_KEYSPACE)?,
             meta: ks(META_KEYSPACE)?,
@@ -321,6 +355,7 @@ impl Commit<'_> {
         self.remove_where::<Board>(RowScope::All, |_| false)?;
         self.remove_where::<Event>(RowScope::All, |_| false)?;
         self.remove_where::<Timelog>(RowScope::All, |_| false)?;
+        self.remove_where::<NotedWrite>(RowScope::All, |_| false)?;
         for ks in [&self.store.views, &self.store.jobs] {
             for guard in ks.iter() {
                 self.batch.remove(ks, guard.key()?);

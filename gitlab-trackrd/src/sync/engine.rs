@@ -23,7 +23,7 @@ use super::planner::{self, Plan};
 use super::schedule::{
     self, JobState, RATE_LIMIT_PAUSE_CAP, REJECTED_BACKOFF_CAP, SERVER_BACKOFF_CAP,
 };
-use super::store::{Identity, RowScope, SyncStore};
+use super::store::{Identity, NotedWrite, RowScope, SyncStore};
 use crate::config::SharedConfig;
 use crate::error::{Error, Result};
 use crate::handlers::{ConnState, Session, SessionSlot};
@@ -93,11 +93,8 @@ enum Command {
     Wake,
     /// A new login: retry the jobs that were backed off.
     LoggedIn,
-}
-
-struct NotedWrite {
-    write: Write,
-    at: u64,
+    /// Persist a write GitLab applied (see [`SyncHandle::note_write`]).
+    Note(NotedWrite),
 }
 
 /// The handlers' side of the sync layer: read access to the store plus
@@ -165,11 +162,19 @@ impl SyncHandle {
             relisted: BTreeSet::new(),
             scheduled,
         };
+        let expired = now_secs().saturating_sub(NOTED_WRITE_TTL_SECS);
+        let noted = store
+            .noted
+            .scan(RowScope::Since(expired))
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "reading noted writes failed");
+                Vec::new()
+            });
         tokio::spawn(worker.run());
         Arc::new(Self {
             store,
             tx,
-            noted: Mutex::new(Vec::new()),
+            noted: Mutex::new(noted),
         })
     }
 
@@ -247,12 +252,14 @@ impl SyncHandle {
     /// can be corrected at read time (see [`Self::writes_since`]).
     pub fn note_write(&self, write: &Write) {
         let now = now_secs();
-        let mut noted = self.noted.lock().unwrap();
-        noted.retain(|w| now.saturating_sub(w.at) < NOTED_WRITE_TTL_SECS);
-        noted.push(NotedWrite {
+        let note = NotedWrite {
             write: write.clone(),
             at: now,
-        });
+        };
+        let mut noted = self.noted.lock().unwrap();
+        noted.retain(|w| now.saturating_sub(w.at) < NOTED_WRITE_TTL_SECS);
+        noted.push(note.clone());
+        let _ = self.tx.send(Command::Note(note));
     }
 
     /// Writes noted at or after `since` (a view's fetch start): the ones that
@@ -401,6 +408,20 @@ impl Worker {
             Command::Reconfigure => self.replan = true,
             Command::Wake => {}
             Command::LoggedIn => self.unpark(),
+            Command::Note(note) => self.persist_note(note),
+        }
+    }
+
+    fn persist_note(&mut self, note: NotedWrite) {
+        let expired = note.at.saturating_sub(NOTED_WRITE_TTL_SECS);
+        let stored = (|| -> Result<()> {
+            let mut c = self.store.begin();
+            c.upsert(&[note])?;
+            c.remove_where::<NotedWrite>(RowScope::Before(expired), |_| false)?;
+            c.commit()
+        })();
+        if let Err(e) = stored {
+            warn!(error = %e, "storing a noted write failed");
         }
     }
 
@@ -1504,6 +1525,31 @@ mod tests {
         .await
         .expect("no command blocks on a missing session");
         assert!(!env.sync.has_synced(Job::AssignedIssues));
+    }
+
+    /// A restart before the view catches up must not bring a closed issue
+    /// back.
+    #[tokio::test]
+    async fn noted_writes_survive_a_restart() {
+        let (store, _dir) = open_store();
+        let dormant = || ConnState::Dormant(DormancyReason::NoCredentials);
+        let close = Write {
+            kind: Issuable::Issue,
+            project_id: 7,
+            iid: 1,
+            op: WriteOp::Close,
+        };
+        let before = now_secs();
+        let first = start_on(Arc::clone(&store), dormant());
+        first.sync.note_write(&close);
+        eventually("the note to persist", || {
+            !store.noted.scan(RowScope::All).unwrap().is_empty()
+        })
+        .await;
+        drop(first);
+
+        let second = start_on(store, dormant());
+        assert_eq!(second.sync.writes_since(before), [close]);
     }
 
     #[tokio::test]

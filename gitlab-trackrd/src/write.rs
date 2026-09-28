@@ -60,8 +60,9 @@ impl WriteOp {
     }
 }
 
-/// One write against one issuable.
-#[derive(Debug, Clone, PartialEq)]
+/// One write against one issuable. Persisted in the sync store's noted
+/// writes, so the fields are an on-disk format.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Write {
     pub kind: Issuable,
     pub project_id: i64,
