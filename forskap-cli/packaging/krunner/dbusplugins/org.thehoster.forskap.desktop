@@ -2,7 +2,7 @@
 Type=Service
 Name=GitLab
 Comment=Search tracked GitLab issues and merge requests
-Icon=system-search
+Icon=org.thehoster.forskap
 X-KDE-ServiceTypes=Plasma/Runner
 X-Plasma-API=DBus2
 X-Plasma-DBusRunner-Service=org.thehoster.forskap.SearchProvider

@@ -33,6 +33,16 @@ const FILES: &[(&str, &str)] = &[
         "krunner/dbusplugins/org.thehoster.forskap.desktop",
         include_str!("../../../../packaging/krunner/dbusplugins/org.thehoster.forskap.desktop"),
     ),
+    (
+        "icons/hicolor/scalable/apps/org.thehoster.forskap.svg",
+        include_str!("../../../../packaging/icons/hicolor/scalable/apps/org.thehoster.forskap.svg"),
+    ),
+    (
+        "icons/hicolor/symbolic/apps/org.thehoster.forskap-symbolic.svg",
+        include_str!(
+            "../../../../packaging/icons/hicolor/symbolic/apps/org.thehoster.forskap-symbolic.svg"
+        ),
+    ),
 ];
 
 /// Registrations written before the rename; they would answer alongside ours.
