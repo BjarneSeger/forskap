@@ -4,7 +4,8 @@
 //! rows (empty by default), one-shot failures can be queued in front, and a
 //! path can be gated to hold its next call until released. Every call is
 //! recorded for assertions. Writes succeed unless a failure is queued, and
-//! can all be held behind one gate to observe them in flight.
+//! can all be held behind one gate to observe them in flight. The token calls
+//! fail like reads, by their path ([`TOKEN_PATH`], [`ROTATE_PATH`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -13,8 +14,14 @@ use serde_json::Value;
 use tokio::sync::{Notify, Semaphore};
 
 use crate::error::{Error, Result};
-use crate::gitlab::{GitlabApi, Issuable, Listing};
+use crate::gitlab::{GitlabApi, Issuable, Listing, RotatedToken, TokenInfo};
+use crate::secrets::Token;
 use crate::sync::model::Timelog;
+
+/// Path [`FakeGitlab::fail_next`] fails the token info read by.
+pub const TOKEN_PATH: &str = "personal_access_tokens/self";
+/// Path [`FakeGitlab::fail_next`] fails a rotation by.
+pub const ROTATE_PATH: &str = "personal_access_tokens/self/rotate";
 
 /// A failure to inject, turned into the matching [`Error`] on use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +34,8 @@ pub enum FakeErr {
     Rejected,
     /// A dead token: `Error::Unauthorized`.
     Unauthorized,
+    /// An unusable rotation answer: `Error::RotationLost`.
+    Lost,
 }
 
 impl FakeErr {
@@ -40,6 +49,7 @@ impl FakeErr {
             },
             Self::Rejected => Error::Gitlab("403 Forbidden".into()),
             Self::Unauthorized => Error::Unauthorized("401 Unauthorized".into()),
+            Self::Lost => Error::RotationLost("unreadable answer".into()),
         }
     }
 }
@@ -63,6 +73,11 @@ pub struct FakeGitlab {
     writes: Mutex<Vec<WriteCall>>,
     /// Holds every write while set; see [`FakeGitlab::gate_writes`].
     write_gate: Mutex<Option<Arc<Semaphore>>>,
+    /// The token's info; one that never expires by default.
+    token: Mutex<Option<TokenInfo>>,
+    token_info_calls: Mutex<usize>,
+    /// The `expires_at` of every rotation attempt.
+    rotations: Mutex<Vec<Option<chrono::NaiveDate>>>,
     /// Signalled when a gated call starts waiting on its gate.
     pub gated: Notify,
 }
@@ -116,6 +131,35 @@ impl FakeGitlab {
 
     pub fn serve_timelogs(&self, rows: Vec<Timelog>) {
         *self.timelogs.lock().unwrap() = rows;
+    }
+
+    pub fn serve_token(&self, info: TokenInfo) {
+        *self.token.lock().unwrap() = Some(info);
+    }
+
+    pub fn token_info_calls(&self) -> usize {
+        *self.token_info_calls.lock().unwrap()
+    }
+
+    /// The `expires_at` of every rotation attempt, failed ones included.
+    pub fn rotations(&self) -> Vec<Option<chrono::NaiveDate>> {
+        self.rotations.lock().unwrap().clone()
+    }
+
+    fn served_token(&self) -> TokenInfo {
+        self.token.lock().unwrap().clone().unwrap_or(TokenInfo {
+            scopes: Vec::new(),
+            created_at: None,
+            expires_at: None,
+        })
+    }
+
+    fn next_failure(&self, path: &str) -> Option<FakeErr> {
+        self.failures
+            .lock()
+            .unwrap()
+            .get_mut(path)
+            .and_then(VecDeque::pop_front)
     }
 
     pub fn fail_next_write(&self, err: FakeErr) {
@@ -202,13 +246,7 @@ impl GitlabApi for FakeGitlab {
             self.gated.notify_one();
             gate.notified().await;
         }
-        let failure = self
-            .failures
-            .lock()
-            .unwrap()
-            .get_mut(&path)
-            .and_then(VecDeque::pop_front);
-        if let Some(err) = failure {
+        if let Some(err) = self.next_failure(&path) {
             return Err(err.error());
         }
         let next = self
@@ -266,6 +304,36 @@ impl GitlabApi for FakeGitlab {
 
     async fn unassign_self(&self, kind: Issuable, project_id: i64, iid: i64) -> Result<()> {
         self.write("unassign_self", kind, project_id, iid).await
+    }
+
+    async fn token_info(&self) -> Result<TokenInfo> {
+        *self.token_info_calls.lock().unwrap() += 1;
+        match self.next_failure(TOKEN_PATH) {
+            Some(err) => Err(err.error()),
+            None => Ok(self.served_token()),
+        }
+    }
+
+    /// The n-th rotation attempt yields the token `rotated-n`, living a week
+    /// unless `expires_at` says otherwise.
+    async fn rotate_token(&self, expires_at: Option<chrono::NaiveDate>) -> Result<RotatedToken> {
+        let n = {
+            let mut rotations = self.rotations.lock().unwrap();
+            rotations.push(expires_at);
+            rotations.len()
+        };
+        if let Some(err) = self.next_failure(ROTATE_PATH) {
+            return Err(err.error());
+        }
+        let now = chrono::Utc::now();
+        Ok(RotatedToken {
+            token: Token::new(format!("rotated-{n}")),
+            info: Some(TokenInfo {
+                scopes: self.served_token().scopes,
+                created_at: Some(now),
+                expires_at: expires_at.or(Some(now.date_naive() + chrono::Days::new(7))),
+            }),
+        })
     }
 }
 

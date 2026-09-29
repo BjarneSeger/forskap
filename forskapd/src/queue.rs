@@ -951,6 +951,7 @@ mod tests {
                 gitlab,
                 host: "test".to_string(),
                 user_id: 0,
+                token: Default::default(),
             })));
         let (tx, rx) = mpsc::channel(8);
         let handle = tokio::spawn(worker(
@@ -1100,6 +1101,7 @@ mod tests {
             gitlab: gitlab.clone(),
             host: "test".into(),
             user_id: 0,
+            token: Default::default(),
         });
         drain_wake.notify_one();
         drop(tx);
@@ -1130,6 +1132,7 @@ mod tests {
                 gitlab: gitlab.clone(),
                 host: "test".into(),
                 user_id: 0,
+                token: Default::default(),
             })));
         let settled = Arc::new(std::sync::Mutex::new(Vec::new()));
         let hook_cell = Arc::new(OnceLock::new());

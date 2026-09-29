@@ -102,4 +102,4 @@ method Login(host: string, token: string) -> ()
 
 method Logout() -> ()
 
-method WhoAmI() -> (host: string, user_id: int)
+method WhoAmI() -> (host: string, user_id: int, token_expires_at: ?int, token_rotates: bool)

@@ -2,7 +2,7 @@
 //!
 //! Wraps `gitlab::AsyncGitlab`: one paginated endpoint for every read
 //! ([`Listing`]), the GraphQL timelog query, and the write endpoints the crate
-//! doesn't ship (`add_spent_time`, `close`, assignment).
+//! doesn't ship (`add_spent_time`, `close`, assignment, token rotation).
 
 use std::borrow::Cow;
 use std::future::Future;
@@ -12,6 +12,7 @@ use gitlab::api::{AsyncQuery, UrlBase};
 use tracing::{info, instrument, warn};
 
 use crate::error::{Error, Result};
+use crate::secrets::Token;
 use crate::sync::model::Timelog;
 
 /// Which GitLab issuable an operation targets. Internal counterpart of the
@@ -55,11 +56,34 @@ pub struct GitlabClient {
     /// Required so `assign_self`/`unassign_self` can mutate the issuable's
     /// `assignee_ids` list without an extra round-trip per call.
     current_user_id: i64,
+    /// The token `inner` authenticates with.
+    token: Token,
+}
+
+/// What GitLab knows about the token a client authenticates with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenInfo {
+    pub scopes: Vec<String>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The token dies at the start of this day (UTC); `None` never expires.
+    pub expires_at: Option<chrono::NaiveDate>,
+}
+
+/// The successor of a rotated token. The old one is revoked already.
+#[derive(Debug, Clone)]
+pub struct RotatedToken {
+    pub token: Token,
+    /// `None` if the answer's lifetime was unreadable.
+    pub info: Option<TokenInfo>,
 }
 
 impl GitlabClient {
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    pub fn token(&self) -> &Token {
+        &self.token
     }
 
     pub fn current_user_id(&self) -> i64 {
@@ -209,6 +233,14 @@ pub trait GitlabApi: Send + Sync {
     /// whose issue or MR the user can no longer read comes with `iid` 0: it
     /// exists, but its details are gone.
     async fn list_timelogs(&self, since: chrono::DateTime<chrono::Utc>) -> Result<Vec<Timelog>>;
+
+    /// Scopes and lifetime of the token this client authenticates with.
+    async fn token_info(&self) -> Result<TokenInfo>;
+
+    /// Replace the client's token by a new one expiring at `expires_at`
+    /// (GitLab's default lifetime if `None`). On success the client's own
+    /// token is revoked: every later call through it fails with a 401.
+    async fn rotate_token(&self, expires_at: Option<chrono::NaiveDate>) -> Result<RotatedToken>;
 }
 
 impl GitlabClient {
@@ -253,8 +285,8 @@ impl GitlabClient {
         Ok(())
     }
 
-    pub async fn connect(host: &str, token: &str) -> Result<Self> {
-        let inner = gitlab::GitlabBuilder::new(host.to_string(), token.to_string())
+    pub async fn connect(host: &str, token: &Token) -> Result<Self> {
+        let inner = gitlab::GitlabBuilder::new(host.to_string(), token.expose().to_string())
             .build_async()
             .await
             .map_err(classify_build)?;
@@ -272,6 +304,7 @@ impl GitlabClient {
             inner,
             host: host.to_string(),
             current_user_id,
+            token: token.clone(),
         })
     }
 
@@ -279,7 +312,7 @@ impl GitlabClient {
     /// with bounded exponential back-off (see [`retry_transient`]). A permanent
     /// rejection (a bad token) fails immediately without retrying. Used by the
     /// interactive `Login` handler so a momentary blip doesn't fail the command.
-    pub async fn connect_with_retry(host: &str, token: &str) -> Result<Self> {
+    pub async fn connect_with_retry(host: &str, token: &Token) -> Result<Self> {
         retry_transient("login connect", || Self::connect(host, token)).await
     }
 }
@@ -461,6 +494,109 @@ impl GitlabApi for GitlabClient {
         info!(count = out.len(), "fetched timelogs from GitLab");
         Ok(out)
     }
+
+    #[instrument(skip(self))]
+    async fn token_info(&self) -> Result<TokenInfo> {
+        let raw: serde_json::Value = SelfTokenEndpoint
+            .query_async(&self.inner)
+            .await
+            .map_err(classify)?;
+        token_info_from(&raw)
+    }
+
+    #[instrument(skip(self))]
+    async fn rotate_token(&self, expires_at: Option<chrono::NaiveDate>) -> Result<RotatedToken> {
+        // Never retried in here: whether a failed attempt may be repeated is
+        // the caller's decision, the old token may be gone already.
+        let raw: serde_json::Value = RotateSelfTokenEndpoint { expires_at }
+            .query_async(&self.inner)
+            .await
+            .map_err(|e| {
+                let refused = has_status(&e);
+                match classify(e) {
+                    // No status to tell a refusal by: GitLab may have rotated.
+                    Error::Gitlab(detail) if !refused => Error::RotationLost(detail),
+                    other => other,
+                }
+            })?;
+        rotated_token_from(&raw)
+    }
+}
+
+/// `GET /personal_access_tokens/self`
+struct SelfTokenEndpoint;
+
+impl gitlab::api::Endpoint for SelfTokenEndpoint {
+    fn method(&self) -> http::Method {
+        http::Method::GET
+    }
+
+    fn endpoint(&self) -> Cow<'static, str> {
+        "personal_access_tokens/self".into()
+    }
+}
+
+/// `POST /personal_access_tokens/self/rotate`
+struct RotateSelfTokenEndpoint {
+    expires_at: Option<chrono::NaiveDate>,
+}
+
+impl gitlab::api::Endpoint for RotateSelfTokenEndpoint {
+    fn method(&self) -> http::Method {
+        http::Method::POST
+    }
+
+    fn endpoint(&self) -> Cow<'static, str> {
+        "personal_access_tokens/self/rotate".into()
+    }
+
+    fn body(&self) -> std::result::Result<Option<(&'static str, Vec<u8>)>, gitlab::api::BodyError> {
+        let Some(expires_at) = self.expires_at else {
+            return Ok(None);
+        };
+        let body = serde_json::json!({"expires_at": expires_at.format("%Y-%m-%d").to_string()});
+        Ok(Some(("application/json", serde_json::to_vec(&body)?)))
+    }
+}
+
+/// Parse a personal access token as GitLab's REST API returns it.
+fn token_info_from(raw: &serde_json::Value) -> Result<TokenInfo> {
+    let scopes = raw["scopes"]
+        .as_array()
+        .ok_or_else(|| Error::Gitlab("token response carries no scopes".into()))?
+        .iter()
+        .filter_map(|s| s.as_str().map(str::to_string))
+        .collect();
+    let expires_at = match &raw["expires_at"] {
+        serde_json::Value::Null => None,
+        v => Some(
+            v.as_str()
+                .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                .ok_or_else(|| Error::Gitlab(format!("unparsable token expiry: {v}")))?,
+        ),
+    };
+    Ok(TokenInfo {
+        scopes,
+        created_at: raw["created_at"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.to_utc()),
+        expires_at,
+    })
+}
+
+/// Parse a rotate response. Its errors never quote the response: it holds
+/// the new token. Only a missing token fails it: the old one is revoked, so
+/// the new one must not be dropped over an unreadable lifetime.
+fn rotated_token_from(raw: &serde_json::Value) -> Result<RotatedToken> {
+    let token = raw["token"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| Error::RotationLost("rotate response carries no token".into()))?;
+    Ok(RotatedToken {
+        token: Token::new(token),
+        info: token_info_from(raw).ok(),
+    })
 }
 
 /// `GET <listing path>` — the one endpoint behind every [`Listing`].
@@ -523,6 +659,23 @@ where
         _ => return Error::Gitlab(detail),
     };
     throttled_or_rejected(status, retry_after, detail)
+}
+
+/// Whether GitLab answered with an HTTP status, as opposed to a failure
+/// before the request or while reading the answer.
+fn has_status<E>(e: &gitlab::api::ApiError<E>) -> bool
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    use gitlab::api::ApiError as A;
+    matches!(
+        e,
+        A::GitlabRateLimited { .. }
+            | A::GitlabService { .. }
+            | A::GitlabWithStatus { .. }
+            | A::GitlabObjectWithStatus { .. }
+            | A::GitlabUnrecognizedWithStatus { .. }
+    )
 }
 
 /// [`Error::Throttled`] for 429/5xx, [`Error::Unauthorized`] for 401,
@@ -1224,6 +1377,84 @@ mod tests {
             let removed = compute_new_assignees(&added, self_id, false).expect("present → change");
             prop_assert_eq!(removed, current);
         }
+    }
+
+    #[test]
+    fn token_endpoints_render_path_and_body() {
+        use gitlab::api::Endpoint;
+
+        assert_eq!(SelfTokenEndpoint.endpoint(), "personal_access_tokens/self");
+        assert_eq!(SelfTokenEndpoint.method(), http::Method::GET);
+
+        let rotate = RotateSelfTokenEndpoint {
+            expires_at: chrono::NaiveDate::from_ymd_opt(2027, 1, 31),
+        };
+        assert_eq!(rotate.endpoint(), "personal_access_tokens/self/rotate");
+        assert_eq!(rotate.method(), http::Method::POST);
+        let (mime, body) = rotate.body().unwrap().unwrap();
+        assert_eq!(mime, "application/json");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"expires_at": "2027-01-31"})
+        );
+
+        let default_lifetime = RotateSelfTokenEndpoint { expires_at: None };
+        assert!(default_lifetime.body().unwrap().is_none());
+    }
+
+    #[test]
+    fn token_info_parses_lifetime_and_scopes() {
+        let raw = serde_json::json!({
+            "id": 1,
+            "scopes": ["api", "self_rotate"],
+            "created_at": "2026-01-01T10:00:00.000Z",
+            "expires_at": "2026-12-31",
+        });
+        let info = token_info_from(&raw).unwrap();
+        assert_eq!(info.scopes, ["api", "self_rotate"]);
+        assert_eq!(
+            info.created_at.map(|d| d.timestamp()),
+            Some(1_767_261_600),
+            "{info:?}"
+        );
+        assert_eq!(
+            info.expires_at,
+            chrono::NaiveDate::from_ymd_opt(2026, 12, 31)
+        );
+
+        let forever = serde_json::json!({"scopes": [], "expires_at": null});
+        let info = token_info_from(&forever).unwrap();
+        assert_eq!((info.expires_at, info.created_at), (None, None));
+
+        assert!(token_info_from(&serde_json::json!({"expires_at": null})).is_err());
+        let garbled = serde_json::json!({"scopes": [], "expires_at": "soon"});
+        assert!(token_info_from(&garbled).is_err());
+    }
+
+    #[test]
+    fn a_rotate_response_without_a_token_is_an_error_not_quoting_it() {
+        let raw = serde_json::json!({
+            "scopes": ["self_rotate"],
+            "created_at": "2026-01-01T10:00:00Z",
+            "expires_at": "2026-12-31",
+            "token": "glpat-new",
+        });
+        let rotated = rotated_token_from(&raw).unwrap();
+        assert_eq!(rotated.token.expose(), "glpat-new");
+        assert_eq!(
+            rotated.info.and_then(|i| i.expires_at),
+            chrono::NaiveDate::from_ymd_opt(2026, 12, 31)
+        );
+
+        // The token survives an unreadable lifetime.
+        let broken = serde_json::json!({"token": "glpat-new", "expires_at": "soon"});
+        let rotated = rotated_token_from(&broken).unwrap();
+        assert_eq!(rotated.token.expose(), "glpat-new");
+        assert_eq!(rotated.info, None);
+        assert!(!format!("{rotated:?}").contains("glpat-new"));
+
+        let lost = rotated_token_from(&serde_json::json!({"scopes": []})).unwrap_err();
+        assert!(matches!(lost, Error::RotationLost(_)), "{lost}");
     }
 
     #[test]

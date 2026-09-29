@@ -27,6 +27,7 @@ use super::store::{Identity, NotedWrite, RowScope, SyncStore};
 use crate::config::SharedConfig;
 use crate::error::{Error, Result};
 use crate::handlers::{ConnState, Session, SessionSlot};
+use crate::reconnect::KeychainProbe;
 use crate::write::Write;
 
 /// How often a dormant worker re-checks the session without being woken.
@@ -112,8 +113,16 @@ impl SyncHandle {
         session: SessionSlot,
         config: SharedConfig,
         reconnect_signal: Arc<Notify>,
+        keychain_probe: KeychainProbe,
     ) -> Arc<Self> {
-        Self::start(store, session, config, reconnect_signal, true)
+        Self::start(
+            store,
+            session,
+            config,
+            reconnect_signal,
+            keychain_probe,
+            true,
+        )
     }
 
     /// A worker that runs only demanded jobs, so a test decides exactly
@@ -125,7 +134,8 @@ impl SyncHandle {
         config: SharedConfig,
         reconnect_signal: Arc<Notify>,
     ) -> Arc<Self> {
-        Self::start(store, session, config, reconnect_signal, false)
+        let probe = crate::reconnect::no_keychain_probe();
+        Self::start(store, session, config, reconnect_signal, probe, false)
     }
 
     fn start(
@@ -133,6 +143,7 @@ impl SyncHandle {
         session: SessionSlot,
         config: SharedConfig,
         reconnect_signal: Arc<Notify>,
+        keychain_probe: KeychainProbe,
         scheduled: bool,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -149,6 +160,7 @@ impl SyncHandle {
             session,
             config,
             reconnect_signal,
+            keychain_probe,
             rx,
             plan: Plan::default(),
             identity: None,
@@ -286,6 +298,8 @@ struct Worker {
     session: SessionSlot,
     config: SharedConfig,
     reconnect_signal: Arc<Notify>,
+    /// Asked on a 401, before the session is parked.
+    keychain_probe: KeychainProbe,
     rx: mpsc::UnboundedReceiver<Command>,
     plan: Plan,
     /// Mirror of the persisted job states; the worker is their only writer.
@@ -722,14 +736,25 @@ impl Worker {
                 )
                 .await;
             }
-            // The token, not the job: park the session until `forskap auth login`.
+            // The token, not the job: park the session until `forskap auth login`,
+            // unless the keychain holds a token to reconnect with.
             Error::Unauthorized(detail) => {
-                crate::reconnect::commit_token_rejected(
-                    &self.session,
-                    &session.gitlab,
-                    detail.clone(),
-                )
-                .await;
+                let reconnects = self.config.read().unwrap().reconnect.enabled;
+                if reconnects && (self.keychain_probe)(session.clone()).await {
+                    crate::reconnect::commit_token_replaced(
+                        &self.session,
+                        &self.reconnect_signal,
+                        &session.gitlab,
+                    )
+                    .await;
+                } else {
+                    crate::reconnect::commit_token_rejected(
+                        &self.session,
+                        &session.gitlab,
+                        detail.clone(),
+                    )
+                    .await;
+                }
             }
             Error::Throttled {
                 status: 429,
@@ -1016,6 +1041,7 @@ mod tests {
             gitlab: Arc::clone(fake) as Arc<dyn GitlabApi>,
             host: "gitlab.test".into(),
             user_id,
+            token: Default::default(),
         })
     }
 
@@ -1028,6 +1054,10 @@ mod tests {
     }
 
     fn start_on(store: Arc<SyncStore>, state: ConnState) -> Env {
+        start_probing(store, state, crate::reconnect::no_keychain_probe())
+    }
+
+    fn start_probing(store: Arc<SyncStore>, state: ConnState, probe: KeychainProbe) -> Env {
         let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(state));
         let reconnect = Arc::new(Notify::new());
         let sync = SyncHandle::spawn(
@@ -1035,6 +1065,7 @@ mod tests {
             Arc::clone(&session),
             instant_config(),
             Arc::clone(&reconnect),
+            probe,
         );
         Env {
             sync,
@@ -1211,6 +1242,26 @@ mod tests {
         })
         .await;
         assert_eq!(state(&env, Job::AssignedIssues).failures, 0);
+    }
+
+    /// Another machine sharing the keychain rotated the token: the 401 hands
+    /// the session to the reconnect supervisor instead of parking it.
+    #[tokio::test]
+    async fn a_dead_token_with_a_newer_one_stored_reconnects_instead_of_parking() {
+        let fake = Arc::new(FakeGitlab::default());
+        fake.fail_next("issues", FakeErr::Unauthorized);
+        let (store, _dir) = open_store();
+        let probe: KeychainProbe = Arc::new(|_| Box::pin(async { true }));
+        let env = start_probing(store, connected(&fake, 1), probe);
+
+        tokio::time::timeout(Duration::from_secs(2), env.reconnect.notified())
+            .await
+            .expect("the reconnect supervisor is woken");
+        assert!(matches!(
+            &*env.session.read().await,
+            ConnState::Dormant(r) if r.is_auto_retryable()
+        ));
+        assert_eq!(state(&env, Job::AssignedIssues), JobState::default());
     }
 
     #[tokio::test]

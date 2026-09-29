@@ -7,9 +7,9 @@ use tokio::sync::{Notify, RwLock};
 
 use forskap_api::{
     AsyncCall, Call_ClearCache, Call_Close, Call_GetAssignedIssues, Call_GetAssignedMergeRequests,
-    Call_GetHistory, Call_PostTime, Call_RecordOpen, Call_Search, Call_UnassignSelf,
+    Call_GetHistory, Call_PostTime, Call_RecordOpen, Call_Search, Call_UnassignSelf, Call_WhoAmI,
     GetAssignedIssues_Reply, GetAssignedMergeRequests_Reply, GetHistory_Reply, IssuableKind, Issue,
-    MergeRequest, Search_Reply, VarlinkInterface,
+    MergeRequest, Search_Reply, VarlinkInterface, WhoAmI_Reply,
 };
 
 use crate::config::SharedConfig;
@@ -55,6 +55,7 @@ fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
             queue,
             config,
             reconnect_signal,
+            rotation: Default::default(),
         },
         dir,
     )
@@ -77,6 +78,7 @@ fn connected_handlers(fake: &Arc<FakeGitlab>) -> (Handlers, tempfile::TempDir) {
         gitlab: Arc::clone(fake) as Arc<dyn crate::gitlab::GitlabApi>,
         host: "gitlab.test".into(),
         user_id: 1,
+        token: Default::default(),
     }))
 }
 
@@ -966,6 +968,43 @@ async fn clear_cache_waits_for_new_board_columns() {
     clear_cache(&h, Some(vec!["issues".into()])).await;
     let issues = assigned_issues(&h, None).await;
     assert_eq!(issues[0].graph_status, "Doing");
+}
+
+// ── WhoAmI ─────────────────────────────────────────────────────────────
+
+async fn who_am_i(h: &Handlers) -> WhoAmI_Reply {
+    let mut call = AsyncCall::default();
+    h.who_am_i(&mut call as &mut dyn Call_WhoAmI).await.unwrap();
+    reply(&mut call)
+}
+
+#[tokio::test]
+async fn who_am_i_reports_the_token_once_it_is_known() {
+    let fake = Arc::new(FakeGitlab::default());
+    let (h, _dir) = connected_handlers(&fake);
+
+    let me = who_am_i(&h).await;
+    assert_eq!((me.host.as_str(), me.user_id), ("gitlab.test", 1));
+    assert_eq!((me.token_expires_at, me.token_rotates), (None, false));
+
+    let expires = chrono::Utc::now().date_naive() + chrono::Days::new(30);
+    let info = crate::gitlab::TokenInfo {
+        scopes: vec!["self_rotate".into()],
+        created_at: Some(chrono::Utc::now()),
+        expires_at: Some(expires),
+    };
+    let client: Arc<dyn crate::gitlab::GitlabApi> = fake.clone();
+    h.rotation.publish(&client, &info);
+
+    let me = who_am_i(&h).await;
+    let midnight = expires.and_time(chrono::NaiveTime::MIN).and_utc();
+    assert_eq!(me.token_expires_at, Some(midnight.timestamp()));
+    assert!(me.token_rotates);
+
+    // Read from the config at each call, so a reload shows at once.
+    h.config.write().unwrap().auth.rotate = crate::config::RotatePolicy::Never;
+    assert!(!who_am_i(&h).await.token_rotates);
+    assert_eq!(fake.read_calls() + fake.token_info_calls(), 0);
 }
 
 // ── Properties ─────────────────────────────────────────────────────────

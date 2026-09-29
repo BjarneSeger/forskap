@@ -39,6 +39,11 @@ Paste it back to the prompt and you are logged in — the token is stored in you
 platform's keystore (Secret Service/keyring on Linux, Keychain on macOS), never in a
 file.
 
+The suggested scopes include `self_rotate`: with it the daemon replaces the token by a
+fresh one shortly before it expires, so a short expiry doesn't mean logging in again
+([details](forskapd/README.md#token-rotation)). `forskap auth status` shows when the
+token expires and whether it is rotated.
+
 The daemon keeps working offline: reads serve the local cache, and time you log
 while GitLab is unreachable is queued and posted once it reconnects.
 

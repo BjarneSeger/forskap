@@ -22,6 +22,10 @@ reconnect).
   logs `(op, kind, project_id, iid)`.
   `gate_writes()` holds every write until the returned gate's `release()` (sticky);
   a held write is already in `writes()`, so `writes().len()` counts started attempts.
+- **Token calls**: `serve_token(info)` sets what `token_info` returns (a token
+  without expiry by default); the n-th `rotate_token` yields the token `rotated-n`.
+  Both fail through `fail_next(TOKEN_PATH | ROTATE_PATH, err)`; `rotations()` logs
+  the `expires_at` of every attempt, `token_info_calls()` counts the reads.
 - Assert on traffic with `calls()`, `calls_to(path)`, `timelog_calls()`,
   `read_calls()` — e.g. "a read never touches GitLab" is `read_calls() == 0`.
 - `FakeErr::{Transient, Throttled(status), Rejected, Unauthorized}` build the
@@ -69,6 +73,10 @@ is `Ok`; "did not fire" → `.is_err()`.
   `calls(&fake, "close")` counts writes.
 - `reconnect.rs` injects the connect attempt as a closure into
   `reconnect_loop(session, config, || async { .. })` returning `Attempt::*`.
+- `rotate.rs` injects clock, keychain and connect through its `Env` trait:
+  `rig(info, now)` builds a supervisor around a `FakeEnv` with zeroed waits, and a
+  test calls `engage()` once per evaluation. The sync worker's keychain look on a
+  401 is the `KeychainProbe` closure passed to `SyncHandle::spawn`.
 
 ## Timing rules
 

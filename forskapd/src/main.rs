@@ -14,7 +14,7 @@ use forskapd::sync::store::SyncStore;
 use forskapd::sync::{Job, SyncHandle};
 use forskapd::usage::UsageStats;
 use forskapd::write::Write;
-use forskapd::{config, db, migrate, reconnect, reload, secrets, server};
+use forskapd::{config, db, migrate, reconnect, reload, rotate, secrets, server};
 
 /// Cache keyspaces of the stores the sync layer replaced (plus the unmerged
 /// tracked-search branch's); re-fetchable, so dropped at startup. The retry
@@ -120,9 +120,11 @@ async fn main() -> Result<()> {
         Arc::clone(&session),
         Arc::clone(&config),
         Arc::clone(&reconnect_signal),
+        reconnect::keychain_probe(),
     );
     let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config))?;
     queue.on_settled(settle_hook(&sync, &config));
+    let rotation = Arc::new(rotate::Rotation::default());
     let handlers = Arc::new(Handlers {
         session,
         sync: Arc::clone(&sync),
@@ -130,9 +132,13 @@ async fn main() -> Result<()> {
         queue,
         config: Arc::clone(&config),
         reconnect_signal,
+        rotation: Arc::clone(&rotation),
     });
 
-    reload::spawn(Arc::clone(&config), move || sync.reconfigure());
+    reload::spawn(Arc::clone(&config), move || {
+        sync.reconfigure();
+        rotation.reevaluate();
+    });
 
     // If the daemon booted dormant because GitLab was unreachable, retry the
     // connection in the background with exponential backoff. A successful
@@ -140,6 +146,10 @@ async fn main() -> Result<()> {
     // queue and wakes the sync worker. No-op when already connected or when
     // dormancy needs the user (bad token / logged out).
     reconnect::spawn(Arc::clone(&handlers));
+
+    // Replaces the token by a fresh one shortly before it expires; idles on
+    // a token that doesn't rotate.
+    rotate::spawn(Arc::clone(&handlers));
 
     let listener = server::make_listener(&socket)?;
 

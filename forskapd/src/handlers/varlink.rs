@@ -18,7 +18,7 @@ use forskap_api::{
 use crate::error::{DormancyReason, Error};
 use crate::gitlab::{GitlabClient, Issuable};
 use crate::query::{in_group, namespace_of, parse_iid_query, text_matches};
-use crate::secrets::{self, Credentials};
+use crate::secrets::{self, Credentials, Token};
 use crate::sync::jobs::{ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS};
 use crate::sync::model::{self, RowKey};
 use crate::sync::store::{RowScope, Stored, SyncStore};
@@ -826,6 +826,7 @@ impl VarlinkInterface for Handlers {
         host: String,
         token: String,
     ) -> varlink::Result<()> {
+        let token = Token::new(token);
         let client = match GitlabClient::connect_with_retry(&host, &token).await {
             Ok(c) => c,
             Err(e) => {
@@ -846,12 +847,14 @@ impl VarlinkInterface for Handlers {
         *self.session.write().await = ConnState::Connected(session);
         self.queue.drain_waker().notify_one();
         self.sync.logged_in();
+        self.rotation.reevaluate();
         call.reply()
     }
 
     #[instrument(skip(self, call))]
     async fn logout(&self, call: &mut dyn Call_Logout) -> varlink::Result<()> {
         *self.session.write().await = ConnState::Dormant(DormancyReason::LoggedOut);
+        self.rotation.reevaluate();
         if let Err(e) = secrets::delete().await {
             warn!(error = %e, "Logout: keychain delete failed");
             return call.reply_gitlab_error(format!("keychain delete failed: {e}"));
@@ -863,7 +866,11 @@ impl VarlinkInterface for Handlers {
     #[instrument(skip(self, call))]
     async fn who_am_i(&self, call: &mut dyn Call_WhoAmI) -> varlink::Result<()> {
         match self.current_session().await {
-            Ok(s) => call.reply(s.host, s.user_id),
+            Ok(s) => {
+                let auth = self.config.read().unwrap().auth;
+                let (token_expires_at, token_rotates) = self.rotation.report(&s.gitlab, &auth);
+                call.reply(s.host, s.user_id, token_expires_at, token_rotates)
+            }
             Err(e) => {
                 let (reason, detail) = dormant_args(&e);
                 call.reply_not_authenticated(reason, detail)
