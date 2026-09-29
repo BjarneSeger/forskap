@@ -35,6 +35,7 @@ Keys are grouped into TOML tables, one per concern:
 | `[queue]` `max_delay_secs` | `1800` | Retry-queue backoff cap (30 min). |
 | `[queue]` `max_lifetime_secs` | `604800` | How long a task retries before being dead-lettered (7 days). |
 | `[queue]` `session_wait_secs` | `30` | Worker sleep while the daemon is dormant (no session). |
+| `[queue]` `max_in_flight` | `4` | Most queued writes sent to GitLab at once; writes to the same issue or MR go one at a time, in order (floor 1). |
 | `[reconnect]` `enabled` | `true` | Auto-reconnect after an unreachable-GitLab dormancy (down at boot or dropped mid-run). When `false`, recovery is manual (`tt login` or restart). |
 | `[reconnect]` `base_delay_secs` | `2` | Auto-reconnect backoff initial delay. |
 | `[reconnect]` `max_delay_secs` | `60` | Auto-reconnect backoff cap (1 min); retries continue indefinitely at the cap. |

@@ -20,6 +20,8 @@ reconnect).
   covers the GraphQL timelog read.
 - **Writes** succeed unless `fail_next_write(FakeErr)` queued a failure; `writes()`
   logs `(op, kind, project_id, iid)`.
+  `gate_writes()` holds every write until the returned gate's `release()` (sticky);
+  a held write is already in `writes()`, so `writes().len()` counts started attempts.
 - Assert on traffic with `calls()`, `calls_to(path)`, `timelog_calls()`,
   `read_calls()` — e.g. "a read never touches GitLab" is `read_calls() == 0`.
 - `FakeErr::{Transient, Throttled(status), Rejected, Unauthorized}` build the

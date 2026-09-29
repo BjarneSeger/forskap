@@ -1,24 +1,32 @@
 //! Background retry queue for outgoing write operations.
 //!
 //! Tasks are persisted via `KvStore` before being processed, so they survive
-//! daemon restarts.  A background tokio task works through the queue with
-//! exponential backoff (1 s base, 30 min cap).  Network errors, 429s, and 5xx
-//! on idempotent ops trigger retries for up to 7 days; a GitLab rejection or
-//! an exhausted retry window moves the task to a persistent dead-letter
-//! store, surfaced via `tt queue`. Either way the settle hook hears about it.
+//! daemon restarts. One coordinator task owns the stores and every piece of
+//! scheduling state; each attempt is a spawned future that only runs
+//! `Write::apply` and reports back through a `JoinSet`. Up to
+//! `queue.max_in_flight` attempts run at once, but writes to one issuable run
+//! one at a time in enqueue order. Each task backs off exponentially (1 s
+//! base, 30 min cap); a 429 also pauses every launch until that task's retry.
+//! Network errors, 429s, and 5xx on idempotent ops trigger retries for up to
+//! 7 days; a GitLab rejection or an exhausted retry window moves the task to a
+//! persistent dead-letter store, surfaced via `tt queue`. Either way the
+//! settle hook hears about it.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
+use tokio::task::{JoinError, JoinSet};
+use tokio::time::Instant;
 use tracing::{error, info, warn};
 
 use crate::config::{SharedConfig, next_backoff};
 use crate::db::KvStore;
-use crate::error::Result;
-use crate::gitlab::Issuable;
+use crate::error::{Error, Result};
+use crate::gitlab::{GitlabApi, Issuable};
 use crate::handlers::SessionSlot;
 use crate::write::{Write, WriteOp};
 
@@ -67,7 +75,14 @@ struct QueuedTask {
     queued_at_secs: u64,
 }
 
+/// The issuable a write targets; writes sharing it never overlap.
+type Key = (Issuable, i64, i64);
+
 impl QueuedTask {
+    fn key(&self) -> Key {
+        (self.kind, self.project_id, self.iid)
+    }
+
     fn write(&self) -> Write {
         Write {
             kind: self.kind,
@@ -88,7 +103,7 @@ pub struct RetryQueue {
     store: KvStore<u64, StoredTask>,
     dead_letter: KvStore<u64, StoredFailure>,
     next_id: AtomicU64,
-    /// Fired to wake the worker early while it is deferring a task for lack of a
+    /// Fired to wake the worker early while it is deferring for lack of a
     /// session, so a freshly re-established connection drains the queue at once
     /// instead of waiting out `session_wait`. See [`RetryQueue::drain_waker`].
     drain_wake: Arc<Notify>,
@@ -155,22 +170,10 @@ impl RetryQueue {
         }
 
         let (tx, rx) = mpsc::channel(256);
-
-        if !initial_tasks.is_empty() {
-            let tx_init = tx.clone();
-            tokio::spawn(async move {
-                for task in initial_tasks {
-                    if tx_init.send(task).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-
         let drain_wake = Arc::new(Notify::new());
         let settle_hook = Arc::new(OnceLock::new());
 
-        tokio::spawn(worker(
+        let mut worker = Worker::new(
             session,
             store.clone(),
             dead_letter.clone(),
@@ -178,7 +181,13 @@ impl RetryQueue {
             config,
             Arc::clone(&drain_wake),
             Arc::clone(&settle_hook),
-        ));
+        );
+        // Admitted before anything enqueued from now on, so a reloaded write
+        // keeps its place ahead of a fresh sibling on the same issuable.
+        for task in initial_tasks {
+            worker.admit(task);
+        }
+        tokio::spawn(worker.run());
 
         Ok(Self {
             sender: tx,
@@ -323,123 +332,418 @@ fn snapshot_pending(store: &KvStore<u64, StoredTask>) -> Result<Vec<PendingWrite
     Ok(out)
 }
 
-async fn worker(
+/// One queued write and where it is in its retry schedule.
+struct Pending {
+    task: QueuedTask,
+    /// Attempts launched so far.
+    attempt: u32,
+    /// What the next failure waits; doubles per failure up to the cap.
+    delay: Duration,
+    /// Not before this; `None` is ready.
+    due: Option<Instant>,
+}
+
+/// The coordinator's scheduling state. Clock-free — every method takes
+/// `now` — so the schedule is testable without sleeping through it.
+#[derive(Default)]
+struct Backlog {
+    /// Waiting tasks by id, which is enqueue order.
+    waiting: BTreeMap<u64, Pending>,
+    /// Tasks with an attempt running.
+    in_flight: HashMap<u64, Pending>,
+    /// After a 429: nothing launches before this.
+    paused_until: Option<Instant>,
+}
+
+impl Backlog {
+    fn push(&mut self, pending: Pending) {
+        let id = pending.task.id;
+        let replaced = self.waiting.insert(id, pending);
+        debug_assert!(replaced.is_none(), "task {id} admitted twice");
+    }
+
+    fn is_idle(&self) -> bool {
+        self.waiting.is_empty() && self.in_flight.is_empty()
+    }
+
+    fn paused(&self, now: Instant) -> bool {
+        self.paused_until.is_some_and(|until| until > now)
+    }
+
+    /// Hold every launch until `until`; never shortens a pause already set.
+    fn pause_until(&mut self, until: Instant) {
+        self.paused_until = Some(self.paused_until.map_or(until, |p| p.max(until)));
+    }
+
+    /// Ids that may start now, in enqueue order, at most `slots` of them. A
+    /// task waits while an attempt on its issuable runs or an earlier
+    /// sibling waits — even one still backing off — so writes to one
+    /// issuable land in order.
+    fn eligible(&self, now: Instant, slots: usize) -> Vec<u64> {
+        let mut out = Vec::new();
+        if slots == 0 || self.paused(now) {
+            return out;
+        }
+        let mut claimed: HashSet<Key> = self.in_flight.values().map(|p| p.task.key()).collect();
+        for (id, pending) in &self.waiting {
+            if out.len() == slots {
+                break;
+            }
+            if !claimed.insert(pending.task.key()) {
+                continue;
+            }
+            if pending.due.is_some_and(|due| due > now) {
+                continue;
+            }
+            out.push(*id);
+        }
+        out
+    }
+
+    /// Move `id` to the running attempts and count the attempt.
+    fn start(&mut self, id: u64) -> &Pending {
+        let mut pending = self
+            .waiting
+            .remove(&id)
+            .expect("only waiting ids are started");
+        pending.attempt += 1;
+        self.in_flight.insert(id, pending);
+        &self.in_flight[&id]
+    }
+
+    /// Take `id` back from the running attempts.
+    fn finish(&mut self, id: u64) -> Pending {
+        self.in_flight
+            .remove(&id)
+            .expect("only running ids are finished")
+    }
+
+    /// Put a failed task back to wait out the larger of its backoff and
+    /// `retry_after`, capped at `remaining` (of its lifetime); the backoff
+    /// then doubles up to `max_delay`. Returns the wait chosen.
+    fn back_off(
+        &mut self,
+        mut pending: Pending,
+        now: Instant,
+        retry_after: Option<Duration>,
+        remaining: Duration,
+        max_delay: Duration,
+    ) -> Duration {
+        let wait = pending
+            .delay
+            .max(retry_after.unwrap_or_default())
+            .min(remaining);
+        pending.due = Some(now + wait);
+        pending.delay = next_backoff(pending.delay, max_delay);
+        self.push(pending);
+        wait
+    }
+
+    /// The earliest instant after `now` worth a timer: the end of the pause
+    /// while paused (nothing launches before it), else the earliest due time
+    /// still ahead. `None` when a timer would change nothing — a ready task
+    /// held by a slot or a sibling waits for an event instead.
+    fn next_wake(&self, now: Instant) -> Option<Instant> {
+        if self.waiting.is_empty() {
+            return None;
+        }
+        if let Some(until) = self.paused_until.filter(|until| *until > now) {
+            return Some(until);
+        }
+        self.waiting
+            .values()
+            .filter_map(|p| p.due)
+            .filter(|due| *due > now)
+            .min()
+    }
+}
+
+/// What an attempt's outcome means for its task.
+#[derive(Debug)]
+enum Verdict {
+    Applied,
+    /// Out of the queue for good: rejected, or `expired` past the retry window.
+    DeadLetter {
+        error: String,
+        expired: bool,
+    },
+    /// Try again later; `pause` (a 429) also holds every other launch.
+    Retry {
+        error: Error,
+        pause: bool,
+    },
+}
+
+/// Classify an attempt's outcome. Pure: `elapsed` is how long the task has
+/// been queued, measured against the retry window.
+fn verdict(
+    outcome: Result<()>,
+    op: &WriteOp,
+    elapsed: Duration,
+    max_lifetime: Duration,
+) -> Verdict {
+    match outcome {
+        Ok(()) => Verdict::Applied,
+        Err(e) if e.is_retryable(op.idempotent()) => {
+            if elapsed >= max_lifetime {
+                return Verdict::DeadLetter {
+                    error: format!(
+                        "timed out after {}, seconds retry window: {}",
+                        max_lifetime.as_secs(),
+                        e
+                    ),
+                    expired: true,
+                };
+            }
+            Verdict::Retry {
+                pause: matches!(e, Error::Throttled { status: 429, .. }),
+                error: e,
+            }
+        }
+        Err(e) => Verdict::DeadLetter {
+            error: e.to_string(),
+            expired: false,
+        },
+    }
+}
+
+/// The coordinator: the only owner of the queue stores and the schedule.
+/// Attempts run as spawned futures that do nothing but `Write::apply`.
+struct Worker {
     session: SessionSlot,
     store: KvStore<u64, StoredTask>,
     dead_letter: KvStore<u64, StoredFailure>,
-    mut rx: mpsc::Receiver<QueuedTask>,
+    rx: mpsc::Receiver<QueuedTask>,
+    /// `rx` is closed; the loop ends once the backlog is idle.
+    rx_closed: bool,
     config: SharedConfig,
     drain_wake: Arc<Notify>,
     settle_hook: Arc<OnceLock<SettleHook>>,
-) {
-    while let Some(task) = rx.recv().await {
-        let mut delay = config.read().unwrap().queue.base_delay();
-        let mut attempt = 0u32;
+    backlog: Backlog,
+    /// One spawned `Write::apply` per running attempt.
+    attempts: JoinSet<Result<()>>,
+    /// Queue id per running attempt, by tokio task id: a panic reports only that.
+    attempt_ids: HashMap<tokio::task::Id, u64>,
+}
 
-        // `None` ⇒ succeeded; `Some(msg)` ⇒ gave up and should be dead-lettered.
-        let failure: Option<String> = 'retry: loop {
-            attempt += 1;
-            // Bind the clone in its own statement so the read guard is released
-            // here — not held across the `select!` below or the API call. A
-            // guard held across the defer would block every session *writer*
-            // (the reconnect commit, `tt login`) for up to `session_wait`.
-            let current = session.read().await.gitlab();
-            let gitlab = match current {
-                Some(g) => g,
-                None => {
-                    warn!(
-                        attempt,
-                        project_id = task.project_id,
-                        iid = task.iid,
-                        kind = ?task.kind,
-                        op = task.op.name(),
-                        "no active session; deferring task"
-                    );
-                    let session_wait = config.read().unwrap().queue.session_wait();
-                    // Wake early if a reconnect re-established the session, so a
-                    // deferred task flushes at once instead of waiting out the
-                    // full interval. The waker uses `notify_one`, which leaves a
-                    // permit if we haven't parked here yet — so a nudge fired the
-                    // instant before this `select!` is still delivered on entry.
-                    tokio::select! {
-                        _ = tokio::time::sleep(session_wait) => {}
-                        _ = drain_wake.notified() => {}
-                    }
-                    continue 'retry;
-                }
-            };
-            let outcome = task
-                .write()
-                .apply(&*gitlab, Some(task.queued_at_secs))
-                .await;
+impl Worker {
+    fn new(
+        session: SessionSlot,
+        store: KvStore<u64, StoredTask>,
+        dead_letter: KvStore<u64, StoredFailure>,
+        rx: mpsc::Receiver<QueuedTask>,
+        config: SharedConfig,
+        drain_wake: Arc<Notify>,
+        settle_hook: Arc<OnceLock<SettleHook>>,
+    ) -> Self {
+        Self {
+            session,
+            store,
+            dead_letter,
+            rx,
+            rx_closed: false,
+            config,
+            drain_wake,
+            settle_hook,
+            backlog: Backlog::default(),
+            attempts: JoinSet::new(),
+            attempt_ids: HashMap::new(),
+        }
+    }
 
-            match outcome {
-                Ok(()) => {
-                    if attempt > 1 {
-                        info!(
-                            attempt,
-                            project_id = task.project_id,
-                            iid = task.iid,
-                            kind = ?task.kind,
-                            op = task.op.name(),
-                            "task succeeded after retry"
-                        );
-                    }
-                    break 'retry None;
-                }
-                Err(e) if e.is_retryable(task.op.idempotent()) => {
-                    let elapsed =
-                        Duration::from_secs(now_secs().saturating_sub(task.queued_at_secs));
-                    let max_lifetime = config.read().unwrap().queue.max_lifetime();
-                    if elapsed >= max_lifetime {
-                        error!(
-                            attempt,
-                            error = %e,
-                            project_id = task.project_id,
-                            iid = task.iid,
-                            kind = ?task.kind,
-                            op = task.op.name(),
-                            retry_window = max_lifetime.as_secs(),
-                            "dropping task after retry window"
-                        );
-                        break 'retry Some(format!(
-                            "timed out after {}, seconds retry window: {}",
-                            max_lifetime.as_secs(),
-                            e
-                        ));
-                    }
-                    let sleep = delay
-                        .max(e.retry_after().unwrap_or_default())
-                        .min(max_lifetime.checked_sub(elapsed).unwrap());
-                    warn!(
-                        attempt,
-                        error = %e,
-                        delay_secs = sleep.as_secs(),
-                        project_id = task.project_id,
-                        op = task.op.name(),
-                        "task failed transiently, retrying"
-                    );
-                    tokio::time::sleep(sleep).await;
-                    let max = config.read().unwrap().queue.max_delay();
-                    delay = next_backoff(delay, max);
-                }
-                Err(e) => {
-                    error!(
-                        error = %e,
-                        project_id = task.project_id,
-                        iid = task.iid,
-                        kind = ?task.kind,
-                        op = task.op.name(),
-                        "task rejected by GitLab; dropping"
-                    );
-                    break 'retry Some(e.to_string());
+    /// Admit a task, ready to launch.
+    fn admit(&mut self, task: QueuedTask) {
+        let delay = self.config.read().unwrap().queue.base_delay();
+        self.backlog.push(Pending {
+            task,
+            attempt: 0,
+            delay,
+            due: None,
+        });
+    }
+
+    /// Admit everything already on the channel.
+    fn admit_ready(&mut self) {
+        loop {
+            match self.rx.try_recv() {
+                Ok(task) => self.admit(task),
+                Err(mpsc::error::TryRecvError::Empty) => return,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.rx_closed = true;
+                    return;
                 }
             }
-        };
+        }
+    }
 
-        // The task left the live queue either way. If it failed permanently,
-        // record it in the dead-letter store (keyed by its id) so the user can
-        // see, retry, or dismiss it via `tt queue`.
+    async fn run(mut self) {
+        loop {
+            self.admit_ready();
+            if self.rx_closed && self.backlog.is_idle() {
+                break;
+            }
+            let now = Instant::now();
+            let deferring = self.launch(now).await;
+            let next_wake = if deferring {
+                None
+            } else {
+                self.backlog.next_wake(now)
+            };
+            let session_wait = deferring.then(|| self.config.read().unwrap().queue.session_wait());
+            // A disabled arm still evaluates its expression, hence the
+            // placeholders. The drain waker uses `notify_one`, which leaves a
+            // permit if we haven't parked here yet — so a nudge fired the
+            // instant before this `select!` is still delivered on entry.
+            tokio::select! {
+                task = self.rx.recv(), if !self.rx_closed => match task {
+                    Some(task) => self.admit(task),
+                    None => self.rx_closed = true,
+                },
+                Some(joined) = self.attempts.join_next_with_id(), if !self.attempts.is_empty() => {
+                    self.settle(joined);
+                }
+                _ = tokio::time::sleep_until(next_wake.unwrap_or(now)), if next_wake.is_some() => {}
+                _ = tokio::time::sleep(session_wait.unwrap_or_default()), if session_wait.is_some() => {}
+                _ = self.drain_wake.notified() => {}
+            }
+        }
+    }
+
+    /// Start every eligible task the bound allows. True when something is
+    /// eligible but the session is dormant, so the caller waits for one.
+    async fn launch(&mut self, now: Instant) -> bool {
+        let max = self.config.read().unwrap().queue.max_in_flight();
+        let slots = max.saturating_sub(self.backlog.in_flight.len());
+        let ids = self.backlog.eligible(now, slots);
+        if ids.is_empty() {
+            return false;
+        }
+        // Bind the clone in its own statement so the read guard is released
+        // here — never held across the `select!`. A guard held while waiting
+        // would block every session *writer* (the reconnect commit, `tt login`).
+        let current = self.session.read().await.gitlab();
+        let Some(gitlab) = current else {
+            warn!(
+                waiting = self.backlog.waiting.len(),
+                "no active session; deferring queued writes"
+            );
+            return true;
+        };
+        for id in ids {
+            self.spawn_attempt(id, Arc::clone(&gitlab));
+        }
+        false
+    }
+
+    fn spawn_attempt(&mut self, id: u64, gitlab: Arc<dyn GitlabApi>) {
+        let pending = self.backlog.start(id);
+        let (write, queued_at) = (pending.task.write(), pending.task.queued_at_secs);
+        let handle = self
+            .attempts
+            .spawn(async move { write.apply(&*gitlab, Some(queued_at)).await });
+        self.attempt_ids.insert(handle.id(), id);
+    }
+
+    /// Settle a finished attempt: back its task off, or take it out of the
+    /// queue for good.
+    fn settle(&mut self, joined: std::result::Result<(tokio::task::Id, Result<()>), JoinError>) {
+        let (tid, outcome) = match joined {
+            Ok(joined) => joined,
+            Err(e) => {
+                let id = self
+                    .attempt_ids
+                    .remove(&e.id())
+                    .expect("every attempt is registered");
+                let pending = self.backlog.finish(id);
+                error!(
+                    error = %e,
+                    project_id = pending.task.project_id,
+                    iid = pending.task.iid,
+                    kind = ?pending.task.kind,
+                    op = pending.task.op.name(),
+                    "task attempt did not complete; dropping"
+                );
+                self.conclude(pending.task, Some(format!("attempt did not complete: {e}")));
+                return;
+            }
+        };
+        let id = self
+            .attempt_ids
+            .remove(&tid)
+            .expect("every attempt is registered");
+        let pending = self.backlog.finish(id);
+        let elapsed = Duration::from_secs(now_secs().saturating_sub(pending.task.queued_at_secs));
+        let (max_lifetime, max_delay) = {
+            let cfg = self.config.read().unwrap();
+            (cfg.queue.max_lifetime(), cfg.queue.max_delay())
+        };
+        let attempt = pending.attempt;
+        let (project_id, iid, kind, op) = (
+            pending.task.project_id,
+            pending.task.iid,
+            pending.task.kind,
+            pending.task.op.name(),
+        );
+        match verdict(outcome, &pending.task.op, elapsed, max_lifetime) {
+            Verdict::Applied => {
+                if attempt > 1 {
+                    info!(
+                        attempt,
+                        project_id,
+                        iid,
+                        ?kind,
+                        op,
+                        "task succeeded after retry"
+                    );
+                }
+                self.conclude(pending.task, None);
+            }
+            Verdict::DeadLetter { error, expired } => {
+                if expired {
+                    error!(
+                        attempt,
+                        error = %error,
+                        project_id,
+                        iid,
+                        ?kind,
+                        op,
+                        retry_window = max_lifetime.as_secs(),
+                        "dropping task after retry window"
+                    );
+                } else {
+                    error!(error = %error, project_id, iid, ?kind, op, "task rejected by GitLab; dropping");
+                }
+                self.conclude(pending.task, Some(error));
+            }
+            Verdict::Retry { error, pause } => {
+                let now = Instant::now();
+                let wait = self.backlog.back_off(
+                    pending,
+                    now,
+                    error.retry_after(),
+                    max_lifetime.saturating_sub(elapsed),
+                    max_delay,
+                );
+                if pause {
+                    self.backlog.pause_until(now + wait);
+                }
+                warn!(
+                    attempt,
+                    error = %error,
+                    delay_secs = wait.as_secs(),
+                    project_id,
+                    op,
+                    paused = pause,
+                    "task failed transiently, retrying"
+                );
+            }
+        }
+    }
+
+    /// Take a settled task out of the live queue. A failure is recorded in the
+    /// dead-letter store first (keyed by the task id) so the user can see,
+    /// retry, or dismiss it via `tt queue`.
+    fn conclude(&self, task: QueuedTask, failure: Option<String>) {
         let applied = failure.is_none();
         if let Some(error) = failure {
             let stored = StoredFailure {
@@ -451,7 +755,7 @@ async fn worker(
                 failed_at_secs: now_secs(),
                 error,
             };
-            if let Err(e) = dead_letter.put(task.id, &stored) {
+            if let Err(e) = self.dead_letter.put(task.id, &stored) {
                 warn!(
                     error = %e,
                     task_id = task.id,
@@ -460,17 +764,41 @@ async fn worker(
             }
         }
 
-        if let Err(e) = store.remove(task.id) {
+        if let Err(e) = self.store.remove(task.id) {
             warn!(
                 error = %e,
                 task_id = task.id,
                 "failed to remove completed task from queue db"
             );
         }
-        if let Some(hook) = settle_hook.get() {
+        if let Some(hook) = self.settle_hook.get() {
             hook(&task.write(), task.queued_at_secs, applied);
         }
     }
+}
+
+/// The coordinator as one future, for tests that drive it over a channel.
+#[cfg(test)]
+async fn worker(
+    session: SessionSlot,
+    store: KvStore<u64, StoredTask>,
+    dead_letter: KvStore<u64, StoredFailure>,
+    rx: mpsc::Receiver<QueuedTask>,
+    config: SharedConfig,
+    drain_wake: Arc<Notify>,
+    settle_hook: Arc<OnceLock<SettleHook>>,
+) {
+    Worker::new(
+        session,
+        store,
+        dead_letter,
+        rx,
+        config,
+        drain_wake,
+        settle_hook,
+    )
+    .run()
+    .await;
 }
 
 fn now_secs() -> u64 {
@@ -485,12 +813,12 @@ mod tests {
     use crate::error::DormancyReason;
     use crate::gitlab::GitlabApi;
     use crate::handlers::{ConnState, Session};
-    use crate::testing::{FakeErr, FakeGitlab};
+    use crate::testing::{FakeErr, FakeGitlab, eventually};
 
-    // The max lifetime cutoff and exponential backoff are not exercised
-    // here. Both depend on `SystemTime::now()` rather than tokio's mock clock,
-    // so deterministically driving them would require a clock-injection
-    // abstraction that isn't warranted for the gain.
+    // The schedule (backoff, pause, per-issuable order) is exercised on the
+    // clock-free `Backlog` and `verdict`. Only the wall-clock lifetime
+    // cutoff is not: it depends on `SystemTime::now()`, which a clock
+    // abstraction isn't warranted for.
 
     // ── Persisted-record compatibility ──────────────────────────────────────
 
@@ -602,12 +930,20 @@ mod tests {
         run_worker_one_task_with(crate::config::defaults(), gitlab, store, task).await
     }
 
-    async fn run_worker_one_task_with(
+    /// A worker spawned on a connected session; `dir` backs its dead-letter
+    /// store, so keep it alive.
+    struct Spawned {
+        tx: mpsc::Sender<QueuedTask>,
+        handle: tokio::task::JoinHandle<()>,
+        dead_letter: KvStore<u64, StoredFailure>,
+        dir: tempfile::TempDir,
+    }
+
+    fn spawn_worker(
         cfg: crate::config::Config,
         gitlab: Arc<dyn GitlabApi>,
         store: KvStore<u64, StoredTask>,
-        task: QueuedTask,
-    ) -> Vec<FailedTaskView> {
+    ) -> Spawned {
         let dir = tempfile::tempdir().unwrap();
         let dead_letter = KvStore::open_durable(&test_db(&dir), DEAD_LETTER_KEYSPACE).unwrap();
         let session: SessionSlot =
@@ -617,17 +953,47 @@ mod tests {
                 user_id: 0,
             })));
         let (tx, rx) = mpsc::channel(8);
-        let config = Arc::new(std::sync::RwLock::new(cfg));
-        let drain_wake = Arc::new(Notify::new());
         let handle = tokio::spawn(worker(
             session,
             store,
             dead_letter.clone(),
             rx,
-            config,
-            drain_wake,
+            Arc::new(std::sync::RwLock::new(cfg)),
+            Arc::new(Notify::new()),
             Arc::new(OnceLock::new()),
         ));
+        Spawned {
+            tx,
+            handle,
+            dead_letter,
+            dir,
+        }
+    }
+
+    /// A Close-shaped task on issue `iid` of project 7, queued now.
+    fn task(id: u64, iid: i64, op: WriteOp) -> QueuedTask {
+        QueuedTask {
+            id,
+            project_id: 7,
+            iid,
+            kind: Issuable::Issue,
+            op,
+            queued_at_secs: now_secs(),
+        }
+    }
+
+    async fn run_worker_one_task_with(
+        cfg: crate::config::Config,
+        gitlab: Arc<dyn GitlabApi>,
+        store: KvStore<u64, StoredTask>,
+        task: QueuedTask,
+    ) -> Vec<FailedTaskView> {
+        let Spawned {
+            tx,
+            handle,
+            dead_letter,
+            dir: _dir,
+        } = spawn_worker(cfg, gitlab, store);
         tx.send(task).await.unwrap();
         drop(tx);
         handle.await.unwrap();
@@ -785,24 +1151,17 @@ mod tests {
             hook_cell,
         ));
         gitlab.fail_next_write(FakeErr::Rejected);
-        for iid in [1, 2] {
-            tx.send(QueuedTask {
-                id: iid as u64,
-                project_id: 7,
-                iid,
-                kind: Issuable::Issue,
-                op: WriteOp::Close,
-                queued_at_secs: now_secs(),
-            })
-            .await
-            .unwrap();
+        // Both on one issuable, so they run one after the other and the
+        // queued rejection is the assign's.
+        for (id, op) in [(1, WriteOp::AssignSelf), (2, WriteOp::UnassignSelf)] {
+            tx.send(task(id, 7, op)).await.unwrap();
         }
         drop(tx);
         handle.await.unwrap();
 
         assert_eq!(
             *settled.lock().unwrap(),
-            [("Close", 1, false), ("Close", 2, true)],
+            [("AssignSelf", 7, false), ("UnassignSelf", 7, true)],
             "the rejected task is reported dead-lettered, the next one applied"
         );
     }
@@ -1107,6 +1466,297 @@ mod tests {
             snapshot_pending(&s).unwrap().is_empty(),
             "task removed after success"
         );
+    }
+
+    // ── Concurrency ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn worker_runs_distinct_issuables_concurrently_up_to_the_bound() {
+        let (s, _td) = store();
+        let gitlab = Arc::new(FakeGitlab::default());
+        let gate = gitlab.gate_writes();
+        let mut cfg = crate::config::defaults();
+        cfg.queue.max_in_flight = 3;
+        let Spawned {
+            tx,
+            handle,
+            dir: _dir,
+            ..
+        } = spawn_worker(cfg, gitlab.clone(), s.clone());
+
+        for iid in 1..=6 {
+            s.put(iid as u64, &close_task(iid, 100)).unwrap();
+            tx.send(task(iid as u64, iid, WriteOp::Close))
+                .await
+                .unwrap();
+        }
+        eventually("three attempts started", || gitlab.writes().len() == 3).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(gitlab.writes().len(), 3, "the bound holds while they run");
+
+        gate.release();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("drained once released")
+            .unwrap();
+        assert_eq!(gitlab.writes().len(), 6);
+        assert!(snapshot_pending(&s).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_serializes_writes_to_one_issuable_in_enqueue_order() {
+        let (s, _td) = store();
+        let gitlab = Arc::new(FakeGitlab::default());
+        let gate = gitlab.gate_writes();
+        let Spawned {
+            tx,
+            handle,
+            dir: _dir,
+            ..
+        } = spawn_worker(crate::config::defaults(), gitlab.clone(), s.clone());
+
+        tx.send(task(1, 7, WriteOp::AssignSelf)).await.unwrap();
+        tx.send(task(2, 7, WriteOp::UnassignSelf)).await.unwrap();
+        eventually("the assign started", || gitlab.writes().len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            gitlab.writes(),
+            [("assign_self", Issuable::Issue, 7, 7)],
+            "the unassign waits for the assign to settle"
+        );
+
+        gate.release();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("drained once released")
+            .unwrap();
+        assert_eq!(
+            gitlab.writes(),
+            [
+                ("assign_self", Issuable::Issue, 7, 7),
+                ("unassign_self", Issuable::Issue, 7, 7)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_exits_only_after_in_flight_attempts_settle() {
+        let (s, _td) = store();
+        let gitlab = Arc::new(FakeGitlab::default());
+        let gate = gitlab.gate_writes();
+        let Spawned {
+            tx,
+            mut handle,
+            dir: _dir,
+            ..
+        } = spawn_worker(crate::config::defaults(), gitlab.clone(), s.clone());
+
+        tx.send(task(1, 7, WriteOp::Close)).await.unwrap();
+        eventually("the attempt started", || gitlab.writes().len() == 1).await;
+        drop(tx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut handle)
+                .await
+                .is_err(),
+            "the sender is gone but the attempt is still running"
+        );
+
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("exits once the attempt settles")
+            .unwrap();
+    }
+
+    // ── Backlog schedule (pure) ─────────────────────────────────────────────
+
+    fn pending(id: u64, iid: i64, due: Option<Instant>) -> Pending {
+        Pending {
+            task: task(id, iid, WriteOp::Close),
+            attempt: 0,
+            delay: Duration::from_secs(1),
+            due,
+        }
+    }
+
+    #[test]
+    fn backlog_runs_distinct_keys_at_once_and_one_key_in_order() {
+        let now = Instant::now();
+        let mut b = Backlog::default();
+        b.push(pending(1, 1, None));
+        b.push(pending(2, 1, None));
+        b.push(pending(3, 2, None));
+        assert_eq!(
+            b.eligible(now, 8),
+            [1, 3],
+            "one per issuable, lowest id first"
+        );
+        b.start(1);
+        b.start(3);
+        assert!(b.eligible(now, 8).is_empty(), "both issuables busy");
+        b.finish(1);
+        assert_eq!(b.eligible(now, 8), [2]);
+    }
+
+    #[test]
+    fn backlog_honours_the_slot_bound() {
+        let now = Instant::now();
+        let mut b = Backlog::default();
+        for id in 1..=6 {
+            b.push(pending(id, id as i64, None));
+        }
+        assert_eq!(b.eligible(now, 3), [1, 2, 3]);
+        assert!(b.eligible(now, 0).is_empty());
+    }
+
+    #[test]
+    fn a_backing_off_task_blocks_its_later_siblings() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(10);
+        let mut b = Backlog::default();
+        b.push(pending(1, 1, Some(later)));
+        b.push(pending(2, 1, None));
+        assert!(
+            b.eligible(now, 8).is_empty(),
+            "the ready sibling waits behind the earlier one"
+        );
+        assert_eq!(b.eligible(later, 8), [1]);
+    }
+
+    #[test]
+    fn back_off_takes_the_larger_of_backoff_and_retry_after_capped_by_lifetime() {
+        let now = Instant::now();
+        let secs = Duration::from_secs;
+        let mut b = Backlog::default();
+        let mut p = pending(1, 1, None);
+        p.delay = secs(4);
+
+        let wait = b.back_off(p, now, Some(secs(10)), secs(7), secs(30));
+        assert_eq!(
+            wait,
+            secs(7),
+            "retry_after beats the backoff, the lifetime caps both"
+        );
+        let p = b.waiting.remove(&1).unwrap();
+        assert_eq!(p.due, Some(now + secs(7)));
+        assert_eq!(p.delay, secs(8), "doubled for the next failure");
+
+        let wait = b.back_off(p, now, None, secs(3600), secs(30));
+        assert_eq!(wait, secs(8));
+        let p = b.waiting.remove(&1).unwrap();
+        assert_eq!(p.delay, secs(16));
+
+        b.back_off(
+            Pending {
+                delay: secs(30),
+                ..p
+            },
+            now,
+            None,
+            secs(3600),
+            secs(30),
+        );
+        assert_eq!(b.waiting[&1].delay, secs(30), "capped at max_delay");
+    }
+
+    #[test]
+    fn pause_blocks_every_launch_until_it_lifts_and_never_shortens() {
+        let now = Instant::now();
+        let secs = Duration::from_secs;
+        let mut b = Backlog::default();
+        b.push(pending(1, 1, None));
+        b.push(pending(2, 2, None));
+
+        b.pause_until(now + secs(5));
+        assert!(b.eligible(now, 8).is_empty());
+        assert_eq!(b.next_wake(now), Some(now + secs(5)));
+        b.pause_until(now + secs(2));
+        assert_eq!(
+            b.next_wake(now),
+            Some(now + secs(5)),
+            "a shorter pause does not cut the longer one"
+        );
+        assert_eq!(b.eligible(now + secs(5), 8), [1, 2]);
+        assert_eq!(
+            b.next_wake(now + secs(5)),
+            None,
+            "ready tasks need no timer"
+        );
+    }
+
+    #[test]
+    fn next_wake_is_the_earliest_future_due_and_ignores_ready_tasks() {
+        let now = Instant::now();
+        let secs = Duration::from_secs;
+        let mut b = Backlog::default();
+        assert_eq!(b.next_wake(now), None, "nothing waiting");
+        b.push(pending(1, 1, Some(now + secs(5))));
+        b.push(pending(2, 2, Some(now + secs(2))));
+        b.push(pending(3, 3, None));
+        assert_eq!(b.next_wake(now), Some(now + secs(2)));
+        assert_eq!(
+            b.next_wake(now + secs(2)),
+            Some(now + secs(5)),
+            "a due time that passed is no timer"
+        );
+        assert_eq!(b.next_wake(now + secs(5)), None);
+        b.pause_until(now + secs(1));
+        assert_eq!(
+            b.next_wake(now),
+            Some(now + secs(1)),
+            "the pause end comes first"
+        );
+    }
+
+    // ── verdict (pure) ──────────────────────────────────────────────────────
+
+    #[test]
+    fn verdict_pauses_on_429_retries_5xx_only_when_idempotent_and_times_out() {
+        let post = WriteOp::PostTime {
+            duration: "1h".into(),
+            summary: None,
+            issuable_id: None,
+        };
+        let window = Duration::from_secs(60);
+        let fresh = Duration::ZERO;
+        let err = |e: FakeErr| Err(e.error());
+
+        assert!(matches!(
+            verdict(Ok(()), &post, fresh, window),
+            Verdict::Applied
+        ));
+        assert!(matches!(
+            verdict(err(FakeErr::Throttled(429)), &post, fresh, window),
+            Verdict::Retry { pause: true, .. }
+        ));
+        assert!(matches!(
+            verdict(err(FakeErr::Transient), &post, fresh, window),
+            Verdict::Retry { pause: false, .. }
+        ));
+        assert!(matches!(
+            verdict(err(FakeErr::Throttled(503)), &WriteOp::Close, fresh, window),
+            Verdict::Retry { pause: false, .. }
+        ));
+        assert!(
+            matches!(
+                verdict(err(FakeErr::Throttled(503)), &post, fresh, window),
+                Verdict::DeadLetter { expired: false, .. }
+            ),
+            "a 5xx may already have booked the time"
+        );
+        assert!(matches!(
+            verdict(err(FakeErr::Rejected), &WriteOp::Close, fresh, window),
+            Verdict::DeadLetter { expired: false, .. }
+        ));
+        match verdict(err(FakeErr::Transient), &WriteOp::Close, window, window) {
+            Verdict::DeadLetter {
+                error,
+                expired: true,
+            } => assert!(error.contains("retry window"), "{error}"),
+            other => panic!("expected an expired dead letter, got {other:?}"),
+        }
     }
 
     // ── Dead-letter store ───────────────────────────────────────────────────
