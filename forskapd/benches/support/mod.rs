@@ -64,6 +64,7 @@ pub fn dormant_env() -> BenchEnv {
         Arc::clone(&session),
         Arc::clone(&config),
         Arc::clone(&reconnect_signal),
+        forskapd::reconnect::keychain_probe(),
     );
     let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config)).unwrap();
     let usage = Arc::new(UsageStats::open(&db).unwrap());
@@ -76,6 +77,7 @@ pub fn dormant_env() -> BenchEnv {
             queue,
             config,
             reconnect_signal,
+            rotation: Default::default(),
         },
         rt,
         _dir: dir,

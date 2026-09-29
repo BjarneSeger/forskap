@@ -20,9 +20,12 @@
 //!
 //! Only a *transient* dormancy (`DormancyReason::is_auto_retryable`) is retried:
 //! a rejected token, missing credentials, or an explicit logout all need the
-//! user and would just spin.
+//! user and would just spin. The exception is a token rejected while the
+//! keychain holds another one (rotated by a machine sharing the keychain): the
+//! sync worker hands that to the supervisor too ([`commit_token_replaced`]).
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +41,49 @@ use crate::sync::Job;
 
 /// How long a reconnect waits for its probing sync job.
 const RECOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long the sync worker waits for the keychain on a 401; a locked
+/// keyring may sit on a prompt.
+const KEYCHAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Asked by the sync worker on a 401: whether the keychain holds another
+/// token than the session's, so reconnecting beats parking the session.
+pub type KeychainProbe =
+    Arc<dyn Fn(Session) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+
+pub fn keychain_probe() -> KeychainProbe {
+    Arc::new(|session| {
+        Box::pin(async move {
+            match tokio::time::timeout(KEYCHAIN_PROBE_TIMEOUT, secrets::load()).await {
+                Ok(loaded) => holds_another_token(loaded, &session),
+                Err(_) => {
+                    warn!("keychain read timed out; not looking for a newer token");
+                    false
+                }
+            }
+        })
+    })
+}
+
+/// A probe that never finds a newer token.
+#[cfg(test)]
+pub(crate) fn no_keychain_probe() -> KeychainProbe {
+    Arc::new(|_| Box::pin(async { false }))
+}
+
+fn holds_another_token(
+    loaded: crate::error::Result<Option<Credentials>>,
+    session: &Session,
+) -> bool {
+    match loaded {
+        Ok(Some(c)) => c.host == session.host && c.token != session.token,
+        Ok(None) => false,
+        Err(e) => {
+            warn!(error = %e, "keychain read failed; not looking for a newer token");
+            false
+        }
+    }
+}
 
 /// Outcome of one connection attempt, abstracted so the loop's state machine can
 /// be unit-tested without a live GitLab (mirrors the fake `GitlabApi` the queue
@@ -167,6 +213,7 @@ async fn engage_once(handlers: Arc<Handlers>) -> Engaged {
     )
     .await;
     if committed {
+        handlers.rotation.reevaluate();
         handlers.queue.drain_waker().notify_one();
         // One foreground job through the sync worker doubles as the health
         // probe: if it re-demotes the session, the supervisor backs off.
@@ -354,6 +401,29 @@ pub(crate) async fn commit_token_rejected(
     }
 }
 
+/// Demote a live session whose token GitLab rejected while the keychain
+/// holds another one, and wake the supervisor to reconnect with that. The
+/// same identity CAS as [`commit_unreachable`].
+pub(crate) async fn commit_token_replaced(
+    session: &SessionSlot,
+    signal: &Notify,
+    failed_client: &Arc<dyn GitlabApi>,
+) {
+    let mut slot = session.write().await;
+    if let ConnState::Connected(s) = &*slot {
+        if !Arc::ptr_eq(&s.gitlab, failed_client) {
+            return;
+        }
+        let host = s.host.clone();
+        info!(host = %host, "GitLab rejected the token, the keychain holds a newer one; reconnecting");
+        *slot = ConnState::Dormant(DormancyReason::Unreachable {
+            host,
+            detail: "token rejected; reconnecting with the newer one from the keychain".into(),
+        });
+        signal.notify_one();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +433,7 @@ mod tests {
 
     use crate::error::Error;
     use crate::gitlab::GitlabApi;
+    use crate::secrets::Token;
     use crate::testing::FakeGitlab;
 
     fn unreachable_slot() -> SessionSlot {
@@ -386,6 +457,7 @@ mod tests {
             gitlab: Arc::new(FakeGitlab::default()),
             host: "gitlab.example.com".into(),
             user_id: 42,
+            token: Default::default(),
         }
     }
 
@@ -450,7 +522,7 @@ mod tests {
         let creds = resolve_credentials(
             Ok(Some(Credentials {
                 host: "gitlab.example.com".into(),
-                token: "t".into(),
+                token: Token::new("t"),
             })),
             &session,
         )
@@ -508,6 +580,7 @@ mod tests {
             gitlab: Arc::clone(&client),
             host: "gitlab.example.com".into(),
             user_id: 42,
+            token: Default::default(),
         })));
         let signal = Notify::new();
 
@@ -577,6 +650,7 @@ mod tests {
             gitlab: Arc::clone(&client_b),
             host: "gitlab.example.com".into(),
             user_id: 1,
+            token: Default::default(),
         })));
         let signal = Notify::new();
 
@@ -592,6 +666,60 @@ mod tests {
                 .is_err(),
             "no wakeup when the failing client was superseded"
         );
+    }
+
+    #[test]
+    fn only_another_token_for_the_same_host_is_worth_a_reconnect() {
+        let session = Session {
+            token: Token::new("old"),
+            ..connected_session()
+        };
+        let stored = |host: &str, token: &str| {
+            Ok(Some(Credentials {
+                host: host.into(),
+                token: Token::new(token),
+            }))
+        };
+        assert!(holds_another_token(
+            stored("gitlab.example.com", "new"),
+            &session
+        ));
+        assert!(!holds_another_token(
+            stored("gitlab.example.com", "old"),
+            &session
+        ));
+        assert!(!holds_another_token(stored("other.test", "new"), &session));
+        assert!(!holds_another_token(Ok(None), &session));
+        assert!(!holds_another_token(
+            Err(Error::Secrets("keyring locked".into())),
+            &session
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_replaced_token_demotes_retryably_and_signals() {
+        let client: Arc<dyn GitlabApi> = Arc::new(FakeGitlab::default());
+        let stale: Arc<dyn GitlabApi> = Arc::new(FakeGitlab::default());
+        let session: SessionSlot = Arc::new(RwLock::new(ConnState::Connected(Session {
+            gitlab: Arc::clone(&client),
+            ..connected_session()
+        })));
+        let signal = Notify::new();
+
+        commit_token_replaced(&session, &signal, &stale).await;
+        assert!(
+            matches!(&*session.read().await, ConnState::Connected(_)),
+            "a superseded client's 401 must not demote the newer session"
+        );
+
+        commit_token_replaced(&session, &signal, &client).await;
+        assert!(matches!(
+            &*session.read().await,
+            ConnState::Dormant(r) if r.is_auto_retryable()
+        ));
+        tokio::time::timeout(std::time::Duration::from_millis(200), signal.notified())
+            .await
+            .expect("the supervisor is woken");
     }
 
     #[tokio::test]

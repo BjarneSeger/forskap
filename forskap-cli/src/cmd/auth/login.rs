@@ -19,6 +19,7 @@ pub async fn run(host: String) -> Result<()> {
 
     println!("Opening {url}");
     println!("Generate a token with the `api` and `read_user` scopes, then paste it below.");
+    println!("Add the `self_rotate` scope to have the daemon renew it before it expires.");
     if let Err(e) = open::that(&url) {
         eprintln!("(couldn't open browser automatically: {e})");
         eprintln!("Open the URL above manually.");

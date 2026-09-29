@@ -16,6 +16,7 @@ pub mod query;
 pub mod queue;
 pub mod reconnect;
 pub mod reload;
+pub mod rotate;
 pub mod secrets;
 pub mod server;
 pub mod service;

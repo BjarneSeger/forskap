@@ -136,7 +136,9 @@ type NotAuthReason (no_credentials, keychain_error, unreachable, token_rejected,
 | `logged_out`     | the user explicitly logged out this session                        |
 
 The daemon auto-recovers from `unreachable` in the background (unless disabled via
-`[reconnect]` config); the other reasons need the user.
+`[reconnect]` config); the other reasons need the user. A token GitLab rejects while
+the keychain holds a newer one (rotated by another machine sharing the keychain) is
+reported as `unreachable` for the moment it takes to reconnect with that one.
 
 # Methods
 
@@ -204,10 +206,17 @@ up even while GitLab is unreachable). Events carry the issuable `kind` — time 
 on merge requests appears here like issue time. Served from local state; never
 errors on cache trouble (degrades to whatever is readable).
 
-### `WhoAmI() -> (host: string, user_id: int)`
+### `WhoAmI() -> (host: string, user_id: int, token_expires_at: ?int, token_rotates: bool)`
 
 The connected GitLab host and the authenticated user's ID, answered from the session
 without a round-trip. `NotAuthenticated` when dormant.
+
+`token_expires_at` is the moment the token expires, in unix seconds; absent when it
+never expires or the daemon hasn't read the token's details yet (it does so in the
+background after connecting). `token_rotates` tells whether the daemon will replace
+the token by a fresh one before that, under the current `[auth]` config: `false` for
+a token without an expiry or without the needed scope, with `rotate = "never"`, and
+once GitLab refused to rotate it.
 
 ## Writing (queued when GitLab is away)
 

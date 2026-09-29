@@ -75,6 +75,10 @@ pub struct Config {
     /// hitting GitLab in bursts.
     #[config(nested)]
     pub sync: SyncConfig,
+
+    /// Automatic rotation of the GitLab token before it expires.
+    #[config(nested)]
+    pub auth: AuthConfig,
 }
 
 /// Varlink server settings (see `server.rs`).
@@ -407,6 +411,43 @@ impl SyncConfig {
     }
 }
 
+/// Token rotation, consumed by `rotate.rs`.
+#[derive(Debug, Clone, Copy, ConfiqueConfig)]
+pub struct AuthConfig {
+    /// Which tokens the daemon replaces by a fresh one shortly before they
+    /// expire. Rotating revokes the token you pasted, which breaks every
+    /// other tool using it, so the default `"scoped"` only rotates tokens
+    /// created for it: those with the `self_rotate` scope. `"always"` also
+    /// rotates tokens that can rotate through the `api` scope, `"never"`
+    /// turns rotation off. A token without an expiry date is never rotated.
+    #[config(default = "scoped")]
+    pub rotate: RotatePolicy,
+
+    /// How many days before it expires a token is rotated. A token living
+    /// less than three times as long is rotated once a third of its lifetime
+    /// is left. (7 days by default, at least 1.)
+    #[config(default = 7)]
+    pub rotate_before_days: u64,
+}
+
+/// Which tokens are rotated — see [`AuthConfig::rotate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RotatePolicy {
+    /// Only tokens carrying the `self_rotate` scope.
+    Scoped,
+    /// Every token that is able to rotate itself.
+    Always,
+    Never,
+}
+
+impl AuthConfig {
+    /// How long before its expiry a token is rotated.
+    pub fn rotate_before(&self) -> Duration {
+        hours(self.rotate_before_days.saturating_mul(24))
+    }
+}
+
 /// `h` hours, saturating: `Duration::from_hours` panics past `u64::MAX`
 /// seconds, and a huge window must mean "everything", not a dead task.
 fn hours(h: u64) -> Duration {
@@ -460,6 +501,14 @@ fn normalize_queue(queue: &mut QueueConfig) {
     }
 }
 
+/// Floor the rotation lead: with 0 days a token would expire unrotated.
+fn normalize_auth(auth: &mut AuthConfig) {
+    if auth.rotate_before_days == 0 {
+        warn!("auth.rotate_before_days of 0 would let the token expire; flooring to 1");
+        auth.rotate_before_days = 1;
+    }
+}
+
 /// Load the layered config: user file → system default → built-in defaults.
 ///
 /// Missing files are treated as empty layers; parse errors propagate. Backoff
@@ -484,6 +533,7 @@ pub fn load() -> Result<Config, confique::Error> {
     normalize_search(&mut config.search);
     normalize_refresh(&mut config.refresh);
     normalize_sync(&mut config.sync);
+    normalize_auth(&mut config.auth);
     Ok(config)
 }
 
@@ -649,6 +699,25 @@ mod tests {
     }
 
     #[test]
+    fn auth_defaults_rotate_only_scoped_tokens() {
+        let c = defaults();
+        assert_eq!(c.auth.rotate, RotatePolicy::Scoped);
+        assert_eq!(c.auth.rotate_before(), Duration::from_hours(7 * 24));
+    }
+
+    #[test]
+    fn rotate_policy_parses_its_three_names() {
+        for (name, policy) in [
+            ("\"scoped\"", RotatePolicy::Scoped),
+            ("\"always\"", RotatePolicy::Always),
+            ("\"never\"", RotatePolicy::Never),
+        ] {
+            let parsed: RotatePolicy = serde_json::from_str(name).unwrap();
+            assert_eq!(parsed, policy);
+        }
+    }
+
+    #[test]
     fn huge_hour_windows_saturate_instead_of_panicking() {
         let mut c = defaults();
         c.search.tracked_retention_hours = u64::MAX;
@@ -703,6 +772,16 @@ mod tests {
                     "in-range values are left untouched"
                 );
             }
+        }
+
+        #[test]
+        fn normalize_auth_floors_the_rotation_lead(days in any::<u64>()) {
+            let mut a = defaults().auth;
+            a.rotate_before_days = days;
+            normalize_auth(&mut a);
+            prop_assert_eq!(a.rotate_before_days, days.max(1));
+            // Saturates instead of panicking.
+            let _ = a.rotate_before();
         }
 
         #[test]

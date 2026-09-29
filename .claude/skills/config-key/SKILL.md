@@ -12,7 +12,7 @@ Config lives in `forskapd/src/config.rs` (confique, layered TOML: user file →
 
 - Add it to the sub-struct matching its TOML table (`ServerConfig`, `Quick/SlowRefreshConfig`,
   `HistoryConfig`, `QueueConfig`, `ReconnectConfig`, `SearchConfig`, `UsageConfig`,
-  `SyncConfig`) with `#[config(default = …)]` and a
+  `SyncConfig`, `AuthConfig`) with `#[config(default = …)]` and a
   doc comment. **The doc comment becomes the annotation in the generated config
   template** — write it for end users, include the default's meaning ("30 min", "90 days").
 - New TOML table → new `#[config(nested)]` struct, owned by the module that consumes it.

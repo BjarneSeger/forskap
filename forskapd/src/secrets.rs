@@ -14,10 +14,31 @@ const SERVICE: &str = "forskapd";
 /// Service name from before the rename; read once, then moved to [`SERVICE`].
 const LEGACY_SERVICE: &str = "gitlab-trackrd";
 
+/// A GitLab token. `Debug` is redacted, so it can't leak through a log line.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Token(String);
+
+impl Token {
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
+    /// The secret itself: for GitLab and the keychain only, never for a log.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token(<redacted>)")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Credentials {
     pub host: String,
-    pub token: String,
+    pub token: Token,
 }
 
 pub async fn load() -> Result<Option<Credentials>> {
@@ -50,7 +71,7 @@ pub async fn delete() -> Result<()> {
 fn encode(creds: &Credentials) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&serde_json::json!({
         "host": creds.host,
-        "token": creds.token,
+        "token": creds.token.expose(),
     }))?)
 }
 
@@ -62,8 +83,8 @@ fn decode(bytes: &[u8]) -> Result<Credentials> {
         .to_string();
     let token = v["token"]
         .as_str()
-        .ok_or_else(|| Error::Secrets("stored secret missing 'token'".to_string()))?
-        .to_string();
+        .map(Token::new)
+        .ok_or_else(|| Error::Secrets("stored secret missing 'token'".to_string()))?;
     Ok(Credentials { host, token })
 }
 
@@ -128,12 +149,21 @@ mod tests {
         fn encode_decode_roundtrips_any_credentials(host in ".*", token in ".*") {
             let creds = Credentials {
                 host: host.clone(),
-                token: token.clone(),
+                token: Token::new(token.clone()),
             };
             let back = decode(&encode(&creds).unwrap()).unwrap();
             prop_assert_eq!(back.host, host);
-            prop_assert_eq!(back.token, token);
+            prop_assert_eq!(back.token.expose(), token);
         }
+    }
+
+    #[test]
+    fn a_token_never_shows_in_debug_output() {
+        let creds = Credentials {
+            host: "gitlab.test".into(),
+            token: Token::new("glpat-secret"),
+        };
+        assert!(!format!("{creds:?}").contains("glpat-secret"));
     }
 }
 

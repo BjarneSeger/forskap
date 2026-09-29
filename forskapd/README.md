@@ -48,9 +48,26 @@ Keys are grouped into TOML tables, one per concern:
 | `[sync]` `job_gap_ms` | `250` | Pause between two sync jobs (jittered), so a backlog of due jobs trickles out. |
 | `[sync]` `startup_spread_secs` | `60` | Window over which jobs already overdue at startup are spread; the assigned lists and recent timelogs always run at once. |
 | `[usage]` `retention_hours` | `2160` | How long an issue/MR keeps its `RecordOpen` ranking after its last open (90 days); older entries are dropped on the next recorded open. |
+| `[auth]` `rotate` | `"scoped"` | Which tokens are replaced by a fresh one before they expire: `"scoped"` = only tokens with the `self_rotate` scope, `"always"` = also tokens that can rotate through the `api` scope, `"never"` = none. Rotating revokes the token you pasted, which breaks every other tool using it — hence the default. A token without an expiry date is never rotated. |
+| `[auth]` `rotate_before_days` | `7` | How many days before its expiry a token is rotated (floor 1). A token living less than three times as long is rotated once a third of its lifetime is left. |
 
 Credentials are configured through the `org.thehoster.forskapd.Login`
 interface or by just calling `forskap auth login`.
+
+### Token rotation
+
+A token with an expiry date and the `self_rotate` scope is rotated by the daemon
+shortly before it expires (see `[auth]` above): GitLab issues a new token living as
+long as the old one did (its default lifetime if the instance refuses that) and
+revokes the old one. The new token replaces the old one in the keychain;
+`forskap auth status` shows the expiry and whether rotation is active.
+
+Should the keychain refuse the new token, the daemon keeps running on it, logs an
+error and keeps retrying the write. If it is restarted before that worked, the
+keychain holds the revoked token and `forskap auth login` with a new one is needed.
+
+On machines sharing the keychain entry (iCloud Keychain) one of them rotates; the
+others pick the new token up from the keychain once GitLab rejects the old one.
 
 Logging can be set by changing the `FORSKAPD_LOG` environment variable to
 `trace`, `debug`, `info`, `warn` or `error` (ordered from most to least verbose)
@@ -66,6 +83,7 @@ varlinkctl call unix:$XDG_RUNTIME_DIR/forskapd.socket org.thehoster.forskapd.Get
 
 - Rust 1.85+
 - A GitLab personal access token with at least `read_api` + `write_api` scopes
+  (plus `self_rotate` to have it rotated before it expires)
 
 ### Build
 
