@@ -1,5 +1,5 @@
-//! Persistent client-side state — currently just the last-prompt timestamp
-//! and the last issue the user logged against.
+//! Persistent client-side state: the last-prompt timestamp, the last item
+//! time was logged on, and the last failed write already reported.
 //!
 //! Stored as JSON under `$XDG_STATE_HOME/gitlab_trackr/state.json` (with a
 //! `data_local_dir()` fallback for platforms that don't define a state dir).
@@ -19,8 +19,8 @@ pub struct State {
     /// Unix epoch seconds of the last completed `tt tick` prompt cycle.
     /// `0` means "never" and triggers a prompt on the next tick.
     pub last_prompt: u64,
-    /// Most recently logged-against issue, used by `tt log <iid>` to skip the
-    /// `--project-id` flag when the user re-logs against the same issue.
+    /// Item time was last logged on; acting on it again needs no `--project`
+    /// (see [`crate::cmd::project`]).
     pub last_issue: Option<LastIssue>,
     /// Highest dead-letter failure id already surfaced via the `tt tick`
     /// notice, so each queued-action failure is reported at most once. See

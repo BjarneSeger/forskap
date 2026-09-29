@@ -1,3 +1,3 @@
 [D-BUS Service]
 Name=org.thehoster.gitlab.trackr.SearchProvider
-Exec=/usr/bin/tt search-provider
+Exec=/usr/bin/tt integration search-provider serve

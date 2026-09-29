@@ -1,7 +1,7 @@
 //! `org.gnome.Shell.SearchProvider2`: GNOME Shell asks for result ids on
 //! every keystroke, then for the metas of the ids it will show, and finally
 //! to activate one. Registered through the `.ini` and `.desktop` files that
-//! `tt search-provider install` writes.
+//! `tt integration search-provider install` writes.
 
 use std::collections::HashMap;
 

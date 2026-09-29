@@ -620,7 +620,7 @@ impl Worker {
         }
         // Bind the clone in its own statement so the read guard is released
         // here — never held across the `select!`. A guard held while waiting
-        // would block every session *writer* (the reconnect commit, `tt login`).
+        // would block every session *writer* (the reconnect commit, `tt auth login`).
         let current = self.session.read().await.gitlab();
         let Some(gitlab) = current else {
             warn!(

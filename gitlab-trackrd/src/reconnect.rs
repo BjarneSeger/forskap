@@ -1,12 +1,12 @@
 //! Background supervisor that re-establishes the GitLab session whenever it goes
 //! dormant because GitLab was unreachable — whether at boot or lost mid-run.
 //!
-//! `GitlabClient::connect` is otherwise only called at startup and on `tt login`,
+//! `GitlabClient::connect` is otherwise only called at startup and on `tt auth login`,
 //! and neither retries. So if the stored (known-good) token can't reach GitLab,
 //! the session lands `Dormant(Unreachable)` — at boot (initial connect failed)
 //! or at runtime (a background-refresh or write-handler call failed transiently
 //! and called [`commit_unreachable`]) — and, without this task, would stay there
-//! until the user runs `tt login` or restarts the daemon.
+//! until the user runs `tt auth login` or restarts the daemon.
 //!
 //! The supervisor watches for that state and retries the connection with the same
 //! style of exponential back-off as the retry queue (see `queue`), reusing the
@@ -146,7 +146,7 @@ where
 /// commits the real reason (keychain error / no credentials) and bails, and
 /// `reconnect_loop` reuses the one pre-loaded credential across its retries.
 /// Reading per engagement (rather than once for the daemon's life) lets a token
-/// rotated by `tt login` between outages take effect.
+/// rotated by `tt auth login` between outages take effect.
 async fn engage_once(handlers: Arc<Handlers>) -> Engaged {
     if !slot_is_retryable(&handlers.session).await {
         return Engaged::Stable;
@@ -189,7 +189,7 @@ async fn engage_once(handlers: Arc<Handlers>) -> Engaged {
 /// with either "no credentials" (logged out / cleared) or a read error; both
 /// mean the current `Dormant(Unreachable)` is no longer the true reason, so we
 /// commit the honest one (via the same CAS as `commit_dormant`, so a racing
-/// `tt login` is never clobbered) and return `None` to stop the task.
+/// `tt auth login` is never clobbered) and return `None` to stop the task.
 async fn resolve_credentials(
     loaded: crate::error::Result<Option<Credentials>>,
     session: &SessionSlot,
@@ -232,7 +232,7 @@ where
     let mut delay: Option<Duration> = None;
     loop {
         // Stop the instant the slot is no longer dormant-for-a-retryable-reason:
-        // a concurrent `tt login` (Connected) or `tt logout` (LoggedOut) won, or
+        // a concurrent `tt auth login` (Connected) or `tt auth logout` (LoggedOut) won, or
         // a previous iteration already succeeded.
         if !slot_is_retryable(&session).await {
             return false;
@@ -275,7 +275,7 @@ async fn slot_is_retryable(session: &SessionSlot) -> bool {
 }
 
 /// Compare-and-set the slot to `Connected` iff it is *still* dormant-and-
-/// retryable, so a racing `tt login` / `tt logout` is never clobbered. Returns
+/// retryable, so a racing `tt auth login` / `tt auth logout` is never clobbered. Returns
 /// whether it committed.
 async fn commit_connected(session: &SessionSlot, new_session: Session) -> bool {
     let mut slot = session.write().await;
@@ -310,7 +310,7 @@ async fn commit_dormant(session: &SessionSlot, reason: DormancyReason) {
 /// A compare-and-set on session *identity*: the slot transitions only if it is
 /// still `Connected` to the very client that failed (`Arc::ptr_eq`). This never
 /// clobbers a `LoggedOut` / `TokenRejected` / `NoCredentials` reason a concurrent
-/// `tt logout` / rejection set, *nor* a fresh session a concurrent `tt login`
+/// `tt auth logout` / rejection set, *nor* a fresh session a concurrent `tt auth login`
 /// established — a stale in-flight fetch against a superseded client can't tear
 /// down the new connection. Repeated detections against the same client (e.g.
 /// both the issues and the timelog fetch in one refresh pass) are idempotent: the
@@ -336,7 +336,7 @@ pub(crate) async fn commit_unreachable(
 }
 
 /// Demote a live session after `failed_client` got a 401: the token is dead
-/// and only `tt login` helps, so the supervisor isn't woken. The same
+/// and only `tt auth login` helps, so the supervisor isn't woken. The same
 /// identity CAS as [`commit_unreachable`].
 pub(crate) async fn commit_token_rejected(
     session: &SessionSlot,
@@ -349,7 +349,7 @@ pub(crate) async fn commit_token_rejected(
             return;
         }
         let host = s.host.clone();
-        warn!(host = %host, error = %detail, "GitLab rejected the token; run `tt login`");
+        warn!(host = %host, error = %detail, "GitLab rejected the token; run `tt auth login`");
         *slot = ConnState::Dormant(DormancyReason::TokenRejected { host, detail });
     }
 }

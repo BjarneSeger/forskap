@@ -1,4 +1,4 @@
-//! `tt prompt` — interactive issue/MR picker + time logger.
+//! `tt time prompt` — interactive issue/MR picker + time logger.
 //!
 //! Shared by [`crate::cmd::tick`], which feeds in an elapsed-time-based
 //! duration suggestion.
@@ -92,8 +92,7 @@ pub async fn run() -> Result<()> {
 /// time entry was logged, `false` if the user skipped or had no assigned issues.
 pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Result<bool> {
     let cfg = config::load()?;
-    let socket = cfg.socket.clone().unwrap_or_else(client::default_socket);
-    let client = client::connect(&socket).await?;
+    let client = client::connect(&client::socket(&cfg)).await?;
     let issues = client
         .get_assigned_issues(None)
         .call()

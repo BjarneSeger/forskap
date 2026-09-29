@@ -23,7 +23,7 @@
 //	if err != nil {
 //		var notAuth *trackr.NotAuthenticated
 //		if errors.As(err, &notAuth) {
-//			log.Fatal("log in first: tt login --host gitlab.com")
+//			log.Fatal("log in first: tt auth login --host gitlab.com")
 //		}
 //		log.Fatal(err)
 //	}

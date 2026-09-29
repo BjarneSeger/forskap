@@ -2,7 +2,7 @@
 
 A [noctalia-shell](https://noctalia.dev) plugin that puts `tt search` behind the
 launcher prefix `/gl`. Results come from the daemon's cache (instant, works offline),
-activating an issue or merge request opens it in the browser through `tt open` — which
+activating an issue or merge request opens it in the browser through `tt issue open` / `tt mr open` — which
 also counts the open, so what you visit most ranks first. Projects and groups open via
 `xdg-open`.
 
@@ -63,7 +63,7 @@ plugin only forwards it as each row's `score`. With `shell.launcher.categories =
 the launcher additionally shows Issues / Merge requests / Projects / Groups filter
 buttons (`F6` cycles them).
 
-Reset the statistics with `tt refresh --usage`.
+Reset the statistics with `tt sync refresh --scope usage`.
 
 ## Changing the prefix
 

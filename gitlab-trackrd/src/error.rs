@@ -10,7 +10,7 @@ pub enum Error {
     #[error("GitLab error: {0}")]
     Gitlab(String),
 
-    /// GitLab answered 401: the token is dead, and only `tt login` helps.
+    /// GitLab answered 401: the token is dead, and only `tt auth login` helps.
     #[error("GitLab rejected the token: {0}")]
     Unauthorized(String),
 
@@ -137,7 +137,7 @@ impl DormancyReason {
     ///
     /// Only a transient network failure (`Unreachable`) is worth auto-retrying:
     /// the credentials are known-good and the outage is expected to clear. Every
-    /// other reason needs the user to act — `tt login` after a `TokenRejected` /
+    /// other reason needs the user to act — `tt auth login` after a `TokenRejected` /
     /// `NoCredentials` / `LoggedOut`, or fixing the keychain — so retrying would
     /// just spin. Consumed by the background reconnect task (see `reconnect`).
     pub fn is_auto_retryable(&self) -> bool {

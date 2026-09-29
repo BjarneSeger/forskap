@@ -7,7 +7,7 @@
 //! 429 pauses the whole worker; a 5xx or a rejection backs off only its job;
 //! a network error backs off its job and demotes the session, parking the
 //! worker until the reconnect supervisor wakes it; a 401 parks the session
-//! until `tt login`.
+//! until `tt auth login`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -481,7 +481,7 @@ impl Worker {
                 at = at.max(self.boot + schedule::startup_offset(&key, spread));
             }
             if at <= now {
-                // Until the full history first synced, `tt history` shows
+                // Until the full history first synced, `tt time history` shows
                 // just the recent window: it ranks with the events till then.
                 let class = if job == Job::AllTimelogs && state.last_ok == 0 {
                     1
@@ -722,7 +722,7 @@ impl Worker {
                 )
                 .await;
             }
-            // The token, not the job: park the session until `tt login`.
+            // The token, not the job: park the session until `tt auth login`.
             Error::Unauthorized(detail) => {
                 crate::reconnect::commit_token_rejected(
                     &self.session,

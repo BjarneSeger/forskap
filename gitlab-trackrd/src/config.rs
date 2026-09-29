@@ -12,7 +12,7 @@
 //! runtime types those modules expect.
 //!
 //! Credentials are deliberately **not** here — the GitLab host/token live in the
-//! OS keychain and are set through the varlink API (`tt login`), never via this
+//! OS keychain and are set through the varlink API (`tt auth login`), never via this
 //! file or the environment.
 //!
 //! Run the `gen-config-template` binary to print an annotated TOML template with
@@ -273,13 +273,13 @@ impl QueueConfig {
 pub struct ReconnectConfig {
     /// Whether the daemon auto-reconnects after an unreachable-GitLab dormancy
     /// (whether GitLab was down at boot or the connection dropped mid-run). When
-    /// `false`, recovery is manual (`tt login` or a restart) — the session still
+    /// `false`, recovery is manual (`tt auth login` or a restart) — the session still
     /// honestly reports `unreachable`, it just isn't retried. Re-read on every
     /// retry, so disabling it via a hot config reload stops an in-flight reconnect
     /// on the next iteration. The supervisor task is long-lived (parked between
     /// outages) and re-checks the dormant slot on a periodic tick (≤ `max_delay`),
     /// so a `false`→`true` reload is picked up at the next tick — no disconnect,
-    /// `tt login`, or restart required.
+    /// `tt auth login`, or restart required.
     #[config(default = true)]
     pub enabled: bool,
 

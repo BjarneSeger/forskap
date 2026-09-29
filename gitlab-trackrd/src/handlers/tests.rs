@@ -918,7 +918,7 @@ async fn clear_cache_usage_only_when_listed() {
 }
 
 /// Connected: the reply waits for the foreground views and the history to
-/// refill, so a `tt refresh` followed by `tt list` shows fresh data.
+/// refill, so a `tt sync refresh` followed by `tt issue list` shows fresh data.
 #[tokio::test]
 async fn clear_cache_refills_the_foreground_before_replying() {
     let fake = Arc::new(FakeGitlab::default());
@@ -950,7 +950,7 @@ async fn clear_cache_refills_only_what_it_cleared() {
 }
 
 /// Board columns of freshly assigned projects land before the refill
-/// replies, so `tt list` right after `tt refresh` shows them.
+/// replies, so `tt issue list` right after `tt sync refresh` shows them.
 #[tokio::test]
 async fn clear_cache_waits_for_new_board_columns() {
     let fake = Arc::new(FakeGitlab::default());
