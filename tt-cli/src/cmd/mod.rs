@@ -16,6 +16,8 @@ pub mod prompt;
 pub mod queue;
 pub mod refresh;
 pub mod search;
+#[cfg(target_os = "linux")]
+pub mod search_provider;
 pub mod tick;
 pub mod unassign;
 pub mod whoami;

@@ -27,7 +27,7 @@ To verify daemon/CLI changes end-to-end at the real varlink surface, use the `ve
 
 - `gitlab-trackr-api/` — the varlink interface crate. **Single source of truth is `gitlab-trackr-api/varlink/org.thehoster.gitlab.trackrd.varlink`**; Rust types/traits are generated from it at build time (`build.rs` + `varlink_generator`). Versioned independently from the workspace and dual-licensed MIT/Apache-2.0 (the rest is GPL-3.0-only).
 - `gitlab-trackrd/` — the daemon. Human-facing interface docs in `gitlab-trackrd/docs/varlink_interface.md` — keep in sync with the `.varlink` file.
-- `tt-cli/` — binary `tt`. One module per subcommand under `src/cmd/`; shell-hook snippets under `src/hooks/`.
+- `tt-cli/` — binary `tt`. One module per subcommand under `src/cmd/`; shell-hook snippets under `src/hooks/`; `packaging/` holds the GNOME Shell / KRunner / D-Bus registration files that both `tt search-provider install` (via `include_str!`) and the nfpm package ship.
 - `clients/go/` — **generated** Go binding. After changing the `.varlink` interface, run `go generate ./...` in `clients/go` and commit the result; CI (`go-binding.yml`) fails if the committed binding is stale. Never hand-edit `orgthehostergitlabtrackrd.go`.
 - `gitlab-trackr/` + `catalog.toml` — noctalia-shell launcher provider (`/gl`, Luau + `plugin.toml`). Shells out to `tt search --output json` / `tt open`; no daemon access of its own. The repo root is a noctalia plugin *source* (`plugins source add … git <repo>`): the plugin dir must equal the id suffix and `catalog.toml` mirrors `plugin.toml` (id, version, plugin_api) — bump both together.
 

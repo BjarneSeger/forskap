@@ -72,3 +72,19 @@ nfpms:
         dst: /usr/share/gitlab-trackrd/config.toml
         file_info:
           mode: 0644
+      - src: tt-cli/packaging/gnome-shell/search-providers/org.thehoster.gitlab.trackr.search-provider.ini
+        dst: /usr/share/gnome-shell/search-providers/org.thehoster.gitlab.trackr.search-provider.ini
+        file_info:
+          mode: 0644
+      - src: tt-cli/packaging/applications/org.thehoster.gitlab.trackr.desktop
+        dst: /usr/share/applications/org.thehoster.gitlab.trackr.desktop
+        file_info:
+          mode: 0644
+      - src: tt-cli/packaging/dbus-1/services/org.thehoster.gitlab.trackr.SearchProvider.service
+        dst: /usr/share/dbus-1/services/org.thehoster.gitlab.trackr.SearchProvider.service
+        file_info:
+          mode: 0644
+      - src: tt-cli/packaging/krunner/dbusplugins/org.thehoster.gitlab.trackr.desktop
+        dst: /usr/share/krunner/dbusplugins/org.thehoster.gitlab.trackr.desktop
+        file_info:
+          mode: 0644

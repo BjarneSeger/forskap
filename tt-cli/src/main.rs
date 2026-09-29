@@ -93,5 +93,7 @@ async fn main() -> Result<()> {
         } => cmd::unassign::run(&issuable, mr, project_id).await,
         Command::History { days } => cmd::history::run(output, days).await,
         Command::Queue { action } => cmd::queue::run(action, output).await,
+        #[cfg(target_os = "linux")]
+        Command::SearchProvider { action } => cmd::search_provider::run(action).await,
     }
 }

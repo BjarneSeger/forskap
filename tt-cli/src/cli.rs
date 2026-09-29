@@ -230,6 +230,14 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<QueueAction>,
     },
+    /// Serve `tt search` results to GNOME Shell and KRunner over D-Bus. The
+    /// session bus starts this on demand once the files from
+    /// `tt search-provider install` are in place; it exits again when idle.
+    #[cfg(target_os = "linux")]
+    SearchProvider {
+        #[command(subcommand)]
+        action: Option<SearchProviderAction>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -246,6 +254,23 @@ pub enum QueueAction {
     },
     /// Drop every failed action.
     Clear,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Subcommand)]
+pub enum SearchProviderAction {
+    /// Write the GNOME Shell, KRunner and D-Bus activation files under PREFIX
+    /// with this binary's path filled in. GNOME Shell only reads providers
+    /// from `$XDG_DATA_DIRS`, so the default prefix needs root; KRunner and
+    /// D-Bus activation also work from `~/.local/share`.
+    Install {
+        /// Data directory to install into (default: /usr/local/share).
+        #[arg(long, value_name = "DIR")]
+        prefix: Option<std::path::PathBuf>,
+    },
+    /// Open your GitLab instance in the browser (the desktop entry's action).
+    #[command(hide = true)]
+    Launch,
 }
 
 #[derive(Subcommand)]
