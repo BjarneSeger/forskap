@@ -19,7 +19,9 @@ use crate::sync::model::Timelog;
 /// don't couple the on-disk format to the api crate; `Default = Issue`
 /// because every record written before MR support was an issue, which lets
 /// them deserialize via `#[serde(default)]`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum Issuable {
     #[default]
     Issue,

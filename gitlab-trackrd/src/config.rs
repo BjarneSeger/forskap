@@ -223,6 +223,12 @@ pub struct QueueConfig {
     /// dormant (no GitLab session) before checking again.
     #[config(default = 30)]
     pub session_wait_secs: u64,
+
+    /// Most queued writes the retry worker sends to GitLab at once. Writes to
+    /// the same issue or MR always go one at a time, in the order they were
+    /// queued. (4 by default; at least 1.)
+    #[config(default = 4)]
+    pub max_in_flight: u64,
 }
 
 impl QueueConfig {
@@ -244,6 +250,13 @@ impl QueueConfig {
     /// How long the worker sleeps while dormant (no session) before retrying.
     pub fn session_wait(&self) -> Duration {
         Duration::from_secs(self.session_wait_secs)
+    }
+
+    /// Most attempts in flight at once; never below one.
+    pub fn max_in_flight(&self) -> usize {
+        usize::try_from(self.max_in_flight)
+            .unwrap_or(usize::MAX)
+            .max(1)
     }
 }
 
@@ -443,6 +456,14 @@ fn normalize_backoff(base_secs: &mut u64, max_secs: &mut u64, section: &str) {
     }
 }
 
+/// Floor the queue's in-flight bound: 0 would never send a queued write.
+fn normalize_queue(queue: &mut QueueConfig) {
+    if queue.max_in_flight == 0 {
+        warn!("queue.max_in_flight of 0 would never send a queued write; flooring to 1");
+        queue.max_in_flight = 1;
+    }
+}
+
 /// Load the layered config: user file → system default → built-in defaults.
 ///
 /// Missing files are treated as empty layers; parse errors propagate. Backoff
@@ -463,6 +484,7 @@ pub fn load() -> Result<Config, confique::Error> {
         &mut config.queue.max_delay_secs,
         "queue",
     );
+    normalize_queue(&mut config.queue);
     normalize_search(&mut config.search);
     normalize_refresh(&mut config.refresh);
     normalize_sync(&mut config.sync);
@@ -685,6 +707,15 @@ mod tests {
                     "in-range values are left untouched"
                 );
             }
+        }
+
+        #[test]
+        fn normalize_queue_floors_max_in_flight(n in any::<u64>()) {
+            let mut q = defaults().queue;
+            q.max_in_flight = n;
+            normalize_queue(&mut q);
+            prop_assert_eq!(q.max_in_flight, n.max(1));
+            prop_assert!(q.max_in_flight() >= 1);
         }
 
         #[test]

@@ -3,13 +3,14 @@
 //! Reads are routed by [`Listing::path`]: each path serves a standing set of
 //! rows (empty by default), one-shot failures can be queued in front, and a
 //! path can be gated to hold its next call until released. Every call is
-//! recorded for assertions. Writes succeed unless a failure is queued.
+//! recorded for assertions. Writes succeed unless a failure is queued, and
+//! can all be held behind one gate to observe them in flight.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 
 use crate::error::{Error, Result};
 use crate::gitlab::{GitlabApi, Issuable, Listing};
@@ -60,8 +61,20 @@ pub struct FakeGitlab {
     timelog_calls: Mutex<Vec<chrono::DateTime<chrono::Utc>>>,
     write_failures: Mutex<VecDeque<FakeErr>>,
     writes: Mutex<Vec<WriteCall>>,
+    /// Holds every write while set; see [`FakeGitlab::gate_writes`].
+    write_gate: Mutex<Option<Arc<Semaphore>>>,
     /// Signalled when a gated call starts waiting on its gate.
     pub gated: Notify,
+}
+
+/// Releases the writes held by [`FakeGitlab::gate_writes`].
+pub struct WriteGate(Arc<Semaphore>);
+
+impl WriteGate {
+    /// Let every held write through, and every later one at once.
+    pub fn release(&self) {
+        self.0.close();
+    }
 }
 
 impl FakeGitlab {
@@ -109,6 +122,15 @@ impl FakeGitlab {
         self.write_failures.lock().unwrap().push_back(err);
     }
 
+    /// Hold every write from now on until the returned gate is released. A
+    /// held write is already recorded in [`writes`](Self::writes), so its
+    /// length counts the attempts started.
+    pub fn gate_writes(&self) -> WriteGate {
+        let gate = Arc::new(Semaphore::new(0));
+        *self.write_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        WriteGate(gate)
+    }
+
     pub fn calls(&self) -> Vec<Listing> {
         self.calls.lock().unwrap().clone()
     }
@@ -145,11 +167,23 @@ impl FakeGitlab {
         self.writes.lock().unwrap().clone()
     }
 
-    fn write(&self, op: &'static str, kind: Issuable, project_id: i64, iid: i64) -> Result<()> {
+    async fn write(
+        &self,
+        op: &'static str,
+        kind: Issuable,
+        project_id: i64,
+        iid: i64,
+    ) -> Result<()> {
         self.writes
             .lock()
             .unwrap()
             .push((op, kind, project_id, iid));
+        // Cloned out so the std lock is not held across the await; a closed
+        // gate fails the acquire, which is the release.
+        let gate = self.write_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            let _ = gate.acquire().await;
+        }
         match self.write_failures.lock().unwrap().pop_front() {
             Some(err) => Err(err.error()),
             None => Ok(()),
@@ -208,7 +242,7 @@ impl GitlabApi for FakeGitlab {
         _duration: &str,
         _summary: Option<&str>,
     ) -> Result<()> {
-        self.write("add_spent_time", kind, project_id, iid)
+        self.write("add_spent_time", kind, project_id, iid).await
     }
 
     async fn create_timelog(
@@ -219,19 +253,19 @@ impl GitlabApi for FakeGitlab {
         _summary: &str,
         _spent_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
-        self.write("create_timelog", kind, 0, issuable_id)
+        self.write("create_timelog", kind, 0, issuable_id).await
     }
 
     async fn close(&self, kind: Issuable, project_id: i64, iid: i64) -> Result<()> {
-        self.write("close", kind, project_id, iid)
+        self.write("close", kind, project_id, iid).await
     }
 
     async fn assign_self(&self, kind: Issuable, project_id: i64, iid: i64) -> Result<()> {
-        self.write("assign_self", kind, project_id, iid)
+        self.write("assign_self", kind, project_id, iid).await
     }
 
     async fn unassign_self(&self, kind: Issuable, project_id: i64, iid: i64) -> Result<()> {
-        self.write("unassign_self", kind, project_id, iid)
+        self.write("unassign_self", kind, project_id, iid).await
     }
 }
 
