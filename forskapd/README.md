@@ -67,7 +67,10 @@ error and keeps retrying the write. If it is restarted before that worked, the
 keychain holds the revoked token and `forskap auth login` with a new one is needed.
 
 On machines sharing the keychain entry (iCloud Keychain) one of them rotates; the
-others pick the new token up from the keychain once GitLab rejects the old one.
+others pick the new token up from the keychain once GitLab rejects the old one. Each
+daemon rotates up to a day earlier than configured, by a random share of its own, so
+two of them rarely rotate before the keychain has synchronized. If they do, the
+later rotation revokes the new token and `forskap auth login` is needed.
 
 Logging can be set by changing the `FORSKAPD_LOG` environment variable to
 `trace`, `debug`, `info`, `warn` or `error` (ordered from most to least verbose)

@@ -14,12 +14,14 @@ use crate::friendly::friendly;
 
 pub async fn run(host: String) -> Result<()> {
     let url = format!(
-        "https://{host}/-/user_settings/personal_access_tokens?name=forskapd&scopes=api,read_user"
+        "https://{host}/-/user_settings/personal_access_tokens?name=forskapd&scopes=api,read_user,self_rotate"
     );
 
     println!("Opening {url}");
-    println!("Generate a token with the `api` and `read_user` scopes, then paste it below.");
-    println!("Add the `self_rotate` scope to have the daemon renew it before it expires.");
+    println!(
+        "Generate a token with the `api`, `read_user` and `self_rotate` scopes, then paste it below."
+    );
+    println!("With `self_rotate` the daemon renews the token before it expires.");
     if let Err(e) = open::that(&url) {
         eprintln!("(couldn't open browser automatically: {e})");
         eprintln!("Open the URL above manually.");

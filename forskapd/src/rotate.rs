@@ -27,6 +27,9 @@ use crate::gitlab::{GitlabApi, GitlabClient, TokenInfo};
 use crate::handlers::{ConnState, Handlers, Session, SessionSlot};
 use crate::secrets::{self, Credentials, Token};
 
+/// Widest spread of the rotation point between machines.
+const SPREAD_MAX: TimeDelta = TimeDelta::hours(24);
+
 /// Keychain writes tried before the session is swapped without one.
 const KEYCHAIN_ATTEMPTS: u32 = 4;
 
@@ -78,7 +81,7 @@ impl Rotation {
             return (None, false);
         };
         let rotates =
-            !status.refused && matches!(plan(auth, &status.info, Utc::now()), Plan::At(_));
+            !status.refused && matches!(plan(auth, &status.info, Utc::now(), 0.0), Plan::At(_));
         let expires_at = status.info.expires_at.map(|d| expiry(d).timestamp());
         (expires_at, rotates)
     }
@@ -141,8 +144,10 @@ fn expiry(date: NaiveDate) -> DateTime<Utc> {
 
 /// Whether and when the token rotates: once less than `rotate_before` is
 /// left, or a third of its lifetime if that is shorter, so a short-lived
-/// token doesn't rotate at every look.
-fn plan(auth: &AuthConfig, info: &TokenInfo, now: DateTime<Utc>) -> Plan {
+/// token doesn't rotate at every look. `spread` in `[0, 1)` moves it earlier
+/// by up to half of that, a day at most: machines sharing the keychain must
+/// not rotate at the same moment, the later one would revoke the new token.
+fn plan(auth: &AuthConfig, info: &TokenInfo, now: DateTime<Utc>, spread: f64) -> Plan {
     if auth.rotate == RotatePolicy::Never {
         return Plan::Idle(Why::Disabled);
     }
@@ -165,9 +170,12 @@ fn plan(auth: &AuthConfig, info: &TokenInfo, now: DateTime<Utc>) -> Plan {
     if let Some(created) = info.created_at.filter(|c| *c < expires) {
         lead = lead.min((expires - created) / 3);
     }
+    let width = (lead / 2).min(SPREAD_MAX).num_seconds() as f64;
+    let early = TimeDelta::seconds((width * spread.clamp(0.0, 1.0)) as i64);
     Plan::At(
         expires
             .checked_sub_signed(lead)
+            .and_then(|at| at.checked_sub_signed(early))
             .unwrap_or(DateTime::<Utc>::MIN_UTC),
     )
 }
@@ -237,9 +245,16 @@ pub fn spawn(handlers: Arc<Handlers>) {
         rotation: Arc::clone(&handlers.rotation),
         env: Arc::new(Live(handlers)),
         pacing: PACING,
+        spread: random_unit(),
         watch: None,
     };
     tokio::spawn(supervisor.run());
+}
+
+/// A value in `[0, 1)` differing between daemons.
+fn random_unit() -> f64 {
+    use std::hash::{BuildHasher, RandomState};
+    crate::sync::schedule::unit("rotation", RandomState::new().hash_one(0u8))
 }
 
 /// What was last logged about a token, so a recheck doesn't repeat it.
@@ -284,6 +299,8 @@ struct Supervisor<E> {
     rotation: Arc<Rotation>,
     env: Arc<E>,
     pacing: Pacing,
+    /// This daemon's share of the rotation point's spread, in `[0, 1)`.
+    spread: f64,
     watch: Option<Watch>,
 }
 
@@ -338,7 +355,7 @@ impl<E: Env> Supervisor<E> {
 
         let auth = self.config.read().unwrap().auth;
         let now = self.env.now();
-        let at = match plan(&auth, &info, now) {
+        let at = match plan(&auth, &info, now, self.spread) {
             Plan::At(at) => at,
             Plan::Idle(why) => {
                 if watch.note(Note::Idle(why)) {
@@ -785,6 +802,7 @@ mod tests {
                 retry_max: Duration::ZERO,
                 keychain_base: Duration::ZERO,
             },
+            spread: 0.0,
             watch: None,
         };
         Rig {
@@ -813,6 +831,7 @@ mod tests {
             &auth(RotatePolicy::Scoped),
             &yearly(),
             at("2026-06-01T00:00:00Z"),
+            0.0,
         );
         assert_eq!(plan, Plan::At(at("2026-12-24T00:00:00Z")));
     }
@@ -824,8 +843,27 @@ mod tests {
             &auth(RotatePolicy::Scoped),
             &info,
             at("2026-06-01T00:00:00Z"),
+            0.0,
         );
         assert_eq!(plan, Plan::At(at("2026-06-05T00:00:00Z")));
+    }
+
+    #[test]
+    fn the_spread_moves_the_rotation_earlier_by_a_day_or_half_the_lead() {
+        let scoped = auth(RotatePolicy::Scoped);
+        let now = at("2026-06-01T00:00:00Z");
+        assert_eq!(
+            plan(&scoped, &yearly(), now, 0.5),
+            Plan::At(at("2026-12-23T12:00:00Z"))
+        );
+        // A lead of two days spreads over one.
+        let weekly = token(&["self_rotate"], "2026-06-01T00:00:00Z", Some("2026-06-07"));
+        assert_eq!(
+            plan(&scoped, &weekly, now, 0.5),
+            Plan::At(at("2026-06-04T12:00:00Z"))
+        );
+        let unit = random_unit();
+        assert!((0.0..1.0).contains(&unit), "{unit}");
     }
 
     #[test]
@@ -847,7 +885,7 @@ mod tests {
             ),
         ];
         for (policy, scopes, idle) in cases {
-            let got = plan(&auth(policy), &with(&scopes), now);
+            let got = plan(&auth(policy), &with(&scopes), now, 0.0);
             match idle {
                 Some(why) => assert_eq!(got, Plan::Idle(why), "{policy:?} {scopes:?}"),
                 None => assert!(matches!(got, Plan::At(_)), "{policy:?} {scopes:?}"),
@@ -860,11 +898,11 @@ mod tests {
         let forever = token(&["self_rotate"], "2025-12-31T10:00:00Z", None);
         let scoped = auth(RotatePolicy::Scoped);
         assert_eq!(
-            plan(&scoped, &forever, at("2026-06-01T00:00:00Z")),
+            plan(&scoped, &forever, at("2026-06-01T00:00:00Z"), 0.0),
             Plan::Idle(Why::NoExpiry)
         );
         assert_eq!(
-            plan(&scoped, &yearly(), at("2026-12-31T00:00:00Z")),
+            plan(&scoped, &yearly(), at("2026-12-31T00:00:00Z"), 0.0),
             Plan::Idle(Why::Expired)
         );
     }
@@ -876,7 +914,7 @@ mod tests {
         let mut info = yearly();
         info.created_at = None;
         assert!(matches!(
-            plan(&auth, &info, at("2026-06-01T00:00:00Z")),
+            plan(&auth, &info, at("2026-06-01T00:00:00Z"), 0.0),
             Plan::At(_)
         ));
     }
