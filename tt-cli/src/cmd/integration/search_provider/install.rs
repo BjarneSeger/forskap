@@ -1,4 +1,4 @@
-//! `tt search-provider install` — write the registration files with this
+//! `tt integration search-provider install` — write the registration files with this
 //! binary's path filled in. The same files ship verbatim in the package
 //! (`tt-cli/packaging/`, wired up in `.goreleaser.yaml`) for `/usr/bin/tt`.
 
@@ -16,22 +16,24 @@ const FILES: &[(&str, &str)] = &[
     (
         "gnome-shell/search-providers/org.thehoster.gitlab.trackr.search-provider.ini",
         include_str!(
-            "../../../packaging/gnome-shell/search-providers/org.thehoster.gitlab.trackr.search-provider.ini"
+            "../../../../packaging/gnome-shell/search-providers/org.thehoster.gitlab.trackr.search-provider.ini"
         ),
     ),
     (
         "applications/org.thehoster.gitlab.trackr.desktop",
-        include_str!("../../../packaging/applications/org.thehoster.gitlab.trackr.desktop"),
+        include_str!("../../../../packaging/applications/org.thehoster.gitlab.trackr.desktop"),
     ),
     (
         "dbus-1/services/org.thehoster.gitlab.trackr.SearchProvider.service",
         include_str!(
-            "../../../packaging/dbus-1/services/org.thehoster.gitlab.trackr.SearchProvider.service"
+            "../../../../packaging/dbus-1/services/org.thehoster.gitlab.trackr.SearchProvider.service"
         ),
     ),
     (
         "krunner/dbusplugins/org.thehoster.gitlab.trackr.desktop",
-        include_str!("../../../packaging/krunner/dbusplugins/org.thehoster.gitlab.trackr.desktop"),
+        include_str!(
+            "../../../../packaging/krunner/dbusplugins/org.thehoster.gitlab.trackr.desktop"
+        ),
     ),
 ];
 

@@ -1,23 +1,13 @@
-//! One module per `tt` subcommand. Each exposes a single `run(...)` entry
-//! point invoked from [`crate::main`].
+//! Mirrors the command tree: one module per group, one per subcommand inside
+//! it. Each group exposes a `run(...)` that [`crate::main`] dispatches to.
 
-pub mod assign;
-pub mod close;
+pub mod auth;
 pub mod config;
-pub mod history;
-pub mod hook;
-pub mod list;
-pub mod log;
-pub mod login;
-pub mod logout;
-pub mod open;
-pub mod project;
-pub mod prompt;
-pub mod queue;
-pub mod refresh;
-pub mod search;
 #[cfg(target_os = "linux")]
-pub mod search_provider;
-pub mod tick;
-pub mod unassign;
-pub mod whoami;
+pub mod integration;
+pub mod item;
+pub mod project;
+pub mod queue;
+pub mod search;
+pub mod sync;
+pub mod time;

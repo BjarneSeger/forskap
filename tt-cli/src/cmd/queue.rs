@@ -1,93 +1,86 @@
-//! `tt queue` — inspect and manage failed queued actions.
+//! `tt queue` — inspect and manage failed queued writes.
 //!
-//! A write op that hit a network error is queued and retried by the daemon.
-//! If GitLab later rejects it, or the retry window expires, the daemon moves it
-//! to a dead-letter store. This command lists those failures and lets the user
-//! retry or dismiss them.
+//! A write that hit a network error is queued and retried by the daemon. If
+//! GitLab later rejects it, or the retry window expires, the daemon moves it
+//! to a dead-letter store. This lists those failures and lets the user retry
+//! or dismiss them.
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use gitlab_trackr_api::{IssuableKind, VarlinkClient, VarlinkClientInterface};
 
-use crate::cli::{OutputFormat, QueueAction};
-use crate::{client, config};
+use crate::cli::{OutputFormat, QueueCommand};
+use crate::friendly::friendly;
+use crate::{client, output};
 
-pub async fn run(action: Option<QueueAction>, output: OutputFormat) -> Result<()> {
-    let cfg = config::load()?;
-    let socket = cfg.socket.unwrap_or_else(client::default_socket);
-    let client = client::connect(&socket).await?;
+pub async fn run(command: QueueCommand) -> Result<()> {
+    let client = client::connect_default().await?;
 
-    match action {
-        None => list(&client, output).await,
-        Some(QueueAction::Retry { id }) => {
+    match command {
+        QueueCommand::List { output } => list(&client, output.output).await,
+        QueueCommand::Retry { id } => {
             client
-                .retry_failure(id as i64)
+                .retry_failure(id)
                 .call()
                 .await
-                .map_err(|e| anyhow::anyhow!("RetryFailure failed: {e}"))?;
-            println!("re-enqueued failed action {id}");
+                .map_err(|e| friendly("RetryFailure", e))?;
+            println!("re-enqueued failed write {id}");
             Ok(())
         }
-        Some(QueueAction::Dismiss { id }) => {
+        QueueCommand::Dismiss { id } => {
             client
-                .dismiss_failure(id as i64)
+                .dismiss_failure(id)
                 .call()
                 .await
-                .map_err(|e| anyhow::anyhow!("DismissFailure failed: {e}"))?;
-            println!("dismissed failed action {id}");
+                .map_err(|e| friendly("DismissFailure", e))?;
+            println!("dismissed failed write {id}");
             Ok(())
         }
-        Some(QueueAction::Clear) => {
+        QueueCommand::Clear => {
             client
                 .clear_failures()
                 .call()
                 .await
-                .map_err(|e| anyhow::anyhow!("ClearFailures failed: {e}"))?;
-            println!("cleared all failed actions");
+                .map_err(|e| friendly("ClearFailures", e))?;
+            println!("cleared all failed writes");
             Ok(())
         }
     }
 }
 
-async fn list(client: &VarlinkClient, output: OutputFormat) -> Result<()> {
+async fn list(client: &VarlinkClient, format: OutputFormat) -> Result<()> {
     let reply = client
         .get_failures()
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("GetFailures failed: {e}"))?;
+        .map_err(|e| friendly("GetFailures", e))?;
 
-    match output {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&reply.failures)?);
+    output::emit(format, &reply.failures, |failures| {
+        if failures.is_empty() {
+            println!("no failed writes");
+            return;
         }
-        OutputFormat::Text => {
-            if reply.failures.is_empty() {
-                println!("no failed actions");
-                return Ok(());
-            }
-            for f in &reply.failures {
-                let when = DateTime::<Utc>::from_timestamp(f.failed_at, 0)
-                    .map(|d| d.to_rfc3339())
-                    .unwrap_or_else(|| f.failed_at.to_string());
-                let detail = if f.detail.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", f.detail)
-                };
-                let sigil = match f.kind {
-                    IssuableKind::merge_request => '!',
-                    IssuableKind::issue => '#',
-                };
-                println!(
-                    "[{}] {} {sigil}{}{}  —  {}  ({})",
-                    f.id, f.op, f.iid, detail, f.error, when
-                );
-            }
+        for f in failures {
+            let when = DateTime::<Utc>::from_timestamp(f.failed_at, 0)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_else(|| f.failed_at.to_string());
+            let detail = if f.detail.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", f.detail)
+            };
+            let sigil = match f.kind {
+                IssuableKind::merge_request => '!',
+                IssuableKind::issue => '#',
+            };
             println!(
-                "\nretry with `tt queue retry <id>`, drop with `tt queue dismiss <id>`, \
-                 or `tt queue clear`"
+                "[{}] {} {sigil}{}{}  —  {}  ({})",
+                f.id, f.op, f.iid, detail, f.error, when
             );
         }
-    }
-    Ok(())
+        println!(
+            "\nretry with `tt queue retry <id>`, drop with `tt queue dismiss <id>`, \
+             or `tt queue clear`"
+        );
+    })
 }

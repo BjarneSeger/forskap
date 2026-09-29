@@ -1,15 +1,15 @@
 //! GitLab-style issuable references on the command line.
 //!
-//! The issuable-acting commands (`log`, `close`, `assign`, `unassign`) take
-//! their target positionally as `42`, `#42`, or `!42` — the sigils GitLab
-//! itself uses: `#` for issues, `!` for merge requests. A bare number is an
-//! issue unless the `--mr` flag says otherwise; a sigil that contradicts
-//! `--mr` is an error rather than a silent guess.
+//! `tt time log` acts on either kind, so it takes its target positionally as
+//! `42`, `#42`, or `!42` — the sigils GitLab itself uses: `#` for issues, `!`
+//! for merge requests. A bare number is an issue unless the `--mr` flag says
+//! otherwise; a sigil that contradicts `--mr` is an error rather than a silent
+//! guess. (`tt issue` / `tt mr` know the kind from the command group.)
 //!
 //! Shell note (surfaced in the clap help texts): `!` triggers history
 //! expansion in interactive bash/zsh and `#` starts a comment, so those forms
-//! need quoting there (`tt close '!42'`); fish needs none, and `42 --mr`
-//! avoids the issue entirely.
+//! need quoting there (`tt time log '!42' 1h`); fish needs none, and
+//! `42 --mr` avoids the issue entirely.
 
 use anyhow::{Result, bail};
 use gitlab_trackr_api::IssuableKind;
@@ -75,6 +75,21 @@ pub fn wire(kind: RefKind) -> IssuableKind {
     match kind {
         RefKind::Issue => IssuableKind::issue,
         RefKind::Mr => IssuableKind::merge_request,
+    }
+}
+
+/// The `Search` kind holding this kind's rows.
+pub fn search_kind(kind: RefKind) -> &'static str {
+    match kind {
+        RefKind::Issue => "issues",
+        RefKind::Mr => "merge_requests",
+    }
+}
+
+pub fn noun(kind: RefKind) -> &'static str {
+    match kind {
+        RefKind::Issue => "issue",
+        RefKind::Mr => "merge request",
     }
 }
 

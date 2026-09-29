@@ -57,9 +57,10 @@ the daemon are the to-do list.
 
 ## 4. CLI
 
-New subcommand module under `tt-cli/src/cmd/`, wired into `tt-cli/src/cli.rs`.
-Shell completions under `tt-cli/completions/` regenerate from `cli.rs` on every build
-(`tt-cli/build.rs`) and are committed — include the diff.
+New subcommand module in its group under `tt-cli/src/cmd/`, wired into
+`tt-cli/src/cli.rs` (clap-only: `build.rs` includes it) and covered in
+`tt-cli/src/cli_tests.rs`. Shell completions under `tt-cli/completions/` regenerate
+from `cli.rs` on every build and are gitignored.
 
 ## 5. Docs
 

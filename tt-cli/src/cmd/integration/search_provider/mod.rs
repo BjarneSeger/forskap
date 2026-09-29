@@ -1,14 +1,15 @@
-//! `tt search-provider` — serve `tt search` to GNOME Shell and KRunner.
+//! `tt integration search-provider` — serve `tt search` to GNOME Shell and
+//! KRunner.
 //!
 //! One process owns the bus name [`BUS_NAME`] and exposes two objects: the
 //! GNOME `org.gnome.Shell.SearchProvider2` interface at [`GNOME_PATH`] and
 //! the KRunner `org.kde.krunner1` interface at [`KRUNNER_PATH`]. The session
 //! bus starts it on demand through the `dbus-1/services` file that
-//! `tt search-provider install` writes, and it exits after [`IDLE`] without a
+//! `install` writes, and it exits after [`IDLE`] without a
 //! call, so nothing runs while no launcher is open.
 //!
 //! Everything comes from the daemon (`Search`, `RecordOpen`, `WhoAmI`), the
-//! same calls the noctalia plugin makes through `tt search` / `tt open`; the
+//! same calls the noctalia plugin makes through `tt search` / `tt issue open`; the
 //! query grammar ([`query`]) and result ids ([`results`]) are shared with it.
 
 mod gnome;
@@ -27,7 +28,8 @@ use gitlab_trackr_api::{ErrorKind, VarlinkClientInterface};
 use tokio::signal::unix::{SignalKind, signal};
 use zbus::zvariant::{OwnedValue, Value};
 
-use crate::cli::SearchProviderAction;
+use crate::cli::SearchProviderCommand;
+use crate::cmd::item;
 use crate::friendly::friendly;
 use crate::{client, config, refspec};
 use results::{Row, Target};
@@ -44,11 +46,11 @@ const IDLE: Duration = Duration::from_secs(120);
 /// provider anyway.
 const PER_KIND_LIMIT: i64 = 10;
 
-pub async fn run(action: Option<SearchProviderAction>) -> Result<()> {
-    match action {
-        Some(SearchProviderAction::Install { prefix }) => install::run(prefix),
-        Some(SearchProviderAction::Launch) => Provider::new()?.launch_search("").await,
-        None => serve().await,
+pub async fn run(command: SearchProviderCommand) -> Result<()> {
+    match command {
+        SearchProviderCommand::Serve => serve().await,
+        SearchProviderCommand::Install { prefix } => install::run(prefix),
+        SearchProviderCommand::Launch => Provider::new()?.launch_search("").await,
     }
 }
 
@@ -111,13 +113,14 @@ pub(super) struct Hits {
 impl Provider {
     fn new() -> Result<Self> {
         let cfg = config::load()?;
+        let socket = client::socket(&cfg);
         let trigger_word = cfg
             .search_provider
             .trigger_word
             .map(|w| w.trim().to_string())
             .filter(|w| !w.is_empty());
         Ok(Self {
-            socket: cfg.socket.unwrap_or_else(client::default_socket),
+            socket,
             trigger_word,
             inner: Arc::new(Mutex::new(Inner {
                 rows: HashMap::new(),
@@ -186,7 +189,7 @@ impl Provider {
     }
 
     /// Open a picked result: `url:` ids go straight to the browser, issuables
-    /// are counted in the daemon first (same order as `tt open`).
+    /// are counted in the daemon first (same order as `tt issue open`).
     async fn activate(&self, id: &str) -> Result<()> {
         match results::parse_id(id).ok_or_else(|| anyhow!("unknown result id {id:?}"))? {
             Target::Url(url) => self.open_url(&url),
@@ -198,7 +201,10 @@ impl Provider {
                 let client = client::connect(&self.socket).await?;
                 let url = match self.cached(id) {
                     Some(row) => row.url,
-                    None => crate::cmd::open::lookup_url(&client, kind, project_id, iid).await?,
+                    None => item::lookup(&client, kind, project_id, iid)
+                        .await?
+                        .web_url()
+                        .to_string(),
                 };
                 client
                     .record_open(project_id, iid, refspec::wire(kind))

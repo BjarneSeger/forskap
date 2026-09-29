@@ -1,8 +1,8 @@
 # tt-cli
-A cli helper for logging times in gitlab
+A CLI for GitLab, served from the cache of `gitlab-trackrd`.
 
-tt allows native-ish integration of timetracking into you workflow by regularly
-asking you what you worked on, in the terminal.
+Besides issues, merge requests and search, tt integrates time tracking into your
+workflow by regularly asking you what you worked on, in the terminal.
 
 # Setup
 
@@ -17,7 +17,7 @@ systemctl enable --now --user gitlab-trackrd.socket
 
 
 ```sh
-tt hook <SHELL>
+tt time hook <SHELL>
 ```
 
 to get the snippet to add to your respective shellrc. After that, you will be asked
@@ -32,7 +32,7 @@ carapace does not currently support globally installed specs.
 
 ## Config
 The config lives at `$XDG_CONFIG_HOME/` or `$HOME/.config/` under
-`gitlab_trackr_cli/config.toml`. You can run `tt config path` to see what it 
+`gitlab-trackr-cli/config.toml`. You can run `tt config path` to see what it 
 resolves to on your system. To get a sample config, run
 
 ```sh

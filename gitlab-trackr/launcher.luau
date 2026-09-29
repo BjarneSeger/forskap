@@ -1,7 +1,7 @@
 -- Noctalia launcher provider for gitlab-trackrd: `/gl <query>`.
 --
 -- Thin by design, like `tt` itself: every query is one `tt search --output
--- json` run, every activation one `tt open` (issues/MRs — which also records
+-- json` run, every activation one `tt issue|mr open` (issues/MRs — which also records
 -- the open so the daemon ranks it higher next time) or `xdg-open`
 -- (projects/groups). The daemon owns ranking; results are emitted in its
 -- order with `score = open_count`, so frequently opened issues and MRs
@@ -198,14 +198,12 @@ function onActivate(id)
   if kind == nil then
     return
   end
-  local argv = { ttPath(), "open", iid, "-p", projectId }
-  if kind == "merge_requests" then
-    table.insert(argv, "--mr")
-  end
+  local group = kind == "merge_requests" and "mr" or "issue"
+  local argv = { ttPath(), group, "open", iid, "-p", projectId }
   noctalia.runAsync(argv, function(result)
     if result.exitCode ~= 0 then
       local why = firstLine(result.stderr)
-      noctalia.notifyError("GitLab Trackr", why ~= "" and why or "tt open failed")
+      noctalia.notifyError("GitLab Trackr", why ~= "" and why or "tt " .. group .. " open failed")
     end
   end)
 end

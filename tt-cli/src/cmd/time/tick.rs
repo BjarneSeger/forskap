@@ -10,13 +10,14 @@
 //! terminal, so there's no risk of colliding with a TUI. Nushell instead uses
 //! `remind`: reedline keeps the terminal in raw mode across its hooks, so a
 //! TUI launched from one corrupts the line editor — `remind` only prints a
-//! one-line nudge and the user logs with `tt prompt`. See `hooks/nu.txt`.
+//! one-line nudge and the user logs with `tt time prompt`. See `hooks/nu.txt`.
 
 use anyhow::{Context, Result};
 use gitlab_trackr_api::VarlinkClientInterface;
 
+use super::prompt;
 use crate::cli::TickMode;
-use crate::{client, cmd::prompt, config, state};
+use crate::{client, config, state};
 
 pub async fn run(mode: TickMode) -> Result<()> {
     match mode {
@@ -60,8 +61,8 @@ async fn run_inline() -> Result<()> {
 /// Nushell path: if the interval has elapsed, print a one-line reminder to log
 /// time (and surface any new queued-action failures). Never opens inquire —
 /// reedline owns the terminal in raw mode during nushell's hooks, so a TUI
-/// launched there corrupts the line editor. The user logs with `tt prompt`,
-/// which runs as an ordinary foreground command with a clean terminal and
+/// launched there corrupts the line editor. The user logs with `tt time
+/// prompt`, which runs as an ordinary foreground command with a clean terminal and
 /// resets the interval. The nudge therefore repeats each command until logged.
 async fn run_remind() -> Result<()> {
     let cfg = config::load()?;
@@ -78,8 +79,8 @@ async fn run_remind() -> Result<()> {
     let _ = state::save(&st);
 
     match st.elapsed_suggestion() {
-        Some(elapsed) => eprintln!("tt: {elapsed} unlogged — run `tt prompt` to log time"),
-        None => eprintln!("tt: run `tt prompt` to log time"),
+        Some(elapsed) => eprintln!("tt: {elapsed} unlogged — run `tt time prompt` to log time"),
+        None => eprintln!("tt: run `tt time prompt` to log time"),
     }
     Ok(())
 }
@@ -90,9 +91,7 @@ async fn run_remind() -> Result<()> {
 /// downed daemon never blocks or breaks the prompt. Gated behind the interval
 /// check by its call sites, so the cheap no-network fast path is untouched.
 async fn notify_new_failures(st: &mut state::State) {
-    let Ok(cfg) = config::load() else { return };
-    let socket = cfg.socket.unwrap_or_else(client::default_socket);
-    let Ok(client) = client::connect(&socket).await else {
+    let Ok(client) = client::connect_default().await else {
         return;
     };
     let Ok(reply) = client.get_failures().call().await else {

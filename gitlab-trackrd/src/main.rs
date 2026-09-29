@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
     }
     let db_dir = data_dir.join("db");
 
-    // Credentials come only from the OS keychain (set via `tt login`). The
+    // Credentials come only from the OS keychain (set via `tt auth login`). The
     // daemon never refuses to start: any failure here leaves it *dormant*
     // (serving, but returning `NotAuthenticated`). The dormancy reason is kept
     // in the session slot so the CLI can report a specific cause.
@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
             ConnState::Dormant(DormancyReason::KeychainError(e.to_string()))
         }
         Ok(None) => {
-            info!("no credentials available; daemon starting dormant (run `tt login`)");
+            info!("no credentials available; daemon starting dormant (run `tt auth login`)");
             ConnState::Dormant(DormancyReason::NoCredentials)
         }
         Ok(Some(c)) => match GitlabClient::connect(&c.host, &c.token).await {

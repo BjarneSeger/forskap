@@ -2,8 +2,8 @@
 
 /// The group namespace an issue belongs to, parsed from its `web_url`
 /// (`https://host/<namespace>/-/issues/<iid>`). Returns `""` when there is no
-/// namespace to parse — such issues still show in `tt list`, they just don't
-/// match any `tt list <group>` filter.
+/// namespace to parse — such issues still show in `tt issue list`, they just don't
+/// match any `tt issue list --group` filter.
 pub fn namespace_of(web_url: &str) -> String {
     web_url
         .split_once("://")

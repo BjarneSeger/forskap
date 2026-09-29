@@ -1,6 +1,6 @@
-//! `tt` — interactive client for the [`gitlab-trackrd`] varlink daemon.
+//! `tt` — client for the [`gitlab-trackrd`] varlink daemon.
 //!
-//! See the per-subcommand modules under [`cmd`] for behaviour. The binary is
+//! See the modules under [`cmd`], which mirror the command tree. The binary is
 //! deliberately thin: all GitLab access goes through the daemon over a unix
 //! socket, so `tt` only handles argument parsing, local state (last-prompt
 //! timestamp, last-used issue) and the interactive UI.
@@ -14,86 +14,48 @@ use clap::Parser;
 ///
 /// GitLab terminology note: every issue/MR has both a global `id` and a
 /// per-project `iid` (the `#42` / `!7` shown in the UI). The varlink API needs
-/// `project_id`, `iid`, and the issuable kind to address one; users almost
-/// always know the `iid` but rarely the `project_id`, so the issuable-acting
-/// commands accept a `#42`/`!42`-style ref positionally (see [`refspec`]) and
-/// resolve the project lazily (see [`cmd::project`]).
+/// `project_id`, `iid`, and the kind to address one; users almost always know
+/// the `iid` but rarely the project, so `tt issue` / `tt mr` take the `iid`
+/// positionally and resolve the project lazily (see [`cmd::project`]).
 mod cli;
+#[cfg(test)]
+mod cli_tests;
 mod client;
 mod cmd;
 mod config;
 mod friendly;
+mod output;
 mod refspec;
 mod state;
 
 use cli::{Cli, Command};
+use refspec::RefKind;
 
-/// Single-thread tokio flavour: each invocation does at most one varlink
-/// round-trip plus stdin/stdout work, so a multi-thread runtime would just add
+/// Single-thread tokio flavour: each invocation does at most a few varlink
+/// round-trips plus stdin/stdout work, so a multi-thread runtime would just add
 /// startup overhead to the hot `tt tick` path (fires on every shell prompt).
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let args = Cli::parse();
-    let output = args.output;
-    match args.command {
-        Command::List { groups, mrs } => cmd::list::run(groups, mrs, output).await,
+    match Cli::parse().command {
+        Command::Issue { command } => cmd::item::run(RefKind::Issue, command).await,
+        Command::Mr { command } => cmd::item::run(RefKind::Mr, command).await,
         Command::Search {
             query,
             kinds,
             limit,
-        } => cmd::search::run(query, kinds, limit, output).await,
-        Command::Open {
-            issuable,
-            mr,
-            project_id,
-            no_browser,
-        } => cmd::open::run(&issuable, mr, project_id, no_browser).await,
-        Command::Log {
-            issuable,
-            duration,
-            mr,
-            project_id,
-            summary,
-        } => cmd::log::run(&issuable, duration, mr, project_id, summary).await,
-        Command::Prompt => cmd::prompt::run().await,
-        Command::Tick { mode } => cmd::tick::run(mode).await,
-        Command::Hook { shell } => {
-            cmd::hook::run(shell);
+            output,
+        } => cmd::search::run(query, kinds, limit, output.output).await,
+        Command::Time { command } => cmd::time::run(command).await,
+        Command::Auth { command } => cmd::auth::run(command).await,
+        Command::Sync { command } => cmd::sync::run(command).await,
+        Command::Queue { command } => cmd::queue::run(command).await,
+        Command::Config { command } => {
+            cmd::config::run(command);
             Ok(())
         }
-        Command::Refresh {
-            quick,
-            slow,
-            stale,
-            issues,
-            search,
-            usage,
-        } => cmd::refresh::run(quick, slow, stale, issues, search, usage).await,
-        Command::Config { action } => {
-            cmd::config::run(action);
-            Ok(())
-        }
-        Command::Login { host } => cmd::login::run(host).await,
-        Command::Logout => cmd::logout::run().await,
-        Command::Whoami => cmd::whoami::run(output).await,
-        Command::Close {
-            issuable,
-            mr,
-            project_id,
-        } => cmd::close::run(&issuable, mr, project_id).await,
-        Command::Assign {
-            issuable,
-            mr,
-            project_id,
-        } => cmd::assign::run(&issuable, mr, project_id).await,
-        Command::Unassign {
-            issuable,
-            mr,
-            project_id,
-        } => cmd::unassign::run(&issuable, mr, project_id).await,
-        Command::History { days } => cmd::history::run(output, days).await,
-        Command::Queue { action } => cmd::queue::run(action, output).await,
         #[cfg(target_os = "linux")]
-        Command::SearchProvider { action } => cmd::search_provider::run(action).await,
+        Command::Integration { command } => cmd::integration::run(command).await,
+        Command::Tick { mode } => cmd::time::tick::run(mode).await,
+        Command::Prompt => cmd::time::prompt::run().await,
     }
 }

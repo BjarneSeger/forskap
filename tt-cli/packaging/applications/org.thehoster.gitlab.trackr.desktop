@@ -2,7 +2,7 @@
 Type=Application
 Name=GitLab Trackr
 Comment=Search tracked GitLab issues and merge requests
-Exec=/usr/bin/tt search-provider launch
+Exec=/usr/bin/tt integration search-provider launch
 Icon=system-search
 Categories=Development;
 Keywords=GitLab;issue;merge request;

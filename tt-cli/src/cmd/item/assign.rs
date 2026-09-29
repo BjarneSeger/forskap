@@ -1,0 +1,25 @@
+//! `tt issue assign` / `tt mr assign` — add yourself to the assignees, without displacing anyone already on it.
+
+use anyhow::Result;
+use gitlab_trackr_api::VarlinkClientInterface;
+
+use super::locate;
+use crate::cli::TargetArgs;
+use crate::friendly::friendly;
+use crate::refspec::{self, RefKind};
+
+pub async fn run(kind: RefKind, target: TargetArgs) -> Result<()> {
+    let iid = target.iid;
+    let (client, project_id) = locate(kind, &target).await?;
+    client
+        .assign_self(project_id, iid, refspec::wire(kind))
+        .call()
+        .await
+        .map_err(|e| friendly("AssignSelf", e))?;
+
+    println!(
+        "assigned to {}{iid} (project {project_id})",
+        refspec::sigil(kind)
+    );
+    Ok(())
+}

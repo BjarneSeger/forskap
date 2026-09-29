@@ -22,14 +22,14 @@ pub fn friendly(op: &str, e: ApiError) -> anyhow::Error {
 
 /// The message for a dormancy `reason` code, with `detail` appended in
 /// parentheses when present. Unknown codes and a missing reason (older daemon)
-/// fall back to the generic "run `tt login`" line.
+/// fall back to the generic "run `tt auth login`" line.
 fn message_for(reason: Option<NotAuthReason>, detail: Option<&str>) -> String {
     let base = match reason {
         Some(NotAuthReason::no_credentials) => {
-            "Not connected to GitLab. Run `tt login` to authenticate."
+            "Not connected to GitLab. Run `tt auth login` to authenticate."
         }
         Some(NotAuthReason::token_rejected) => {
-            "GitLab rejected the stored token. Run `tt login` to re-authenticate."
+            "GitLab rejected the stored token. Run `tt auth login` to re-authenticate."
         }
         Some(NotAuthReason::unreachable) => {
             "Can't reach GitLab — the daemon is not connected. It retries \
@@ -38,10 +38,10 @@ fn message_for(reason: Option<NotAuthReason>, detail: Option<&str>) -> String {
         }
         Some(NotAuthReason::keychain_error) => {
             "Couldn't read your saved credentials from the keychain. \
-             Run `tt login` to store them again."
+             Run `tt auth login` to store them again."
         }
-        Some(NotAuthReason::logged_out) => "Logged out. Run `tt login` to authenticate.",
-        None => "Not connected to GitLab. Run `tt login` to authenticate.",
+        Some(NotAuthReason::logged_out) => "Logged out. Run `tt auth login` to authenticate.",
+        None => "Not connected to GitLab. Run `tt auth login` to authenticate.",
     };
     match detail {
         Some(d) if !d.is_empty() => format!("{base} ({d})"),
@@ -55,7 +55,7 @@ mod tests {
 
     #[test]
     fn maps_each_known_reason() {
-        assert!(message_for(Some(NotAuthReason::no_credentials), None).contains("tt login"));
+        assert!(message_for(Some(NotAuthReason::no_credentials), None).contains("tt auth login"));
         assert!(message_for(Some(NotAuthReason::token_rejected), None).contains("rejected"));
         assert!(message_for(Some(NotAuthReason::unreachable), None).contains("reach GitLab"));
         assert!(message_for(Some(NotAuthReason::keychain_error), None).contains("keychain"));
@@ -66,7 +66,7 @@ mod tests {
     fn missing_reason_falls_back() {
         // A daemon predating the `reason` field sends it absent (`None`); the
         // enum type makes an *unknown* code unrepresentable.
-        let fallback = "Not connected to GitLab. Run `tt login` to authenticate.";
+        let fallback = "Not connected to GitLab. Run `tt auth login` to authenticate.";
         assert_eq!(message_for(None, None), fallback);
     }
 

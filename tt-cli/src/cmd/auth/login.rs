@@ -1,4 +1,4 @@
-//! `tt login` — interactive GitLab authentication.
+//! `tt auth login` — interactive GitLab authentication.
 //!
 //! Opens the GitLab PAT creation page with sensible scope hints, prompts for
 //! the resulting token, and hands it to the daemon which validates it,
@@ -9,7 +9,8 @@ use anyhow::{Context, Result};
 use gitlab_trackr_api::VarlinkClientInterface;
 use inquire::Password;
 
-use crate::{client, config};
+use crate::client;
+use crate::friendly::friendly;
 
 pub async fn run(host: String) -> Result<()> {
     let url = format!(
@@ -39,21 +40,19 @@ pub async fn run(host: String) -> Result<()> {
         anyhow::bail!("no token entered; aborting");
     }
 
-    let cfg = config::load()?;
-    let socket = cfg.socket.unwrap_or_else(client::default_socket);
-    let client = client::connect(&socket).await?;
+    let client = client::connect_default().await?;
 
     client
         .login(host.clone(), token)
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("Login failed: {e}"))?;
+        .map_err(|e| friendly("Login", e))?;
 
     let me = client
         .who_am_i()
         .call()
         .await
-        .map_err(|e| crate::friendly::friendly("WhoAmI", e))?;
+        .map_err(|e| friendly("WhoAmI", e))?;
     println!("Logged in to {} as user #{}.", me.host, me.user_id);
     Ok(())
 }

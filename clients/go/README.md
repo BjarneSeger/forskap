@@ -37,7 +37,7 @@ issues, err := c.GetAssignedIssues(ctx, nil)
 if err != nil {
 	var notAuth *trackr.NotAuthenticated
 	if errors.As(err, &notAuth) {
-		log.Fatal("not authenticated; run: tt login --host gitlab.com")
+		log.Fatal("not authenticated; run: tt auth login --host gitlab.com")
 	}
 	log.Fatal(err)
 }

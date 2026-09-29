@@ -1,11 +1,11 @@
-# Install: append to ~/.config/nushell/config.nu (or `tt hook nu | save -a $nu.config-path`).
+# Install: append to ~/.config/nushell/config.nu (or `tt time hook nu | save -a $nu.config-path`).
 # Verified against Nushell 0.90+ — older versions had a different hooks schema.
 #
 # Unlike bash/zsh/fish, nushell's line editor (reedline) keeps the terminal in
 # raw mode across its prompt hooks. Launching the interactive picker (a TUI)
 # from a hook corrupts reedline's terminal state, so the hook here only checks
 # the interval and prints a one-line reminder when time is owed. You log the
-# time yourself by running `tt prompt` — an ordinary command, which gets a
+# time yourself by running `tt time prompt` — an ordinary command, which gets a
 # clean terminal and resets the interval.
 $env.config = ($env.config | upsert hooks.pre_execution (
     ($env.config.hooks?.pre_execution? | default []) ++ [{|| tt tick --mode remind }]

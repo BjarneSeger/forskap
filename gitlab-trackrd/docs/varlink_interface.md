@@ -121,7 +121,7 @@ duration, unknown failure id). `message` is human-readable.
 GitLab session (it is *dormant*). `reason` says why; `detail` carries free text (host,
 underlying error) for the reasons that have one. Both fields are optional so older
 daemons that send neither stay compatible — clients fall back to a generic
-"run `tt login`" message.
+"run `tt auth login`" message.
 
 ```varlink
 type NotAuthReason (no_credentials, keychain_error, unreachable, token_rejected, logged_out)
@@ -267,7 +267,7 @@ Deletes all dead-lettered tasks.
 ### `RecordOpen(project_id: int, iid: int, kind: IssuableKind) -> ()`
 
 Counts one open of an issue or merge request — the client's "the user just went
-there" signal (`tt open`, a launcher activation). Purely local bookkeeping: no GitLab
+there" signal (`tt issue open`, a launcher activation). Purely local bookkeeping: no GitLab
 round-trip, no queueing, works while dormant. `Search` ranks by these counts and
 reports them as `open_count` (also on `GetAssignedIssues` /
 `GetAssignedMergeRequests` rows). An entry expires `usage.retention_hours` (default
@@ -305,7 +305,7 @@ dormant — the cleared state then stays empty until the next successful sync.
 Connects to `host` with the personal access token, stores the credentials in the OS
 keychain, and flips the daemon to connected (waking the retry-queue drain).
 `GitlabError` when GitLab rejects the token or the keychain write fails. Prefer
-`tt login`, which walks through creating a PAT with the right scopes.
+`tt auth login`, which walks through creating a PAT with the right scopes.
 
 ### `Logout() -> ()`
 

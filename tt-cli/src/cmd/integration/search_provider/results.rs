@@ -1,6 +1,6 @@
 //! Result rows for the desktop shells, mirrored from the noctalia plugin
 //! (`gitlab-trackr/launcher.luau`): same ids, titles and subtitles, so the
-//! launchers behave alike and `tt open` counts the same thing.
+//! launchers behave alike and `tt issue open` counts the same thing.
 
 use gitlab_trackr_api::Search_Reply;
 

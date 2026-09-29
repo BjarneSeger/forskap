@@ -26,18 +26,18 @@ pub struct Config {
     #[config(default = "30m")]
     pub default_duration: String,
 
-    /// Override the daemon's varlink socket address. Mirrors the
-    /// `GITLAB_TRACKRD_SOCKET` env var. If unset, the same XDG-runtime-dir
-    /// fallback chain as the daemon is used.
+    /// Override the daemon's varlink socket address; the
+    /// `GITLAB_TRACKRD_SOCKET` env var wins over it. If neither is set, the
+    /// same XDG-runtime-dir fallback chain as the daemon is used.
     pub socket: Option<String>,
 
-    // Read only by the Linux-only `tt search-provider`.
+    // Read only by the Linux-only `tt integration search-provider`.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     #[config(nested)]
     pub search_provider: SearchProvider,
 }
 
-/// Settings for `tt search-provider`, the GNOME Shell / KRunner integration.
+/// Settings for `tt integration search-provider`, the GNOME Shell / KRunner integration.
 #[derive(Debug, ConfiqueConfig)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct SearchProvider {

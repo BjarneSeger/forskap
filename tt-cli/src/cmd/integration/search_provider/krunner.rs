@@ -1,7 +1,7 @@
 //! `org.kde.krunner1`: KRunner sends the whole query to `Match`, shows the
 //! returned matches under their category and calls `Run` for the pick,
 //! preceded by `SetActivationToken` on Wayland. Registered through the
-//! `krunner/dbusplugins` desktop file `tt search-provider install` writes;
+//! `krunner/dbusplugins` desktop file `tt integration search-provider install` writes;
 //! `X-Plasma-API=DBus2` there makes KRunner honour [`Runner::config`].
 
 use std::collections::HashMap;

@@ -1,25 +1,14 @@
-use clap::{Parser, Subcommand, ValueEnum};
+// Included verbatim by build.rs for the completions: clap-only, no crate types.
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
     name = "tt",
-    about = "GitLab time-tracking CLI",
+    about = "Cached GitLab CLI",
     version,
     max_term_width = 100
 )]
 pub struct Cli {
-    /// Output format for data-returning commands (`list`, `search`, `history`,
-    /// `whoami`). Mutation commands accept the flag but keep their plain
-    /// status messages.
-    #[arg(
-        long = "output",
-        short = 'o',
-        value_enum,
-        default_value_t = OutputFormat::Text,
-        global = true,
-    )]
-    pub output: OutputFormat,
-
     #[command(subcommand)]
     pub command: Command,
 }
@@ -31,141 +20,208 @@ pub enum OutputFormat {
     Json,
 }
 
-/// `tt tick` operating mode. `inline` (the default) is the single-shot path
-/// for bash/fish/zsh, whose prompt hooks fire in a clean cooked terminal: it
-/// checks the interval and runs the interactive prompt directly. `remind` is
-/// the nushell path: reedline keeps the terminal in raw mode across nushell's
-/// hooks, so launching the picker (a TUI) from one corrupts the line editor —
-/// instead `remind` just prints a one-line nudge and the user logs by running
-/// `tt prompt` (an ordinary foreground command, which gets a clean terminal).
-#[derive(Clone, Copy, Default, ValueEnum)]
-pub enum TickMode {
-    /// Check the interval and, if elapsed, run the interactive prompt
-    /// directly. Used by bash's PROMPT_COMMAND, fish's fish_postexec, and
-    /// zsh's precmd.
-    #[default]
-    Inline,
-    /// Check the interval and, if elapsed, print a one-line reminder to run
-    /// `tt prompt`. Never opens inquire. Used by nushell's `pre_execution`
-    /// hook, where running a TUI would corrupt reedline's terminal state.
-    Remind,
+/// Carried by the commands that print data.
+#[derive(Args, Clone, Copy)]
+pub struct OutputArgs {
+    /// Output format.
+    #[arg(
+        long,
+        short = 'o',
+        value_enum,
+        value_name = "FORMAT",
+        default_value_t = OutputFormat::Text,
+    )]
+    pub output: OutputFormat,
+}
+
+#[derive(Args)]
+pub struct ProjectArgs {
+    /// Project, as numeric ID or full path (`group/project`). If omitted, it
+    /// is resolved from the item you last logged time on, then your assigned
+    /// items, then the search corpus.
+    #[arg(short = 'p', long, value_name = "PROJECT")]
+    pub project: Option<String>,
+}
+
+/// One issue or merge request; the command group says which.
+#[derive(Args)]
+pub struct TargetArgs {
+    /// Number within the project: the `42` of `#42` / `!42`.
+    #[arg(value_name = "IID", value_parser = clap::value_parser!(i64).range(1..))]
+    pub iid: i64,
+    #[command(flatten)]
+    pub project: ProjectArgs,
+}
+
+#[derive(Args, Clone, Copy)]
+pub struct WindowArgs {
+    /// How many days back to show, up to the daemon's retention.
+    #[arg(long, default_value_t = 7)]
+    pub days: u32,
 }
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// List issues assigned to you (or merge requests, with --mrs).
-    List {
-        /// Restrict to issues in the given GitLab group. Repeat the flag to
-        /// query several groups; the daemon merges their results.
-        #[arg(long = "group", value_name = "GROUP")]
-        groups: Vec<String>,
-        /// List your open merge requests instead of issues. Synced on the
-        /// same cadence as the assigned issues.
-        #[arg(long)]
-        mrs: bool,
+    /// Issues: list, view, open, close, assign.
+    Issue {
+        #[command(subcommand)]
+        command: ItemCommand,
     },
-    /// Search the daemon's cached issues, merge requests, projects, and
-    /// groups. Matches titles, labels, and project/group paths
-    /// case-insensitively; a query like `#123` finds issues/MRs by number.
-    /// Issues/MRs you open often (`tt open`) rank first; with no query at all
-    /// it lists just those. Pure cache read — freshness comes from the
-    /// daemon's background sync.
+    /// Merge requests: list, view, open, close, assign.
+    Mr {
+        #[command(subcommand)]
+        command: ItemCommand,
+    },
+    /// Search the cached issues, merge requests, projects and groups.
+    ///
+    /// Matches titles, labels and project/group paths case-insensitively;
+    /// `#123` finds issues/MRs by number. Items you open often rank first;
+    /// with no query it lists just those.
     Search {
         /// Search text. Omit it to list the frequently opened issues/MRs.
-        query: Option<String>,
+        #[arg(value_name = "QUERY")]
+        query: Vec<String>,
         /// Restrict to one or more result kinds. Repeat the flag to combine.
         #[arg(long = "kind", value_enum, value_name = "KIND")]
         kinds: Vec<SearchKind>,
-        /// Maximum results per kind (daemon default: 50).
-        #[arg(long)]
+        /// Maximum results per kind.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
         limit: Option<i64>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
-    /// Open an issue or merge request in the browser and count the open, so
-    /// it ranks higher in `tt search` (and launchers built on it).
-    Open {
-        /// Issue or MR reference (`42`, `#42`, or `!42`; quote sigils in
-        /// bash/zsh).
-        #[arg(value_name = "REF")]
-        issuable: String,
-        /// Treat a bare number as a merge request.
-        #[arg(long)]
-        mr: bool,
-        /// Project ID. If omitted, resolved like `tt log`.
-        #[arg(short = 'p', long)]
-        project_id: Option<i64>,
-        /// Only record the open and print the URL; don't launch a browser.
-        #[arg(long)]
-        no_browser: bool,
+    /// Time tracking: log time, review it, and the shell reminder.
+    Time {
+        #[command(subcommand)]
+        command: TimeCommand,
     },
-    /// Log time on an issue or merge request non-interactively.
-    Log {
-        /// Issue or MR reference: `42`/`#42` is an issue, `!42` a merge
-        /// request. Quote sigil forms in bash/zsh (`'!42'`); `42 --mr` needs
-        /// no quoting.
-        #[arg(value_name = "REF")]
-        issuable: String,
-        /// Duration string accepted by GitLab (e.g. `30m`, `1h15m`).
-        duration: String,
-        /// Treat a bare number as a merge request.
-        #[arg(long)]
-        mr: bool,
-        /// Project ID. If omitted, resolved from the last-used issuable or by
-        /// scanning your assigned issues/MRs for one matching the reference.
-        #[arg(short = 'p', long)]
-        project_id: Option<i64>,
-        /// Optional summary note.
-        #[arg(short = 's', long)]
-        summary: Option<String>,
+    /// The daemon's GitLab login.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
     },
-    /// Interactively pick an issue and log time.
-    Prompt,
-    /// Hook entry: if enough time has elapsed, run the interactive prompt
-    /// (`inline`) or print a reminder (`remind`); otherwise exit silently.
-    /// bash/zsh/fish use the default `inline` mode; nushell uses `remind` —
-    /// see `tt hook nu`.
-    Tick {
-        #[arg(long, value_enum, default_value_t = TickMode::Inline)]
-        mode: TickMode,
+    /// The daemon's background sync with GitLab.
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommand,
     },
-    /// Print a shell snippet that wires `tt tick` into the pre-prompt hook.
-    Hook {
-        #[arg(value_enum)]
-        shell: Shell,
-    },
-    /// Drop the daemon's caches and re-fetch. With no flags it clears
-    /// everything synced; pass flags to target only those slices. Waits until
-    /// what it cleared of the assigned lists and the history is re-synced; the
-    /// search corpus refills in the background. Open statistics are user data
-    /// and only go with an explicit `--usage`.
-    Refresh {
-        /// Clear the quick history band (the last 24h).
-        #[arg(long)]
-        quick: bool,
-        /// Clear the slow history band (24h up to the 90-day retention).
-        #[arg(long)]
-        slow: bool,
-        /// Clear history past the retention horizon (normally already pruned).
-        #[arg(long)]
-        stale: bool,
-        /// Clear the assigned issue/MR lists and the board columns.
-        #[arg(long)]
-        issues: bool,
-        /// Clear the search corpus (issues, MRs, projects, groups); it
-        /// refills in the background.
-        #[arg(long)]
-        search: bool,
-        /// Forget the open counts behind `tt search` ranking (never cleared
-        /// implicitly).
-        #[arg(long)]
-        usage: bool,
+    /// Writes the daemon queued because GitLab was unreachable.
+    ///
+    /// One that GitLab then rejects, or that outlives the retry window, is
+    /// kept here as failed.
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommand,
     },
     /// Inspect or scaffold the user configuration file.
     Config {
         #[command(subcommand)]
-        action: ConfigAction,
+        command: ConfigCommand,
     },
-    /// Interactively authenticate against GitLab and store the token in the OS
-    /// keychain (Keychain on macOS, secret-service on Linux).
+    /// Desktop integrations.
+    #[cfg(target_os = "linux")]
+    Integration {
+        #[command(subcommand)]
+        command: IntegrationCommand,
+    },
+    // Installed shell hooks call these two spellings.
+    #[command(hide = true)]
+    Tick {
+        #[arg(long, value_enum, default_value_t = TickMode::Inline)]
+        mode: TickMode,
+    },
+    #[command(hide = true)]
+    Prompt,
+}
+
+/// The verbs shared by `tt issue` and `tt mr`.
+#[derive(Subcommand)]
+pub enum ItemCommand {
+    /// List the open ones assigned to you.
+    List {
+        /// Restrict to the given GitLab group. Repeat the flag for several.
+        #[arg(long = "group", value_name = "GROUP")]
+        groups: Vec<String>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Show what the cache knows about one.
+    View {
+        #[command(flatten)]
+        target: TargetArgs,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Open one in the browser.
+    ///
+    /// The open is counted, so it ranks higher in `tt search` and the
+    /// launchers built on it.
+    Open {
+        #[command(flatten)]
+        target: TargetArgs,
+        /// Only count the open and print the URL.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Close one.
+    Close {
+        #[command(flatten)]
+        target: TargetArgs,
+    },
+    /// Add yourself to the assignees, keeping the existing ones.
+    Assign {
+        #[command(flatten)]
+        target: TargetArgs,
+    },
+    /// Remove yourself from the assignees.
+    Unassign {
+        #[command(flatten)]
+        target: TargetArgs,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TimeCommand {
+    /// Log time on an issue or merge request.
+    Log {
+        /// `42` or `#42` for an issue, `!42` for a merge request. The sigils
+        /// need quoting in bash/zsh; `42 --mr` does not.
+        #[arg(value_name = "REF")]
+        reference: String,
+        /// Duration in GitLab syntax (e.g. `30m`, `1h15m`).
+        duration: String,
+        /// Treat a bare number as a merge request.
+        #[arg(long)]
+        mr: bool,
+        #[command(flatten)]
+        project: ProjectArgs,
+        /// Summary note.
+        #[arg(short = 's', long)]
+        summary: Option<String>,
+    },
+    /// Interactively pick an assigned issue or merge request and log time.
+    Prompt,
+    /// Show the time you logged recently.
+    History {
+        #[command(flatten)]
+        window: WindowArgs,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Print the snippet that makes your shell remind you to log time.
+    Hook {
+        /// Shell to print the snippet for.
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AuthCommand {
+    /// Authenticate against GitLab.
+    ///
+    /// Asks for a personal access token and stores it in the OS keychain
+    /// (Keychain on macOS, secret-service on Linux).
     Login {
         /// GitLab host (e.g. `gitlab.com` or `gitlab.mycorp.com`).
         #[arg(long, default_value = "gitlab.com")]
@@ -173,96 +229,95 @@ pub enum Command {
     },
     /// Clear the stored credentials and disconnect the daemon from GitLab.
     Logout,
-    /// Print the authenticated user (host + numeric user ID).
-    Whoami,
-    /// Close an issue or merge request.
-    Close {
-        /// Issue or MR reference (`42`, `#42`, or `!42`; quote sigils in
-        /// bash/zsh).
-        #[arg(value_name = "REF")]
-        issuable: String,
-        /// Treat a bare number as a merge request.
-        #[arg(long)]
-        mr: bool,
-        /// Project ID. If omitted, resolved like `tt log`.
-        #[arg(short = 'p', long)]
-        project_id: Option<i64>,
-    },
-    /// Assign yourself to an issue or merge request (without removing
-    /// existing assignees).
-    Assign {
-        /// Issue or MR reference (`42`, `#42`, or `!42`; quote sigils in
-        /// bash/zsh).
-        #[arg(value_name = "REF")]
-        issuable: String,
-        /// Treat a bare number as a merge request.
-        #[arg(long)]
-        mr: bool,
-        /// Project ID. If omitted, resolved like `tt log`.
-        #[arg(short = 'p', long)]
-        project_id: Option<i64>,
-    },
-    /// Remove yourself from an issue's or merge request's assignee list.
-    Unassign {
-        /// Issue or MR reference (`42`, `#42`, or `!42`; quote sigils in
-        /// bash/zsh).
-        #[arg(value_name = "REF")]
-        issuable: String,
-        /// Treat a bare number as a merge request.
-        #[arg(long)]
-        mr: bool,
-        /// Project ID. If omitted, resolved like `tt log`.
-        #[arg(short = 'p', long)]
-        project_id: Option<i64>,
-    },
-    /// Show recent time-tracking history. Defaults to the last 7 days; widen
-    /// up to the 90-day retention with `--days`.
-    History {
-        /// How many days back to show (the daemon retains up to 90).
-        #[arg(long, default_value_t = 7)]
-        days: u32,
-    },
-    /// Inspect and manage failed queued actions. A write op that hit a network
-    /// error is queued and retried in the background; if GitLab then rejects it
-    /// or the retry window expires, it lands here. With no subcommand, lists the
-    /// failures.
-    Queue {
-        #[command(subcommand)]
-        action: Option<QueueAction>,
-    },
-    /// Serve `tt search` results to GNOME Shell and KRunner over D-Bus. The
-    /// session bus starts this on demand once the files from
-    /// `tt search-provider install` are in place; it exits again when idle.
-    #[cfg(target_os = "linux")]
-    SearchProvider {
-        #[command(subcommand)]
-        action: Option<SearchProviderAction>,
+    /// Print the host and user the daemon is logged in as.
+    Status {
+        #[command(flatten)]
+        output: OutputArgs,
     },
 }
 
 #[derive(Subcommand)]
-pub enum QueueAction {
-    /// Re-enqueue a failed action for another attempt.
+pub enum SyncCommand {
+    /// Drop cached data and fetch it again.
+    ///
+    /// Without `--scope` that is everything synced; open counts only go with
+    /// an explicit `--scope usage`. Waits for the assigned lists and the time
+    /// history; the search corpus refills in the background.
+    Refresh {
+        /// What to drop. Repeat the flag to combine.
+        #[arg(long = "scope", value_enum, value_name = "SCOPE")]
+        scopes: Vec<RefreshScope>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RefreshScope {
+    /// The assigned issue and merge request lists, and the board columns.
+    Assigned,
+    /// The search corpus: issues, merge requests, projects, groups.
+    Search,
+    /// The logged time.
+    History,
+    /// The open counts behind the search ranking. User data, not a cache.
+    Usage,
+}
+
+#[derive(Subcommand)]
+pub enum QueueCommand {
+    /// List the failed writes.
+    List {
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Queue a failed write for another attempt.
     Retry {
-        /// The failed action's id (shown by `tt queue`).
-        id: u64,
+        /// Id as shown by `tt queue list`.
+        #[arg(value_parser = clap::value_parser!(i64).range(0..))]
+        id: i64,
     },
-    /// Drop a failed action without retrying it.
+    /// Drop a failed write.
     Dismiss {
-        /// The failed action's id (shown by `tt queue`).
-        id: u64,
+        /// Id as shown by `tt queue list`.
+        #[arg(value_parser = clap::value_parser!(i64).range(0..))]
+        id: i64,
     },
-    /// Drop every failed action.
+    /// Drop every failed write.
     Clear,
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+    /// Print an annotated TOML template with the current defaults.
+    ///
+    /// Pipe it into the file `tt config path` names.
+    Template,
+    /// Print the path of the user config file.
+    Path,
 }
 
 #[cfg(target_os = "linux")]
 #[derive(Subcommand)]
-pub enum SearchProviderAction {
-    /// Write the GNOME Shell, KRunner and D-Bus activation files under PREFIX
-    /// with this binary's path filled in. GNOME Shell only reads providers
-    /// from `$XDG_DATA_DIRS`, so the default prefix needs root; KRunner and
-    /// D-Bus activation also work from `~/.local/share`.
+pub enum IntegrationCommand {
+    /// `tt search` for GNOME Shell and KRunner.
+    SearchProvider {
+        #[command(subcommand)]
+        command: SearchProviderCommand,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Subcommand)]
+pub enum SearchProviderCommand {
+    /// Serve searches over D-Bus until idle.
+    ///
+    /// The session bus starts this on demand once the files from `install`
+    /// are in place.
+    Serve,
+    /// Write the GNOME Shell, KRunner and D-Bus activation files.
+    ///
+    /// They go under PREFIX with this binary's path filled in. GNOME Shell
+    /// only reads providers from `$XDG_DATA_DIRS`, so the default prefix needs
+    /// root; KRunner and D-Bus activation also work from `~/.local/share`.
     Install {
         /// Data directory to install into (default: /usr/local/share).
         #[arg(long, value_name = "DIR")]
@@ -273,13 +328,16 @@ pub enum SearchProviderAction {
     Launch,
 }
 
-#[derive(Subcommand)]
-pub enum ConfigAction {
-    /// Print an annotated TOML template (with current defaults and doc
-    /// comments) to stdout. Pipe into `$XDG_CONFIG_HOME/gitlab-trackr-cli/config.toml`.
-    Template,
-    /// Print the resolved path to the user config file.
-    Path,
+/// `inline` is for shells whose prompt hooks run in a cooked terminal
+/// (bash, zsh, fish). Nushell's reedline stays in raw mode across its hooks, so
+/// a picker launched from one corrupts the line editor: `remind` only prints.
+#[derive(Clone, Copy, Default, ValueEnum)]
+pub enum TickMode {
+    /// Run the interactive prompt once the interval has elapsed.
+    #[default]
+    Inline,
+    /// Print a one-line reminder once the interval has elapsed.
+    Remind,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -290,8 +348,7 @@ pub enum Shell {
     Nu,
 }
 
-/// Result kinds `tt search` can restrict to (`--kind`). `mrs` maps to the
-/// wire value `merge_requests`.
+/// `mrs` maps to the wire value `merge_requests`.
 #[derive(Clone, Copy, ValueEnum)]
 pub enum SearchKind {
     Issues,
