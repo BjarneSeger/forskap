@@ -1,0 +1,4 @@
+# Install: forskap time hook fish > ~/.config/fish/conf.d/forskap.fish
+function __forskap_tick --on-event fish_postexec
+    command forskap tick
+end

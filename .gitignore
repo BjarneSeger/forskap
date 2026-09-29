@@ -1,7 +1,7 @@
 /target
-tt-cli/completions/
+forskap-cli/completions/
 # Rendered in CI by the goreleaser `before` hook (gen-config-template).
-gitlab-trackrd/packaging/config.toml
+forskapd/packaging/config.toml
 # Transient copy made by the Go binding's `go generate` step; the generated
-# binding itself (clients/go/orgthehostergitlabtrackrd.go) is intentionally committed.
+# binding itself (clients/go/orgthehosterforskapd.go) is intentionally committed.
 clients/go/interface.varlink

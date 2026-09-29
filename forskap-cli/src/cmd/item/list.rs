@@ -1,0 +1,45 @@
+//! `forskap issue list` / `forskap mr list` — your assigned, open issues or merge
+//! requests.
+//!
+//! Pure cache read: the daemon's background sync owns freshness, so this just
+//! serves whatever was last synced — no fetch, effectively free.
+
+use anyhow::Result;
+use forskap_api::VarlinkClientInterface;
+
+use crate::cli::OutputFormat;
+use crate::friendly::friendly;
+use crate::refspec::RefKind;
+use crate::{client, output};
+
+pub async fn run(kind: RefKind, groups: Vec<String>, format: OutputFormat) -> Result<()> {
+    let client = client::connect_default().await?;
+    let filter = (!groups.is_empty()).then_some(groups);
+
+    match kind {
+        RefKind::Issue => {
+            let reply = client
+                .get_assigned_issues(filter)
+                .call()
+                .await
+                .map_err(|e| friendly("GetAssignedIssues", e))?;
+            output::emit(format, &reply.issues, |issues| {
+                for i in issues {
+                    println!("#{:<5} {:<8} {}  {}", i.iid, i.state, i.title, i.web_url);
+                }
+            })
+        }
+        RefKind::Mr => {
+            let reply = client
+                .get_assigned_merge_requests(filter)
+                .call()
+                .await
+                .map_err(|e| friendly("GetAssignedMergeRequests", e))?;
+            output::emit(format, &reply.merge_requests, |mrs| {
+                for m in mrs {
+                    println!("!{:<5} {:<8} {}  {}", m.iid, m.state, m.title, m.web_url);
+                }
+            })
+        }
+    }
+}

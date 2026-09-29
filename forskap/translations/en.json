@@ -1,0 +1,6 @@
+{
+  "settings.forskap_path.label": "forskap binary",
+  "settings.forskap_path.description": "Path to the forskap CLI. Set it when forskap is not on noctalia's PATH (e.g. ~/.cargo/bin/forskap).",
+  "settings.limit.label": "Results per kind",
+  "settings.limit.description": "Maximum issues, merge requests, projects and groups each shown per query."
+}

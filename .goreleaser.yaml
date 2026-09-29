@@ -1,16 +1,16 @@
 version: 2
 
-project_name: gitlab-trackr
+project_name: forskap
 
 before:
   hooks:
     # Render the annotated default config shipped as the package-provided
-    # layer at /usr/share/gitlab-trackrd/config.toml (see nfpms contents).
-    - sh -c "cargo run --quiet --package gitlab-trackrd --bin gen-config-template > gitlab-trackrd/packaging/config.toml"
+    # layer at /usr/share/forskapd/config.toml (see nfpms contents).
+    - sh -c "cargo run --quiet --package forskapd --bin gen-config-template > forskapd/packaging/config.toml"
 
 builds:
-  - id: gitlab-trackrd
-    binary: gitlab-trackrd
+  - id: forskapd
+    binary: forskapd
     builder: rust
     targets:
       - "x86_64-unknown-linux-gnu"
@@ -18,9 +18,9 @@ builds:
     command: zigbuild
     flags:
       - --release
-      - --package=gitlab-trackrd
-  - id: tt-cli
-    binary: tt
+      - --package=forskapd
+  - id: forskap-cli
+    binary: forskap
     builder: rust
     targets:
       - "x86_64-unknown-linux-gnu"
@@ -28,22 +28,22 @@ builds:
     command: zigbuild
     flags:
       - --release
-      - --package=tt-cli
+      - --package=forskap-cli
 
 archives:
-  - id: gitlab-trackrd
+  - id: forskapd
     ids:
-      - gitlab-trackrd
-      - tt-cli
+      - forskapd
+      - forskap-cli
     formats:
       - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
 nfpms:
   - ids:
-      - tt-cli
-      - gitlab-trackrd
-    package_name: gitlab-trackr-utils
+      - forskap-cli
+      - forskapd
+    package_name: forskap-utils
     maintainer: Bjarne Seger <bjarneseger@thehoster.org>
     description: GitLab time-tracking utils
     formats:
@@ -51,40 +51,50 @@ nfpms:
       - rpm
       - archlinux
     bindir: /usr/bin
+    replaces:
+      - gitlab-trackr-utils
+    conflicts:
+      - gitlab-trackr-utils
+    provides:
+      - gitlab-trackr-utils
     contents:
-      - src: tt-cli/completions/tt.bash
-        dst: /usr/share/bash-completion/completions/tt
-      - src: tt-cli/completions/_tt
-        dst: /usr/share/zsh/site-functions/_tt
-      - src: tt-cli/completions/tt.fish
-        dst: /usr/share/fish/vendor_completions.d/tt.fish
-      - src: tt-cli/completions/tt.yaml
-        dst: /usr/share/carapace/specs/tt.yaml
-      - src: gitlab-trackrd/packaging/gitlab-trackrd.service
-        dst: /usr/lib/systemd/user/gitlab-trackrd.service
+      # Installed shell hooks call `tt tick`.
+      - src: /usr/bin/forskap
+        dst: /usr/bin/tt
+        type: symlink
+      - src: forskap-cli/completions/forskap.bash
+        dst: /usr/share/bash-completion/completions/forskap
+      - src: forskap-cli/completions/_forskap
+        dst: /usr/share/zsh/site-functions/_forskap
+      - src: forskap-cli/completions/forskap.fish
+        dst: /usr/share/fish/vendor_completions.d/forskap.fish
+      - src: forskap-cli/completions/forskap.yaml
+        dst: /usr/share/carapace/specs/forskap.yaml
+      - src: forskapd/packaging/forskapd.service
+        dst: /usr/lib/systemd/user/forskapd.service
         file_info:
           mode: 0644
-      - src: gitlab-trackrd/packaging/gitlab-trackrd.socket
-        dst: /usr/lib/systemd/user/gitlab-trackrd.socket
+      - src: forskapd/packaging/forskapd.socket
+        dst: /usr/lib/systemd/user/forskapd.socket
         file_info:
           mode: 0644
-      - src: gitlab-trackrd/packaging/config.toml
-        dst: /usr/share/gitlab-trackrd/config.toml
+      - src: forskapd/packaging/config.toml
+        dst: /usr/share/forskapd/config.toml
         file_info:
           mode: 0644
-      - src: tt-cli/packaging/gnome-shell/search-providers/org.thehoster.gitlab.trackr.search-provider.ini
-        dst: /usr/share/gnome-shell/search-providers/org.thehoster.gitlab.trackr.search-provider.ini
+      - src: forskap-cli/packaging/gnome-shell/search-providers/org.thehoster.forskap.search-provider.ini
+        dst: /usr/share/gnome-shell/search-providers/org.thehoster.forskap.search-provider.ini
         file_info:
           mode: 0644
-      - src: tt-cli/packaging/applications/org.thehoster.gitlab.trackr.desktop
-        dst: /usr/share/applications/org.thehoster.gitlab.trackr.desktop
+      - src: forskap-cli/packaging/applications/org.thehoster.forskap.desktop
+        dst: /usr/share/applications/org.thehoster.forskap.desktop
         file_info:
           mode: 0644
-      - src: tt-cli/packaging/dbus-1/services/org.thehoster.gitlab.trackr.SearchProvider.service
-        dst: /usr/share/dbus-1/services/org.thehoster.gitlab.trackr.SearchProvider.service
+      - src: forskap-cli/packaging/dbus-1/services/org.thehoster.forskap.SearchProvider.service
+        dst: /usr/share/dbus-1/services/org.thehoster.forskap.SearchProvider.service
         file_info:
           mode: 0644
-      - src: tt-cli/packaging/krunner/dbusplugins/org.thehoster.gitlab.trackr.desktop
-        dst: /usr/share/krunner/dbusplugins/org.thehoster.gitlab.trackr.desktop
+      - src: forskap-cli/packaging/krunner/dbusplugins/org.thehoster.forskap.desktop
+        dst: /usr/share/krunner/dbusplugins/org.thehoster.forskap.desktop
         file_info:
           mode: 0644

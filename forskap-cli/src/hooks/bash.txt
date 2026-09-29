@@ -1,0 +1,7 @@
+# Install: forskap time hook bash >> ~/.bashrc    (or source it from .bashrc)
+__forskap_tick() { command forskap tick; }
+case "${PROMPT_COMMAND:-}" in
+    *__forskap_tick*) ;;
+    "")  PROMPT_COMMAND="__forskap_tick" ;;
+    *)   PROMPT_COMMAND="__forskap_tick;${PROMPT_COMMAND}" ;;
+esac

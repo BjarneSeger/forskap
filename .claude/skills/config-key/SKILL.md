@@ -5,8 +5,8 @@ description: Checklist for adding or changing a daemon config key (confique stru
 
 # Adding / changing a daemon config key
 
-Config lives in `gitlab-trackrd/src/config.rs` (confique, layered TOML: user file →
-`/usr/share/gitlab-trackrd/config.toml` → baked-in defaults; every key optional).
+Config lives in `forskapd/src/config.rs` (confique, layered TOML: user file →
+`/usr/share/forskapd/config.toml` → baked-in defaults; every key optional).
 
 ## 1. The field
 
@@ -39,18 +39,18 @@ Config lives in `gitlab-trackrd/src/config.rs` (confique, layered TOML: user fil
 
 ## 3. Docs — one manual spot, the rest is generated
 
-- Update the config table in `gitlab-trackrd/README.md` (key, default, description).
+- Update the config table in `forskapd/README.md` (key, default, description).
   This is the only hand-maintained copy.
-- Do **not** touch `gitlab-trackrd/packaging/config.toml` or any template output: the
+- Do **not** touch `forskapd/packaging/config.toml` or any template output: the
   shipped default config is regenerated on every release by the goreleaser hook running
-  `cargo run -p gitlab-trackrd --bin gen-config-template`.
+  `cargo run -p forskapd --bin gen-config-template`.
 
 ## 4. Verify
 
 ```sh
-cargo run -p gitlab-trackrd --bin gen-config-template   # new key + annotation present?
-cargo test -p gitlab-trackrd config                     # config unit tests
+cargo run -p forskapd --bin gen-config-template   # new key + annotation present?
+cargo test -p forskapd config                     # config unit tests
 ```
 
 For reload behavior, the `verify` skill's isolated instance + editing
-`$XDG_CONFIG_HOME/gitlab-trackrd/config.toml` exercises the watcher end-to-end.
+`$XDG_CONFIG_HOME/forskapd/config.toml` exercises the watcher end-to-end.

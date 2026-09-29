@@ -1,8 +1,8 @@
-// Package orgthehostergitlabtrackrd is a Go client for the
-// org.thehoster.gitlab.trackrd varlink interface exposed by the gitlab-trackrd
+// Package orgthehosterforskapd is a Go client for the
+// org.thehoster.forskapd varlink interface exposed by the forskapd
 // daemon over a Unix socket.
 //
-// The wire types and low-level call helpers (orgthehostergitlabtrackrd.go) are
+// The wire types and low-level call helpers (orgthehosterforskapd.go) are
 // generated from the interface definition shared with the Rust crates; the
 // Client type (client.go) is a thin, hand-written convenience layer that resolves
 // the daemon socket and exposes one Go method per varlink method.
@@ -10,10 +10,10 @@
 // Because the generated package name is derived from the interface name, callers
 // usually import it under a shorter alias:
 //
-//	import trackr "github.com/BjarneSeger/gitlab_trackr/clients/go"
+//	import forskap "github.com/BjarneSeger/forskap/clients/go"
 //
 //	ctx := context.Background()
-//	c, err := trackr.Dial(ctx)
+//	c, err := forskap.Dial(ctx)
 //	if err != nil {
 //		log.Fatal(err)
 //	}
@@ -21,9 +21,9 @@
 //
 //	issues, err := c.GetAssignedIssues(ctx, nil)
 //	if err != nil {
-//		var notAuth *trackr.NotAuthenticated
+//		var notAuth *forskap.NotAuthenticated
 //		if errors.As(err, &notAuth) {
-//			log.Fatal("log in first: tt auth login --host gitlab.com")
+//			log.Fatal("log in first: forskap auth login --host gitlab.com")
 //		}
 //		log.Fatal(err)
 //	}
@@ -34,4 +34,4 @@
 // Errors returned by the daemon surface as *GitlabError or *NotAuthenticated;
 // match them with errors.As. Optional parameters are pointers, where nil omits
 // the field on the wire.
-package orgthehostergitlabtrackrd
+package orgthehosterforskapd

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Forskap
+Comment=Search tracked GitLab issues and merge requests
+Exec=/usr/bin/forskap integration search-provider launch
+Icon=system-search
+Categories=Development;
+Keywords=GitLab;issue;merge request;
