@@ -14,6 +14,11 @@ pub enum Error {
     #[error("GitLab rejected the token: {0}")]
     Unauthorized(String),
 
+    /// A rotation GitLab may have carried out, whose answer was unusable:
+    /// the token may be revoked with its successor unknown.
+    #[error("token rotation answer unusable: {0}")]
+    RotationLost(String),
+
     /// Transient network error — safe to retry.
     #[error("network error: {0}")]
     Transient(String),

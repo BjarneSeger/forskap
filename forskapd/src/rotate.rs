@@ -398,8 +398,11 @@ impl<E: Env> Supervisor<E> {
         };
         // Without it the lead isn't capped, and a short default lifetime
         // would be due again at once.
-        rotated.info.created_at.get_or_insert(now);
-        info!(expires_at = ?rotated.info.expires_at, "rotated the GitLab token");
+        if let Some(info) = &mut rotated.info {
+            info.created_at.get_or_insert(now);
+        }
+        let expires_at = rotated.info.as_ref().and_then(|i| i.expires_at);
+        info!(?expires_at, "rotated the GitLab token");
 
         let creds = Credentials {
             host: session.host.clone(),
@@ -430,8 +433,11 @@ impl<E: Env> Supervisor<E> {
         };
         if let Some(client) = swapped {
             info!("session switched to the rotated GitLab token");
-            self.rotation.publish(&client, &rotated.info);
-            self.watch = Some(Watch::new(&client, Some(rotated.info)));
+            // Without the lifetime the next evaluation reads it.
+            if let Some(info) = &rotated.info {
+                self.rotation.publish(&client, info);
+            }
+            self.watch = Some(Watch::new(&client, rotated.info));
             self.env.swapped();
             return Duration::ZERO;
         }
@@ -534,7 +540,9 @@ impl<E: Env> Supervisor<E> {
             debug!(error = %e, "{what} failed: the token is dead");
             return self.pacing.recheck;
         }
-        if loud {
+        if matches!(e, Error::RotationLost(_)) {
+            error!(error = %e, "{what} may have revoked it without yielding a new one; `forskap auth login` with a new token is needed if GitLab rejects it from now on");
+        } else if loud {
             warn!(error = %e, "{what} was refused; not rotating this token");
         } else {
             info!(error = %e, "{what} was refused; not rotating this token");
@@ -985,6 +993,23 @@ mod tests {
         assert_eq!(rig.fake.rotations(), [Some(day("2027-12-25")), None]);
         assert_eq!(live_token(&rig.session).await.as_deref(), Some("rotated-2"));
         assert_eq!(rig.env.stored().as_deref(), Some("rotated-2"));
+    }
+
+    /// The token may be revoked already: using it for another attempt
+    /// could cost its successor.
+    #[tokio::test]
+    async fn an_unusable_rotation_answer_is_not_followed_by_another_attempt() {
+        let mut rig = rig(yearly(), "2026-12-25T09:00:00Z");
+        rig.fake.fail_next(ROTATE_PATH, FakeErr::Lost);
+
+        rig.supervisor.engage().await;
+        rig.supervisor.engage().await;
+
+        assert_eq!(rig.fake.rotations().len(), 1);
+        assert!(matches!(
+            &*rig.session.read().await,
+            ConnState::Connected(_)
+        ));
     }
 
     #[tokio::test]

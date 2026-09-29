@@ -73,7 +73,8 @@ pub struct TokenInfo {
 #[derive(Debug, Clone)]
 pub struct RotatedToken {
     pub token: Token,
-    pub info: TokenInfo,
+    /// `None` if the answer's lifetime was unreadable.
+    pub info: Option<TokenInfo>,
 }
 
 impl GitlabClient {
@@ -510,7 +511,14 @@ impl GitlabApi for GitlabClient {
         let raw: serde_json::Value = RotateSelfTokenEndpoint { expires_at }
             .query_async(&self.inner)
             .await
-            .map_err(classify)?;
+            .map_err(|e| {
+                let refused = has_status(&e);
+                match classify(e) {
+                    // No status to tell a refusal by: GitLab may have rotated.
+                    Error::Gitlab(detail) if !refused => Error::RotationLost(detail),
+                    other => other,
+                }
+            })?;
         rotated_token_from(&raw)
     }
 }
@@ -578,15 +586,16 @@ fn token_info_from(raw: &serde_json::Value) -> Result<TokenInfo> {
 }
 
 /// Parse a rotate response. Its errors never quote the response: it holds
-/// the new token.
+/// the new token. Only a missing token fails it: the old one is revoked, so
+/// the new one must not be dropped over an unreadable lifetime.
 fn rotated_token_from(raw: &serde_json::Value) -> Result<RotatedToken> {
     let token = raw["token"]
         .as_str()
         .filter(|t| !t.is_empty())
-        .ok_or_else(|| Error::Gitlab("rotate response carries no token".into()))?;
+        .ok_or_else(|| Error::RotationLost("rotate response carries no token".into()))?;
     Ok(RotatedToken {
         token: Token::new(token),
-        info: token_info_from(raw)?,
+        info: token_info_from(raw).ok(),
     })
 }
 
@@ -650,6 +659,23 @@ where
         _ => return Error::Gitlab(detail),
     };
     throttled_or_rejected(status, retry_after, detail)
+}
+
+/// Whether GitLab answered with an HTTP status, as opposed to a failure
+/// before the request or while reading the answer.
+fn has_status<E>(e: &gitlab::api::ApiError<E>) -> bool
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    use gitlab::api::ApiError as A;
+    matches!(
+        e,
+        A::GitlabRateLimited { .. }
+            | A::GitlabService { .. }
+            | A::GitlabWithStatus { .. }
+            | A::GitlabObjectWithStatus { .. }
+            | A::GitlabUnrecognizedWithStatus { .. }
+    )
 }
 
 /// [`Error::Throttled`] for 429/5xx, [`Error::Unauthorized`] for 401,
@@ -1416,15 +1442,19 @@ mod tests {
         let rotated = rotated_token_from(&raw).unwrap();
         assert_eq!(rotated.token.expose(), "glpat-new");
         assert_eq!(
-            rotated.info.expires_at,
+            rotated.info.and_then(|i| i.expires_at),
             chrono::NaiveDate::from_ymd_opt(2026, 12, 31)
         );
+
+        // The token survives an unreadable lifetime.
+        let broken = serde_json::json!({"token": "glpat-new", "expires_at": "soon"});
+        let rotated = rotated_token_from(&broken).unwrap();
+        assert_eq!(rotated.token.expose(), "glpat-new");
+        assert_eq!(rotated.info, None);
         assert!(!format!("{rotated:?}").contains("glpat-new"));
 
-        let broken = serde_json::json!({"token": "glpat-new", "expires_at": "soon"});
-        let err = rotated_token_from(&broken).unwrap_err().to_string();
-        assert!(!err.contains("glpat-new"), "{err}");
-        assert!(rotated_token_from(&serde_json::json!({"scopes": []})).is_err());
+        let lost = rotated_token_from(&serde_json::json!({"scopes": []})).unwrap_err();
+        assert!(matches!(lost, Error::RotationLost(_)), "{lost}");
     }
 
     #[test]

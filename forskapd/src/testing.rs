@@ -34,6 +34,8 @@ pub enum FakeErr {
     Rejected,
     /// A dead token: `Error::Unauthorized`.
     Unauthorized,
+    /// An unusable rotation answer: `Error::RotationLost`.
+    Lost,
 }
 
 impl FakeErr {
@@ -47,6 +49,7 @@ impl FakeErr {
             },
             Self::Rejected => Error::Gitlab("403 Forbidden".into()),
             Self::Unauthorized => Error::Unauthorized("401 Unauthorized".into()),
+            Self::Lost => Error::RotationLost("unreadable answer".into()),
         }
     }
 }
@@ -325,11 +328,11 @@ impl GitlabApi for FakeGitlab {
         let now = chrono::Utc::now();
         Ok(RotatedToken {
             token: Token::new(format!("rotated-{n}")),
-            info: TokenInfo {
+            info: Some(TokenInfo {
                 scopes: self.served_token().scopes,
                 created_at: Some(now),
                 expires_at: expires_at.or(Some(now.date_naive() + chrono::Days::new(7))),
-            },
+            }),
         })
     }
 }
