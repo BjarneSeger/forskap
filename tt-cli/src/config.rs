@@ -30,6 +30,23 @@ pub struct Config {
     /// `GITLAB_TRACKRD_SOCKET` env var. If unset, the same XDG-runtime-dir
     /// fallback chain as the daemon is used.
     pub socket: Option<String>,
+
+    // Read only by the Linux-only `tt search-provider`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[config(nested)]
+    pub search_provider: SearchProvider,
+}
+
+/// Settings for `tt search-provider`, the GNOME Shell / KRunner integration.
+#[derive(Debug, ConfiqueConfig)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct SearchProvider {
+    /// Only answer desktop searches that start with this word, e.g. `gl` makes
+    /// `gl oauth` search for "oauth" and `gl` alone list frequently opened
+    /// items, while any other search returns nothing. Unset, every search is
+    /// answered (queries shorter than two characters are ignored). KRunner
+    /// reads the word once at startup, so restart it after changing this.
+    pub trigger_word: Option<String>,
 }
 
 pub fn config_path() -> PathBuf {

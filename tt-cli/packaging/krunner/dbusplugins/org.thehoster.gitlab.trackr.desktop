@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Service
+Name=GitLab
+Comment=Search tracked GitLab issues and merge requests
+Icon=system-search
+X-KDE-ServiceTypes=Plasma/Runner
+X-Plasma-API=DBus2
+X-Plasma-DBusRunner-Service=org.thehoster.gitlab.trackr.SearchProvider
+X-Plasma-DBusRunner-Path=/org/thehoster/gitlab/trackr/Runner
+X-Plasma-Request-Actions-Once=true
+X-KDE-PluginInfo-Name=gitlab-trackr
+X-KDE-PluginInfo-Author=Bjarne Seger
+X-KDE-PluginInfo-License=GPL-3.0-only
+X-KDE-PluginInfo-EnabledByDefault=true

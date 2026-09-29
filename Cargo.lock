@@ -3412,6 +3412,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "varlink",
+ "zbus",
 ]
 
 [[package]]

@@ -57,7 +57,7 @@ pub async fn run(
 
 /// The issuable's `web_url` from the daemon's caches, or an error naming the
 /// ref when neither cache knows it.
-async fn lookup_url(
+pub(super) async fn lookup_url(
     client: &gitlab_trackr_api::VarlinkClient,
     kind: RefKind,
     project_id: i64,

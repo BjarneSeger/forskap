@@ -29,3 +29,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 varlink.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
