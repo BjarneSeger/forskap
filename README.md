@@ -1,6 +1,6 @@
-<img src="forskap-cli/packaging/icons/hicolor/scalable/apps/org.thehoster.forskap.svg" alt="" width="96" align="right">
-
 # forskap
+
+<img src="forskap-cli/packaging/icons/hicolor/scalable/apps/org.thehoster.forskap.svg" alt="" width="96">
 
 A cached GitLab CLI with time-tracking helpers. Formerly `gitlab-trackr` / `tt` —
 see [Upgrading from gitlab-trackr](#upgrading-from-gitlab-trackr).
