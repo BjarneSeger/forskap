@@ -8,7 +8,12 @@ use crate::sync::model;
 
 /// `board_labels` are the issue's project board lists, `None` when never
 /// synced (then `graph_status` stays empty).
-pub fn issue(i: model::Issue, board_labels: Option<&[String]>, open_count: i64) -> Issue {
+pub fn issue(
+    i: model::Issue,
+    board_labels: Option<&[String]>,
+    open_count: i64,
+    project_avatar: String,
+) -> Issue {
     Issue {
         graph_status: graph_status_from(board_labels, &i.labels, &i.state),
         parent: i.parent_url().to_string(),
@@ -20,10 +25,15 @@ pub fn issue(i: model::Issue, board_labels: Option<&[String]>, open_count: i64) 
         web_url: i.web_url,
         state: i.state,
         open_count,
+        project_avatar,
     }
 }
 
-pub fn merge_request(m: model::MergeRequest, open_count: i64) -> MergeRequest {
+pub fn merge_request(
+    m: model::MergeRequest,
+    open_count: i64,
+    project_avatar: String,
+) -> MergeRequest {
     MergeRequest {
         id: m.id,
         iid: m.iid,
@@ -33,15 +43,17 @@ pub fn merge_request(m: model::MergeRequest, open_count: i64) -> MergeRequest {
         state: m.state,
         assignees: m.assignees.into_iter().map(|a| a.username).collect(),
         open_count,
+        project_avatar,
     }
 }
 
-pub fn project(p: model::Project) -> Project {
+pub fn project(p: model::Project, avatar: String) -> Project {
     Project {
         id: p.id,
         name: p.name,
         path: p.path_with_namespace,
         web_url: p.web_url,
+        avatar,
     }
 }
 

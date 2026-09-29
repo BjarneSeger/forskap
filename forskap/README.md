@@ -4,7 +4,8 @@ A [noctalia-shell](https://noctalia.dev) plugin that puts `forskap search` behin
 launcher prefix `/gl`. Results come from the daemon's cache (instant, works offline),
 activating an issue or merge request opens it in the browser through `forskap issue open` / `forskap mr open` — which
 also counts the open, so what you visit most ranks first. Projects and groups open via
-`xdg-open`.
+`xdg-open`. Issues, merge requests and projects show the avatar of their project, where
+it has one.
 
 Requires noctalia ≥ 5.1 (plugin API 24) and a running `forskapd` with `forskap` on the
 `PATH` noctalia sees (or set the **forskap binary** setting).

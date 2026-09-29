@@ -131,6 +131,9 @@ pub struct Project {
     pub path_with_namespace: String,
     #[serde(default, deserialize_with = "de::nullable")]
     pub web_url: String,
+    /// Empty when the project has no avatar.
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub avatar_url: String,
 }
 
 /// `GET /groups`.
@@ -275,7 +278,7 @@ impl Resource for MergeRequest {
 impl Resource for Project {
     const NAME: &'static str = "projects";
     const KEYSPACE: &'static str = "gl_projects_v1";
-    const SCHEMA: u32 = 1;
+    const SCHEMA: u32 = 2;
     fn key(&self) -> RowKey {
         (positive(self.id), 0)
     }
@@ -513,6 +516,23 @@ mod tests {
         };
         let back: Timelog = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
         assert_eq!(back, t);
+    }
+
+    #[test]
+    fn project_reads_its_avatar_url() {
+        let p: Project = serde_json::from_value(json!({
+            "id": 7, "name": "API", "path_with_namespace": "team/api",
+            "avatar_url": "https://gl/uploads/-/system/project/avatar/7/logo.png",
+        }))
+        .unwrap();
+        assert_eq!(
+            p.avatar_url,
+            "https://gl/uploads/-/system/project/avatar/7/logo.png"
+        );
+        for none in [json!({"id": 7, "avatar_url": null}), json!({"id": 7})] {
+            let p: Project = serde_json::from_value(none).unwrap();
+            assert_eq!(p.avatar_url, "");
+        }
     }
 
     #[test]

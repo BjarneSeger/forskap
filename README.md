@@ -96,8 +96,8 @@ available as the [`forskap-api`](forskap-api/README.md) Rust crate or the
 [noctalia-shell](https://noctalia.dev) launcher provider: type `/gl <query>` to search
 issues, merge requests, projects and groups through `forskap search`, and activate a result
 to open it in the browser via `forskap issue open` / `forskap mr open` — which also counts the open, so the things you
-visit most float to the top (and `/gl` on its own lists them). This repository doubles
-as a noctalia plugin source (`catalog.toml`):
+visit most float to the top (and `/gl` on its own lists them). Results show the avatar
+of their project. This repository doubles as a noctalia plugin source (`catalog.toml`):
 
 ```sh
 noctalia msg plugins source add forskap git https://github.com/BjarneSeger/forskap
@@ -109,7 +109,8 @@ noctalia msg plugins enable thehoster/forskap
 `forskap integration search-provider` serves the same search to GNOME Shell's overview search and to
 KRunner (Plasma 6) over D-Bus. The session bus starts it on demand and it exits again
 when idle; picking a result opens it in the browser and counts the open like `forskap issue open`.
-Type `mr oauth`, `#42` or `!42` to narrow the kind, or just `oauth`.
+Type `mr oauth`, `#42` or `!42` to narrow the kind, or just `oauth`. Results show the
+avatar of their project, where it has one.
 
 The deb/rpm/arch package installs the registration files. From a `cargo install`, write
 them yourself — GNOME Shell only reads providers from `$XDG_DATA_DIRS`, so this needs root

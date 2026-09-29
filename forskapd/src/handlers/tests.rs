@@ -16,6 +16,7 @@ use crate::config::SharedConfig;
 use crate::error::DormancyReason;
 use crate::gitlab::Issuable;
 use crate::queue::RetryQueue;
+use crate::sync::avatars::Avatar;
 use crate::sync::jobs::{ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS};
 use crate::sync::model::{self, Board, BoardList, LabelRef, RowKey, UserRef};
 use crate::sync::schedule::JobState;
@@ -42,6 +43,7 @@ fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
     let reconnect_signal = Arc::new(Notify::new());
     let sync = SyncHandle::spawn_on_demand(
         Arc::new(SyncStore::open(&db).unwrap()),
+        crate::sync::AvatarDir::new(dir.path().join("avatars")),
         Arc::clone(&session),
         Arc::clone(&config),
         Arc::clone(&reconnect_signal),
@@ -234,6 +236,7 @@ fn seed_corpus(h: &Handlers) {
             name: "auth-service".into(),
             path_with_namespace: "team/auth-service".into(),
             web_url: "https://gl/team/auth-service".into(),
+            ..Default::default()
         }],
     );
     seed(
@@ -761,6 +764,77 @@ async fn search_never_synced_is_honest_about_the_session() {
     let (h, _dir) = connected_handlers(&fake);
     let r = run_search(&h, "x", None, None).await;
     assert!(r.issues.is_empty() && r.projects.is_empty());
+}
+
+// ── Avatars ────────────────────────────────────────────────────────────
+
+/// Avatars fetched for projects 1 and 4; project 2's fetch found none.
+fn seed_avatars(h: &Handlers) {
+    let avatar = |project_id, file: &str| Avatar {
+        project_id,
+        file: file.into(),
+    };
+    seed(
+        h,
+        &[avatar(1, "1-a.png"), avatar(2, ""), avatar(4, "4-b.svg")],
+    );
+}
+
+fn avatar_path(dir: &tempfile::TempDir, file: &str) -> String {
+    let path = dir.path().join("avatars").join(file);
+    path.to_str().unwrap().to_string()
+}
+
+/// The rows name the files, so a read works without them on disk.
+#[tokio::test]
+async fn search_hits_carry_their_projects_avatar() {
+    let (h, dir) = dormant_handlers();
+    seed_corpus(&h);
+    seed_avatars(&h);
+
+    let r = run_search(&h, "oauth", None, None).await;
+    assert_eq!(r.issues[0].project_avatar, avatar_path(&dir, "1-a.png"));
+    assert_eq!(
+        r.merge_requests[0].project_avatar,
+        avatar_path(&dir, "1-a.png")
+    );
+    let r = run_search(&h, "auth-serv", None, None).await;
+    assert_eq!(r.projects[0].avatar, avatar_path(&dir, "4-b.svg"));
+}
+
+#[tokio::test]
+async fn assigned_items_carry_their_projects_avatar() {
+    let (h, dir) = dormant_handlers();
+    seed_assigned_issues(&h);
+    seed_assigned_mrs(&h);
+    seed_avatars(&h);
+
+    let avatars = |project_avatars: Vec<(i64, String)>| -> Vec<(i64, String)> {
+        let mut sorted = project_avatars;
+        sorted.sort();
+        sorted.dedup();
+        sorted
+    };
+    let expected = [(1, avatar_path(&dir, "1-a.png")), (2, String::new())];
+    let issues = assigned_issues(&h, None).await;
+    assert_eq!(
+        avatars(
+            issues
+                .into_iter()
+                .map(|i| (i.project_id, i.project_avatar))
+                .collect()
+        ),
+        expected
+    );
+    let mrs = assigned_mrs(&h, None).await;
+    assert_eq!(
+        avatars(
+            mrs.into_iter()
+                .map(|m| (m.project_id, m.project_avatar))
+                .collect()
+        ),
+        expected
+    );
 }
 
 // ── History ────────────────────────────────────────────────────────────

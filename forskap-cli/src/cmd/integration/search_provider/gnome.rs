@@ -52,7 +52,9 @@ impl SearchProvider2 {
                     Some(row) => {
                         meta.insert("name".to_string(), ov(row.title.as_str()));
                         meta.insert("description".to_string(), ov(row.subtitle.as_str()));
-                        meta.insert("gicon".to_string(), ov(row.kind.icon()));
+                        // A serialized GIcon: a path reads as a file icon,
+                        // a bare name as a themed one.
+                        meta.insert("gicon".to_string(), ov(row.icon()));
                         meta.insert("clipboardText".to_string(), ov(row.url.as_str()));
                     }
                     None => {

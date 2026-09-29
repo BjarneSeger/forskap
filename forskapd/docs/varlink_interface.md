@@ -36,7 +36,8 @@ type Issue (
   graph_status: string, # board column the issue sits in, derived from its labels
                         # matched against the project's issue board; empty when no
                         # board/label matches
-  open_count:   int     # opens recorded through RecordOpen (within usage.retention_hours)
+  open_count:   int,    # opens recorded through RecordOpen (within usage.retention_hours)
+  project_avatar: string  # file of the project's avatar, see Project.avatar; empty when none
 )
 ```
 
@@ -89,7 +90,8 @@ type MergeRequest (
   web_url:    string,
   state:      string,   # "opened" | "closed" | "merged" | "locked"
   assignees:  []string, # assignee usernames, captured at the last search sync
-  open_count: int       # opens recorded through RecordOpen (within usage.retention_hours)
+  open_count: int,      # opens recorded through RecordOpen (within usage.retention_hours)
+  project_avatar: string  # file of the project's avatar, see Project.avatar; empty when none
 )
 ```
 
@@ -98,9 +100,19 @@ type Project (
   id:      int,
   name:    string,
   path:    string,  # full namespace path ("team/backend/api")
-  web_url: string
+  web_url: string,
+  avatar:  string   # absolute path of the avatar image on the daemon's machine;
+                    # empty when the project has none
 )
 ```
+
+The daemon downloads the avatars of the member projects into
+`$XDG_CACHE_HOME/forskapd/avatars/` (a private project's avatar is only readable with
+the token), so a launcher can show the file as it is. The extension tells the format
+(`png`, `jpg`, `gif`, `webp`, `ico`, `bmp`, `tiff`, `svg`). A changed avatar gets a new
+file name, and the path is empty until the download ran, for projects you are not a
+member of, for images above 1 MiB, and on GitLab before 16.9. The file may be gone if
+the cache directory was emptied; the daemon fetches it again at its next start.
 
 ```varlink
 type Group (
@@ -294,7 +306,7 @@ clears everything synced. Otherwise each scope string selects a slice:
 | scope    | clears                                                         |
 |----------|----------------------------------------------------------------|
 | `issues` | the assigned issue/MR lists and the board columns              |
-| `search` | the corpus: issues, MRs, projects, groups                      |
+| `search` | the corpus: issues, MRs, projects, groups, project avatars     |
 | `quick`  | history inside the quick window (last `refresh.quick.window_hours`) |
 | `slow`   | history between the retention horizon and the quick window     |
 | `stale`  | history older than `history.retention_hours` (normally already pruned) |

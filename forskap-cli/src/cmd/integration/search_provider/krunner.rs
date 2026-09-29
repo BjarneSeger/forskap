@@ -56,9 +56,10 @@ impl Runner {
                 properties.insert("category".to_string(), ov("GitLab"));
                 properties.insert("urls".to_string(), ov(vec![row.url.clone()]));
                 Match {
+                    // KRunner's icon loader takes a path as well as a name.
+                    icon: row.icon().to_string(),
                     id: row.id,
                     text: row.title,
-                    icon: row.kind.icon().to_string(),
                     category_relevance,
                     // Frequently opened items float up; the cap keeps a
                     // favourite from pinning every other row to the floor.

@@ -2,6 +2,8 @@
 //! (`forskap/launcher.luau`): same ids, titles and subtitles, so the
 //! launchers behave alike and `forskap issue open` counts the same thing.
 
+use std::path::Path;
+
 use forskap_api::Search_Reply;
 
 use super::query::Kind;
@@ -16,6 +18,25 @@ pub struct Row {
     pub kind: Kind,
     pub score: i64,
     pub url: String,
+    /// The project's avatar file, as the daemon downloaded it.
+    pub avatar: Option<String>,
+}
+
+impl Row {
+    /// What the shells show next to the row. Both take an absolute path
+    /// where they take a themed icon name. The avatars are cache files, so
+    /// one that is gone falls back to the kind's icon instead of a blank.
+    pub fn icon(&self) -> &str {
+        match &self.avatar {
+            Some(file) if Path::new(file).is_file() => file,
+            _ => self.kind.icon(),
+        }
+    }
+}
+
+/// An avatar path off the wire, where empty means none.
+fn avatar(path: &str) -> Option<String> {
+    (!path.is_empty()).then(|| path.to_string())
 }
 
 /// What a result id points at once the user picks it.
@@ -40,6 +61,7 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
             kind: Kind::Issues,
             score: i.open_count,
             url: i.web_url.clone(),
+            avatar: avatar(&i.project_avatar),
         });
     }
     for m in &reply.merge_requests {
@@ -50,6 +72,7 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
             kind: Kind::MergeRequests,
             score: m.open_count,
             url: m.web_url.clone(),
+            avatar: avatar(&m.project_avatar),
         });
     }
     for p in &reply.projects {
@@ -60,6 +83,7 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
             kind: Kind::Projects,
             score: 0,
             url: p.web_url.clone(),
+            avatar: avatar(&p.avatar),
         });
     }
     for g in &reply.groups {
@@ -70,6 +94,7 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
             kind: Kind::Groups,
             score: 0,
             url: g.web_url.clone(),
+            avatar: None,
         });
     }
     out
@@ -137,6 +162,7 @@ mod tests {
                 total_time: "1h".into(),
                 graph_status: String::new(),
                 open_count: 3,
+                project_avatar: "/cache/avatars/7-a.png".into(),
             }],
             merge_requests: vec![MergeRequest {
                 id: 2,
@@ -147,12 +173,14 @@ mod tests {
                 state: "merged".into(),
                 assignees: vec![],
                 open_count: 0,
+                project_avatar: "/cache/avatars/7-a.png".into(),
             }],
             projects: vec![Project {
                 id: 7,
                 name: "API".into(),
                 path: "team/api".into(),
                 web_url: "https://gl.example.com/team/api".into(),
+                avatar: String::new(),
             }],
             groups: vec![Group {
                 id: 3,
@@ -184,6 +212,27 @@ mod tests {
         assert_eq!(rows[2].title, "team/api");
         assert_eq!(rows[2].subtitle, "API");
         assert_eq!(rows[3].kind, Kind::Groups);
+    }
+
+    #[test]
+    fn rows_carry_the_project_avatar() {
+        let avatars: Vec<_> = rows(&reply()).into_iter().map(|r| r.avatar).collect();
+        let of_project = Some("/cache/avatars/7-a.png".to_string());
+        assert_eq!(avatars, [of_project.clone(), of_project, None, None]);
+    }
+
+    #[test]
+    fn the_icon_is_the_avatar_while_its_file_exists() {
+        let file = std::env::temp_dir().join(format!("forskap-icon-{}.png", std::process::id()));
+        std::fs::write(&file, b"png").unwrap();
+        let mut row = rows(&reply()).remove(0);
+        row.avatar = Some(file.to_str().unwrap().to_string());
+        assert_eq!(row.icon(), file.to_str().unwrap());
+
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(row.icon(), Kind::Issues.icon());
+        row.avatar = None;
+        assert_eq!(row.icon(), Kind::Issues.icon());
     }
 
     #[test]

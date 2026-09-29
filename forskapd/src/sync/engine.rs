@@ -8,6 +8,9 @@
 //! a network error backs off its job and demotes the session, parking the
 //! worker until the reconnect supervisor wakes it; a 401 parks the session
 //! until `forskap auth login`.
+//!
+//! The avatar files are the worker's too: written with their row, removed
+//! by a sweep once a commit dropped rows.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -16,8 +19,9 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
+use super::avatars::{Avatar, AvatarDir};
 use super::jobs::{self, ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, FetchCtx, Job, Staged, Windows};
-use super::model::{Board, Group, Issue, MergeRequest, Project, RowKey, Timelog};
+use super::model::{Board, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog};
 use super::now_secs;
 use super::planner::{self, Plan};
 use super::schedule::{
@@ -44,7 +48,7 @@ pub enum Clear {
     Everything,
     /// The assigned issue/MR views and the board labels.
     Assigned,
-    /// Issues, MRs, projects and groups.
+    /// Issues, MRs, projects, groups and the project avatars.
     Corpus,
     /// Timelogs spent in `[from, until)`.
     Timelogs { from: u64, until: u64 },
@@ -62,6 +66,7 @@ impl Clear {
                 key.starts_with("member/")
                     || key.ends_with("/issues")
                     || key.ends_with("/merge_requests")
+                    || key.ends_with("/avatar")
             }
             Self::Timelogs { .. } => key.starts_with("timelogs/"),
         }
@@ -102,6 +107,7 @@ enum Command {
 /// commands for the worker.
 pub struct SyncHandle {
     store: Arc<SyncStore>,
+    avatars: AvatarDir,
     tx: mpsc::UnboundedSender<Command>,
     noted: Mutex<Vec<NotedWrite>>,
 }
@@ -110,6 +116,7 @@ impl SyncHandle {
     /// Start the worker. It stops once the returned handle is dropped.
     pub fn spawn(
         store: Arc<SyncStore>,
+        avatars: AvatarDir,
         session: SessionSlot,
         config: SharedConfig,
         reconnect_signal: Arc<Notify>,
@@ -117,6 +124,7 @@ impl SyncHandle {
     ) -> Arc<Self> {
         Self::start(
             store,
+            avatars,
             session,
             config,
             reconnect_signal,
@@ -130,16 +138,27 @@ impl SyncHandle {
     #[cfg(test)]
     pub(crate) fn spawn_on_demand(
         store: Arc<SyncStore>,
+        avatars: AvatarDir,
         session: SessionSlot,
         config: SharedConfig,
         reconnect_signal: Arc<Notify>,
     ) -> Arc<Self> {
         let probe = crate::reconnect::no_keychain_probe();
-        Self::start(store, session, config, reconnect_signal, probe, false)
+        Self::start(
+            store,
+            avatars,
+            session,
+            config,
+            reconnect_signal,
+            probe,
+            false,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start(
         store: Arc<SyncStore>,
+        avatars: AvatarDir,
         session: SessionSlot,
         config: SharedConfig,
         reconnect_signal: Arc<Notify>,
@@ -157,6 +176,7 @@ impl SyncHandle {
                 .into_iter()
                 .collect(),
             store: Arc::clone(&store),
+            avatars: avatars.clone(),
             session,
             config,
             reconnect_signal,
@@ -185,6 +205,7 @@ impl SyncHandle {
         tokio::spawn(worker.run());
         Arc::new(Self {
             store,
+            avatars,
             tx,
             noted: Mutex::new(noted),
         })
@@ -192,6 +213,11 @@ impl SyncHandle {
 
     pub fn store(&self) -> &SyncStore {
         &self.store
+    }
+
+    /// Where the files the avatar rows name live.
+    pub fn avatars(&self) -> &AvatarDir {
+        &self.avatars
     }
 
     /// The session may have changed (login, reconnect).
@@ -295,6 +321,7 @@ enum Next {
 
 struct Worker {
     store: Arc<SyncStore>,
+    avatars: AvatarDir,
     session: SessionSlot,
     config: SharedConfig,
     reconnect_signal: Arc<Notify>,
@@ -324,6 +351,7 @@ struct Worker {
 
 impl Worker {
     async fn run(mut self) {
+        self.restore_avatars();
         loop {
             if self.replan {
                 self.replan_now();
@@ -490,7 +518,8 @@ impl Worker {
             let key = job.key();
             let state = self.states.get(&key).copied().unwrap_or_default();
             let cadence = job.cadence(&cfg);
-            let mut at = schedule::due_at(&key, &state, cadence, job.fingerprint(&cfg), jitter);
+            let fingerprint = self.plan.fingerprint(job, &cfg);
+            let mut at = schedule::due_at(&key, &state, cadence, fingerprint, jitter);
             if job.priority() > 0 {
                 at = at.max(self.boot + schedule::startup_offset(&key, spread));
             }
@@ -525,7 +554,7 @@ impl Worker {
         let started = now_secs();
         let (full, fingerprint, windows) = {
             let cfg = self.config.read().unwrap();
-            let fingerprint = job.fingerprint(&cfg);
+            let fingerprint = self.plan.fingerprint(job, &cfg);
             let full = schedule::run_is_full(
                 &key,
                 &state,
@@ -550,6 +579,8 @@ impl Worker {
                 state,
                 started,
                 windows,
+                fingerprint,
+                avatars: self.avatars.clone(),
             },
         ));
         let joined = loop {
@@ -581,8 +612,15 @@ impl Worker {
             }
             Some(Ok(Ok(staged))) => {
                 let before = job.view().map(|name| self.view_keys(name));
+                let replaced = self.avatar_file(job);
                 if self.commit(job, &key, state, staged, started, full, fingerprint) {
                     self.after_commit(job, before, &mut waiters);
+                    // Only now does no row name the previous file any more.
+                    if let Some(old) =
+                        replaced.filter(|old| self.avatar_file(job).as_ref() != Some(old))
+                    {
+                        self.avatars.remove(&old);
+                    }
                 }
             }
             Some(Ok(Err(e))) => self.on_error(&key, state, e, session).await,
@@ -702,6 +740,67 @@ impl Worker {
             Ok(rows) => debug!(view = name, rows, "dropped rows that left the view"),
             Err(e) => warn!(error = %e, view = name, "dropping rows that left the view failed"),
         }
+    }
+
+    /// The file `job`'s avatar row names, if it is an avatar job with one.
+    fn avatar_file(&self, job: Job) -> Option<String> {
+        let Job::ProjectAvatar(project) = job else {
+            return None;
+        };
+        let row = self.store.avatars.get((project.max(0) as u64, 0));
+        row.ok().flatten().map(|a| a.file).filter(|f| !f.is_empty())
+    }
+
+    /// Remove the avatar files no row names (any more).
+    fn sweep_avatars(&self) {
+        match self.store.avatars.scan(RowScope::All) {
+            Ok(rows) => {
+                let keep = rows.into_iter().map(|a| a.file).collect();
+                let removed = self.avatars.sweep(&keep);
+                if removed > 0 {
+                    debug!(removed, "removed avatar files without a row");
+                }
+            }
+            Err(e) => warn!(error = %e, "reading the avatars failed; keeping every file"),
+        }
+    }
+
+    /// Line rows and files up after a restart: an avatar whose file is gone
+    /// (a wiped cache directory) is fetched again, a file without a row (a
+    /// crash before the commit) is removed.
+    fn restore_avatars(&mut self) {
+        let rows = self.store.avatars.scan(RowScope::All).unwrap_or_else(|e| {
+            warn!(error = %e, "reading the avatars failed");
+            Vec::new()
+        });
+        let lost: Vec<Avatar> = rows
+            .into_iter()
+            .filter(|a| !a.file.is_empty() && !self.avatars.exists(&a.file))
+            .collect();
+        if !lost.is_empty() {
+            let keys: Vec<String> = lost
+                .iter()
+                .map(|a| Job::ProjectAvatar(a.project_id).key())
+                .collect();
+            let mut c = self.store.begin();
+            for (avatar, key) in lost.iter().zip(&keys) {
+                c.remove::<Avatar>(avatar.key());
+                c.remove_job(key);
+            }
+            match c.commit() {
+                Ok(()) => {
+                    info!(
+                        avatars = lost.len(),
+                        "avatar files are gone; fetching them again"
+                    );
+                    for key in &keys {
+                        self.states.remove(key);
+                    }
+                }
+                Err(e) => warn!(error = %e, "dropping avatars without a file failed"),
+            }
+        }
+        self.sweep_avatars();
     }
 
     /// Planned board jobs of the assigned issues' projects that never
@@ -840,6 +939,7 @@ impl Worker {
                     c.remove_where::<MergeRequest>(RowScope::All, |_| false)?;
                     c.remove_where::<Project>(RowScope::All, |_| false)?;
                     c.remove_where::<Group>(RowScope::All, |_| false)?;
+                    c.remove_where::<Avatar>(RowScope::All, |_| false)?;
                 }
                 Clear::Timelogs { from, until } => {
                     c.remove_where::<Timelog>(RowScope::Since(from), |k| k.0 >= until)?;
@@ -851,7 +951,12 @@ impl Worker {
             c.commit()
         })();
         match cleared {
-            Ok(()) => info!(?what, jobs_reset = reset.len(), "synced data cleared"),
+            Ok(()) => {
+                info!(?what, jobs_reset = reset.len(), "synced data cleared");
+                if matches!(what, Clear::Everything | Clear::Corpus) {
+                    self.sweep_avatars();
+                }
+            }
             Err(e) => warn!(?what, error = %e, "clearing synced data failed"),
         }
         for key in &reset {
@@ -880,7 +985,8 @@ impl Worker {
             return Ok(());
         }
         let mut c = self.store.begin();
-        if let Some(known) = self.store.identity()?.filter(|k| *k != me) {
+        let changed = self.store.identity()?.filter(|k| *k != me);
+        if let Some(known) = &changed {
             info!(
                 from_host = %known.host,
                 from_user = known.user_id,
@@ -898,6 +1004,9 @@ impl Worker {
         }
         c.set_identity(&me)?;
         c.commit()?;
+        if changed.is_some() {
+            self.sweep_avatars();
+        }
         self.identity = Some(me);
         Ok(())
     }
@@ -935,6 +1044,9 @@ impl Worker {
             // The dropped evidence is about to come back; dropping jobs now
             // would throw away corpora that must then be refetched in full.
             plan.jobs.extend(self.plan.jobs.iter().copied());
+            for (&project, &url) in &self.plan.avatars {
+                plan.avatars.entry(project).or_insert(url);
+            }
         }
         if plan.jobs == self.plan.jobs {
             self.plan = plan;
@@ -951,6 +1063,7 @@ impl Worker {
             jobs = plan.jobs.len(),
             tracked = plan.tracked.len(),
             corpus = plan.corpus,
+            avatars = plan.avatars.len(),
             from_assignments = plan.evidence.assigned,
             from_events = plan.evidence.events,
             from_timelogs = plan.evidence.timelogs,
@@ -990,6 +1103,7 @@ impl Worker {
                 for key in &stale {
                     self.states.remove(key);
                 }
+                self.sweep_avatars();
                 (stale.len(), rows)
             }
             Err(e) => {
@@ -1006,7 +1120,10 @@ mod tests {
     use crate::error::DormancyReason;
     use crate::gitlab::{GitlabApi, Issuable, Listing};
     use crate::sync::model::{Issue, Project};
-    use crate::testing::{FakeErr, FakeGitlab, event_json, eventually, issue_json, project_json};
+    use crate::testing::{
+        FakeErr, FakeGitlab, PNG, event_json, eventually, issue_json, project_json,
+        project_json_with_avatar,
+    };
     use crate::write::WriteOp;
 
     /// What an empty store plans before any evidence arrives.
@@ -1025,7 +1142,16 @@ mod tests {
         session: SessionSlot,
         reconnect: Arc<Notify>,
         store: Arc<SyncStore>,
+        avatars: AvatarDir,
         _dir: Option<tempfile::TempDir>,
+        _avatar_tmp: Option<tempfile::TempDir>,
+    }
+
+    impl Env {
+        fn keeping(mut self, avatars: tempfile::TempDir) -> Self {
+            self._avatar_tmp = Some(avatars);
+            self
+        }
     }
 
     fn open_store() -> (Arc<SyncStore>, tempfile::TempDir) {
@@ -1034,6 +1160,11 @@ mod tests {
             .open()
             .unwrap();
         (Arc::new(SyncStore::open(&db).unwrap()), dir)
+    }
+
+    /// The avatar directory of a store opened by [`open_store`] in `dir`.
+    fn avatar_dir(dir: &tempfile::TempDir) -> AvatarDir {
+        AvatarDir::new(dir.path().join("avatars"))
     }
 
     fn connected(fake: &Arc<FakeGitlab>, user_id: i64) -> ConnState {
@@ -1058,10 +1189,27 @@ mod tests {
     }
 
     fn start_probing(store: Arc<SyncStore>, state: ConnState, probe: KeychainProbe) -> Env {
+        let tmp = tempfile::tempdir().unwrap();
+        start_in(store, AvatarDir::new(tmp.path()), state, probe).keeping(tmp)
+    }
+
+    /// A worker keeping its avatars in `dir`, next to the store's database.
+    fn start_with_avatars(store: Arc<SyncStore>, dir: &tempfile::TempDir, state: ConnState) -> Env {
+        let probe = crate::reconnect::no_keychain_probe();
+        start_in(store, avatar_dir(dir), state, probe)
+    }
+
+    fn start_in(
+        store: Arc<SyncStore>,
+        avatars: AvatarDir,
+        state: ConnState,
+        probe: KeychainProbe,
+    ) -> Env {
         let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(state));
         let reconnect = Arc::new(Notify::new());
         let sync = SyncHandle::spawn(
             Arc::clone(&store),
+            avatars.clone(),
             Arc::clone(&session),
             instant_config(),
             Arc::clone(&reconnect),
@@ -1072,7 +1220,9 @@ mod tests {
             session,
             reconnect,
             store,
+            avatars,
             _dir: None,
+            _avatar_tmp: None,
         }
     }
 
@@ -1091,12 +1241,14 @@ mod tests {
     /// Mark `jobs` as synced just now, so none of them is due.
     fn mark_synced(store: &SyncStore, jobs: &[Job]) {
         let now = now_secs();
+        // For the avatar URLs the fingerprints cover.
+        let plan = planner::plan(store, crate::config::SearchPopulation::Tracked, 0).unwrap();
         let mut c = store.begin();
         for job in jobs {
             let state = JobState {
                 last_ok: now,
                 last_full: now,
-                fingerprint: job.fingerprint(&crate::config::defaults()),
+                fingerprint: plan.fingerprint(*job, &crate::config::defaults()),
                 ..Default::default()
             };
             c.set_job(&job.key(), &state).unwrap();
@@ -1618,11 +1770,194 @@ mod tests {
         assert!(env.sync.writes_since(before + 5).is_empty());
     }
 
+    /// Members 7 (with an avatar) and 8 (without), listed just now.
+    fn seed_avatar_project(store: &SyncStore, url: &str) {
+        let mut c = store.begin();
+        c.upsert(&[
+            Project {
+                id: 7,
+                avatar_url: url.into(),
+                ..Default::default()
+            },
+            Project {
+                id: 8,
+                ..Default::default()
+            },
+        ])
+        .unwrap();
+        c.commit().unwrap();
+        mark_synced(store, &BASE);
+    }
+
+    fn avatar_file(env: &Env, project: u64) -> Option<String> {
+        let row = env.store.avatars.get((project, 0)).unwrap();
+        row.map(|a| a.file)
+    }
+
+    fn files(dir: &AvatarDir) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir.path_of("")) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The avatar is downloaded on its own, once: neither time nor a
+    /// restart fetches it again.
+    #[tokio::test]
+    async fn an_avatar_is_fetched_once_per_url() {
+        let (store, dir) = open_store();
+        seed_avatar_project(&store, "https://gl/a.png");
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve_avatar(7, PNG);
+        let first = start_with_avatars(Arc::clone(&store), &dir, connected(&fake, 1));
+
+        eventually("the avatar", || avatar_file(&first, 7).is_some()).await;
+        let file = avatar_file(&first, 7).unwrap();
+        assert_eq!(files(&first.avatars), std::slice::from_ref(&file));
+        assert_eq!(state(&first, Job::ProjectAvatar(8)), JobState::default());
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let second = start_with_avatars(store, &dir, connected(&fake, 1));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(fake.avatar_calls(), [7], "{:?}", fake.calls());
+        assert_eq!(files(&avatar_dir(&dir)), [file]);
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn a_new_avatar_url_replaces_the_file() {
+        let (store, dir) = open_store();
+        seed_avatar_project(&store, "https://gl/a.png");
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve_avatar(7, PNG);
+        fake.serve("projects", vec![project_json_with_avatar(7, "b.gif")]);
+        let env = start_with_avatars(store, &dir, connected(&fake, 1));
+        eventually("the avatar", || avatar_file(&env, 7).is_some()).await;
+        let old = avatar_file(&env, 7).unwrap();
+
+        fake.serve_avatar(7, b"GIF89a");
+        env.sync.refresh_now(&[Job::MemberProjects]).await;
+        eventually("the new avatar", || {
+            avatar_file(&env, 7).is_some_and(|f| f != old)
+        })
+        .await;
+        let new = avatar_file(&env, 7).unwrap();
+        assert!(new.ends_with(".gif"), "{new}");
+        assert_eq!(files(&env.avatars), [new]);
+        assert_eq!(fake.avatar_calls(), [7, 7]);
+    }
+
+    /// GitLab before 16.9 answers 404: recorded as "none", not retried.
+    #[tokio::test]
+    async fn a_missing_avatar_is_no_failure() {
+        let (store, dir) = open_store();
+        seed_avatar_project(&store, "https://gl/a.png");
+        let fake = Arc::new(FakeGitlab::default());
+        let env = start_with_avatars(store, &dir, connected(&fake, 1));
+
+        eventually("the avatar job", || avatar_file(&env, 7).is_some()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(avatar_file(&env, 7).unwrap(), "");
+        let ran = state(&env, Job::ProjectAvatar(7));
+        assert_eq!((ran.failures, ran.retry_at), (0, 0));
+        assert_eq!(fake.avatar_calls(), [7]);
+    }
+
+    /// An avatar never runs ahead of data that is due.
+    #[tokio::test]
+    async fn avatars_wait_for_everything_else() {
+        let (store, dir) = open_store();
+        seed_avatar_project(&store, "https://gl/a.png");
+        let mut c = store.begin();
+        c.remove_job(&Job::MemberGroups.key());
+        c.commit().unwrap();
+        let fake = Arc::new(FakeGitlab::default());
+        let gate = fake.gate("groups");
+        let env = start_with_avatars(store, &dir, connected(&fake, 1));
+
+        tokio::time::timeout(Duration::from_secs(2), fake.gated.notified())
+            .await
+            .expect("the group listing starts");
+        assert!(fake.avatar_calls().is_empty());
+        gate.notify_one();
+        eventually("the avatar", || avatar_file(&env, 7).is_some()).await;
+    }
+
+    #[tokio::test]
+    async fn a_project_losing_its_avatar_loses_the_file() {
+        let (store, dir) = open_store();
+        seed_avatar_project(&store, "https://gl/a.png");
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve_avatar(7, PNG);
+        fake.serve("projects", vec![project_json(7)]);
+        let env = start_with_avatars(store, &dir, connected(&fake, 1));
+        eventually("the avatar", || !files(&env.avatars).is_empty()).await;
+
+        env.sync.refresh_now(&[Job::MemberProjects]).await;
+        eventually("the avatar to go", || avatar_file(&env, 7).is_none()).await;
+        eventually("its file to go", || files(&env.avatars).is_empty()).await;
+        assert_eq!(state(&env, Job::ProjectAvatar(7)), JobState::default());
+    }
+
+    #[tokio::test]
+    async fn clearing_the_corpus_drops_the_avatars_and_fetches_them_again() {
+        let (store, dir) = open_store();
+        seed_avatar_project(&store, "https://gl/a.png");
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve_avatar(7, PNG);
+        let env = start_with_avatars(store, &dir, connected(&fake, 1));
+        eventually("the avatar", || !files(&env.avatars).is_empty()).await;
+
+        // The refilled listing has no member left.
+        env.sync.clear(Clear::Corpus).await;
+        assert_eq!(avatar_file(&env, 7), None);
+        assert!(files(&env.avatars).is_empty());
+
+        fake.serve("projects", vec![project_json_with_avatar(7, "a.png")]);
+        env.sync.clear(Clear::Everything).await;
+        eventually("the avatar again", || !files(&env.avatars).is_empty()).await;
+    }
+
+    /// `~/.cache` may be wiped at any time: the files come back.
+    #[tokio::test]
+    async fn a_boot_fetches_avatars_whose_file_is_gone() {
+        let (store, dir) = open_store();
+        seed_avatar_project(&store, "https://gl/a.png");
+        mark_synced(&store, &[Job::ProjectAvatar(7)]);
+        let mut c = store.begin();
+        c.upsert(&[Avatar {
+            project_id: 7,
+            file: "7-1.png".into(),
+        }])
+        .unwrap();
+        c.commit().unwrap();
+        avatar_dir(&dir).write("9-1.png", PNG).unwrap();
+
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve_avatar(7, PNG);
+        let env = start_with_avatars(store, &dir, connected(&fake, 1));
+        eventually("the avatar", || {
+            avatar_file(&env, 7).is_some_and(|f| f != "7-1.png")
+        })
+        .await;
+        assert_eq!(files(&env.avatars), [avatar_file(&env, 7).unwrap()]);
+    }
+
     #[test]
     fn clears_reset_the_jobs_whose_data_they_drop() {
         let keys = BASE
             .iter()
-            .chain(&[Job::ProjectIssues(7), Job::ProjectBoards(7), Job::AllIssues])
+            .chain(&[
+                Job::ProjectIssues(7),
+                Job::ProjectBoards(7),
+                Job::AllIssues,
+                Job::ProjectAvatar(7),
+            ])
             .map(Job::key)
             .collect::<Vec<_>>();
         let reset = |what: Clear| {
@@ -1647,7 +1982,8 @@ mod tests {
                 "member/projects",
                 "member/groups",
                 "project/7/issues",
-                "all/issues"
+                "all/issues",
+                "project/7/avatar"
             ]
         );
         assert_eq!(

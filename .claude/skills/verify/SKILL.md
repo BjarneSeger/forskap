@@ -7,7 +7,7 @@ description: Build, launch, and drive forskapd + forskap end-to-end in an isolat
 
 The daemon (`forskapd`) serves a varlink unix socket; the CLI (`forskap`) is
 the user surface. Both resolve the socket from `$XDG_RUNTIME_DIR/forskapd.socket`
-and data/config from the XDG dirs, so a fully isolated instance only needs env vars.
+and data/config/cache from the XDG dirs, so a fully isolated instance only needs env vars.
 
 ## Recipe
 
@@ -15,8 +15,8 @@ and data/config from the XDG dirs, so a fully isolated instance only needs env v
 cargo build -p forskapd -p forskap-cli
 
 S=$(mktemp -d /tmp/gt-verify.XXXX)          # KEEP SHORT — socket path must fit SUN_LEN (~108 chars)
-mkdir -p $S/{config,data,runtime}; chmod 700 $S/runtime
-export XDG_CONFIG_HOME=$S/config XDG_DATA_HOME=$S/data XDG_RUNTIME_DIR=$S/runtime
+mkdir -p $S/{config,data,cache,runtime}; chmod 700 $S/runtime
+export XDG_CONFIG_HOME=$S/config XDG_DATA_HOME=$S/data XDG_CACHE_HOME=$S/cache XDG_RUNTIME_DIR=$S/runtime
 
 RUST_LOG=info ./target/debug/forskapd > $S/daemon.log 2>&1 &
 # wait for $S/runtime/forskapd.socket to appear, then drive:
@@ -34,6 +34,9 @@ RUST_LOG=info ./target/debug/forskapd > $S/daemon.log 2>&1 &
   unless the write target is intentional; they post to the live GitLab.
 - **Stale socket**: after SIGKILL the daemon leaves the socket file and a
   restart dies with `AddrInUse` — Use SIGTERM or `rm` the socket before restarting.
+- **Avatars**: files under `$XDG_CACHE_HOME/forskapd/avatars/`. Without the
+  override the instance sweeps the real daemon's avatar files (it removes files
+  its own store doesn't name).
 - **Storage**: fjall database at `$XDG_DATA_HOME/forskapd/db/`.
   Startup deletes legacy `*.redb` files in `$XDG_DATA_HOME/forskapd/`;
   plant fakes there to test the cleanup path.

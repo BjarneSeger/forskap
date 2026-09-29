@@ -26,6 +26,10 @@ reconnect).
   without expiry by default); the n-th `rotate_token` yields the token `rotated-n`.
   Both fail through `fail_next(TOKEN_PATH | ROTATE_PATH, err)`; `rotations()` logs
   the `expires_at` of every attempt, `token_info_calls()` counts the reads.
+- **Avatars**: `serve_avatar(project_id, bytes)` sets a project's image (`PNG` is
+  a minimal one), a project without one answers like GitLab's 404; failures go
+  through `fail_next("projects/<id>/avatar", err)`, `avatar_calls()` logs the
+  downloads. `project_json_with_avatar(id, file)` is a member project with one.
 - Assert on traffic with `calls()`, `calls_to(path)`, `timelog_calls()`,
   `read_calls()` — e.g. "a read never touches GitLab" is `read_calls() == 0`.
 - `FakeErr::{Transient, Throttled(status), Rejected, Unauthorized}` build the
@@ -64,7 +68,8 @@ is `Ok`; "did not fire" → `.is_err()`.
   the `Staged` result to a commit, assert on the store and `fake.calls_to(..)`.
 - `engine.rs`: `start(state)` / `start_on(store, state)` spawn the real scheduled
   worker with `instant_config()` (no job gap, no startup spread); drive it with
-  `refresh_now`, `clear`, and `eventually`.
+  `refresh_now`, `clear`, and `eventually`. `start_with_avatars(store, &dir, state)`
+  keeps the avatar files in `dir`, for tests that restart or look at them.
 
 ## Queue and reconnect tests
 

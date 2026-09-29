@@ -82,6 +82,17 @@ local function projectPath(webUrl)
   return path or ""
 end
 
+-- The project's avatar as the daemon downloaded it, nil when there is none.
+-- noctalia takes an absolute path for `icon` and shows `glyph` until the
+-- image is loaded, but swaps a missing file for a generic icon: the avatars
+-- are cache files, so check.
+local function avatarIcon(path)
+  if path ~= nil and path ~= "" and noctalia.fileExists(path) then
+    return path
+  end
+  return nil
+end
+
 local function joinNonEmpty(parts)
   local kept = {}
   for _, p in ipairs(parts) do
@@ -98,6 +109,7 @@ local function issuableRow(kind, sigil, item)
     title = string.format("%s%d %s", sigil, item.iid, item.title),
     subtitle = joinNonEmpty({ projectPath(item.web_url), item.state, item.total_time }),
     glyph = GLYPH[kind],
+    icon = avatarIcon(item.project_avatar),
     category = CATEGORY[kind],
     score = item.open_count or 0,
   }
@@ -109,6 +121,7 @@ local function urlRow(kind, item)
     title = item.path,
     subtitle = item.name,
     glyph = GLYPH[kind],
+    icon = avatarIcon(item.avatar),
     category = CATEGORY[kind],
   }
 end
