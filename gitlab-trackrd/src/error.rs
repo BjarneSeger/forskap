@@ -10,9 +10,23 @@ pub enum Error {
     #[error("GitLab error: {0}")]
     Gitlab(String),
 
+    /// GitLab answered 401: the token is dead, and only `tt login` helps.
+    #[error("GitLab rejected the token: {0}")]
+    Unauthorized(String),
+
     /// Transient network error — safe to retry.
     #[error("network error: {0}")]
     Transient(String),
+
+    /// GitLab answered 429 or 5xx: the request may succeed later, and the
+    /// session itself is fine.
+    #[error("GitLab unavailable ({status}): {detail}")]
+    Throttled {
+        status: u16,
+        /// The server's `Retry-After`, when it sent one.
+        retry_after: Option<std::time::Duration>,
+        detail: String,
+    },
 
     #[error("secret store: {0}")]
     Secrets(String),
@@ -34,6 +48,27 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// Whether the same request may succeed if repeated later. A 5xx counts
+    /// only for `idempotent` requests: the server may have applied a
+    /// non-idempotent write before failing.
+    pub fn is_retryable(&self, idempotent: bool) -> bool {
+        match self {
+            Self::Transient(_) => true,
+            Self::Throttled { status, .. } => *status == 429 || idempotent,
+            _ => false,
+        }
+    }
+
+    /// The server-requested pause before retrying, if any.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Throttled { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+}
 
 /// Why the daemon has no live GitLab session. Attached to
 /// [`Error::NotAuthenticated`] so the reason the daemon already logs at startup
@@ -78,14 +113,18 @@ impl DormancyReason {
         }
     }
 
-    /// Classify a failed initial `GitlabClient::connect`: a transient/network
-    /// error means GitLab was unreachable; anything else means the token was
+    /// Classify a failed `GitlabClient::connect`: a network error or a
+    /// 429/5xx means GitLab was unreachable; anything else means the token was
     /// rejected.
     pub fn from_connect_error(host: &str, e: &Error) -> Self {
         match e {
             Error::Transient(detail) => Self::Unreachable {
                 host: host.to_string(),
                 detail: detail.clone(),
+            },
+            e @ Error::Throttled { .. } => Self::Unreachable {
+                host: host.to_string(),
+                detail: e.to_string(),
             },
             other => Self::TokenRejected {
                 host: host.to_string(),
@@ -134,6 +173,37 @@ mod tests {
             r.detail().as_deref(),
             Some("gitlab.example.com: GitLab error: 401 Unauthorized")
         );
+    }
+
+    #[test]
+    fn from_connect_error_classifies_throttled_as_unreachable() {
+        for status in [429, 502] {
+            let r = DormancyReason::from_connect_error(
+                "gitlab.example.com",
+                &Error::Throttled {
+                    status,
+                    retry_after: None,
+                    detail: "busy".into(),
+                },
+            );
+            assert!(r.is_auto_retryable(), "{status} must not park the daemon");
+        }
+    }
+
+    #[test]
+    fn retryability_by_error_and_idempotency() {
+        let throttled = |status| Error::Throttled {
+            status,
+            retry_after: None,
+            detail: String::new(),
+        };
+        for idempotent in [true, false] {
+            assert!(Error::Transient("x".into()).is_retryable(idempotent));
+            assert!(throttled(429).is_retryable(idempotent));
+            assert!(!Error::Gitlab("404".into()).is_retryable(idempotent));
+        }
+        assert!(throttled(503).is_retryable(true));
+        assert!(!throttled(503).is_retryable(false));
     }
 
     #[test]

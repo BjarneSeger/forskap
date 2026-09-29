@@ -1,9 +1,9 @@
 //! `tt refresh` — drop the daemon's caches and re-fetch.
 //!
-//! With no flags this clears everything (assigned issues, boards, and all three
-//! history bands) — use it after editing an issue in the GitLab UI when you
-//! don't want to wait out the daemon's refresh interval. The per-band flags
-//! clear only the named caches; cleared history bands are re-fetched right away.
+//! With no flags this clears everything synced — use it after editing an issue
+//! in the GitLab UI when you don't want to wait out the daemon's sync interval.
+//! The per-slice flags clear only the named caches. The daemon replies once
+//! what it cleared of the assigned lists and the history is re-synced.
 //! `--usage` is the exception: open statistics are user data, so only that
 //! explicit flag drops them.
 

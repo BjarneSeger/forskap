@@ -12,10 +12,10 @@
 //! style of exponential back-off as the retry queue (see `queue`), reusing the
 //! `[reconnect]` config and the shared session slot as the integration seam. The
 //! moment it flips the slot back to `Connected`, the queue worker's defer loop
-//! and the background refresh loops resume on their own; we additionally nudge
-//! the queue and kick an immediate refresh so recovery is instant. Between
+//! and the sync worker resume on their own; we additionally nudge
+//! the queue and wake the sync worker so recovery is instant. Between
 //! engagements it parks on [`Handlers::reconnect_signal`], woken by the next
-//! runtime demotion or a periodic re-check tick; a reconnect whose warm-up
+//! runtime demotion or a periodic re-check tick; a reconnect whose first sync
 //! immediately re-fails backs off before retrying (see [`supervise`]).
 //!
 //! Only a *transient* dormancy (`DormancyReason::is_auto_retryable`) is retried:
@@ -30,10 +30,14 @@ use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::config::{SharedConfig, next_backoff};
-use crate::error::{DormancyReason, Error};
+use crate::error::DormancyReason;
 use crate::gitlab::{GitlabApi, GitlabClient};
 use crate::handlers::{ConnState, Handlers, Session, SessionSlot};
 use crate::secrets::{self, Credentials};
+use crate::sync::Job;
+
+/// How long a reconnect waits for its probing sync job.
+const RECOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Outcome of one connection attempt, abstracted so the loop's state machine can
 /// be unit-tested without a live GitLab (mirrors the fake `GitlabApi` the queue
@@ -67,7 +71,7 @@ enum Engaged {
     /// Nothing to do, reconnected-and-healthy, or deliberately stopped — park
     /// until the next demotion signal or periodic re-check.
     Stable,
-    /// Reconnected, but the post-reconnect warm-up immediately failed and
+    /// Reconnected, but the post-reconnect sync immediately failed and
     /// re-demoted the session. Re-engaging at once would spin against a partial
     /// outage, so the supervisor backs off first.
     Flapping,
@@ -77,7 +81,7 @@ enum Engaged {
 /// an injected `engage` step.
 ///
 /// Two waits guard the two failure shapes:
-/// * A `Flapping` engagement (reconnect succeeded but warm-up re-failed) sleeps
+/// * A `Flapping` engagement (reconnect succeeded but its first sync re-failed) sleeps
 ///   an exponential back-off before re-engaging, so a partial outage — the cheap
 ///   `connect` probe reachable while the heavier fetches are not — can't storm.
 /// * A `Stable` engagement parks until the next runtime demotion signal *or* a
@@ -106,7 +110,7 @@ where
                 let d = flap_delay.unwrap_or(base);
                 warn!(
                     delay_secs = d.as_secs(),
-                    "reconnected but warm-up re-failed; backing off before retrying"
+                    "reconnected but the first sync re-failed; backing off before retrying"
                 );
                 tokio::time::sleep(d).await;
                 flap_delay = Some(next_backoff(d, max));
@@ -129,7 +133,7 @@ where
 /// One reconnect engagement: if the session is dormant for an auto-retryable
 /// reason (and auto-reconnect is enabled), re-establish it with bounded
 /// exponential back-off and, on success, run the recovery side effects. Returns
-/// [`Engaged::Flapping`] when the reconnect succeeded but its warm-up immediately
+/// [`Engaged::Flapping`] when the reconnect succeeded but its first sync immediately
 /// re-demoted the session (so the supervisor backs off), or [`Engaged::Stable`]
 /// otherwise. A no-op returning `Stable` when the slot isn't retryable, so a
 /// connected session costs only the guard check.
@@ -164,7 +168,16 @@ async fn engage_once(handlers: Arc<Handlers>) -> Engaged {
     .await;
     if committed {
         handlers.queue.drain_waker().notify_one();
-        handlers.warm_up().await;
+        // One foreground job through the sync worker doubles as the health
+        // probe: if it re-demotes the session, the supervisor backs off.
+        handlers.sync.wake();
+        let recovery = handlers.sync.refresh_now(&[Job::AssignedIssues]);
+        if tokio::time::timeout(RECOVERY_PROBE_TIMEOUT, recovery)
+            .await
+            .is_err()
+        {
+            warn!("post-reconnect sync still running; not waiting for it");
+        }
         if slot_is_retryable(&handlers.session).await {
             return Engaged::Flapping;
         }
@@ -196,16 +209,15 @@ async fn resolve_credentials(
 
 /// One connection attempt with pre-loaded credentials, mapped to an [`Attempt`]
 /// for `reconnect_loop`. No keychain read — the credentials are loaded once by
-/// the caller. A non-transient error is a rejected token (the only remaining
-/// possibility once the network-error case is peeled off), so build it directly.
+/// the caller. The retryable/permanent split is the boot-time one
+/// ([`DormancyReason::from_connect_error`]), so a 5xx keeps retrying here too.
 async fn connect_once(creds: &Credentials) -> Attempt {
     match GitlabClient::connect(&creds.host, &creds.token).await {
         Ok(client) => Attempt::Connected(Session::from_client(client)),
-        Err(Error::Transient(detail)) => Attempt::Transient(detail),
-        Err(e) => Attempt::Permanent(DormancyReason::TokenRejected {
-            host: creds.host.clone(),
-            detail: e.to_string(),
-        }),
+        Err(e) => match DormancyReason::from_connect_error(&creds.host, &e) {
+            r if r.is_auto_retryable() => Attempt::Transient(e.to_string()),
+            r => Attempt::Permanent(r),
+        },
     }
 }
 
@@ -323,6 +335,25 @@ pub(crate) async fn commit_unreachable(
     }
 }
 
+/// Demote a live session after `failed_client` got a 401: the token is dead
+/// and only `tt login` helps, so the supervisor isn't woken. The same
+/// identity CAS as [`commit_unreachable`].
+pub(crate) async fn commit_token_rejected(
+    session: &SessionSlot,
+    failed_client: &Arc<dyn GitlabApi>,
+    detail: String,
+) {
+    let mut slot = session.write().await;
+    if let ConnState::Connected(s) = &*slot {
+        if !Arc::ptr_eq(&s.gitlab, failed_client) {
+            return;
+        }
+        let host = s.host.clone();
+        warn!(host = %host, error = %detail, "GitLab rejected the token; run `tt login`");
+        *slot = ConnState::Dormant(DormancyReason::TokenRejected { host, detail });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,81 +361,9 @@ mod tests {
 
     use tokio::sync::RwLock;
 
-    use crate::gitlab::{FetchedTimelog, GitlabApi, Issuable, IssueWithLabels};
-
-    struct NoopGitlab;
-
-    #[async_trait::async_trait]
-    impl GitlabApi for NoopGitlab {
-        async fn fetch_assigned_issues(
-            &self,
-            _group: Option<String>,
-        ) -> crate::error::Result<Vec<IssueWithLabels>> {
-            unimplemented!()
-        }
-        async fn add_spent_time(
-            &self,
-            _k: Issuable,
-            _p: i64,
-            _i: i64,
-            _d: &str,
-            _s: Option<&str>,
-        ) -> crate::error::Result<()> {
-            unimplemented!()
-        }
-        async fn create_timelog(
-            &self,
-            _k: Issuable,
-            _id: i64,
-            _d: &str,
-            _s: &str,
-            _at: chrono::DateTime<chrono::Utc>,
-        ) -> crate::error::Result<()> {
-            unimplemented!()
-        }
-        async fn fetch_my_timelogs(
-            &self,
-            _since: chrono::DateTime<chrono::Utc>,
-        ) -> crate::error::Result<Vec<FetchedTimelog>> {
-            unimplemented!()
-        }
-        async fn close(&self, _k: Issuable, _p: i64, _i: i64) -> crate::error::Result<()> {
-            unimplemented!()
-        }
-        async fn assign_self(&self, _k: Issuable, _p: i64, _i: i64) -> crate::error::Result<()> {
-            unimplemented!()
-        }
-        async fn unassign_self(&self, _k: Issuable, _p: i64, _i: i64) -> crate::error::Result<()> {
-            unimplemented!()
-        }
-        async fn fetch_board_list_labels(&self, _p: i64) -> crate::error::Result<Vec<String>> {
-            unimplemented!()
-        }
-        async fn fetch_issues_for_search(
-            &self,
-            _p: Option<i64>,
-            _after: Option<chrono::DateTime<chrono::Utc>>,
-        ) -> crate::error::Result<Vec<crate::search::SearchIssue>> {
-            unimplemented!()
-        }
-        async fn fetch_merge_requests_for_search(
-            &self,
-            _p: Option<i64>,
-            _after: Option<chrono::DateTime<chrono::Utc>>,
-        ) -> crate::error::Result<Vec<crate::search::SearchMr>> {
-            unimplemented!()
-        }
-        async fn fetch_member_projects(
-            &self,
-        ) -> crate::error::Result<Vec<crate::search::SearchProject>> {
-            unimplemented!()
-        }
-        async fn fetch_member_groups(
-            &self,
-        ) -> crate::error::Result<Vec<crate::search::SearchGroup>> {
-            unimplemented!()
-        }
-    }
+    use crate::error::Error;
+    use crate::gitlab::GitlabApi;
+    use crate::testing::FakeGitlab;
 
     fn unreachable_slot() -> SessionSlot {
         let reason = DormancyReason::Unreachable {
@@ -424,7 +383,7 @@ mod tests {
 
     fn connected_session() -> Session {
         Session {
-            gitlab: Arc::new(NoopGitlab),
+            gitlab: Arc::new(FakeGitlab::default()),
             host: "gitlab.example.com".into(),
             user_id: 42,
         }
@@ -544,7 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_unreachable_demotes_connected_and_signals() {
-        let client: Arc<dyn GitlabApi> = Arc::new(NoopGitlab);
+        let client: Arc<dyn GitlabApi> = Arc::new(FakeGitlab::default());
         let session: SessionSlot = Arc::new(RwLock::new(ConnState::Connected(Session {
             gitlab: Arc::clone(&client),
             host: "gitlab.example.com".into(),
@@ -573,7 +532,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_unreachable_noop_when_not_connected() {
-        let client: Arc<dyn GitlabApi> = Arc::new(NoopGitlab);
+        let client: Arc<dyn GitlabApi> = Arc::new(FakeGitlab::default());
         for reason in [
             DormancyReason::NoCredentials,
             DormancyReason::LoggedOut,
@@ -612,8 +571,8 @@ mod tests {
 
     #[tokio::test]
     async fn commit_unreachable_noop_when_client_superseded() {
-        let client_a: Arc<dyn GitlabApi> = Arc::new(NoopGitlab);
-        let client_b: Arc<dyn GitlabApi> = Arc::new(NoopGitlab);
+        let client_a: Arc<dyn GitlabApi> = Arc::new(FakeGitlab::default());
+        let client_b: Arc<dyn GitlabApi> = Arc::new(FakeGitlab::default());
         let session: SessionSlot = Arc::new(RwLock::new(ConnState::Connected(Session {
             gitlab: Arc::clone(&client_b),
             host: "gitlab.example.com".into(),

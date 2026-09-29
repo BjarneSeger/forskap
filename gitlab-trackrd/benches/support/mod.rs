@@ -4,8 +4,8 @@
 //! Deliberately independent of the `#[cfg(test)]` fixtures in
 //! `handlers/tests.rs` — benches are separate compilation units that link the
 //! library without `cfg(test)`, so those helpers are invisible here. The
-//! session is always dormant: every benched path is a pure cache read or
-//! write, and dormancy proves no network access is possible.
+//! session is always dormant: every benched path is a pure store read, and
+//! dormancy proves no network access is possible (the sync worker parks).
 #![allow(dead_code)] // each bench target compiles this module independently
 
 use std::sync::Arc;
@@ -13,41 +13,38 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Notify, RwLock};
 
-use gitlab_trackr_api::Issue;
-use gitlab_trackrd::boards::BoardCache;
-use gitlab_trackrd::cache::IssueCache;
 use gitlab_trackrd::config::SharedConfig;
 use gitlab_trackrd::error::DormancyReason;
 use gitlab_trackrd::gitlab::Issuable;
 use gitlab_trackrd::handlers::{ConnState, Handlers, SessionSlot};
-use gitlab_trackrd::history::{HistoryCache, StoredTimelog};
 use gitlab_trackrd::queue::RetryQueue;
-use gitlab_trackrd::refresh_meta::RefreshMeta;
-use gitlab_trackrd::search::{
-    MrAssignee, SEARCH_SCHEMA_VERSION, SearchGroup, SearchIssue, SearchMr, SearchProject,
-    SyncStamps,
+use gitlab_trackrd::sync::jobs::ASSIGNED_MERGE_REQUESTS;
+use gitlab_trackrd::sync::model::{
+    Board, BoardList, Group, Issue, LabelRef, MergeRequest, Project, Resource, Timelog, UserRef,
 };
+use gitlab_trackrd::sync::schedule::JobState;
+use gitlab_trackrd::sync::store::{Stored, SyncStore, View};
+use gitlab_trackrd::sync::{Job, SyncHandle};
 use gitlab_trackrd::usage::UsageStats;
-
-/// The user id the seeded stamps claim ran the sync; assigned-MR benches
-/// filter for this id.
-pub const SYNCED_USER_ID: i64 = 1;
 
 /// A `Handlers` on a fresh temp-dir fjall database. The `TempDir` is bundled
 /// so it outlives the stores — dropping it deletes the database out from
-/// under fjall. The runtime is bundled too: `RetryQueue::new` spawns its
-/// worker task, so construction must happen inside a runtime context, and the
-/// async handler benches drive their futures on the same runtime
-/// (`b.to_async(&env.rt)`).
+/// under fjall. The runtime is bundled too: the queue and sync workers are
+/// spawned at construction, and the async handler benches drive their
+/// futures on the same runtime (`b.to_async(&env.rt)`).
 pub struct BenchEnv {
     pub h: Handlers,
     pub rt: tokio::runtime::Runtime,
     _dir: tempfile::TempDir,
 }
 
+impl BenchEnv {
+    pub fn store(&self) -> &SyncStore {
+        self.h.sync.store()
+    }
+}
+
 pub fn dormant_env() -> BenchEnv {
-    // The benched read paths never await real IO; the time driver is for the
-    // (idle) queue worker's backoff sleeps.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -60,27 +57,25 @@ pub fn dormant_env() -> BenchEnv {
     let session: SessionSlot = Arc::new(RwLock::new(ConnState::Dormant(
         DormancyReason::NoCredentials,
     )));
-    let cache = Arc::new(IssueCache::open(&db).unwrap());
-    let boards = Arc::new(BoardCache::open(&db).unwrap());
-    let history = Arc::new(HistoryCache::open(&db).unwrap());
-    let search = Arc::new(gitlab_trackrd::search::SearchCache::open(&db).unwrap());
-    let refresh_meta = Arc::new(RefreshMeta::open(&db).unwrap());
-    let usage = Arc::new(UsageStats::open(&db).unwrap());
     let config: SharedConfig = Arc::new(std::sync::RwLock::new(gitlab_trackrd::config::defaults()));
+    let reconnect_signal = Arc::new(Notify::new());
+    let sync = SyncHandle::spawn(
+        Arc::new(SyncStore::open(&db).unwrap()),
+        Arc::clone(&session),
+        Arc::clone(&config),
+        Arc::clone(&reconnect_signal),
+    );
     let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config)).unwrap();
+    let usage = Arc::new(UsageStats::open(&db).unwrap());
     drop(_guard);
     BenchEnv {
         h: Handlers {
             session,
-            cache,
-            boards,
-            history,
-            search,
-            refresh_meta,
+            sync,
             usage,
             queue,
             config,
-            reconnect_signal: Arc::new(Notify::new()),
+            reconnect_signal,
         },
         rt,
         _dir: dir,
@@ -124,174 +119,173 @@ fn namespace(i: u64) -> &'static str {
     if i % 2 == 0 { "team" } else { "other" }
 }
 
-pub fn search_issue(i: u64) -> SearchIssue {
-    SearchIssue {
-        id: i as i64,
-        iid: (i % 1_000 + 1) as i64,
-        project_id: (i % 50 + 1) as i64,
+/// 50 projects; `(project, iid)` is unique per `i`.
+fn project_of(i: u64) -> i64 {
+    (i % 50 + 1) as i64
+}
+
+fn iid_of(i: u64) -> i64 {
+    (i / 50 + 1) as i64
+}
+
+pub fn issue(i: u64) -> Issue {
+    Issue {
+        id: i as i64 + 1,
+        iid: iid_of(i),
+        project_id: project_of(i),
         title: title(i, "Issue"),
         web_url: format!(
             "https://gl/{}/proj{}/-/issues/{}",
             namespace(i),
-            i % 50,
-            i % 1_000 + 1
+            project_of(i),
+            iid_of(i)
         ),
         state: if i % 5 == 0 { "closed" } else { "opened" }.to_string(),
         labels: label_set(i),
-        parent: String::new(),
-        total_time: String::new(),
-        updated_at_secs: shuffled(i, 1_000_000) + 1,
+        updated_at: shuffled(i, 1_000_000) + 1,
+        ..Default::default()
     }
 }
 
-pub fn search_mr(i: u64) -> SearchMr {
-    // A fixed handful assigned to the synced user (the assigned-MR view);
-    // some assigned to someone else so the assignee filter does real work.
-    let assignees = if i < 10 {
-        vec![MrAssignee {
-            id: SYNCED_USER_ID,
-            username: "me".to_string(),
-        }]
-    } else if i % 3 == 0 {
-        vec![MrAssignee {
+pub fn merge_request(i: u64) -> MergeRequest {
+    let assignees = if i % 3 == 0 {
+        vec![UserRef {
             id: 999,
             username: "other".to_string(),
         }]
     } else {
         Vec::new()
     };
-    SearchMr {
-        id: i as i64,
-        iid: (i % 1_000 + 1) as i64,
-        project_id: (i % 50 + 1) as i64,
+    MergeRequest {
+        id: i as i64 + 1,
+        iid: iid_of(i),
+        project_id: project_of(i),
         title: title(i, "MR"),
         web_url: format!(
             "https://gl/{}/proj{}/-/merge_requests/{}",
             namespace(i),
-            i % 50,
-            i % 1_000 + 1
+            project_of(i),
+            iid_of(i)
         ),
-        state: if i >= 10 && i % 5 == 0 {
-            "merged"
-        } else {
-            "opened"
-        }
-        .to_string(),
+        state: if i % 5 == 0 { "merged" } else { "opened" }.to_string(),
         labels: label_set(i),
         assignees,
-        updated_at_secs: shuffled(i, 1_000_000) + 1,
+        updated_at: shuffled(i, 1_000_000) + 1,
     }
 }
 
-pub fn search_project(i: u64) -> SearchProject {
-    SearchProject {
-        id: i as i64,
+pub fn project(i: u64) -> Project {
+    Project {
+        id: i as i64 + 1,
         name: format!("proj{i}"),
-        path: format!("{}/proj{i}", namespace(i)),
+        path_with_namespace: format!("{}/proj{i}", namespace(i)),
         web_url: format!("https://gl/{}/proj{i}", namespace(i)),
     }
 }
 
-pub fn search_group(i: u64) -> SearchGroup {
-    SearchGroup {
-        id: i as i64,
+pub fn group(i: u64) -> Group {
+    Group {
+        id: i as i64 + 1,
         name: format!("group{i}"),
-        path: format!("{}/group{i}", namespace(i)),
+        full_path: format!("{}/group{i}", namespace(i)),
         web_url: format!("https://gl/{}/group{i}", namespace(i)),
     }
 }
 
-pub fn wire_issue(i: u64) -> Issue {
-    Issue {
-        id: i as i64,
-        iid: (i % 1_000 + 1) as i64,
-        project_id: (i % 50 + 1) as i64,
-        title: title(i, "Issue"),
-        web_url: format!(
-            "https://gl/{}/proj{}/-/issues/{}",
-            namespace(i),
-            i % 50,
-            i % 1_000 + 1
-        ),
-        state: "opened".to_string(),
-        parent: String::new(),
-        total_time: String::new(),
-        graph_status: String::new(),
-        open_count: 0,
-    }
-}
-
-/// A stored timelog with `spent_at_secs` spread uniformly over the 30 days
-/// before `now`, shuffled so store order is not time order.
-pub fn stored_timelog(i: u64, now: u64) -> StoredTimelog {
-    StoredTimelog {
-        timelog_id: i,
-        spent_at_secs: now - shuffled(i, 30 * 86_400),
+/// A timelog spent uniformly over the 30 days before `now`, shuffled so
+/// generation order is not time order.
+pub fn timelog(i: u64, now: u64) -> Timelog {
+    Timelog {
+        id: i + 1,
+        spent_at: now - shuffled(i, 30 * 86_400),
         kind: if i % 4 == 0 {
             Issuable::MergeRequest
         } else {
             Issuable::Issue
         },
-        project_id: (i % 50 + 1) as i64,
-        iid: (i % 1_000 + 1) as i64,
+        project_id: project_of(i),
+        iid: iid_of(i),
         title: title(i, "Issue"),
-        web_url: format!("https://gl/team/proj{}/-/issues/{}", i % 50, i % 1_000 + 1),
-        duration: "1h 30m".to_string(),
+        web_url: format!(
+            "https://gl/team/proj{}/-/issues/{}",
+            project_of(i),
+            iid_of(i)
+        ),
+        time_spent: 5400,
         summary: "worked on it".to_string(),
     }
 }
 
-/// Sync stamps that pass every cold-cache guard in the read handlers
-/// (non-zero partial stamp, current schema, non-zero synced user).
-pub fn valid_stamps() -> SyncStamps {
-    SyncStamps {
-        last_partial_sync_secs: 1_700_000_000,
-        last_full_sync_secs: 1_700_000_000,
-        degraded_to_member: false,
-        schema_version: SEARCH_SCHEMA_VERSION,
-        synced_user_id: SYNCED_USER_ID,
-    }
+pub fn put<R: Stored>(env: &BenchEnv, rows: &[R]) {
+    let mut c = env.store().begin();
+    c.upsert(rows).unwrap();
+    c.commit().unwrap();
 }
 
-/// Seed the full search corpus through the real write paths: `n` issues,
-/// `n/2` MRs, `n/50` projects, `n/100` groups, plus board labels for every
-/// project id the issues reference (so the per-hit `boards.get` in
-/// `wire_search_issue` finds something) and stamps that unlock the readers.
+/// Mark `jobs` synced, unlocking the readers' cold-cache guards.
+pub fn mark_synced(env: &BenchEnv, jobs: &[Job]) {
+    let mut c = env.store().begin();
+    for job in jobs {
+        c.set_job(
+            &job.key(),
+            &JobState {
+                last_ok: 1_700_000_000,
+                last_full: 1_700_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    c.commit().unwrap();
+}
+
+/// Seed the full search corpus: `n` issues, `n/2` MRs, `n/50` projects,
+/// `n/100` groups, plus synced boards for every project the issues use, so
+/// the per-hit `graph_status` lookup finds something.
 pub fn seed_search_corpus(env: &BenchEnv, n: u64) {
-    let guard = env.h.search.try_begin_sync().unwrap();
-    let issues: Vec<_> = (0..n).map(search_issue).collect();
-    guard.upsert_issues(&issues).unwrap();
-    let mrs: Vec<_> = (0..n / 2).map(search_mr).collect();
-    guard.upsert_mrs(&mrs).unwrap();
-    let projects: Vec<_> = (0..(n / 50).max(1)).map(search_project).collect();
-    guard.upsert_projects(&projects).unwrap();
-    let groups: Vec<_> = (0..(n / 100).max(1)).map(search_group).collect();
-    guard.upsert_groups(&groups).unwrap();
-    guard.set_stamps(&valid_stamps()).unwrap();
-    for pid in 1..=50 {
-        env.h
-            .boards
-            .put(pid, vec!["Doing".into(), "Review".into(), "Done".into()])
-            .unwrap();
-    }
+    put(env, &(0..n).map(issue).collect::<Vec<_>>());
+    put(env, &(0..n / 2).map(merge_request).collect::<Vec<_>>());
+    put(env, &(0..(n / 50).max(1)).map(project).collect::<Vec<_>>());
+    put(env, &(0..(n / 100).max(1)).map(group).collect::<Vec<_>>());
+    let lists = ["Doing", "Review", "Done"]
+        .map(|name| BoardList {
+            label: Some(LabelRef { name: name.into() }),
+        })
+        .to_vec();
+    let boards: Vec<Board> = (1..=50)
+        .map(|project_id| Board {
+            id: 1,
+            project_id,
+            lists: lists.clone(),
+        })
+        .collect();
+    put(env, &boards);
+    let mut synced: Vec<Job> = (1..=50).map(Job::ProjectBoards).collect();
+    synced.push(Job::MemberProjects);
+    mark_synced(env, &synced);
 }
 
-/// Seed only MRs + stamps — for the assigned-MR benches, where issues would
-/// just slow down the (unmeasured) setup.
-pub fn seed_mr_corpus(env: &BenchEnv, n: u64) {
-    let guard = env.h.search.try_begin_sync().unwrap();
-    let mrs: Vec<_> = (0..n).map(search_mr).collect();
-    guard.upsert_mrs(&mrs).unwrap();
-    guard.set_stamps(&valid_stamps()).unwrap();
+/// `n` MRs, `assigned` of them listed in the assigned view.
+pub fn seed_mr_corpus(env: &BenchEnv, n: u64, assigned: u64) {
+    let mrs: Vec<_> = (0..n).map(merge_request).collect();
+    put(env, &mrs);
+    let mut c = env.store().begin();
+    c.set_view(
+        ASSIGNED_MERGE_REQUESTS,
+        &View {
+            keys: mrs
+                .iter()
+                .take(assigned as usize)
+                .map(Resource::key)
+                .collect(),
+            fetched_at: 1_700_000_000,
+        },
+    )
+    .unwrap();
+    c.commit().unwrap();
+    mark_synced(env, &[Job::AssignedMergeRequests]);
 }
 
 pub fn seed_history(env: &BenchEnv, n: u64, now: u64) {
-    let entries: Vec<_> = (0..n).map(|i| stored_timelog(i, now)).collect();
-    env.h.history.upsert(&entries).unwrap();
-}
-
-/// One whole-corpus blob write through `IssueCache::put`.
-pub fn seed_issue_cache(env: &BenchEnv, n: u64) {
-    let issues: Vec<_> = (0..n).map(wire_issue).collect();
-    env.h.cache.put(&issues).unwrap();
+    put(env, &(0..n).map(|i| timelog(i, now)).collect::<Vec<_>>());
 }

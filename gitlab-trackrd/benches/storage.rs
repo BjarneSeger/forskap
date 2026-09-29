@@ -1,23 +1,20 @@
 //! The storage substrate: raw `KvStore` scans (fjall iteration + per-entry
-//! JSON decode), the `IssueCache` whole-blob round-trip, and the scan-heavy
-//! `HistoryCache`/`SearchCache` mutations.
+//! JSON decode), the sync store's table scans and batch upserts, the
+//! timelog window scan, and the full-run reconcile.
 //!
 //! No `RetryQueue` benches on purpose: its stores fsync after every mutation
 //! (`open_durable`), so a bench would measure the disk, not the code.
 
 mod support;
 
-use std::collections::HashSet;
 use std::hint::black_box;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use gitlab_trackrd::db::KvStore;
-use gitlab_trackrd::history::StoredTimelog;
+use gitlab_trackrd::sync::model::{Issue, Timelog};
+use gitlab_trackrd::sync::store::RowScope;
 
-use support::{
-    dormant_env, now_secs, search_issue, seed_history, seed_search_corpus, stored_timelog,
-    wire_issue,
-};
+use support::{dormant_env, issue, now_secs, put, seed_history, seed_search_corpus, timelog};
 
 const SIZES: [u64; 3] = [1_000, 10_000, 50_000];
 
@@ -30,9 +27,9 @@ fn kvstore_scan(c: &mut Criterion) {
         let db = fjall::Database::builder(dir.path().join("db"))
             .open()
             .unwrap();
-        let store: KvStore<u64, StoredTimelog> = KvStore::open(&db, "bench_scan").unwrap();
+        let store: KvStore<u64, Timelog> = KvStore::open(&db, "bench_scan").unwrap();
         for i in 0..n {
-            store.put(i, &stored_timelog(i, now)).unwrap();
+            store.put(i, &timelog(i, now)).unwrap();
         }
         group.throughput(Throughput::Elements(n));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
@@ -42,26 +39,27 @@ fn kvstore_scan(c: &mut Criterion) {
     group.finish();
 }
 
-fn issue_cache(c: &mut Criterion) {
-    let mut group = c.benchmark_group("issue_cache");
-    for n in [100u64, 1_000, 10_000] {
+fn table(c: &mut Criterion) {
+    let mut group = c.benchmark_group("table");
+    group.sample_size(30);
+    for n in SIZES {
         let env = dormant_env();
-        let issues: Vec<_> = (0..n).map(wire_issue).collect();
-        // Steady-state: the single "assigned" blob is overwritten in place.
-        env.h.cache.put(&issues).unwrap();
+        let rows: Vec<Issue> = (0..n).map(issue).collect();
+        put(&env, &rows);
         group.throughput(Throughput::Elements(n));
-        group.bench_with_input(BenchmarkId::new("put", n), &n, |b, _| {
-            b.iter(|| env.h.cache.put(black_box(&issues)).unwrap());
+        group.bench_with_input(BenchmarkId::new("scan", n), &n, |b, _| {
+            b.iter(|| black_box(env.store().issues.scan(RowScope::All).unwrap()));
         });
-        group.bench_with_input(BenchmarkId::new("get", n), &n, |b, _| {
-            b.iter(|| black_box(env.h.cache.get().unwrap()));
+        // Steady state: a sync run re-upserting rows already stored.
+        group.bench_with_input(BenchmarkId::new("upsert", n), &n, |b, _| {
+            b.iter(|| put(&env, black_box(&rows)));
         });
     }
     group.finish();
 }
 
-fn history(c: &mut Criterion) {
-    let mut group = c.benchmark_group("history");
+fn timelogs(c: &mut Criterion) {
+    let mut group = c.benchmark_group("timelogs");
     group.sample_size(30);
     let now = now_secs();
     for n in SIZES {
@@ -70,25 +68,32 @@ fn history(c: &mut Criterion) {
         // spent_at is uniform over 30 days; a 9-day cutoff selects ~30%.
         let cutoff = now - 9 * 86_400;
         group.throughput(Throughput::Elements(n));
-        group.bench_with_input(BenchmarkId::new("all_since", n), &n, |b, _| {
-            b.iter(|| black_box(env.h.history.all_since(cutoff).unwrap()));
+        group.bench_with_input(BenchmarkId::new("since", n), &n, |b, _| {
+            b.iter(|| black_box(env.store().timelogs.scan(RowScope::Since(cutoff)).unwrap()));
         });
     }
     for n in [1_000u64, 10_000] {
         let env = dormant_env();
         seed_history(&env, n, now);
         // The oldest ~10% band; each iteration clears it, setup reseeds only
-        // that band so the timed scan always runs over the full n entries.
+        // that band.
         let (band_min, band_max) = (now - 30 * 86_400, now - 27 * 86_400);
         let band: Vec<_> = (0..n)
-            .map(|i| stored_timelog(i, now))
-            .filter(|t| t.spent_at_secs >= band_min && t.spent_at_secs < band_max)
+            .map(|i| timelog(i, now))
+            .filter(|t| t.spent_at >= band_min && t.spent_at < band_max)
             .collect();
-        group.throughput(Throughput::Elements(n));
-        group.bench_with_input(BenchmarkId::new("clear_between", n), &n, |b, _| {
+        group.throughput(Throughput::Elements(band.len() as u64));
+        group.bench_with_input(BenchmarkId::new("clear_band", n), &n, |b, _| {
             b.iter_batched(
-                || env.h.history.upsert(&band).unwrap(),
-                |()| black_box(env.h.history.clear_between(band_min, band_max).unwrap()),
+                || put(&env, &band),
+                |()| {
+                    let mut c = env.store().begin();
+                    let removed = c
+                        .remove_where::<Timelog>(RowScope::Since(band_min), |k| k.0 >= band_max)
+                        .unwrap();
+                    c.commit().unwrap();
+                    black_box(removed)
+                },
                 BatchSize::PerIteration,
             );
         });
@@ -96,54 +101,43 @@ fn history(c: &mut Criterion) {
     group.finish();
 }
 
-fn search_cache_mut(c: &mut Criterion) {
-    let mut group = c.benchmark_group("search_cache_mut");
+fn reconcile(c: &mut Criterion) {
+    let mut group = c.benchmark_group("reconcile");
     group.sample_size(30);
     for n in [1_000u64, 10_000] {
         let env = dormant_env();
         seed_search_corpus(&env, n);
-        // The full-resync deletion diff: keep 90%, reseed the stale 10% tail
-        // each iteration so the timed scan always sees n entries.
-        let keep_n = n * 9 / 10;
-        let keep: HashSet<u64> = (0..keep_n).collect();
-        let stale: Vec<_> = (keep_n..n).map(search_issue).collect();
+        // A full `all` run: keep 90%, reseed the stale 10% tail each
+        // iteration so the timed scan always sees n rows.
+        let rows: Vec<Issue> = (0..n).map(issue).collect();
+        let keep_n = (n * 9 / 10) as usize;
+        let (kept, stale) = rows.split_at(keep_n);
         group.throughput(Throughput::Elements(n));
-        group.bench_with_input(BenchmarkId::new("retain_issues", n), &n, |b, _| {
+        group.bench_with_input(BenchmarkId::new("all", n), &n, |b, _| {
             b.iter_batched(
-                || {
-                    let guard = env.h.search.try_begin_sync().unwrap();
-                    guard.upsert_issues(&stale).unwrap();
-                },
+                || put(&env, stale),
                 |()| {
-                    let guard = env.h.search.try_begin_sync().unwrap();
-                    black_box(guard.retain_issues(&keep).unwrap());
+                    let mut c = env.store().begin();
+                    let removed = c.reconcile(RowScope::All, kept).unwrap();
+                    c.commit().unwrap();
+                    black_box(removed)
                 },
                 BatchSize::PerIteration,
             );
         });
-        group.bench_with_input(BenchmarkId::new("update_mr", n), &n, |b, _| {
-            let mut flip = false;
+        // One tracked project's full run: a key-range scan, not the table.
+        let project: Vec<Issue> = rows.iter().filter(|i| i.project_id == 1).cloned().collect();
+        group.bench_with_input(BenchmarkId::new("project", n), &n, |b, _| {
             b.iter(|| {
-                flip = !flip;
-                let guard = env.h.search.try_begin_sync().unwrap();
-                black_box(
-                    guard
-                        .update_mr(1, 1, |m| {
-                            m.state = if flip { "opened" } else { "closed" }.to_string();
-                        })
-                        .unwrap(),
-                );
+                let mut c = env.store().begin();
+                let removed = c.reconcile(RowScope::Prefix(1), &project).unwrap();
+                c.commit().unwrap();
+                black_box(removed)
             });
         });
     }
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    kvstore_scan,
-    issue_cache,
-    history,
-    search_cache_mut
-);
+criterion_group!(benches, kvstore_scan, table, timelogs, reconcile);
 criterion_main!(benches);

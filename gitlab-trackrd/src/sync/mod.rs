@@ -1,0 +1,25 @@
+//! The background sync layer: fetches GitLab resources into one generic store
+//! on a jittered schedule. Request handlers only ever read that store.
+//!
+//! - [`model`]: typed mirrors of the GitLab resources.
+//! - [`store`]: their fjall tables plus views, job states and identity.
+//! - [`jobs`]: what each job fetches and how it lands.
+//! - [`planner`]: which jobs to keep scheduled (the tracked projects).
+//! - [`schedule`]: jittered due times and backoff, as pure functions.
+//! - [`engine`]: the single worker running it all, and the handlers' handle.
+
+pub mod engine;
+pub mod jobs;
+pub mod model;
+pub mod planner;
+pub mod schedule;
+pub mod store;
+
+pub use engine::{Clear, SyncHandle};
+pub use jobs::Job;
+
+pub(crate) fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}

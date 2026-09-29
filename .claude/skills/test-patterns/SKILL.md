@@ -1,66 +1,79 @@
 ---
 name: test-patterns
-description: The established mock and test conventions in this workspace (FakeGitlab styles, handler scaffolding, varlink call driving, timing rules) — read before writing or extending daemon tests so new tests reuse the existing helpers.
+description: The established mock and test conventions in this workspace (the shared FakeGitlab, handler and sync-engine scaffolding, varlink call driving, timing rules) — read before writing or extending daemon tests so new tests reuse the existing helpers.
 ---
 
 # Test patterns in gitlab-trackrd
 
-All tests are inline `#[cfg(test)]` modules — no `tests/` dirs. Three suites have
-established mocking styles; reuse their helpers instead of inventing new scaffolding.
+All tests are inline `#[cfg(test)]` modules — no `tests/` dirs. There is **one**
+GitLab mock; reuse the helpers below instead of inventing new scaffolding.
 
-## Handler tests (`src/handlers/tests.rs`) — the richest suite
+## The shared fake (`src/testing.rs`)
 
-**Mock**: `FakeGitlab` implements the `GitlabApi` trait.
-- Call counts in `AtomicUsize` fields (e.g. `board_calls`), read via accessor methods.
-- Canned responses in `Mutex<HashMap<..>>`, consumed with `.remove()` — each canned
-  entry answers exactly one fetch.
-- Error injection via `enum FetchErr { Transient, Permanent }`; builders
-  `with_board_labels`, `with_board_error`, `failing`, `failing_write`.
-- Trait methods a test never hits: `unimplemented!()`.
+`FakeGitlab` implements `GitlabApi` for every suite (handlers, sync, queue,
+reconnect).
+- **Reads** are routed by `Listing::path()`: `serve(path, rows)` sets the JSON rows
+  every call to that path returns (empty by default), `serve_next(path, rows)`
+  answers only the next call (e.g. a page walk that differs from its follow-up
+  delta); `fail_next(path, FakeErr)` queues one-shot failures; `gate(path)` holds the next call until the returned
+  `Notify` fires (`fake.gated` signals that the call started). `serve_timelogs(..)`
+  covers the GraphQL timelog read.
+- **Writes** succeed unless `fail_next_write(FakeErr)` queued a failure; `writes()`
+  logs `(op, kind, project_id, iid)`.
+- Assert on traffic with `calls()`, `calls_to(path)`, `timelog_calls()`,
+  `read_calls()` — e.g. "a read never touches GitLab" is `read_calls() == 0`.
+- `FakeErr::{Transient, Throttled(status), Rejected, Unauthorized}` build the
+  matching `Error` (`Unauthorized` is a 401: a dead token).
+- JSON builders `issue_json`, `event_json`; `eventually(what, || cond)` polls up to 2 s.
 
-**Scaffolding**: `handlers_with(state: ConnState) -> (Handlers, TempDir)` opens a real
-fjall DB in a `tempfile::tempdir()` and builds all caches + `RetryQueue` on it, config
-from `config::defaults()`. Keep the `TempDir` alive for the test's duration.
-Wrappers: `dormant_handlers()` (NoCredentials) and `connected_handlers(fake)`.
+## Handler tests (`src/handlers/tests.rs`)
 
-**Data builders**: `issue(..)`, `iwl(..)` (IssueWithLabels), `stored(..)`
-(StoredTimelog), `seed_grouped_cache(&h)`, `reply_issues(call)` to parse a reply.
+**Scaffolding**: `handlers_with(state) -> (Handlers, TempDir)` opens a real fjall DB
+in a tempdir and spawns the sync worker with `SyncHandle::spawn_on_demand` — it runs
+only demanded jobs, so the test decides when GitLab is read. Wrappers:
+`dormant_handlers()` (NoCredentials; also used by `service.rs` tests),
+`unreachable_handlers()`, `connected_handlers(&fake)`. Keep the `TempDir` alive.
 
-**Driving a varlink method**:
+**Seeding the store directly**: `seed(&h, &rows)` upserts mirror rows,
+`seed_view(&h, name, keys, fetched_at)` writes an assigned view,
+`mark_synced(&h, &[Job::…])` makes the cold-cache guards treat data as warm.
+Composite seeds: `seed_assigned_issues`, `seed_assigned_mrs`, `seed_corpus`.
 
-```rust
-use gitlab_trackr_api::AsyncCall;
-let mut call = AsyncCall::default();
-h.post_time(&mut call as &mut dyn Call_PostTime, 1, 2, "1h".into(), None).await?;
-let reply = call.take_reply();          // assert on .error / .parameters
-```
-
-`NotAuthenticated` is asserted via the full error string
-`"org.thehoster.gitlab.trackrd.NotAuthenticated"`.
+**Driving a varlink method**: helpers wrap `AsyncCall` — `assigned_issues`,
+`assigned_mrs`, `run_search`, `history`, `post_time`, `close`, `clear_cache`,
+`run_record_open`; `reply::<T_Reply>(&mut call)` parses success,
+`reply_error(&mut call)` returns the error name (`NOT_AUTHENTICATED`,
+`GITLAB_ERROR` constants).
 
 **Reconnect-signal assertions**: demotion woke the supervisor →
-`tokio::time::timeout(Duration::from_millis(200), h.reconnect_signal.notified()).await`
-is `Ok`; "did not fire" → assert `.is_err()`.
+`tokio::time::timeout(Duration::from_millis(200), h.reconnect_signal.notified())`
+is `Ok`; "did not fire" → `.is_err()`.
 
-## Queue tests (`src/queue.rs`)
+## Sync tests (`src/sync/*`)
 
-Own `FakeGitlab`: per-method `Mutex<VecDeque<Result<()>>>` response queues with
-`push_*` helpers, plus `AtomicUsize` counters; unlisted methods panic. DB helpers
-`test_db` / `store` on a tempdir.
+- `schedule.rs` is pure (`now` passed in): proptests on jitter bands and backoff.
+- `store.rs`/`planner.rs`: a tempdir `SyncStore`, rows committed through
+  `store.begin()` … `commit()`.
+- `jobs.rs`: call `fetch(job, ctx)` with a `FetchCtx` built around the fake, apply
+  the `Staged` result to a commit, assert on the store and `fake.calls_to(..)`.
+- `engine.rs`: `start(state)` / `start_on(store, state)` spawn the real scheduled
+  worker with `instant_config()` (no job gap, no startup spread); drive it with
+  `refresh_now`, `clear`, and `eventually`.
 
-## Reconnect tests (`src/reconnect.rs`)
+## Queue and reconnect tests
 
-No GitLab mock behavior at all — `NoopGitlab` is all `unimplemented!()`. The connect
-attempt is injected as a closure into `reconnect_loop(session, config, || async { .. })`
-returning `Attempt::*`. Timing is defeated with `instant_config()` (backoff delays set
-to 0), not a mocked clock. Helpers: `unreachable_slot()`, `connected_session()`.
+- `queue.rs` spawns `worker(..)` directly on a channel; `run_worker_one_task[_with]`
+  runs one task to completion, `instant_retry_config()` zeroes the backoff, and
+  `calls(&fake, "close")` counts writes.
+- `reconnect.rs` injects the connect attempt as a closure into
+  `reconnect_loop(session, config, || async { .. })` returning `Attempt::*`.
 
 ## Timing rules
 
-- **No `tokio::time::pause()` anywhere.** Backoff code uses `SystemTime::now()`, which
-  a paused tokio clock does not affect. Tests use short real sleeps and
-  `tokio::time::timeout` with small budgets (≤ a few hundred ms).
-- Backoff/lifetime schedules are deliberately not unit-tested for the same reason —
-  see the comment near the top of the queue test module (`queue.rs:568`).
-- Prefer defeating delays via config (`instant_config` pattern) over sleeping through
-  them.
+- **No `tokio::time::pause()` anywhere.** Backoff and scheduling use
+  `SystemTime::now()`, which a paused tokio clock does not affect. Tests use short
+  real sleeps and `tokio::time::timeout` with small budgets (≤ a few hundred ms), or
+  `eventually`.
+- Prefer defeating delays via config (`instant_config`, `instant_retry_config`) over
+  sleeping through them; keep schedule logic in pure functions so it is testable
+  without a clock.

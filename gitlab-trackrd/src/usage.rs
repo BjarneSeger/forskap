@@ -2,15 +2,12 @@
 //! opened through `RecordOpen`. The `Search` handler ranks frequently opened
 //! items first from this record; nothing else reads it.
 //!
-//! One JSON record in its own keyspace, mirroring [`RefreshMeta`]
-//! (`refresh_meta.rs`): a read-modify-write under an internal lock, lazy
-//! durability. Opens are human-rate events and the record is capped, so
+//! One JSON record in its own keyspace: a read-modify-write under an internal
+//! lock, lazy durability. Opens are human-rate events and the record is capped, so
 //! rewriting it whole is cheaper than a per-entry keyspace would be. There
 //! is no background pruning — every write drops entries past the retention
 //! cutoff and enforces the cap, so the record stays bounded without a timer
 //! and regardless of session state.
-//!
-//! [`RefreshMeta`]: crate::refresh_meta::RefreshMeta
 
 use std::collections::BTreeMap;
 

@@ -152,10 +152,47 @@ impl<V: Serialize + DeserializeOwned> KvStore<u64, V> {
     }
 }
 
+/// Delete whichever of `names` exist, returning those dropped. Only for
+/// retiring re-fetchable caches; never pass a keyspace holding user data.
+pub fn drop_keyspaces(db: &Database, names: &[&str]) -> Result<Vec<String>> {
+    let mut dropped = Vec::new();
+    for &name in names {
+        if db.keyspace_exists(name) {
+            db.delete_keyspace(db.keyspace(name, KeyspaceCreateOptions::default)?)?;
+            dropped.push(name.to_string());
+        }
+    }
+    Ok(dropped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn drop_keyspaces_removes_only_the_named_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let db = Database::builder(&path).open().unwrap();
+            let old: KvStore<u64, String> = KvStore::open(&db, "old_cache_v1").unwrap();
+            old.put(1, &"stale".to_string()).unwrap();
+            let kept: KvStore<u64, String> = KvStore::open(&db, "retry_queue_v1").unwrap();
+            kept.put(1, &"pending".to_string()).unwrap();
+            let dropped = drop_keyspaces(&db, &["old_cache_v1", "never_existed"]).unwrap();
+            assert_eq!(dropped, ["old_cache_v1"]);
+            db.persist(PersistMode::SyncAll).unwrap();
+        }
+        let db = Database::builder(&path).open().unwrap();
+        assert!(!db.keyspace_exists("old_cache_v1"));
+        assert!(
+            !db.keyspace_exists("never_existed"),
+            "a missing name isn't created"
+        );
+        let kept: KvStore<u64, String> = KvStore::open(&db, "retry_queue_v1").unwrap();
+        assert_eq!(kept.get(1).unwrap().as_deref(), Some("pending"));
+    }
 
     proptest! {
         /// [`KvStore::scan`] decodes keys with `from_be_bytes` and fjall

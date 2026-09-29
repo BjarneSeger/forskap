@@ -1,14 +1,14 @@
-//! Varlink method implementations — orchestration only.
+//! Varlink method implementations.
 //!
-//! Each method is a short cascade: consult the cache, fall back to GitLab,
-//! reply. GitLab errors become `GitlabError` varlink replies; cache failures
-//! are logged and treated as a miss so the daemon stays available.
+//! Reads never touch GitLab: they serve whatever the sync layer
+//! ([`crate::sync`]) last stored, corrected at read time for writes it hasn't
+//! picked up yet. A store read failure is logged and treated as empty so the
+//! daemon stays available. Writes try GitLab once and fall back to the retry
+//! queue.
 //!
-//! Split across submodules to keep each file readable:
-//! - [`refresh`] — the background cache/history warm-up and refresh cascade.
-//! - [`search_sync`] — the stamp-gated background sync of the search cache.
 //! - [`varlink`] — the [`VarlinkInterface`](gitlab_trackr_api::VarlinkInterface)
-//!   method impls plus the write-path deferral helpers they use.
+//!   method impls plus the write cascade.
+//! - [`wire`] — projections of stored rows onto the wire types.
 //!
 //! This module holds the shared connection types, the helpers every submodule
 //! reaches for, and the small pure validators.
@@ -20,24 +20,15 @@ use tokio::sync::{Notify, RwLock};
 
 use gitlab_trackr_api::NotAuthReason;
 
-use crate::boards::BoardCache;
-use crate::cache::IssueCache;
 use crate::config::SharedConfig;
-use crate::error::{DormancyReason, Error};
+use crate::error::DormancyReason;
 use crate::gitlab::{GitlabApi, GitlabClient};
-use crate::history::HistoryCache;
 use crate::queue::RetryQueue;
-use crate::refresh_meta::RefreshMeta;
-use crate::search::SearchCache;
+use crate::sync::SyncHandle;
 use crate::usage::UsageStats;
 
-mod refresh;
-mod search_sync;
 mod varlink;
-
-// Exposed for the Criterion benches only; not a stable API.
-#[doc(hidden)]
-pub use refresh::enrich_timelog;
+mod wire;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -64,7 +55,7 @@ impl Session {
 }
 
 /// Connection state the daemon shares between the handlers, the retry queue,
-/// and the background refresh task.
+/// and the sync worker.
 ///
 /// `Dormant` carries *why* there is no session (see [`DormancyReason`]) so the
 /// CLI can report a specific cause instead of a bare "not authenticated".
@@ -88,23 +79,18 @@ pub type SessionSlot = Arc<RwLock<ConnState>>;
 
 pub struct Handlers {
     pub session: SessionSlot,
-    pub cache: Arc<IssueCache>,
-    pub boards: Arc<BoardCache>,
-    pub history: Arc<HistoryCache>,
-    pub search: Arc<SearchCache>,
-    /// Persisted last-run stamps the refresh tiers gate on, so a restart
-    /// inside an interval serves the caches instead of re-polling GitLab.
-    pub refresh_meta: Arc<RefreshMeta>,
+    /// The sync layer: the store every read serves from, plus the commands
+    /// to refresh or clear it.
+    pub sync: Arc<SyncHandle>,
     /// Open statistics behind `RecordOpen`; `Search` ranks by them.
     pub usage: Arc<UsageStats>,
     pub queue: RetryQueue,
-    /// Live daemon config; history windows are read from `config.history` at use
-    /// time so a hot reload takes effect without a restart.
+    /// Live daemon config, read at use time so a hot reload takes effect
+    /// without a restart.
     pub config: SharedConfig,
-    /// Nudged the instant a runtime GitLab call fails transiently and the session
-    /// is demoted to `Dormant(Unreachable)` (see [`crate::reconnect::commit_unreachable`]),
-    /// waking the background reconnect supervisor so it re-engages at once instead
-    /// of only at startup.
+    /// Nudged when the sync worker demotes the session to
+    /// `Dormant(Unreachable)` (see [`crate::reconnect::commit_unreachable`]),
+    /// waking the reconnect supervisor.
     pub reconnect_signal: Arc<Notify>,
 }
 
@@ -126,40 +112,9 @@ impl Handlers {
             ConnState::Dormant(r) => Err(r.clone()),
         }
     }
-
-    /// Route a GitLab error observed by a background refresh into the connection
-    /// state: a transient (network) failure demotes the live session to
-    /// `Dormant(Unreachable)` and wakes the reconnect supervisor, so a connection
-    /// lost mid-run is noticed and retried the same way one down at boot is.
-    /// `gitlab` is the client the failed call used; demotion is guarded on its
-    /// identity so a stale in-flight fetch can't clobber a session a concurrent
-    /// `tt login` just established (see [`crate::reconnect::commit_unreachable`]).
-    /// Any non-transient error (e.g. a mid-run token revocation, not
-    /// auto-retryable) is left to the caller's log. Idempotent: a second call
-    /// while already dormant is a no-op.
-    ///
-    /// Only the background refresh paths call this. The write handlers queue on a
-    /// transient failure (the retry queue drains them) rather than demoting, so a
-    /// single blipped write can't tear the whole session down; the periodic
-    /// refresh — which retries internally before failing — stays the demotion
-    /// authority.
-    async fn note_gitlab_error(&self, gitlab: &Arc<dyn GitlabApi>, e: &Error) {
-        if let Error::Transient(detail) = e {
-            crate::reconnect::commit_unreachable(
-                &self.session,
-                &self.reconnect_signal,
-                gitlab,
-                detail.clone(),
-            )
-            .await;
-        }
-    }
 }
 
-/// Extract the varlink `(reason, detail)` pair from a dormancy error so the six
-/// `reply_not_authenticated` sites don't each repeat the match. The error is
-/// always `NotAuthenticated` here (all `gitlab()`/`current_session()` yield);
-/// the fallback is purely defensive.
+/// Extract the varlink `(reason, detail)` pair from a dormancy error.
 fn dormant_args(reason: &DormancyReason) -> (Option<NotAuthReason>, Option<String>) {
     (Some(reason.reason()), reason.detail())
 }

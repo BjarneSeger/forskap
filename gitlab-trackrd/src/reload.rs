@@ -31,11 +31,12 @@ fn is_config_change(event: &Event, path: &Path) -> bool {
     ) && event.paths.iter().any(|p| p == path)
 }
 
-/// Start watching the config file and reload `shared` whenever it changes.
+/// Start watching the config file and reload `shared` whenever it changes,
+/// calling `on_reload` after each successful reload.
 ///
 /// Best-effort: if the config directory can't be watched the daemon still runs,
 /// it just won't pick up edits live.
-pub fn spawn(shared: SharedConfig) {
+pub fn spawn(shared: SharedConfig, on_reload: impl Fn() + Send + 'static) {
     let path = config::config_path();
     let Some(dir) = path.parent().map(|p| p.to_path_buf()) else {
         warn!(path = %path.display(), "config path has no parent; not watching for changes");
@@ -94,6 +95,7 @@ pub fn spawn(shared: SharedConfig) {
                         );
                     }
                     info!("config reloaded");
+                    on_reload();
                 }
                 Err(e) => {
                     warn!(error = %e, "config reload failed; keeping previous config");

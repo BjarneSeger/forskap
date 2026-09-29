@@ -47,8 +47,7 @@ pub struct Config {
     #[config(nested)]
     pub server: ServerConfig,
 
-    /// Background refresh tiers — cadence plus timelog window for each of the
-    /// `quick` and `slow` tiers.
+    /// Sync cadences for the foreground (`quick`) and bulk (`slow`) data.
     #[config(nested)]
     pub refresh: RefreshConfig,
 
@@ -64,13 +63,18 @@ pub struct Config {
     #[config(nested)]
     pub reconnect: ReconnectConfig,
 
-    /// Search-cache population and sync cadence.
+    /// Search-corpus population and per-project sync cadence.
     #[config(nested)]
     pub search: SearchConfig,
 
     /// Open-statistics retention (what `Search` ranks by).
     #[config(nested)]
     pub usage: UsageConfig,
+
+    /// Pacing of the background sync, so its requests trickle out instead of
+    /// hitting GitLab in bursts.
+    #[config(nested)]
+    pub sync: SyncConfig,
 }
 
 /// Varlink server settings (see `server.rs`).
@@ -99,24 +103,20 @@ impl ServerConfig {
     }
 }
 
-/// Background refresh tiers (driven from `main.rs`). Work is split by cost and
+/// Sync cadences, consumed by the `sync` jobs. Work is split by cost and
 /// volatility:
 ///
-/// * `quick` — fast-changing and cheap to fetch: assigned issues, board
-///   columns, and your most recent timelogs. Polled frequently.
-/// * `slow` — the large, slow-moving body of timelog history. Polled rarely.
-///
-/// Each tier owns both its cadence (`interval_secs`) and how far back its
-/// timelog pull reaches (`window_hours`), so the two are configured together
-/// instead of split across tables. Keep the windows ordered
-/// `quick.window_hours` ≤ `slow.window_hours` ≤ `history.retention_hours`.
+/// * `quick` — fast-changing and cheap to fetch: the assigned issue/MR lists
+///   and your most recent timelogs. Synced frequently.
+/// * `slow` — the large, slow-moving rest: the full timelog history, the
+///   board columns and the memberships. Synced rarely.
 #[derive(Debug, ConfiqueConfig)]
 pub struct RefreshConfig {
-    /// Quick tier: assigned issues, boards, and recent timelogs.
+    /// Quick tier: assigned issues/MRs and recent timelogs.
     #[config(nested)]
     pub quick: QuickRefreshConfig,
 
-    /// Slow tier: the bulk of your timelog history.
+    /// Slow tier: the full timelog history and board columns.
     #[config(nested)]
     pub slow: SlowRefreshConfig,
 }
@@ -126,14 +126,14 @@ pub struct RefreshConfig {
 /// the two tiers ship different defaults.
 #[derive(Debug, ConfiqueConfig)]
 pub struct QuickRefreshConfig {
-    /// Seconds between quick refreshes (assigned issues, boards, and the most
-    /// recent timelogs). Five minutes by default.
+    /// Seconds between quick syncs (assigned issues/MRs and the most recent
+    /// timelogs). Five minutes by default.
     #[config(default = 300)]
     pub interval_secs: u64,
 
-    /// How far back, in hours, the quick timelog pull reaches. Issues and boards
-    /// are always fetched in full; this bounds only the timelog query. (24h by
-    /// default.)
+    /// How far back, in hours, the quick timelog sync reaches. Timelogs
+    /// deleted in GitLab inside this window disappear at the next quick sync;
+    /// older ones at the next slow sync. (24h by default.)
     #[config(default = 24)]
     pub window_hours: u64,
 }
@@ -146,7 +146,7 @@ impl QuickRefreshConfig {
 
     /// Timelog look-back span.
     pub fn window(&self) -> Duration {
-        Duration::from_hours(self.window_hours)
+        hours(self.window_hours)
     }
 }
 
@@ -154,15 +154,11 @@ impl QuickRefreshConfig {
 /// [`QuickRefreshConfig`] only in its defaults (see that type's note).
 #[derive(Debug, ConfiqueConfig)]
 pub struct SlowRefreshConfig {
-    /// Seconds between slow refreshes of the bulk timelog history. Once a day by
-    /// default.
+    /// Seconds between slow syncs of the full timelog history (the whole
+    /// `history.retention_hours`), the board columns, and your project and
+    /// group memberships. Once a day by default.
     #[config(default = 86400)]
     pub interval_secs: u64,
-
-    /// How far back, in hours, the slow timelog pull reaches. (30 days by
-    /// default.)
-    #[config(default = 720)]
-    pub window_hours: u64,
 }
 
 impl SlowRefreshConfig {
@@ -170,19 +166,13 @@ impl SlowRefreshConfig {
     pub fn interval(&self) -> Duration {
         Duration::from_secs(self.interval_secs)
     }
-
-    /// Timelog look-back span.
-    pub fn window(&self) -> Duration {
-        Duration::from_hours(self.window_hours)
-    }
 }
 
-/// Timelog history retention, consumed by `history.rs` via `Handlers`.
+/// Timelog history retention, consumed by the timelog sync jobs.
 #[derive(Debug, ConfiqueConfig)]
 pub struct HistoryConfig {
-    /// Total timelog history to keep, in hours: fetched once at startup, and
-    /// anything older is pruned. Should be ≥ `refresh.slow.window_hours`.
-    /// (90 days by default.)
+    /// Total timelog history to keep, in hours: synced in full on the slow
+    /// cadence, and anything older is pruned. (90 days by default.)
     #[config(default = 2160)]
     pub retention_hours: u64,
 }
@@ -190,7 +180,7 @@ pub struct HistoryConfig {
 impl HistoryConfig {
     /// Retention horizon: the oldest timelog kept on disk.
     pub fn retention(&self) -> Duration {
-        Duration::from_hours(self.retention_hours)
+        hours(self.retention_hours)
     }
 }
 
@@ -208,7 +198,7 @@ pub struct UsageConfig {
 impl UsageConfig {
     /// Retention horizon: the oldest last-open kept.
     pub fn retention(&self) -> Duration {
-        Duration::from_hours(self.retention_hours)
+        hours(self.retention_hours)
     }
 }
 
@@ -302,25 +292,26 @@ impl ReconnectConfig {
     }
 }
 
-/// Search-cache sync tuning, consumed by `handlers/search_sync.rs`.
+/// Search-corpus sync tuning, consumed by the `sync` planner and jobs.
 ///
-/// The search cache holds issues, merge requests, projects, and groups as
-/// individual entries. It is synced incrementally (`updated_after` deltas)
+/// The corpus holds issues, merge requests, projects, and groups. Each
+/// project's issues and MRs are synced incrementally (`updated_after` deltas)
 /// on the partial cadence and fully resynced — which also reconciles
-/// deletions — on the full cadence. Both stamps persist across restarts, so
+/// deletions — on the full cadence. Job states persist across restarts, so
 /// restarting the daemon inside the partial interval does not re-poll GitLab.
 #[derive(Debug, ConfiqueConfig)]
 pub struct SearchConfig {
-    /// What the search cache holds for issues and merge requests: `"all"`
-    /// syncs everything your token can see (GitLab `scope=all`; on very large
-    /// instances the initial sync can be huge — prefer `"member"` there),
-    /// `"member"` only what is in projects you are a member of. The default
-    /// `"auto"` picks for you: `"member"` on gitlab.com (which rejects the
-    /// global fetch outright), `"all"` on self-hosted instances — falling back
-    /// to `"member"` until the next full resync if the instance rejects the
-    /// global fetch too. Projects and groups themselves are always
-    /// membership-scoped.
-    #[config(default = "auto")]
+    /// What the search corpus holds for issues and merge requests. The
+    /// default `"tracked"` covers the member projects you are active in:
+    /// assigned issues/MRs, your pushes, issues, MRs and comments, and your
+    /// timelogs (see `tracked_retention_hours`). Activity in a project you
+    /// aren't a member of (an upstream you contribute to) only keeps your
+    /// assigned items there. `"member"` covers every project you
+    /// are a member of, `"all"` everything your token can see (GitLab
+    /// `scope=all`; huge on large instances, and rejected by gitlab.com).
+    /// Projects and groups themselves are always membership-scoped. `"auto"`
+    /// is accepted as an alias of `"tracked"`.
+    #[config(default = "tracked")]
     pub population: SearchPopulation,
 
     /// Minimum seconds between incremental search-cache syncs. (30 min by
@@ -332,6 +323,19 @@ pub struct SearchConfig {
     /// items. (7 days by default.)
     #[config(default = 604800)]
     pub full_interval_secs: u64,
+
+    /// How long, in hours, your activity in a project keeps it in the
+    /// `"tracked"` population after the last time you touched it (an
+    /// assignment, a push, an issue, MR or comment, a timelog). (90 days by
+    /// default.)
+    #[config(default = 2160)]
+    pub tracked_retention_hours: u64,
+
+    /// Most issues and most merge requests kept per corpus project: the most
+    /// recently updated ones. Bounds the sync of very large projects.
+    /// (1000 by default, at least 100.)
+    #[config(default = 1000)]
+    pub max_items_per_project: u64,
 }
 
 /// Which issues/MRs the search cache is populated with — see
@@ -339,14 +343,14 @@ pub struct SearchConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchPopulation {
-    /// Resolve per host: `Member` on gitlab.com, otherwise `All` with an
-    /// automatic fallback to `Member` when the instance rejects the global
-    /// fetch (see `handlers/search_sync.rs`).
-    Auto,
     /// Everything the token can see (`scope=all` on the global endpoints).
     All,
     /// Only projects the user is a member of (one fetch per project).
     Member,
+    /// Only projects with recent activity of the user's (see
+    /// [`SearchConfig::tracked_retention_hours`]).
+    #[serde(alias = "auto")]
+    Tracked,
 }
 
 impl SearchConfig {
@@ -359,6 +363,45 @@ impl SearchConfig {
     pub fn full_interval(&self) -> Duration {
         Duration::from_secs(self.full_interval_secs)
     }
+
+    /// How long activity keeps a project tracked.
+    pub fn tracked_retention(&self) -> Duration {
+        hours(self.tracked_retention_hours)
+    }
+}
+
+/// Background sync pacing, consumed by `sync::engine`.
+#[derive(Debug, ConfiqueConfig)]
+pub struct SyncConfig {
+    /// Random spread applied to every sync interval, as a fraction: 0.15 runs
+    /// a 5-minute job anywhere from 4¼ to 5¾ minutes after the last one, so
+    /// jobs sharing an interval don't hit GitLab together. (0 to 0.5; 0.15 by
+    /// default.)
+    #[config(default = 0.15)]
+    pub jitter: f64,
+
+    /// Pause between two sync jobs, in milliseconds (jittered like the
+    /// intervals), so a backlog of due jobs trickles out. (250 ms by default.)
+    #[config(default = 250)]
+    pub job_gap_ms: u64,
+
+    /// Seconds over which jobs already overdue at startup are spread out. The
+    /// assigned issue/MR lists and recent timelogs always run at once. (1 min
+    /// by default.)
+    #[config(default = 60)]
+    pub startup_spread_secs: u64,
+}
+
+impl SyncConfig {
+    pub fn job_gap(&self) -> Duration {
+        Duration::from_millis(self.job_gap_ms)
+    }
+}
+
+/// `h` hours, saturating: `Duration::from_hours` panics past `u64::MAX`
+/// seconds, and a huge window must mean "everything", not a dead task.
+fn hours(h: u64) -> Duration {
+    Duration::from_secs(h.saturating_mul(3600))
 }
 
 /// `$XDG_CONFIG_HOME/gitlab-trackrd/config.toml` (falls back to `./`).
@@ -421,10 +464,55 @@ pub fn load() -> Result<Config, confique::Error> {
         "queue",
     );
     normalize_search(&mut config.search);
+    normalize_refresh(&mut config.refresh);
+    normalize_sync(&mut config.sync);
     Ok(config)
 }
 
-/// Clamp the search sync cadences into a sane range and warn on any change.
+/// Floor both refresh cadences: an interval of 0 would poll GitLab
+/// back-to-back.
+fn normalize_refresh(refresh: &mut RefreshConfig) {
+    for (tier, secs) in [
+        ("quick", &mut refresh.quick.interval_secs),
+        ("slow", &mut refresh.slow.interval_secs),
+    ] {
+        if *secs < 60 {
+            warn!(
+                tier,
+                configured = *secs,
+                "refresh interval_secs below 60 would hammer GitLab; flooring to 60"
+            );
+            *secs = 60;
+        }
+    }
+}
+
+/// Keep the jitter a fraction that can't push an interval to zero or double
+/// it, and the job gap short enough not to stall the queue.
+fn normalize_sync(sync: &mut SyncConfig) {
+    if !(0.0..=0.5).contains(&sync.jitter) {
+        let clamped = if sync.jitter.is_nan() {
+            0.0
+        } else {
+            sync.jitter.clamp(0.0, 0.5)
+        };
+        warn!(
+            configured = sync.jitter,
+            clamped, "sync.jitter must be between 0 and 0.5; clamping"
+        );
+        sync.jitter = clamped;
+    }
+    if sync.job_gap_ms > 60_000 {
+        warn!(
+            configured = sync.job_gap_ms,
+            "sync.job_gap_ms above 60000 would stall the sync queue; capping to 60000"
+        );
+        sync.job_gap_ms = 60_000;
+    }
+}
+
+/// Clamp the corpus sync cadences and the tracked retention into a sane
+/// range and warn on any change.
 /// A partial interval of 0 would busy-spin the sync loop; a full interval
 /// below the partial one would make every sync a full resync.
 fn normalize_search(search: &mut SearchConfig) {
@@ -434,6 +522,20 @@ fn normalize_search(search: &mut SearchConfig) {
             "search.partial_interval_secs below 60 would hammer GitLab; flooring to 60"
         );
         search.partial_interval_secs = 60;
+    }
+    if search.tracked_retention_hours < 24 {
+        warn!(
+            configured = search.tracked_retention_hours,
+            "search.tracked_retention_hours below 24 would drop projects almost at once; flooring to 24"
+        );
+        search.tracked_retention_hours = 24;
+    }
+    if search.max_items_per_project < 100 {
+        warn!(
+            configured = search.max_items_per_project,
+            "search.max_items_per_project below 100 would hide most of a project; flooring to 100"
+        );
+        search.max_items_per_project = 100;
     }
     if search.full_interval_secs < search.partial_interval_secs {
         warn!(
@@ -513,12 +615,60 @@ mod tests {
     #[test]
     fn search_defaults() {
         let c = defaults();
-        assert_eq!(c.search.population, SearchPopulation::Auto);
+        assert_eq!(c.search.population, SearchPopulation::Tracked);
         assert_eq!(c.search.partial_interval(), Duration::from_secs(1800));
         assert_eq!(c.search.full_interval(), Duration::from_secs(604800));
     }
 
+    #[test]
+    fn sync_defaults() {
+        let c = defaults();
+        assert_eq!(c.sync.jitter, 0.15);
+        assert_eq!(c.sync.job_gap(), Duration::from_millis(250));
+        assert_eq!(c.sync.startup_spread_secs, 60);
+        assert_eq!(c.search.tracked_retention(), Duration::from_hours(2160));
+        assert_eq!(c.search.max_items_per_project, 1000);
+    }
+
+    #[test]
+    fn huge_hour_windows_saturate_instead_of_panicking() {
+        let mut c = defaults();
+        c.search.tracked_retention_hours = u64::MAX;
+        assert_eq!(c.search.tracked_retention(), Duration::from_secs(u64::MAX));
+    }
+
+    #[test]
+    fn search_population_parses_tracked_and_its_auto_alias() {
+        for name in ["\"tracked\"", "\"auto\""] {
+            let p: SearchPopulation = serde_json::from_str(name).unwrap();
+            assert_eq!(p, SearchPopulation::Tracked);
+        }
+    }
+
     proptest! {
+        #[test]
+        fn normalize_sync_keeps_jitter_a_sane_fraction(jitter in any::<f64>(), gap in any::<u64>()) {
+            let mut s = defaults().sync;
+            s.jitter = jitter;
+            s.job_gap_ms = gap;
+            normalize_sync(&mut s);
+            prop_assert!((0.0..=0.5).contains(&s.jitter));
+            prop_assert!(s.job_gap_ms <= 60_000);
+            if (0.0..=0.5).contains(&jitter) {
+                prop_assert_eq!(s.jitter, jitter, "in-range values are left untouched");
+            }
+        }
+
+        #[test]
+        fn normalize_refresh_floors_both_intervals(quick in any::<u64>(), slow in any::<u64>()) {
+            let mut r = defaults().refresh;
+            r.quick.interval_secs = quick;
+            r.slow.interval_secs = slow;
+            normalize_refresh(&mut r);
+            prop_assert_eq!(r.quick.interval_secs, quick.max(60));
+            prop_assert_eq!(r.slow.interval_secs, slow.max(60));
+        }
+
         #[test]
         fn normalize_backoff_floors_the_base_and_orders_the_pair(
             base_in in any::<u64>(),

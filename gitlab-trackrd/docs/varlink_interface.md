@@ -3,19 +3,23 @@
 Machine-readable definition: [`gitlab-trackr-api/varlink/org.thehoster.gitlab.trackrd.varlink`](../../gitlab-trackr-api/varlink/org.thehoster.gitlab.trackrd.varlink)
 — that file is the source of truth; this document explains the behavior behind it.
 
-**Caching model**: the daemon has no TTL. Background sync owns freshness — a quick
-tier refreshes issues, boards, and the recent timelog window every few minutes, a slow
-tier re-polls the bulk history daily, and the search corpus (issues, merge requests,
-projects, groups) syncs incrementally via `updated_after` deltas at most every
-`search.partial_interval_secs` (default 30 min) with a full resync — which also
-reconciles deletions — every `search.full_interval_secs` (default weekly). Read
+**Caching model**: the daemon has no TTL. A background sync worker owns freshness:
+it runs one job at a time from a persisted, jittered schedule — the assigned
+issue/MR lists and the recent timelog window every few minutes
+(`refresh.quick.interval_secs`), each tracked project's issues and MRs as
+`updated_after` deltas every `search.partial_interval_secs` (default 30 min) with a
+full resync that also reconciles deletions every `search.full_interval_secs`
+(default weekly), and the full timelog history, board columns and project/group
+memberships daily. Read
 methods serve whatever was last synced from the local store
 (`$XDG_DATA_HOME/gitlab-trackrd/db/`). Reads never trigger a GitLab round-trip.
 
 **Write model**: mutating methods reply success even when GitLab is unreachable — the
 operation is persisted to a retry queue and drained on reconnect (exponential backoff,
 dead-lettered after the retry window; see `GetFailures`). Only an actual GitLab
-*rejection* surfaces as `GitlabError`.
+*rejection* surfaces as `GitlabError`. The reads reflect a write at once — a queued
+or just-applied close/unassign hides the item from the assigned lists — and the
+jobs that display it rerun right after it lands.
 
 # Types
 
@@ -140,23 +144,20 @@ The daemon auto-recovers from `unreachable` in the background (unless disabled v
 
 ### `GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)`
 
-Open issues assigned to the authenticated user, served purely from the cache.
-`groups` filters to the given group namespaces (parsed from each issue's `web_url`);
-issues appearing under several requested groups are deduplicated. Omitted or empty
-`groups` returns everything. When the cache has never been populated: replies with an
-empty list if a session exists (first sync pending), `NotAuthenticated` otherwise.
+Open issues assigned to the authenticated user, served purely from the cache,
+grouped by namespace. `groups` filters to the given group namespaces (parsed from
+each issue's `web_url`, subgroups included); an issue matching several requested
+groups is listed once. Omitted or empty `groups` returns everything. When the list
+has never been synced: replies with an empty list if a session exists (first sync
+pending), `NotAuthenticated` otherwise.
 
 ### `GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)`
 
 Open merge requests assigned to the authenticated user, served purely from the
-search corpus (no separate MR cache): the sync captures each MR's assignees plus
-the syncing user's id, and this filters on both — so it works while dormant, and
-freshness follows the **search** cadence (delta every `search.partial_interval_secs`,
-default 30 min), not the issue quick tier. `groups` filters by namespace exactly
-like `GetAssignedIssues`. Replies newest-updated first. When the corpus has never
-been synced (or was synced by a daemon predating assignee capture): empty list if a
-session exists, `NotAuthenticated` otherwise. `ClearCache` scope `search` clears
-and refills this view.
+cache and synced on the quick cadence like the assigned issues. `groups` filters by
+namespace exactly like `GetAssignedIssues`. Replies newest-updated first. When the
+list has never been synced: empty list if a session exists, `NotAuthenticated`
+otherwise.
 
 ### `Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group)`
 
@@ -179,16 +180,20 @@ at least one recorded open, ranked the same way; projects and groups are empty i
 that mode. The statistics are read once per call and a read failure degrades to the
 plain recency order.
 
-What the corpus contains depends on the `[search]` daemon config: issues and MRs
-from everything the token can see (`population = "all"`) or only from member
-projects (`"member"`); the default `"auto"` resolves to `"member"` on gitlab.com
-(which rejects the global fetch) and `"all"` elsewhere, falling back to `"member"`
-until the next full resync if the instance rejects the global fetch too. Projects
-and groups are always membership-scoped.
-Issue `graph_status` is filled best-effort from already-cached board labels and is
-empty for projects the board cache has never seen. When the cache has never been
-synced: replies with empty arrays if a session exists (first sync pending),
-`NotAuthenticated` otherwise.
+What the corpus contains depends on the `[search]` daemon config. The default
+`population = "tracked"` holds the issues and MRs of the member projects you are
+active in: where you have assigned issues/MRs, pushed, opened or commented on an issue
+or MR, or logged time within `search.tracked_retention_hours` (default 90 days).
+Activity in a project you aren't a member of only keeps your assigned items there.
+Each project contributes at most its `search.max_items_per_project` most recently
+updated issues and MRs. `"member"`
+holds every member project's, `"all"` everything the token can see (`"auto"` is an
+alias of `"tracked"`). Projects and groups are always membership-scoped.
+Issue `graph_status` comes from the synced board columns of the issue's project and
+is empty for projects whose boards were never synced (only those of assigned issues'
+projects and of tracked member projects are).
+When the member projects have never been synced: replies with empty arrays if a
+session exists (first sync pending), `NotAuthenticated` otherwise.
 
 ### `GetHistory(days: ?int) -> (events: []HistoryEvent)`
 
@@ -222,20 +227,18 @@ Records spent time on the issuable. `duration` uses GitLab's time-tracking synta
 
 ### `Close(project_id: int, iid: int, kind: IssuableKind) -> ()`
 
-Closes the issuable. Immediately reflected in the caches: an issue is dropped from
-the assigned-issues cache, an MR's cached state flips to `closed`, so list reads
-show the close before the next sync.
+Closes the issuable. Immediately reflected: the assigned lists stop showing it
+before the next sync.
 
 ### `AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()`
 
-Assigns the authenticated user to the issuable. It appears in the assigned views
-after the next sync of the respective cache.
+Assigns the authenticated user to the issuable. The assigned list is re-synced
+right after the write lands, so it appears within seconds.
 
 ### `UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()`
 
 Removes the authenticated user from the issuable's assignees. Immediately
-reflected in the caches: an issue is dropped from the assigned-issues cache, the
-user is removed from the MR's cached assignee list.
+reflected: the assigned lists stop showing it before the next sync.
 
 ## Retry-queue failures (dead letters)
 
@@ -276,21 +279,24 @@ counts dropped first); both are enforced on write. A non-positive `project_id` o
 
 ### `ClearCache(scope: ?[]string) -> ()`
 
-Clears cached state and re-fetches it when a session exists. Omitted or empty `scope`
-clears everything (issues, boards, full history) and runs the full warm-up. Otherwise
-each scope string selects a slice:
+Clears cached state and makes its sync jobs due at once. Omitted or empty `scope`
+clears everything synced. Otherwise each scope string selects a slice:
 
-| scope    | clears                                              | re-fetches            |
-|----------|-----------------------------------------------------|-----------------------|
-| `issues` | assigned-issues and board caches                    | (next quick refresh)  |
-| `search` | search corpus (issues, MRs, projects, groups — incl. the assigned-MR view) and its sync stamps | full search resync |
-| `quick`  | history inside the quick window (last `refresh.quick.window_hours`) | that window |
-| `slow`   | history between the quick and slow windows          | the slow window       |
-| `stale`  | history older than the slow window                  | the full retention window, then prunes |
-| `usage`  | the `RecordOpen` statistics — **only when listed explicitly**; the empty "everything" scope leaves them alone (user data, not a cache) | — |
+| scope    | clears                                                         |
+|----------|----------------------------------------------------------------|
+| `issues` | the assigned issue/MR lists and the board columns              |
+| `search` | the corpus: issues, MRs, projects, groups                      |
+| `quick`  | history inside the quick window (last `refresh.quick.window_hours`) |
+| `slow`   | history between the retention horizon and the quick window     |
+| `stale`  | history older than `history.retention_hours` (normally already pruned) |
+| `usage`  | the `RecordOpen` statistics — **only when listed explicitly**; the empty "everything" scope leaves them alone (user data, not a cache) |
 
-Replies success even when dormant — the cleared state then simply stays empty until
-the next successful sync.
+When a session exists, the reply waits (up to 30 s) until what it cleared is
+re-synced: the assigned lists for `issues`, `search` and the empty scope (plus the
+board columns of their projects that never synced), the recent and full history
+for a history band and the empty scope. Everything else refills in the
+background; `usage` alone makes no GitLab call. Replies success even when
+dormant — the cleared state then stays empty until the next successful sync.
 
 ## Session
 

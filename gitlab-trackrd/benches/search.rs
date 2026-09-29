@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use gitlab_trackr_api::{AsyncCall, Call_Search, VarlinkInterface};
-use gitlab_trackrd::search::{parse_iid_query, text_matches};
+use gitlab_trackrd::query::{parse_iid_query, text_matches};
 
 use support::{dormant_env, seed_search_corpus};
 

@@ -59,8 +59,8 @@ pub enum Command {
         /// query several groups; the daemon merges their results.
         #[arg(long = "group", value_name = "GROUP")]
         groups: Vec<String>,
-        /// List your open merge requests instead of issues. Served from the
-        /// search corpus, so freshness follows the search sync cadence.
+        /// List your open merge requests instead of issues. Synced on the
+        /// same cadence as the assigned issues.
         #[arg(long)]
         mrs: bool,
     },
@@ -69,7 +69,7 @@ pub enum Command {
     /// case-insensitively; a query like `#123` finds issues/MRs by number.
     /// Issues/MRs you open often (`tt open`) rank first; with no query at all
     /// it lists just those. Pure cache read — freshness comes from the
-    /// background search sync.
+    /// daemon's background sync.
     Search {
         /// Search text. Omit it to list the frequently opened issues/MRs.
         query: Option<String>,
@@ -133,24 +133,25 @@ pub enum Command {
         shell: Shell,
     },
     /// Drop the daemon's caches and re-fetch. With no flags it clears
-    /// everything (issues, boards, and all history bands); pass band flags to
-    /// target only those. Cleared history bands are re-fetched immediately.
-    /// Open statistics are user data and only go with an explicit `--usage`.
+    /// everything synced; pass flags to target only those slices. Waits until
+    /// what it cleared of the assigned lists and the history is re-synced; the
+    /// search corpus refills in the background. Open statistics are user data
+    /// and only go with an explicit `--usage`.
     Refresh {
         /// Clear the quick history band (the last 24h).
         #[arg(long)]
         quick: bool,
-        /// Clear the slow history band (24h–30d).
+        /// Clear the slow history band (24h up to the 90-day retention).
         #[arg(long)]
         slow: bool,
-        /// Clear the stale history band (30d–90d).
+        /// Clear history past the retention horizon (normally already pruned).
         #[arg(long)]
         stale: bool,
-        /// Clear the assigned-issue and board caches.
+        /// Clear the assigned issue/MR lists and the board columns.
         #[arg(long)]
         issues: bool,
-        /// Clear the search cache (issues, MRs, projects, groups) and run a
-        /// full search resync.
+        /// Clear the search corpus (issues, MRs, projects, groups); it
+        /// refills in the background.
         #[arg(long)]
         search: bool,
         /// Forget the open counts behind `tt search` ranking (never cleared
