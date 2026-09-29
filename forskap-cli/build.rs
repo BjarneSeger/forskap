@@ -1,0 +1,22 @@
+use std::path::PathBuf;
+
+use clap::CommandFactory;
+use clap_complete::{
+    generate_to,
+    shells::{Bash, Fish, Zsh},
+};
+
+// Share the CLI definition without duplicating it.
+mod cli {
+    include!("src/cli.rs");
+}
+
+fn main() {
+    let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("completions");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mut cmd = cli::Cli::command();
+    generate_to(Bash, &mut cmd, "forskap", &out_dir).unwrap();
+    generate_to(Fish, &mut cmd, "forskap", &out_dir).unwrap();
+    generate_to(Zsh, &mut cmd, "forskap", &out_dir).unwrap();
+    generate_to(carapace_spec_clap::Spec, &mut cmd, "forskap", &out_dir).unwrap();
+}

@@ -1,0 +1,6 @@
+# Install: forskap time hook zsh >> ~/.zshrc      (or source it from .zshrc)
+__forskap_tick() { command forskap tick }
+typeset -ga precmd_functions
+if [[ ${precmd_functions[(ie)__forskap_tick]} -gt ${#precmd_functions} ]]; then
+    precmd_functions+=(__forskap_tick)
+fi

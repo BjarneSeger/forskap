@@ -1,4 +1,4 @@
-module github.com/BjarneSeger/gitlab_trackr/clients/go
+module github.com/BjarneSeger/forskap/clients/go
 
 go 1.26.4
 

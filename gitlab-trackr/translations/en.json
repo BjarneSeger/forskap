@@ -1,6 +1,0 @@
-{
-  "settings.tt_path.label": "tt binary",
-  "settings.tt_path.description": "Path to the tt CLI. Set it when tt is not on noctalia's PATH (e.g. ~/.cargo/bin/tt).",
-  "settings.limit.label": "Results per kind",
-  "settings.limit.description": "Maximum issues, merge requests, projects and groups each shown per query."
-}

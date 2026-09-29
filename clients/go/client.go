@@ -1,8 +1,8 @@
-package orgthehostergitlabtrackrd
+package orgthehosterforskapd
 
 // This file is hand-written (NOT generated). It provides an ergonomic Client on
-// top of the generated call helpers in orgthehostergitlabtrackrd.go: it resolves
-// the daemon socket the same way tt-cli does, opens the varlink connection, and
+// top of the generated call helpers in orgthehosterforskapd.go: it resolves
+// the daemon socket the same way forskap-cli does, opens the varlink connection, and
 // exposes one Go method per varlink method.
 
 import (
@@ -31,23 +31,26 @@ const (
 	KindMergeRequest IssuableKind = "merge_request"
 )
 
-// DefaultAddress resolves the gitlab-trackrd varlink address using the same
-// precedence as tt-cli:
+// DefaultAddress resolves the forskapd varlink address using the same
+// precedence as forskap-cli:
 //
-//	$GITLAB_TRACKRD_SOCKET, if set (used verbatim, so include the "unix:" scheme)
-//	→ unix:$XDG_RUNTIME_DIR/gitlab-trackrd.socket
-//	→ unix:/tmp/gitlab-trackrd.socket
+//	$FORSKAPD_SOCKET, if set (used verbatim, so include the "unix:" scheme)
+//	→ $GITLAB_TRACKRD_SOCKET, its name before the rename
+//	→ unix:$XDG_RUNTIME_DIR/forskapd.socket
+//	→ unix:/tmp/forskapd.socket
 func DefaultAddress() string {
-	if s := os.Getenv("GITLAB_TRACKRD_SOCKET"); s != "" {
-		return s
+	for _, name := range []string{"FORSKAPD_SOCKET", "GITLAB_TRACKRD_SOCKET"} {
+		if s := os.Getenv(name); s != "" {
+			return s
+		}
 	}
 	if x := os.Getenv("XDG_RUNTIME_DIR"); x != "" {
-		return "unix:" + filepath.Join(x, "gitlab-trackrd.socket")
+		return "unix:" + filepath.Join(x, "forskapd.socket")
 	}
-	return "unix:/tmp/gitlab-trackrd.socket"
+	return "unix:/tmp/forskapd.socket"
 }
 
-// Client is a connected varlink client for the org.thehoster.gitlab.trackrd
+// Client is a connected varlink client for the org.thehoster.forskapd
 // interface. Create one with Dial or DialAddress and release it with Close.
 type Client struct {
 	conn *varlink.Connection
@@ -59,7 +62,7 @@ func Dial(ctx context.Context) (*Client, error) {
 }
 
 // DialAddress connects to the daemon at an explicit varlink address, e.g.
-// "unix:/run/user/1000/gitlab-trackrd.socket" or "tcp:127.0.0.1:12345".
+// "unix:/run/user/1000/forskapd.socket" or "tcp:127.0.0.1:12345".
 func DialAddress(ctx context.Context, address string) (*Client, error) {
 	conn, err := varlink.NewConnection(ctx, address)
 	if err != nil {

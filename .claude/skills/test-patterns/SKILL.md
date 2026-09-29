@@ -3,7 +3,7 @@ name: test-patterns
 description: The established mock and test conventions in this workspace (the shared FakeGitlab, handler and sync-engine scaffolding, varlink call driving, timing rules) — read before writing or extending daemon tests so new tests reuse the existing helpers.
 ---
 
-# Test patterns in gitlab-trackrd
+# Test patterns in forskapd
 
 All tests are inline `#[cfg(test)]` modules — no `tests/` dirs. There is **one**
 GitLab mock; reuse the helpers below instead of inventing new scaffolding.

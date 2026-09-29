@@ -1,0 +1,10 @@
+[Unit]
+Description=GitLab time-tracking varlink daemon
+
+[Socket]
+ListenStream=%t/forskapd.socket
+FileDescriptorName=varlink
+Service=forskapd.service
+
+[Install]
+WantedBy=sockets.target

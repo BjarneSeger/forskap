@@ -7,12 +7,12 @@ name: Go binding
 on:
   push:
     paths:
-      - "gitlab-trackr-api/varlink/**"
+      - "forskap-api/varlink/**"
       - "clients/go/**"
       - ".github/workflows/go-binding.yml"
   pull_request:
     paths:
-      - "gitlab-trackr-api/varlink/**"
+      - "forskap-api/varlink/**"
       - "clients/go/**"
       - ".github/workflows/go-binding.yml"
 

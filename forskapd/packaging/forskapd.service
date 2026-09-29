@@ -1,0 +1,8 @@
+[Unit]
+Description=GitLab time-tracking varlink daemon
+
+[Service]
+ExecStart=/usr/bin/forskapd
+
+[Install]
+WantedBy=default.target

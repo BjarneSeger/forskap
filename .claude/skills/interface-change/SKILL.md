@@ -5,15 +5,15 @@ description: Checklist for changing the varlink API (adding/changing methods, ty
 
 # Changing the varlink interface
 
-Single source of truth: `gitlab-trackr-api/varlink/org.thehoster.gitlab.trackrd.varlink`.
+Single source of truth: `forskap-api/varlink/org.thehoster.forskapd.varlink`.
 Everything else is generated from it or must be updated by hand to match. Work through
 this list top to bottom.
 
 ## 1. Edit the `.varlink` file
 
-- Interface name is `org.thehoster.gitlab.trackrd`. Keep the existing style: one blank
+- Interface name is `org.thehoster.forskapd`. Keep the existing style: one blank
   line between declarations, optional params/fields as `?type`.
-- Bump the version in `gitlab-trackr-api/Cargo.toml` **in the same feature commit**.
+- Bump the version in `forskap-api/Cargo.toml` **in the same feature commit**.
   Convention (see git history): the api crate's version moves inside the commit that
   changes the interface; the workspace version moves only in separate
   `chore: Bump version` commits. The api crate is dual-licensed MIT/Apache-2.0 —
@@ -21,14 +21,14 @@ this list top to bottom.
 
 ## 2. Rust side regenerates itself
 
-`gitlab-trackr-api/build.rs` runs `varlink_generator` into `$OUT_DIR` on every build;
+`forskap-api/build.rs` runs `varlink_generator` into `$OUT_DIR` on every build;
 `lib.rs` `include!`s it. No manual step — the next `cargo build` yields the new
 `VarlinkInterface` trait, `Call_*` traits, and request/reply structs. Compile errors in
 the daemon are the to-do list.
 
 ## 3. Daemon handlers
 
-- Implement the method in `gitlab-trackrd/src/handlers/varlink.rs`
+- Implement the method in `forskapd/src/handlers/varlink.rs`
   (`impl VarlinkInterface for Handlers`). Follow the cascade style: validate eagerly
   (`issue_ref_error`, `looks_like_duration` in `handlers/mod.rs`), consult cache,
   fall back to GitLab, reply.
@@ -47,8 +47,8 @@ the daemon are the to-do list.
 - New GitLab call needed? Reads are a new `Listing` variant (no trait change). A new
   write method goes on the `GitlabApi` trait in `gitlab.rs` **and** on the shared fake in
   `testing.rs`.
-- **New method? Add its arm to the hand-written dispatcher** `handle_trackrd` in
-  `gitlab-trackrd/src/service.rs` (clone the arm of an argument-identical method) plus a
+- **New method? Add its arm to the hand-written dispatcher** `handle_forskapd` in
+  `forskapd/src/service.rs` (clone the arm of an argument-identical method) plus a
   `dispatch_has_an_arm_for_<method>` test next to `dispatch_has_an_arm_for_search`. A
   missing arm compiles fine and only fails at runtime as `MethodNotFound`.
 - New field on a wire type? The store holds GitLab mirrors, not wire types: add the
@@ -57,14 +57,14 @@ the daemon are the to-do list.
 
 ## 4. CLI
 
-New subcommand module in its group under `tt-cli/src/cmd/`, wired into
-`tt-cli/src/cli.rs` (clap-only: `build.rs` includes it) and covered in
-`tt-cli/src/cli_tests.rs`. Shell completions under `tt-cli/completions/` regenerate
+New subcommand module in its group under `forskap-cli/src/cmd/`, wired into
+`forskap-cli/src/cli.rs` (clap-only: `build.rs` includes it) and covered in
+`forskap-cli/src/cli_tests.rs`. Shell completions under `forskap-cli/completions/` regenerate
 from `cli.rs` on every build and are gitignored.
 
 ## 5. Docs
 
-Update `gitlab-trackrd/docs/varlink_interface.md` — it documents every method, type,
+Update `forskapd/docs/varlink_interface.md` — it documents every method, type,
 and error. Keep it complete; it is the human-facing contract.
 
 ## 6. Go binding (CI trap)
@@ -75,7 +75,7 @@ go generate ./...   # copies the .varlink in, runs varlink-go-interface-generato
 go build ./... && go vet ./...
 ```
 
-Commit the regenerated `orgthehostergitlabtrackrd.go` — never hand-edit it. CI
+Commit the regenerated `orgthehosterforskapd.go` — never hand-edit it. CI
 (`.github/workflows/go-binding.yml`) regenerates and fails on `git diff` if the
 committed binding is stale.
 

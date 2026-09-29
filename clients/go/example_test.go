@@ -1,4 +1,4 @@
-package orgthehostergitlabtrackrd_test
+package orgthehosterforskapd_test
 
 import (
 	"context"
@@ -6,16 +6,16 @@ import (
 	"fmt"
 	"log"
 
-	trackr "github.com/BjarneSeger/gitlab_trackr/clients/go"
+	forskap "github.com/BjarneSeger/forskap/clients/go"
 )
 
-// This example connects to a running gitlab-trackrd daemon and lists the issues
+// This example connects to a running forskapd daemon and lists the issues
 // assigned to the authenticated user. It has no // Output: comment, so `go test`
 // compiles it (guarding the public API) without executing it.
 func Example() {
 	ctx := context.Background()
 
-	c, err := trackr.Dial(ctx)
+	c, err := forskap.Dial(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -23,9 +23,9 @@ func Example() {
 
 	issues, err := c.GetAssignedIssues(ctx, nil)
 	if err != nil {
-		var notAuth *trackr.NotAuthenticated
+		var notAuth *forskap.NotAuthenticated
 		if errors.As(err, &notAuth) {
-			log.Fatal("not authenticated; run: tt auth login --host gitlab.com")
+			log.Fatal("not authenticated; run: forskap auth login --host gitlab.com")
 		}
 		log.Fatal(err)
 	}
