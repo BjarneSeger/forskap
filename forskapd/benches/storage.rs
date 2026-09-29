@@ -1,6 +1,7 @@
 //! The storage substrate: raw `KvStore` scans (fjall iteration + per-entry
 //! JSON decode), the sync store's table scans and batch upserts, the
-//! timelog window scan, and the full-run reconcile.
+//! timelog window scan, the full-run reconcile, and the sync plan over a
+//! large membership.
 //!
 //! No `RetryQueue` benches on purpose: its stores fsync after every mutation
 //! (`open_durable`), so a bench would measure the disk, not the code.
@@ -10,11 +11,15 @@ mod support;
 use std::hint::black_box;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use forskapd::config::SearchPopulation;
 use forskapd::db::KvStore;
-use forskapd::sync::model::{Issue, Timelog};
+use forskapd::sync::model::{Issue, Project, Timelog};
+use forskapd::sync::planner;
 use forskapd::sync::store::RowScope;
 
-use support::{dormant_env, issue, now_secs, put, seed_history, seed_search_corpus, timelog};
+use support::{
+    dormant_env, issue, now_secs, project, put, seed_history, seed_search_corpus, timelog,
+};
 
 const SIZES: [u64; 3] = [1_000, 10_000, 50_000];
 
@@ -139,5 +144,22 @@ fn reconcile(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, kvstore_scan, table, timelogs, reconcile);
+/// The plan is derived anew after every run of a plan-feeding job, and
+/// holds one avatar job per member project.
+fn plan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("plan");
+    group.sample_size(30);
+    for n in [1_000u64, 10_000] {
+        let env = dormant_env();
+        let rows: Vec<Project> = (0..n).map(project).collect();
+        put(&env, &rows);
+        group.throughput(Throughput::Elements(n));
+        group.bench_with_input(BenchmarkId::new("member_projects", n), &n, |b, _| {
+            b.iter(|| black_box(planner::plan(env.store(), SearchPopulation::Tracked, 0).unwrap()));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, kvstore_scan, table, timelogs, reconcile, plan);
 criterion_main!(benches);
