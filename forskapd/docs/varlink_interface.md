@@ -98,7 +98,9 @@ type ActivityEvent (
   web_url:      ?string,  # the issue / MR, a pushed branch's commits, else the project; null when unknown
   ref:          ?string,  # pushes only: the branch or tag
   commit_count: ?int,     # pushes only
-  commit_title: ?string   # pushes only: the newest commit's title; null when the ref was deleted
+  commit_title: ?string,  # pushes only: the newest commit's title; null when the ref was deleted
+  description:  ?string   # what the event did: a comment's first line (at most 200 characters, a cut one ends in …),
+                          # a push's commit_title; null for every other event
 )
 ```
 

@@ -129,6 +129,11 @@ pub fn activity(
         (kind.to_string(), iid)
     };
     let push = e.push_data;
+    let description = if e.note.body.is_empty() {
+        push.commit_title.clone()
+    } else {
+        e.note.body
+    };
     let is_push = !push.git_ref.is_empty();
     let base = project
         .map(|p| p.web_url.as_str())
@@ -164,6 +169,7 @@ pub fn activity(
         commit_count: is_push.then_some(push.commit_count),
         r#ref: some(push.git_ref),
         commit_title: some(push.commit_title),
+        description: some(description),
     }
 }
 
@@ -276,6 +282,7 @@ mod tests {
         assert_eq!(push.target_iid, None);
         assert_eq!(push.commit_count, Some(2));
         assert_eq!(push.commit_title.as_deref(), Some("Fix it"));
+        assert_eq!(push.description.as_deref(), Some("Fix it"));
         assert_eq!(
             push.web_url.as_deref(),
             Some("https://gl/team/api/-/commits/feat/x")
@@ -284,11 +291,13 @@ mod tests {
         let deleted = activity(deleted, Some(&p), None);
         assert_eq!(deleted.commit_count, Some(0));
         assert_eq!(deleted.commit_title, None);
+        assert_eq!(deleted.description, None);
         assert_eq!(deleted.web_url.as_deref(), Some("https://gl/team/api"));
 
         let mut comment = event("commented on", "DiffNote", 9001);
         comment.target_title = "Add x".into();
         comment.note = model::NoteRef {
+            body: "lgtm".into(),
             noteable_type: "MergeRequest".into(),
             noteable_iid: 12,
         };
@@ -296,6 +305,8 @@ mod tests {
         assert_eq!(comment.target_type, "MergeRequest");
         assert_eq!(comment.target_iid, Some(12));
         assert_eq!(comment.target_title.as_deref(), Some("Add x"));
+        assert_eq!(comment.description.as_deref(), Some("lgtm"));
+        assert_eq!(comment.commit_title, None);
         assert_eq!(
             comment.web_url.as_deref(),
             Some("https://gl/team/api/-/merge_requests/12")
