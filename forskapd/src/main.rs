@@ -11,7 +11,7 @@ use forskapd::handlers::{ConnState, Handlers, Session, SessionSlot};
 use forskapd::queue::{RetryQueue, SettleHook};
 use forskapd::service::ServiceHandler;
 use forskapd::sync::store::SyncStore;
-use forskapd::sync::{AvatarDir, Job, SyncHandle};
+use forskapd::sync::{AvatarDir, Job, SyncHandle, now_secs};
 use forskapd::usage::UsageStats;
 use forskapd::write::Write;
 use forskapd::{config, db, migrate, reconnect, reload, rotate, secrets, server};
@@ -191,10 +191,7 @@ fn settle_hook(sync: &Arc<SyncHandle>, config: &config::SharedConfig) -> SettleH
         if applied {
             sync.note_write(write);
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let jobs = Job::affected_by_replay(write, queued_at, &config.read().unwrap(), now);
+        let jobs = Job::affected_by_replay(write, queued_at, &config.read().unwrap(), now_secs());
         sync.refresh_soon(&jobs);
     })
 }

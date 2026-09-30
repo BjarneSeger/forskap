@@ -3,11 +3,11 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use forskap_api::{IssuableKind, VarlinkClientInterface};
+use forskap_api::VarlinkClientInterface;
 
 use crate::cli::OutputFormat;
 use crate::friendly::friendly;
-use crate::{client, output, style};
+use crate::{client, output, refspec, style};
 
 pub async fn run(days: u32, format: OutputFormat) -> Result<()> {
     let client = client::connect_default().await?;
@@ -22,10 +22,7 @@ pub async fn run(days: u32, format: OutputFormat) -> Result<()> {
             let ts = DateTime::<Utc>::from_timestamp(e.timestamp, 0)
                 .map(|d| d.to_rfc3339())
                 .unwrap_or_else(|| e.timestamp.to_string());
-            let sigil = match e.kind {
-                IssuableKind::merge_request => '!',
-                IssuableKind::issue => '#',
-            };
+            let sigil = refspec::wire_sigil(&e.kind);
             outln!(
                 "{ts}  {:<8}  {:<6}  {:<6}  {}",
                 style::state(&e.source),

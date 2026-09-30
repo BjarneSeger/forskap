@@ -9,6 +9,7 @@ default-run = "forskapd"
 gitlab.workspace = true
 notify.workspace = true
 fjall.workspace = true
+xxhash-rust.workspace = true
 varlink.workspace = true
 tokio.workspace = true
 serde.workspace = true

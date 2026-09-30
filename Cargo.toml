@@ -32,6 +32,8 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 # Local storage
 notify = "8"
 fjall = "3.1"
+# The hash fjall already brings; its output is fixed by the XXH3 spec.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 security-framework = "3.7"
 security-framework-sys = "2.17"
 oo7 = { version = "0.6", features = ["tracing"] }

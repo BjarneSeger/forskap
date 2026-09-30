@@ -7,11 +7,11 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use forskap_api::{FailedTask, IssuableKind, VarlinkClientInterface};
+use forskap_api::{FailedTask, VarlinkClientInterface};
 
 use crate::cli::{OutputFormat, QueueCommand, WatchArgs};
 use crate::friendly::friendly;
-use crate::{client, output, style, watch};
+use crate::{client, output, refspec, style, watch};
 
 pub async fn run(command: QueueCommand) -> Result<()> {
     match command {
@@ -83,10 +83,7 @@ fn render(failures: &[FailedTask]) -> String {
         } else {
             format!(" ({})", f.detail)
         };
-        let sigil = match f.kind {
-            IssuableKind::merge_request => '!',
-            IssuableKind::issue => '#',
-        };
+        let sigil = refspec::wire_sigil(&f.kind);
         out.push_str(&format!(
             "[{}] {} {}{}  —  {}  ({})\n",
             f.id,
@@ -106,6 +103,8 @@ fn render(failures: &[FailedTask]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use forskap_api::IssuableKind;
+
     use super::*;
 
     #[test]

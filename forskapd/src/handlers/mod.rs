@@ -14,7 +14,6 @@
 //! reaches for, and the small pure validators.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Notify, RwLock};
 
@@ -26,7 +25,7 @@ use crate::gitlab::{GitlabApi, GitlabClient};
 use crate::queue::RetryQueue;
 use crate::rotate::Rotation;
 use crate::secrets::Token;
-use crate::sync::SyncHandle;
+use crate::sync::{SyncHandle, now_secs};
 use crate::usage::UsageStats;
 
 mod varlink;
@@ -127,13 +126,6 @@ impl Handlers {
 /// Extract the varlink `(reason, detail)` pair from a dormancy error.
 fn dormant_args(reason: &DormancyReason) -> (Option<NotAuthReason>, Option<String>) {
     (Some(reason.reason()), reason.detail())
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Reject obviously-malformed issue references up front (eager pre-check), so a
