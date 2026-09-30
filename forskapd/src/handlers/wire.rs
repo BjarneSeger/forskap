@@ -1,13 +1,28 @@
 //! Projections of stored GitLab rows onto the varlink wire types.
 
 use forskap_api::{
-    ActivityEvent, Epic, Group, HistoryEvent, IssuableKind, Issue, MergeRequest, Project, SyncJob,
-    SyncJobStatus,
+    ActivityEvent, Epic, Group, HistoryEvent, HistorySource, IssuableKind, Issue, MergeRequest,
+    Project, SyncJob, SyncJobStatus,
 };
 
 use crate::gitlab::{Issuable, format_duration};
 use crate::query::{graph_status_from, namespace_of};
 use crate::sync::{JobInfo, JobStatus, model};
+
+/// What a wire item shows of its project.
+pub struct ProjectInfo {
+    /// `path_with_namespace` of the stored project.
+    pub path: Option<String>,
+    pub avatar: String,
+}
+
+/// A tracked project the user is no member of has no row, but its items
+/// carry the path in their link.
+fn project_path(stored: Option<String>, web_url: &str) -> String {
+    stored
+        .and_then(some)
+        .unwrap_or_else(|| namespace_of(web_url))
+}
 
 /// `board_labels` are the issue's project board lists, `None` when never
 /// synced (then `graph_status` stays empty).
@@ -15,7 +30,7 @@ pub fn issue(
     i: model::Issue,
     board_labels: Option<&[String]>,
     open_count: i64,
-    project_avatar: String,
+    project: ProjectInfo,
 ) -> Issue {
     Issue {
         graph_status: graph_status_from(board_labels, &i.labels, &i.state),
@@ -25,28 +40,30 @@ pub fn issue(
         iid: i.iid,
         project_id: i.project_id,
         title: i.title,
-        web_url: i.web_url,
         state: i.state,
         open_count,
-        project_avatar,
+        project_avatar: project.avatar,
+        project_path: project_path(project.path, &i.web_url),
+        web_url: i.web_url,
     }
 }
 
 pub fn merge_request(
     m: model::MergeRequest,
     open_count: i64,
-    project_avatar: String,
+    project: ProjectInfo,
 ) -> MergeRequest {
     MergeRequest {
         id: m.id,
         iid: m.iid,
         project_id: m.project_id,
         title: m.title,
-        web_url: m.web_url,
         state: m.state,
         assignees: m.assignees.into_iter().map(|a| a.username).collect(),
         open_count,
-        project_avatar,
+        project_avatar: project.avatar,
+        project_path: project_path(project.path, &m.web_url),
+        web_url: m.web_url,
     }
 }
 
@@ -81,11 +98,11 @@ pub fn epic(e: model::Epic, open_count: i64) -> Epic {
     }
 }
 
-/// A synced timelog as a `"gitlab"` history event.
+/// A synced timelog as a history event.
 pub fn timelog(t: model::Timelog) -> HistoryEvent {
     HistoryEvent {
         timestamp: t.spent_at as i64,
-        source: "gitlab".to_string(),
+        source: HistorySource::gitlab,
         kind: kind(t.kind),
         project_id: t.project_id,
         iid: t.iid,
@@ -218,6 +235,24 @@ mod tests {
             created_at: 100,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn items_name_the_stored_project_or_the_one_in_their_link() {
+        let item = || model::MergeRequest {
+            web_url: "https://gl/other/big/-/merge_requests/5".into(),
+            ..Default::default()
+        };
+        let info = |path: Option<&str>| ProjectInfo {
+            path: path.map(str::to_string),
+            avatar: String::new(),
+        };
+        let stored = merge_request(item(), 0, info(Some("team/api")));
+        assert_eq!(stored.project_path, "team/api");
+        let foreign = merge_request(item(), 0, info(None));
+        assert_eq!(foreign.project_path, "other/big");
+        let unknown = issue(model::Issue::default(), None, 0, info(None));
+        assert_eq!(unknown.project_path, "");
     }
 
     #[test]

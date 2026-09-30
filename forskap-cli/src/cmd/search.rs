@@ -5,7 +5,7 @@
 //! serves whatever was last synced — no fetch, effectively free.
 
 use anyhow::Result;
-use forskap_api::VarlinkClientInterface;
+use forskap_api::{SearchKind as WireKind, VarlinkClientInterface};
 
 use crate::cli::{OutputFormat, SearchKind};
 use crate::friendly::friendly;
@@ -108,13 +108,12 @@ fn opened(count: i64) -> String {
     }
 }
 
-fn wire_kind(kind: SearchKind) -> String {
+pub fn wire_kind(kind: SearchKind) -> WireKind {
     match kind {
-        SearchKind::Issues => "issues",
-        SearchKind::Mrs => "merge_requests",
-        SearchKind::Projects => "projects",
-        SearchKind::Groups => "groups",
-        SearchKind::Epics => "epics",
+        SearchKind::Issues => WireKind::issues,
+        SearchKind::Mrs => WireKind::merge_requests,
+        SearchKind::Projects => WireKind::projects,
+        SearchKind::Groups => WireKind::groups,
+        SearchKind::Epics => WireKind::epics,
     }
-    .to_string()
 }

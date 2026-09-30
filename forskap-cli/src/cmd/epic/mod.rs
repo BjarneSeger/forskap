@@ -15,7 +15,7 @@ mod open;
 mod view;
 
 use anyhow::{Result, bail};
-use forskap_api::{Epic, Group, VarlinkClient, VarlinkClientInterface};
+use forskap_api::{Epic, Group, SearchKind, VarlinkClient, VarlinkClientInterface};
 
 use crate::cli::{EpicArgs, EpicCommand};
 use crate::friendly::friendly;
@@ -71,7 +71,7 @@ async fn cached(client: &VarlinkClient, iid: i64) -> Result<Vec<Epic>> {
     let reply = client
         .search(
             format!("&{iid}"),
-            Some(vec!["epics".to_string()]),
+            Some(vec![SearchKind::epics]),
             Some(SEARCH_LIMIT),
         )
         .call()
@@ -135,7 +135,7 @@ async fn group_id(client: &VarlinkClient, group: &str) -> Result<i64> {
     let reply = client
         .search(
             path.to_string(),
-            Some(vec!["groups".to_string()]),
+            Some(vec![SearchKind::groups]),
             Some(SEARCH_LIMIT),
         )
         .call()

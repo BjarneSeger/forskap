@@ -30,6 +30,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use zbus::zvariant::{OwnedValue, Value};
 
 use crate::cli::SearchProviderCommand;
+use crate::cmd::search::wire_kind;
 use crate::cmd::{epic, item};
 use crate::friendly::friendly;
 use crate::{client, config, refspec};
@@ -158,7 +159,7 @@ impl Provider {
             });
         };
         let client = client::connect(&self.socket).await?;
-        let kinds = parsed.kind.map(|k| vec![k.wire().to_string()]);
+        let kinds = parsed.kind.map(|k| vec![wire_kind(k)]);
         let reply = match client
             .search(parsed.query, kinds, Some(PER_KIND_LIMIT))
             .call()

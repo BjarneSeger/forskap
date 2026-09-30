@@ -6,33 +6,28 @@
 
 use anyhow::Result;
 use clap::ValueEnum;
-use forskap_api::VarlinkClientInterface;
+use forskap_api::{CacheScope, VarlinkClientInterface};
 
 use crate::cli::RefreshScope;
 use crate::client;
 use crate::friendly::friendly;
 
 /// The daemon's `ClearCache` scopes behind each CLI scope.
-fn wire(scope: RefreshScope) -> &'static [&'static str] {
+fn wire(scope: RefreshScope) -> &'static [CacheScope] {
     match scope {
-        RefreshScope::Assigned => &["issues"],
-        RefreshScope::Search => &["search"],
+        RefreshScope::Assigned => &[CacheScope::assigned],
+        RefreshScope::Search => &[CacheScope::search],
         // The daemon syncs the history in three age bands.
-        RefreshScope::History => &["quick", "slow", "stale"],
-        RefreshScope::Usage => &["usage"],
+        RefreshScope::History => &[CacheScope::quick, CacheScope::slow, CacheScope::stale],
+        RefreshScope::Usage => &[CacheScope::usage],
     }
 }
 
 pub async fn run(mut scopes: Vec<RefreshScope>) -> Result<()> {
     scopes.dedup();
     // No scope ⇒ `None`, which the daemon reads as "everything synced".
-    let scope = (!scopes.is_empty()).then(|| {
-        scopes
-            .iter()
-            .flat_map(|s| wire(*s))
-            .map(|s| s.to_string())
-            .collect()
-    });
+    let scope =
+        (!scopes.is_empty()).then(|| scopes.iter().flat_map(|s| wire(*s)).cloned().collect());
 
     let client = client::connect_default().await?;
     client

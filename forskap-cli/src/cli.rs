@@ -463,7 +463,7 @@ pub enum Shell {
 }
 
 /// `mrs` maps to the wire value `merge_requests`.
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SearchKind {
     Issues,
     Mrs,

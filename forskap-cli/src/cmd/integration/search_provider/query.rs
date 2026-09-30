@@ -5,55 +5,35 @@
 
 use std::fmt::Write as _;
 
-/// A result kind as the daemon's `Search` names it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Issues,
-    MergeRequests,
-    Projects,
-    Groups,
-    Epics,
+use crate::cli::SearchKind;
+
+/// Freedesktop icon name present in both Adwaita and Breeze.
+pub fn icon(kind: SearchKind) -> &'static str {
+    match kind {
+        SearchKind::Issues => "emblem-important-symbolic",
+        SearchKind::Mrs => "emblem-synchronizing-symbolic",
+        SearchKind::Projects => "folder-symbolic",
+        SearchKind::Groups => "system-users-symbolic",
+        SearchKind::Epics => "user-bookmarks-symbolic",
+    }
 }
 
-impl Kind {
-    /// The `kinds` filter value for `Search`.
-    pub fn wire(self) -> &'static str {
-        match self {
-            Kind::Issues => "issues",
-            Kind::MergeRequests => "merge_requests",
-            Kind::Projects => "projects",
-            Kind::Groups => "groups",
-            Kind::Epics => "epics",
-        }
-    }
-
-    /// Freedesktop icon name present in both Adwaita and Breeze.
-    pub fn icon(self) -> &'static str {
-        match self {
-            Kind::Issues => "emblem-important-symbolic",
-            Kind::MergeRequests => "emblem-synchronizing-symbolic",
-            Kind::Projects => "folder-symbolic",
-            Kind::Groups => "system-users-symbolic",
-            Kind::Epics => "user-bookmarks-symbolic",
-        }
-    }
-
-    fn from_word(word: &str) -> Option<Kind> {
-        Some(match word.to_ascii_lowercase().as_str() {
-            "i" | "issue" | "issues" => Kind::Issues,
-            "mr" | "mrs" => Kind::MergeRequests,
-            "p" | "project" | "projects" => Kind::Projects,
-            "g" | "group" | "groups" => Kind::Groups,
-            "e" | "epic" | "epics" => Kind::Epics,
-            _ => return None,
-        })
-    }
+/// The kind a leading word of the shorthand stands for.
+fn kind_of(word: &str) -> Option<SearchKind> {
+    Some(match word.to_ascii_lowercase().as_str() {
+        "i" | "issue" | "issues" => SearchKind::Issues,
+        "mr" | "mrs" => SearchKind::Mrs,
+        "p" | "project" | "projects" => SearchKind::Projects,
+        "g" | "group" | "groups" => SearchKind::Groups,
+        "e" | "epic" | "epics" => SearchKind::Epics,
+        _ => return None,
+    })
 }
 
 /// What the user typed, split into the kind filter and the text for `Search`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parsed {
-    pub kind: Option<Kind>,
+    pub kind: Option<SearchKind>,
     pub query: String,
     /// The query was a bare `#42` / `!42` / `&42`: the iid match is the exact
     /// hit.
@@ -88,7 +68,7 @@ pub fn parse(text: &str) -> Parsed {
         Some((w, r)) => (w, r.trim()),
         None => (text, ""),
     };
-    if let Some(kind) = Kind::from_word(word) {
+    if let Some(kind) = kind_of(word) {
         return Parsed {
             kind: Some(kind),
             query: rest.to_string(),
@@ -97,21 +77,21 @@ pub fn parse(text: &str) -> Parsed {
     }
     if let Some(n) = text.strip_prefix('!').filter(|n| is_number(n)) {
         return Parsed {
-            kind: Some(Kind::MergeRequests),
+            kind: Some(SearchKind::Mrs),
             query: format!("#{n}"),
             exact: true,
         };
     }
     if text.strip_prefix('#').is_some_and(is_number) {
         return Parsed {
-            kind: Some(Kind::Issues),
+            kind: Some(SearchKind::Issues),
             query: text.to_string(),
             exact: true,
         };
     }
     if text.strip_prefix('&').is_some_and(is_number) {
         return Parsed {
-            kind: Some(Kind::Epics),
+            kind: Some(SearchKind::Epics),
             query: text.to_string(),
             exact: true,
         };
@@ -162,7 +142,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn p(kind: Option<Kind>, query: &str, exact: bool) -> Parsed {
+    fn p(kind: Option<SearchKind>, query: &str, exact: bool) -> Parsed {
         Parsed {
             kind,
             query: query.to_string(),
@@ -173,21 +153,24 @@ mod tests {
     #[test]
     fn mirrors_the_luau_table() {
         assert_eq!(parse("oauth"), p(None, "oauth", false));
+        assert_eq!(parse("mr oauth"), p(Some(SearchKind::Mrs), "oauth", false));
+        assert_eq!(parse("mr"), p(Some(SearchKind::Mrs), "", false));
+        assert_eq!(parse("!42"), p(Some(SearchKind::Mrs), "#42", true));
+        assert_eq!(parse("#42"), p(Some(SearchKind::Issues), "#42", true));
+        assert_eq!(parse("&42"), p(Some(SearchKind::Epics), "&42", true));
         assert_eq!(
-            parse("mr oauth"),
-            p(Some(Kind::MergeRequests), "oauth", false)
+            parse("e roadmap"),
+            p(Some(SearchKind::Epics), "roadmap", false)
         );
-        assert_eq!(parse("mr"), p(Some(Kind::MergeRequests), "", false));
-        assert_eq!(parse("!42"), p(Some(Kind::MergeRequests), "#42", true));
-        assert_eq!(parse("#42"), p(Some(Kind::Issues), "#42", true));
-        assert_eq!(parse("&42"), p(Some(Kind::Epics), "&42", true));
-        assert_eq!(parse("e roadmap"), p(Some(Kind::Epics), "roadmap", false));
         assert_eq!(
             parse("  Issues  login  "),
-            p(Some(Kind::Issues), "login", false)
+            p(Some(SearchKind::Issues), "login", false)
         );
-        assert_eq!(parse("g infra"), p(Some(Kind::Groups), "infra", false));
-        assert_eq!(parse("p api"), p(Some(Kind::Projects), "api", false));
+        assert_eq!(
+            parse("g infra"),
+            p(Some(SearchKind::Groups), "infra", false)
+        );
+        assert_eq!(parse("p api"), p(Some(SearchKind::Projects), "api", false));
     }
 
     #[test]
@@ -213,11 +196,11 @@ mod tests {
         assert_eq!(interpret("oa", None), Some(p(None, "oa", false)));
         assert_eq!(
             interpret("mr", None),
-            Some(p(Some(Kind::MergeRequests), "", false))
+            Some(p(Some(SearchKind::Mrs), "", false))
         );
         assert_eq!(
             interpret("i o", None),
-            Some(p(Some(Kind::Issues), "o", false))
+            Some(p(Some(SearchKind::Issues), "o", false))
         );
     }
 
@@ -230,7 +213,7 @@ mod tests {
         assert_eq!(interpret("gl o", Some("gl")), Some(p(None, "o", false)));
         assert_eq!(
             interpret("gl !42", Some("gl")),
-            Some(p(Some(Kind::MergeRequests), "#42", true))
+            Some(p(Some(SearchKind::Mrs), "#42", true))
         );
     }
 
@@ -247,11 +230,11 @@ mod tests {
             let parsed = parse(&text);
             prop_assert_eq!(parsed.query.trim(), parsed.query.as_str());
             if parsed.exact {
-                let sigil = if parsed.kind == Some(Kind::Epics) { '&' } else { '#' };
+                let sigil = if parsed.kind == Some(SearchKind::Epics) { '&' } else { '#' };
                 prop_assert!(parsed.query.starts_with(sigil));
                 prop_assert!(matches!(
                     parsed.kind,
-                    Some(Kind::Issues | Kind::MergeRequests | Kind::Epics)
+                    Some(SearchKind::Issues | SearchKind::Mrs | SearchKind::Epics)
                 ));
             }
             prop_assert_eq!(strip_trigger(&text, "gl").is_some(), {

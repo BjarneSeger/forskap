@@ -16,11 +16,11 @@ use std::time::Duration;
 
 use clap::{Arg, Command, CommandFactory};
 use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
-use forskap_api::{Epic, VarlinkClientInterface};
+use forskap_api::{Epic, SearchKind, VarlinkClientInterface};
 
 use crate::cli::Cli;
 use crate::cmd::epic::group_path;
-use crate::item::{Item, project_path};
+use crate::item::{Item, project_of};
 use crate::refspec::{self, RefKind};
 use crate::state::{LastEpic, LastIssue};
 use crate::{client, state};
@@ -170,7 +170,7 @@ struct Known {
 
 impl From<&Item> for Known {
     fn from(item: &Item) -> Self {
-        let help = match project_path(item.web_url()) {
+        let help = match item.project_path() {
             Some(path) => format!("{} ({path})", item.title()),
             None => item.title().to_string(),
         };
@@ -343,7 +343,7 @@ async fn fetch_items(kind: RefKind, rows: &mut Vec<Item>) -> Option<()> {
             rows.extend(reply.merge_requests.into_iter().map(Item::Mr));
         }
     }
-    let kinds = vec![refspec::search_kind(kind).to_string()];
+    let kinds = vec![refspec::search_kind(kind)];
     let reply = client
         .search(String::new(), Some(kinds), None)
         .call()
@@ -361,14 +361,21 @@ async fn fetch_items(kind: RefKind, rows: &mut Vec<Item>) -> Option<()> {
 async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
     let issues = client.get_assigned_issues(None).call().await.ok()?.issues;
-    let urls = issues.iter().map(|i| i.web_url.as_str());
-    rows.extend(urls.filter_map(project_path).map(|p| (p.to_string(), None)));
+    let paths = issues.iter().map(|i| (&i.project_path, &i.web_url));
     let mrs = client.get_assigned_merge_requests(None).call().await.ok()?;
-    let urls = mrs.merge_requests.iter().map(|m| m.web_url.as_str());
-    rows.extend(urls.filter_map(project_path).map(|p| (p.to_string(), None)));
+    let paths = paths.chain(
+        mrs.merge_requests
+            .iter()
+            .map(|m| (&m.project_path, &m.web_url)),
+    );
+    rows.extend(
+        paths
+            .filter_map(|(path, web_url)| project_of(path, web_url))
+            .map(|p| (p.to_string(), None)),
+    );
 
     let query = current.trim_matches('/').to_string();
-    let kinds = vec!["projects".to_string()];
+    let kinds = vec![SearchKind::projects];
     let reply = client.search(query, Some(kinds), None).call().await.ok()?;
     rows.extend(reply.projects.into_iter().map(|p| (p.path, Some(p.name))));
     Some(())
@@ -377,7 +384,7 @@ async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
 /// The epics opened before, most used first (an empty `Search`).
 async fn fetch_epics(rows: &mut Vec<Epic>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
-    let kinds = vec!["epics".to_string()];
+    let kinds = vec![SearchKind::epics];
     let reply = client
         .search(String::new(), Some(kinds), None)
         .call()
@@ -391,7 +398,7 @@ async fn fetch_epics(rows: &mut Vec<Epic>) -> Option<()> {
 async fn fetch_groups(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
     let query = current.trim_matches('/').to_string();
-    let kinds = vec!["groups".to_string()];
+    let kinds = vec![SearchKind::groups];
     let reply = client.search(query, Some(kinds), None).call().await.ok()?;
     rows.extend(reply.groups.into_iter().map(|g| (g.path, Some(g.name))));
     Some(())

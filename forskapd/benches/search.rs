@@ -7,7 +7,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use forskap_api::{AsyncCall, Call_Search, VarlinkInterface};
+use forskap_api::{AsyncCall, Call_Search, SearchKind, VarlinkInterface};
 use forskapd::query::{parse_iid_query, text_matches};
 
 use support::{dormant_env, seed_search_corpus};
@@ -22,15 +22,15 @@ fn search_handler(c: &mut Criterion) {
         let env = dormant_env();
         seed_search_corpus(&env, n);
         group.throughput(Throughput::Elements(n));
-        let variants: [(&str, &str, Option<Vec<String>>); 4] = [
+        let variants: [(&str, &str, Option<Vec<SearchKind>>); 4] = [
             // Needle matching nothing: the pure per-entry filter cost.
-            ("issues_miss", "zzz-nomatch", Some(vec!["issues".into()])),
+            ("issues_miss", "zzz-nomatch", Some(vec![SearchKind::issues])),
             // ~1% hits: adds sort + truncate + per-hit boards.get reads.
-            ("issues_hits", "flaky", Some(vec!["issues".into()])),
+            ("issues_hits", "flaky", Some(vec![SearchKind::issues])),
             // No kind filter: all four corpora scanned.
             ("all_kinds", "flaky", None),
             // Exact-reference query: parse + iid comparison path.
-            ("iid_ref", "#123", Some(vec!["issues".into()])),
+            ("iid_ref", "#123", Some(vec![SearchKind::issues])),
         ];
         for (variant, query, kinds) in variants {
             group.bench_with_input(BenchmarkId::new(variant, n), &n, |b, _| {

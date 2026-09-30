@@ -12,7 +12,7 @@
 //! `42 --mr` avoids the issue entirely.
 
 use anyhow::{Result, bail};
-use forskap_api::IssuableKind;
+use forskap_api::{IssuableKind, SearchKind};
 use serde::{Deserialize, Serialize};
 
 /// Which kind of issuable a ref denotes. The client-side counterpart of the
@@ -87,10 +87,10 @@ pub fn from_wire(kind: &IssuableKind) -> RefKind {
 }
 
 /// The `Search` kind holding this kind's rows.
-pub fn search_kind(kind: RefKind) -> &'static str {
+pub fn search_kind(kind: RefKind) -> SearchKind {
     match kind {
-        RefKind::Issue => "issues",
-        RefKind::Mr => "merge_requests",
+        RefKind::Issue => SearchKind::issues,
+        RefKind::Mr => SearchKind::merge_requests,
     }
 }
 

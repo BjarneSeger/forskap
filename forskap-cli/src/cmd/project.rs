@@ -15,7 +15,7 @@
 //! error asking for `--project`.
 
 use anyhow::{Result, bail};
-use forskap_api::{Project, VarlinkClient, VarlinkClientInterface};
+use forskap_api::{Project, SearchKind, VarlinkClient, VarlinkClientInterface};
 
 use crate::friendly::friendly;
 use crate::item::Item;
@@ -47,7 +47,7 @@ async fn by_arg(client: &VarlinkClient, project: &str) -> Result<i64> {
     let reply = client
         .search(
             path.to_string(),
-            Some(vec!["projects".to_string()]),
+            Some(vec![SearchKind::projects]),
             Some(SEARCH_LIMIT),
         )
         .call()
@@ -105,7 +105,7 @@ async fn by_iid(client: &VarlinkClient, kind: RefKind, iid: i64) -> Result<i64> 
     let reply = client
         .search(
             format!("#{iid}"),
-            Some(vec![refspec::search_kind(kind).to_string()]),
+            Some(vec![refspec::search_kind(kind)]),
             Some(SEARCH_LIMIT),
         )
         .call()

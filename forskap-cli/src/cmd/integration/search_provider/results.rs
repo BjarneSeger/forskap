@@ -6,7 +6,8 @@ use std::path::Path;
 
 use forskap_api::Search_Reply;
 
-use super::query::Kind;
+use super::query;
+use crate::cli::SearchKind;
 use crate::item;
 use crate::refspec::RefKind;
 
@@ -16,7 +17,7 @@ pub struct Row {
     pub id: String,
     pub title: String,
     pub subtitle: String,
-    pub kind: Kind,
+    pub kind: SearchKind,
     pub score: i64,
     pub url: String,
     /// The project's avatar file, as the daemon downloaded it.
@@ -30,7 +31,7 @@ impl Row {
     pub fn icon(&self) -> &str {
         match &self.avatar {
             Some(file) if Path::new(file).is_file() => file,
-            _ => self.kind.icon(),
+            _ => query::icon(self.kind),
         }
     }
 }
@@ -63,8 +64,12 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
         out.push(Row {
             id: format!("issues:{}:{}", i.project_id, i.iid),
             title: format!("#{} {}", i.iid, i.title),
-            subtitle: join(&[project_path(&i.web_url), &i.state, &i.total_time]),
-            kind: Kind::Issues,
+            subtitle: join(&[
+                project_of(&i.project_path, &i.web_url),
+                &i.state,
+                &i.total_time,
+            ]),
+            kind: SearchKind::Issues,
             score: i.open_count,
             url: i.web_url.clone(),
             avatar: avatar(&i.project_avatar),
@@ -74,8 +79,8 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
         out.push(Row {
             id: format!("merge_requests:{}:{}", m.project_id, m.iid),
             title: format!("!{} {}", m.iid, m.title),
-            subtitle: join(&[project_path(&m.web_url), &m.state]),
-            kind: Kind::MergeRequests,
+            subtitle: join(&[project_of(&m.project_path, &m.web_url), &m.state]),
+            kind: SearchKind::Mrs,
             score: m.open_count,
             url: m.web_url.clone(),
             avatar: avatar(&m.project_avatar),
@@ -86,7 +91,7 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
             id: format!("epic:{}:{}", e.group_id, e.iid),
             title: format!("&{} {}", e.iid, e.title),
             subtitle: join(&[group_path(&e.web_url), &e.state]),
-            kind: Kind::Epics,
+            kind: SearchKind::Epics,
             score: e.open_count,
             url: e.web_url.clone(),
             avatar: None,
@@ -97,7 +102,7 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
             id: format!("url:{}", p.web_url),
             title: p.path.clone(),
             subtitle: p.name.clone(),
-            kind: Kind::Projects,
+            kind: SearchKind::Projects,
             score: 0,
             url: p.web_url.clone(),
             avatar: avatar(&p.avatar),
@@ -108,13 +113,18 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
             id: format!("url:{}", g.web_url),
             title: g.path.clone(),
             subtitle: g.name.clone(),
-            kind: Kind::Groups,
+            kind: SearchKind::Groups,
             score: 0,
             url: g.web_url.clone(),
             avatar: None,
         });
     }
     out
+}
+
+/// [`item::project_of`], empty when the path is unknown.
+fn project_of<'a>(project_path: &'a str, web_url: &'a str) -> &'a str {
+    item::project_of(project_path, web_url).unwrap_or_default()
 }
 
 /// [`item::project_path`], empty when the URL doesn't give the path away.
@@ -185,6 +195,7 @@ mod tests {
                 graph_status: String::new(),
                 open_count: 3,
                 project_avatar: "/cache/avatars/7-a.png".into(),
+                project_path: "team/api".into(),
             }],
             merge_requests: vec![MergeRequest {
                 id: 2,
@@ -196,6 +207,8 @@ mod tests {
                 assignees: vec![],
                 open_count: 0,
                 project_avatar: "/cache/avatars/7-a.png".into(),
+                // Unknown to the daemon: the URL names the project.
+                project_path: String::new(),
             }],
             projects: vec![Project {
                 id: 7,
@@ -246,7 +259,7 @@ mod tests {
         assert_eq!(rows[2].score, 2);
         assert_eq!(rows[3].title, "team/api");
         assert_eq!(rows[3].subtitle, "API");
-        assert_eq!(rows[4].kind, Kind::Groups);
+        assert_eq!(rows[4].kind, SearchKind::Groups);
     }
 
     #[test]
@@ -265,9 +278,9 @@ mod tests {
         assert_eq!(row.icon(), file.to_str().unwrap());
 
         std::fs::remove_file(&file).unwrap();
-        assert_eq!(row.icon(), Kind::Issues.icon());
+        assert_eq!(row.icon(), query::icon(SearchKind::Issues));
         row.avatar = None;
-        assert_eq!(row.icon(), Kind::Issues.icon());
+        assert_eq!(row.icon(), query::icon(SearchKind::Issues));
     }
 
     #[test]

@@ -89,6 +89,14 @@ local function projectPath(webUrl)
   return path or ""
 end
 
+-- The path the item carries; an older `forskap` has it only in the URL.
+local function issuableProject(item)
+  if item.project_path ~= nil and item.project_path ~= "" then
+    return item.project_path
+  end
+  return projectPath(item.web_url)
+end
+
 -- "https://gl/groups/team/-/epics/5" → "team": group pages live under
 -- `/groups/`, which is no part of the group's path.
 local function groupPath(webUrl)
@@ -120,7 +128,7 @@ local function issuableRow(kind, sigil, item)
   return {
     id = string.format("%s:%d:%d", kind, item.project_id, item.iid),
     title = string.format("%s%d %s", sigil, item.iid, item.title),
-    subtitle = joinNonEmpty({ projectPath(item.web_url), item.state, item.total_time }),
+    subtitle = joinNonEmpty({ issuableProject(item), item.state, item.total_time }),
     glyph = GLYPH[kind],
     icon = avatarIcon(item.project_avatar),
     category = CATEGORY[kind],

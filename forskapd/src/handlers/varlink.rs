@@ -8,12 +8,12 @@ use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 
 use forskap_api::{
-    ActivityEvent, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
+    ActivityEvent, CacheScope, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
     Call_DismissFailure, Call_GetActivity, Call_GetAssignedIssues, Call_GetAssignedMergeRequests,
     Call_GetFailures, Call_GetHistory, Call_GetSyncJobs, Call_Login, Call_Logout, Call_PostTime,
     Call_RecordEpicOpen, Call_RecordOpen, Call_RetryFailure, Call_Search, Call_UnassignSelf,
-    Call_WhoAmI, Epic, FailedTask, Group, HistoryEvent, IssuableKind, Issue, MergeRequest, Project,
-    VarlinkInterface,
+    Call_WhoAmI, Epic, FailedTask, Group, HistoryEvent, HistorySource, IssuableKind, Issue,
+    MergeRequest, Project, SearchKind, VarlinkInterface,
 };
 
 use crate::error::{DormancyReason, Error};
@@ -31,9 +31,6 @@ use super::{
     ConnState, Handlers, Session, dormant_args, issue_ref_error, looks_like_duration, now_secs,
     wire,
 };
-
-/// The kind strings `Search` accepts, matching the `ClearCache` scope style.
-const SEARCH_KINDS: [&str; 5] = ["issues", "merge_requests", "projects", "groups", "epics"];
 
 /// How long `GetSyncJobs` waits for the worker, which answers between two
 /// awaits even with a fetch in flight.
@@ -283,31 +280,50 @@ impl<'a> BoardLabels<'a> {
     }
 
     /// The wire issue for `i`, with its `graph_status` from the board labels.
-    fn wire(&mut self, i: model::Issue, open_count: i64, project_avatar: String) -> Issue {
+    fn wire(&mut self, i: model::Issue, open_count: i64, project: wire::ProjectInfo) -> Issue {
         let labels = self.of(i.project_id).map(<[String]>::to_vec);
-        wire::issue(i, labels.as_deref(), open_count, project_avatar)
+        wire::issue(i, labels.as_deref(), open_count, project)
     }
 }
 
-/// Avatar file paths per project, read at most once per request from the
-/// rows the sync wrote; the filesystem is never asked.
-struct Avatars<'a> {
+/// What the items show of their project: its path and its avatar file, each
+/// read at most once per request from the rows the sync wrote; the
+/// filesystem is never asked.
+struct Projects<'a> {
     handlers: &'a Handlers,
-    by_project: HashMap<i64, String>,
+    avatars: HashMap<i64, String>,
+    paths: HashMap<i64, Option<String>>,
 }
 
-impl<'a> Avatars<'a> {
+impl<'a> Projects<'a> {
     fn new(handlers: &'a Handlers) -> Self {
         Self {
             handlers,
-            by_project: HashMap::new(),
+            avatars: HashMap::new(),
+            paths: HashMap::new(),
+        }
+    }
+
+    fn of(&mut self, project_id: i64) -> wire::ProjectInfo {
+        let h = self.handlers;
+        let path = self.paths.entry(project_id).or_insert_with(|| {
+            let row = h.store().projects.get((project_id.max(0) as u64, 0));
+            row.unwrap_or_else(|e| {
+                warn!(error = %e, project_id, "project read failed");
+                None
+            })
+            .map(|p| p.path_with_namespace)
+        });
+        wire::ProjectInfo {
+            path: path.clone(),
+            avatar: self.avatar(project_id),
         }
     }
 
     /// The absolute path of the project's avatar, empty when it has none.
-    fn of(&mut self, project_id: i64) -> String {
+    fn avatar(&mut self, project_id: i64) -> String {
         let h = self.handlers;
-        self.by_project
+        self.avatars
             .entry(project_id)
             .or_insert_with(|| {
                 let row = h.store().avatars.get((project_id.max(0) as u64, 0));
@@ -458,13 +474,13 @@ impl VarlinkInterface for Handlers {
 
         let usage = self.usage_or_empty();
         let mut boards = BoardLabels::new(self);
-        let mut avatars = Avatars::new(self);
+        let mut projects = Projects::new(self);
         let issues: Vec<Issue> = rows
             .into_iter()
             .map(|i| {
                 let open = open_count_of(usage.get(Issuable::Issue, i.project_id, i.iid));
-                let avatar = avatars.of(i.project_id);
-                boards.wire(i, open, avatar)
+                let project = projects.of(i.project_id);
+                boards.wire(i, open, project)
             })
             .collect();
         debug!(count = issues.len(), "serving assigned issues");
@@ -489,13 +505,13 @@ impl VarlinkInterface for Handlers {
         rows.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
 
         let usage = self.usage_or_empty();
-        let mut avatars = Avatars::new(self);
+        let mut projects = Projects::new(self);
         let mrs: Vec<MergeRequest> = rows
             .into_iter()
             .map(|m| {
                 let open = open_count_of(usage.get(Issuable::MergeRequest, m.project_id, m.iid));
-                let avatar = avatars.of(m.project_id);
-                wire::merge_request(m, open, avatar)
+                let project = projects.of(m.project_id);
+                wire::merge_request(m, open, project)
             })
             .collect();
         debug!(count = mrs.len(), "serving assigned merge requests");
@@ -507,7 +523,7 @@ impl VarlinkInterface for Handlers {
         &self,
         call: &mut dyn Call_Search,
         query: String,
-        kinds: Option<Vec<String>>,
+        kinds: Option<Vec<SearchKind>>,
         limit: Option<i64>,
     ) -> varlink::Result<()> {
         // An empty query is the "frequently opened" view: only issues, MRs and
@@ -521,13 +537,7 @@ impl VarlinkInterface for Handlers {
             Some(n) => return call.reply_gitlab_error(format!("invalid limit: {n}")),
         };
         let kinds = kinds.unwrap_or_default();
-        if let Some(bad) = kinds.iter().find(|k| !SEARCH_KINDS.contains(&k.as_str())) {
-            return call.reply_gitlab_error(format!(
-                "unknown kind {bad:?} (expected one of: {})",
-                SEARCH_KINDS.join(", ")
-            ));
-        }
-        let want = |k: &str| kinds.is_empty() || kinds.iter().any(|x| x == k);
+        let want = |k: SearchKind| kinds.is_empty() || kinds.contains(&k);
 
         reply_if_cold!(
             self,
@@ -538,10 +548,10 @@ impl VarlinkInterface for Handlers {
 
         let iid_query = parse_iid_query(&query);
         let usage = self.usage_or_empty();
-        let mut avatars = Avatars::new(self);
+        let mut project_info = Projects::new(self);
 
         let mut issues: Vec<Issue> = Vec::new();
-        if want("issues") {
+        if want(SearchKind::issues) {
             let mut hits: Vec<(Option<UsageEntry>, model::Issue)> = self
                 .all::<model::Issue>()
                 .into_iter()
@@ -555,14 +565,14 @@ impl VarlinkInterface for Handlers {
             issues = hits
                 .into_iter()
                 .map(|(u, i)| {
-                    let avatar = avatars.of(i.project_id);
-                    boards.wire(i, open_count_of(u), avatar)
+                    let project = project_info.of(i.project_id);
+                    boards.wire(i, open_count_of(u), project)
                 })
                 .collect();
         }
 
         let mut merge_requests: Vec<MergeRequest> = Vec::new();
-        if want("merge_requests") {
+        if want(SearchKind::merge_requests) {
             let mut hits: Vec<(Option<UsageEntry>, model::MergeRequest)> = self
                 .all::<model::MergeRequest>()
                 .into_iter()
@@ -575,14 +585,14 @@ impl VarlinkInterface for Handlers {
             merge_requests = hits
                 .into_iter()
                 .map(|(u, m)| {
-                    let avatar = avatars.of(m.project_id);
-                    wire::merge_request(m, open_count_of(u), avatar)
+                    let project = project_info.of(m.project_id);
+                    wire::merge_request(m, open_count_of(u), project)
                 })
                 .collect();
         }
 
         let mut projects: Vec<Project> = Vec::new();
-        if want("projects") && !frequent_only {
+        if want(SearchKind::projects) && !frequent_only {
             let mut hits = self.all::<model::Project>();
             hits.retain(|p| {
                 text_matches(&needle, &p.name) || text_matches(&needle, &p.path_with_namespace)
@@ -592,14 +602,14 @@ impl VarlinkInterface for Handlers {
             projects = hits
                 .into_iter()
                 .map(|p| {
-                    let avatar = avatars.of(p.id);
+                    let avatar = project_info.avatar(p.id);
                     wire::project(p, avatar)
                 })
                 .collect();
         }
 
         let mut groups: Vec<Group> = Vec::new();
-        if want("groups") && !frequent_only {
+        if want(SearchKind::groups) && !frequent_only {
             let mut hits = self.all::<model::Group>();
             hits.retain(|g| text_matches(&needle, &g.name) || text_matches(&needle, &g.full_path));
             hits.sort_by(|a, b| a.full_path.cmp(&b.full_path));
@@ -608,7 +618,7 @@ impl VarlinkInterface for Handlers {
         }
 
         let mut epics: Vec<Epic> = Vec::new();
-        if want("epics") {
+        if want(SearchKind::epics) {
             let epic_query = parse_epic_query(&query);
             let mut hits: Vec<(Option<UsageEntry>, model::Epic)> = self
                 .all::<model::Epic>()
@@ -640,11 +650,9 @@ impl VarlinkInterface for Handlers {
     async fn clear_cache(
         &self,
         call: &mut dyn Call_ClearCache,
-        scope: Option<Vec<String>>,
+        scope: Option<Vec<CacheScope>>,
     ) -> varlink::Result<()> {
         let scopes = scope.unwrap_or_default();
-        let all = scopes.is_empty();
-        let want = |s: &str| all || scopes.iter().any(|x| x == s);
 
         let now = now_secs();
         let (quick_start, retention_start) = {
@@ -654,25 +662,27 @@ impl VarlinkInterface for Handlers {
                 now.saturating_sub(c.history.retention().as_secs()),
             )
         };
+        let timelogs = |from, until| Some(Clear::Timelogs { from, until });
         let mut clears = Vec::new();
-        if all {
+        // Open statistics are user data, not a cache: only an explicit scope
+        // clears them, never the "everything" default.
+        let mut usage = false;
+        if scopes.is_empty() {
             clears.push(Clear::Everything);
-        } else {
-            if want("issues") {
-                clears.push(Clear::Assigned);
-            }
-            if want("search") {
-                clears.push(Clear::Corpus);
-            }
-            for (band, from, until) in [
-                ("quick", quick_start, u64::MAX),
-                ("slow", retention_start, quick_start),
-                ("stale", 0, retention_start),
-            ] {
-                if want(band) {
-                    clears.push(Clear::Timelogs { from, until });
+        }
+        for scope in &scopes {
+            let clear = match scope {
+                CacheScope::assigned => Some(Clear::Assigned),
+                CacheScope::search => Some(Clear::Corpus),
+                CacheScope::quick => timelogs(quick_start, u64::MAX),
+                CacheScope::slow => timelogs(retention_start, quick_start),
+                CacheScope::stale => timelogs(0, retention_start),
+                CacheScope::usage => {
+                    usage = true;
+                    None
                 }
-            }
+            };
+            clears.extend(clear.filter(|c| !clears.contains(c)));
         }
         let mut refill: Vec<Job> = clears.iter().flat_map(|c| c.refill()).copied().collect();
         refill.sort_unstable();
@@ -684,9 +694,7 @@ impl VarlinkInterface for Handlers {
             c.await;
         }
 
-        // Open statistics are user data, not a cache: only an explicit scope
-        // clears them, never the "everything" default.
-        if scopes.iter().any(|s| s == "usage") {
+        if usage {
             if let Err(e) = self.usage.clear() {
                 warn!("usage stats clear failed: {e}");
             } else {
@@ -780,7 +788,7 @@ impl VarlinkInterface for Handlers {
                     .unwrap_or_default();
                     events.push(HistoryEvent {
                         timestamp: p.queued_at_secs as i64,
-                        source: "queued".to_string(),
+                        source: HistorySource::queued,
                         kind: wire::kind(kind),
                         project_id,
                         iid,
