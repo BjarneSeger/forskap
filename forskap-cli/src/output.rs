@@ -39,7 +39,7 @@ fn write_to(out: &mut impl Write, args: fmt::Arguments) -> Result<()> {
     }
 }
 
-/// Print `value` as pretty JSON, or hand it to `text` to print.
+/// Print `value` as pretty JSON or as YAML, or hand it to `text` to print.
 pub fn emit<T: Serialize + ?Sized>(
     format: OutputFormat,
     value: &T,
@@ -47,6 +47,8 @@ pub fn emit<T: Serialize + ?Sized>(
 ) -> Result<()> {
     match format {
         OutputFormat::Json => outln!("{}", serde_json::to_string_pretty(value)?),
+        // The serializer ends the document with a newline itself.
+        OutputFormat::Yaml => out!("{}", serde_saphyr::to_string(&value)?),
         OutputFormat::Text => text(value),
     }
 }
@@ -71,6 +73,19 @@ mod tests {
     fn closed_pipe_is_its_own_error() {
         let err = write_to(&mut Failing(io::ErrorKind::BrokenPipe), format_args!("x")).unwrap_err();
         assert!(err.is::<StdoutClosed>());
+    }
+
+    #[test]
+    fn yaml_ends_in_one_newline() {
+        let value = serde_json::json!({
+            "items": [{"iid": 1, "title": "a: b", "labels": [], "due": null}],
+            "note": "two\nlines",
+        });
+        let yaml = serde_saphyr::to_string(&value).unwrap();
+        assert!(yaml.ends_with('\n') && !yaml.ends_with("\n\n"), "{yaml:?}");
+        let empty: [u8; 0] = [];
+        let yaml = serde_saphyr::to_string(&empty).unwrap();
+        assert!(yaml.ends_with('\n') && !yaml.ends_with("\n\n"), "{yaml:?}");
     }
 
     #[test]
