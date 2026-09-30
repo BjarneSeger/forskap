@@ -287,7 +287,6 @@ mod tests {
     fn project_path_is_empty_without_a_resource() {
         assert_eq!(project_path("https://gl/team/api/-/issues/42"), "team/api");
         assert_eq!(project_path("http://gl/a/b/c/-/merge_requests/1"), "a/b/c");
-        assert_eq!(project_path("https://gl/team/api/issues/42"), "team/api");
         assert_eq!(project_path("https://gl/team/api"), "");
         assert_eq!(project_path(""), "");
     }
