@@ -9,6 +9,7 @@ use super::{locate, lookup};
 use crate::cli::TargetArgs;
 use crate::friendly::friendly;
 use crate::refspec::{self, RefKind};
+use crate::style;
 
 pub async fn run(kind: RefKind, target: TargetArgs, no_browser: bool) -> Result<()> {
     let iid = target.iid;
@@ -29,6 +30,9 @@ pub async fn run(kind: RefKind, target: TargetArgs, no_browser: bool) -> Result<
             eprintln!("(couldn't open browser automatically: {e})");
         }
     }
-    outln!("opened {}{iid} {web_url}", refspec::sigil(kind))?;
+    outln!(
+        "opened {} {web_url}",
+        style::reference(refspec::sigil(kind), iid)
+    )?;
     Ok(())
 }

@@ -42,6 +42,7 @@ mod migrate;
 mod pick;
 mod refspec;
 mod state;
+mod style;
 mod watch;
 
 use cli::{Cli, Command};
@@ -76,7 +77,8 @@ fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     migrate::run();
-    let command = Cli::parse().command;
+    let Cli { color, command } = Cli::parse();
+    style::init(color);
     if !matches!(command, Command::Tick { .. } | Command::Prompt) {
         note_old_name();
     }

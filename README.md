@@ -80,6 +80,8 @@ forskap sync jobs               # what the background sync runs now, next, and w
 cache; when a number exists in several projects, name one with `-p`, as full path
 or numeric ID. `forskap epic` has `view` and `open`; epics belong to a group, so an
 ambiguous number takes `-g`. Commands that print data take `-o json` or `-o yaml`.
+On a terminal the text output colours state words, headings and item numbers;
+`--color always|never` overrules that, and `NO_COLOR` is honoured.
 `forskap sync jobs` and `forskap queue list` take `-w`/`--watch [SECS]` to redraw
 their text view every SECS seconds (2 by default) until Ctrl-C; while the daemon
 is away the watch shows the error and keeps trying.

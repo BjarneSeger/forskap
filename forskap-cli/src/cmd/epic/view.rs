@@ -4,13 +4,13 @@ use anyhow::Result;
 
 use super::locate;
 use crate::cli::{EpicArgs, OutputFormat};
-use crate::output;
+use crate::{output, style};
 
 pub async fn run(target: EpicArgs, format: OutputFormat) -> Result<()> {
     let (_client, epic) = locate(&target).await?;
     output::emit(format, &epic, |e| {
-        outln!("&{} {}", e.iid, e.title)?;
-        field("state", &e.state)?;
+        outln!("{} {}", style::reference('&', e.iid), e.title)?;
+        field("state", &style::state(&e.state).to_string())?;
         field("group", &e.group_id.to_string())?;
         field("url", &e.web_url)?;
         if e.open_count > 0 {

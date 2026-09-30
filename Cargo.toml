@@ -42,6 +42,8 @@ proptest = "1"
 # CLI
 clap = { version = "4.6", features = ["derive", "wrap_help"] }
 inquire = "0.9"
+# Already in the tree through clap.
+anstyle = "1"
 confique = { version = "0.4.0", default-features = false, features = ["toml"] }
 # `unstable-dynamic` (the completion engine behind `COMPLETE=<shell> forskap`)
 # carries no semver promise, so this is pinned exactly: bump it deliberately

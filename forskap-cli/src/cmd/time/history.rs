@@ -7,7 +7,7 @@ use forskap_api::{IssuableKind, VarlinkClientInterface};
 
 use crate::cli::OutputFormat;
 use crate::friendly::friendly;
-use crate::{client, output};
+use crate::{client, output, style};
 
 pub async fn run(days: u32, format: OutputFormat) -> Result<()> {
     let client = client::connect_default().await?;
@@ -27,9 +27,9 @@ pub async fn run(days: u32, format: OutputFormat) -> Result<()> {
                 IssuableKind::issue => '#',
             };
             outln!(
-                "{ts}  {:<8}  {sigil}{:<5}  {:<6}  {}",
-                e.source,
-                e.iid,
+                "{ts}  {:<8}  {:<6}  {:<6}  {}",
+                style::state(&e.source),
+                style::reference(sigil, e.iid),
                 e.duration,
                 e.title
             )?;

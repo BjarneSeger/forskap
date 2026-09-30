@@ -9,7 +9,7 @@ use forskap_api::VarlinkClientInterface;
 
 use crate::cli::{OutputFormat, SearchKind};
 use crate::friendly::friendly;
-use crate::{client, output};
+use crate::{client, output, style};
 
 pub async fn run(
     query: Vec<String>,
@@ -45,12 +45,12 @@ pub async fn run(
             );
         }
         if !reply.issues.is_empty() {
-            outln!("Issues:")?;
+            outln!("{}", style::heading("Issues:"))?;
             for i in &reply.issues {
                 outln!(
-                    "  #{:<5} {:<8} {}  {}{}",
-                    i.iid,
-                    i.state,
+                    "  {:<6} {:<8} {}  {}{}",
+                    style::reference('#', i.iid),
+                    style::state(&i.state),
                     i.title,
                     i.web_url,
                     opened(i.open_count)
@@ -58,12 +58,12 @@ pub async fn run(
             }
         }
         if !reply.merge_requests.is_empty() {
-            outln!("Merge requests:")?;
+            outln!("{}", style::heading("Merge requests:"))?;
             for m in &reply.merge_requests {
                 outln!(
-                    "  !{:<5} {:<8} {}  {}{}",
-                    m.iid,
-                    m.state,
+                    "  {:<6} {:<8} {}  {}{}",
+                    style::reference('!', m.iid),
+                    style::state(&m.state),
                     m.title,
                     m.web_url,
                     opened(m.open_count)
@@ -71,12 +71,12 @@ pub async fn run(
             }
         }
         if !reply.epics.is_empty() {
-            outln!("Epics:")?;
+            outln!("{}", style::heading("Epics:"))?;
             for e in &reply.epics {
                 outln!(
-                    "  &{:<5} {:<8} {}  {}{}",
-                    e.iid,
-                    e.state,
+                    "  {:<6} {:<8} {}  {}{}",
+                    style::reference('&', e.iid),
+                    style::state(&e.state),
                     e.title,
                     e.web_url,
                     opened(e.open_count)
@@ -84,13 +84,13 @@ pub async fn run(
             }
         }
         if !reply.projects.is_empty() {
-            outln!("Projects:")?;
+            outln!("{}", style::heading("Projects:"))?;
             for p in &reply.projects {
                 outln!("  {}  {}", p.path, p.web_url)?;
             }
         }
         if !reply.groups.is_empty() {
-            outln!("Groups:")?;
+            outln!("{}", style::heading("Groups:"))?;
             for g in &reply.groups {
                 outln!("  {}  {}", g.path, g.web_url)?;
             }

@@ -51,7 +51,7 @@ The daemon is built around a shared session slot and the principle that it **nev
 
 ## forskap-cli conventions
 
-`forskap` is deliberately thin: argument parsing, local state, interactive UI — all GitLab access goes through the daemon socket. GitLab issues have a global `id` and a per-project `iid`; users know the `iid`, so `forskap issue` / `forskap mr` take the `iid` positionally and resolve the project lazily (`cmd/project.rs`).
+`forskap` is deliberately thin: argument parsing, local state, interactive UI — all GitLab access goes through the daemon socket. GitLab issues have a global `id` and a per-project `iid`; users know the `iid`, so `forskap issue` / `forskap mr` take the `iid` positionally and resolve the project lazily (`cmd/project.rs`). Text views take their colours from the named helpers in `style.rs` (state, heading, reference, error), which also settles `--color`; pad with the helper's value (`{:<8}`), never around a styled string.
 
 ## Error handling
 

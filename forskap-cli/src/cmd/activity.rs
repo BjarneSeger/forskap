@@ -8,7 +8,7 @@ use forskap_api::{ActivityEvent, VarlinkClientInterface};
 
 use crate::cli::OutputFormat;
 use crate::friendly::friendly;
-use crate::{client, output};
+use crate::{client, output, style};
 
 pub async fn run(days: u32, format: OutputFormat) -> Result<()> {
     let client = client::connect_default().await?;
@@ -32,7 +32,8 @@ pub async fn run(days: u32, format: OutputFormat) -> Result<()> {
                 if day.is_some() {
                     outln!("")?;
                 }
-                outln!("{}", at.format("%a %Y-%m-%d"))?;
+                let date = at.format("%a %Y-%m-%d").to_string();
+                outln!("{}", style::heading(&date))?;
                 day = Some(at.date_naive());
             }
             outln!("  {}  {}", at.format("%H:%M"), describe(e))?;
@@ -55,7 +56,7 @@ fn describe(e: &ActivityEvent) -> String {
         _ => "",
     };
     let item = match e.target_iid {
-        Some(iid) if !sigil.is_empty() => format!("{project}{sigil}{iid}"),
+        Some(iid) if !sigil.is_empty() => format!("{project}{}", style::reference(sigil, iid)),
         _ => project,
     };
     let detail = match (&e.r#ref, &e.commit_title) {
@@ -123,6 +124,13 @@ mod tests {
             describe(&event("joined", "", None)),
             "joined        team/api"
         );
+
+        style::force(true);
+        assert_eq!(
+            describe(&closed),
+            "closed        team/api\x1b[36m#3\x1b[0m  Fix the login"
+        );
+        style::force(false);
 
         // A note's number is no item number, and an unknown project shows its id.
         let mut wiki = event("created", "WikiPage::Meta", Some(9));

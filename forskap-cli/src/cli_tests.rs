@@ -4,8 +4,8 @@ use clap::{CommandFactory, Parser};
 use clap_complete::ArgValueCompleter;
 
 use crate::cli::{
-    Cli, Command, EpicCommand, ItemCommand, OutputFormat, QueueCommand, RefreshScope, SyncCommand,
-    TickMode, TimeCommand,
+    Cli, ColorChoice, Command, EpicCommand, ItemCommand, OutputFormat, QueueCommand, RefreshScope,
+    SyncCommand, TickMode, TimeCommand,
 };
 
 fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -237,6 +237,21 @@ fn watch_takes_an_optional_interval() {
     assert!(parse(&["sync", "jobs", "--watch", "0"]).is_err());
     assert!(parse(&["sync", "jobs", "--watch", "soon"]).is_err());
     assert!(parse(&["issue", "list", "--watch"]).is_err());
+}
+
+#[test]
+fn color_is_accepted_anywhere() {
+    let color = |args: &[&str]| parse(args).map(|cli| cli.color).ok();
+    assert_eq!(color(&["issue", "list"]), Some(ColorChoice::Auto));
+    assert_eq!(
+        color(&["--color", "never", "issue", "list"]),
+        Some(ColorChoice::Never)
+    );
+    assert_eq!(
+        color(&["sync", "jobs", "-w", "--color=always"]),
+        Some(ColorChoice::Always)
+    );
+    assert_eq!(color(&["issue", "list", "--color", "blue"]), None);
 }
 
 #[test]
