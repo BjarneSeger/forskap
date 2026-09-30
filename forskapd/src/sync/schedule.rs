@@ -74,8 +74,11 @@ pub fn run_is_full(
 }
 
 /// `secs` scaled by a factor in `[1 - jitter, 1 + jitter]`, deterministic in
-/// `key` and `seed`.
+/// `key` and `seed`. `u64::MAX` means never and stays that.
 pub fn jittered(secs: u64, key: &str, seed: u64, jitter: f64) -> u64 {
+    if secs == u64::MAX {
+        return secs;
+    }
     let offset = (2.0 * unit(key, seed) - 1.0) * jitter.clamp(0.0, 0.5);
     (secs as f64 * (1.0 + offset)).round() as u64
 }
@@ -223,17 +226,17 @@ mod tests {
     }
 
     proptest! {
-        /// Events use `u64::MAX` for "never full again"; jitter must not
-        /// overflow it into a panic.
+        /// Events use `u64::MAX` for "never full again", avatars for "never
+        /// again": jitter must not turn that into a time.
         #[test]
-        fn a_never_full_cadence_never_overflows(
+        fn a_never_cadence_stays_never(
             key in "[a-z]{1,8}",
             at in 1u64..4_000_000_000,
             jitter in 0.0f64..0.5,
         ) {
             let never = Cadence { every: u64::MAX, full_every: Some(u64::MAX) };
             prop_assert!(!run_is_full(&key, &synced(at, 1), never, 1, jitter, at + 1));
-            prop_assert!(due_at(&key, &synced(at, 1), never, 1, jitter) > at);
+            prop_assert_eq!(due_at(&key, &synced(at, 1), never, 1, jitter), u64::MAX);
         }
     }
 
