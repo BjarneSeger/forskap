@@ -34,6 +34,7 @@ mod cli;
 mod cli_tests;
 mod client;
 mod cmd;
+mod columns;
 mod complete;
 mod config;
 mod friendly;

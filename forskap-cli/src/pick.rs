@@ -93,7 +93,7 @@ fn by_place<T>(
     title: impl Fn(&T) -> &str,
 ) -> Vec<Labeled<T>> {
     let places: Vec<String> = values.iter().map(place).collect();
-    let width = places.iter().map(|p| p.chars().count()).max().unwrap_or(0);
+    let [width] = crate::columns::widths(places.iter().map(|p| [p]));
     values
         .into_iter()
         .zip(places)

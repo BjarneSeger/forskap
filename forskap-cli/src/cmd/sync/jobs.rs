@@ -12,7 +12,7 @@ use forskap_api::{GetSyncJobs_Reply, SyncJob, SyncJobStatus, VarlinkClientInterf
 
 use crate::cli::{OutputFormat, WatchArgs};
 use crate::friendly::friendly;
-use crate::{client, output, style, watch};
+use crate::{client, columns, output, style, watch};
 
 pub async fn run(all: bool, format: OutputFormat, watch: WatchArgs) -> Result<()> {
     match watch::interval(watch, format)? {
@@ -112,11 +112,7 @@ fn render(jobs: &[SyncJob], paused_until: Option<i64>, now: i64, all: bool) -> S
     }
     let rows = rows(jobs, now, all);
     let header = ["JOB", "STATUS", "LAST SYNC", "NEXT"].map(str::to_string);
-    let width = |col: usize| {
-        let cells = rows.iter().map(|r| &r.cells).chain([&header]);
-        cells.map(|r| r[col].chars().count()).max().unwrap_or(0)
-    };
-    let (w0, w1, w2) = (width(0), width(1), width(2));
+    let [w0, w1, w2] = columns::widths(rows.iter().map(|r| &r.cells).chain([&header]));
     let line = |[job, status, last, next]: &[String; 4]| {
         let status = style::state(status);
         format!("{job:<w0$}  {status:<w1$}  {last:<w2$}  {next}\n")
