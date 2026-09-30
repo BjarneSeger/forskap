@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
@@ -28,6 +28,7 @@ use crate::db::KvStore;
 use crate::error::{Error, Result};
 use crate::gitlab::{GitlabApi, Issuable};
 use crate::handlers::SessionSlot;
+use crate::sync::now_secs;
 use crate::write::{Write, WriteOp};
 
 const QUEUE_KEYSPACE: &str = "retry_queue_v1";
@@ -799,12 +800,6 @@ async fn worker(
     )
     .run()
     .await;
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]
