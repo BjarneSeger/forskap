@@ -155,6 +155,13 @@ func (c *Client) GetHistory(ctx context.Context, days *int64) ([]HistoryEvent, e
 	return GetHistory().Call(ctx, c.conn, days)
 }
 
+// GetActivity returns the user's contribution events (pushes, comments,
+// opened and merged items), newest first, optionally limited to the last n
+// days (nil = daemon default window). Served from what the daemon synced.
+func (c *Client) GetActivity(ctx context.Context, days *int64) ([]ActivityEvent, error) {
+	return GetActivity().Call(ctx, c.conn, days)
+}
+
 // GetFailures returns queued operations that have failed.
 func (c *Client) GetFailures(ctx context.Context) ([]FailedTask, error) {
 	return GetFailures().Call(ctx, c.conn)

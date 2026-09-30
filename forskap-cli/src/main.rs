@@ -88,6 +88,9 @@ async fn run() -> Result<()> {
             limit,
             output,
         } => cmd::search::run(query, kinds, limit, output.output).await,
+        Command::Activity { window, output } => {
+            cmd::activity::run(window.days, output.output).await
+        }
         Command::Time { command } => cmd::time::run(command).await,
         Command::Auth { command } => cmd::auth::run(command).await,
         Command::Sync { command } => cmd::sync::run(command).await,

@@ -87,6 +87,22 @@ type SyncJob (
 ```
 
 ```varlink
+type ActivityEvent (
+  timestamp:    int,      # unix seconds
+  action:       string,   # GitLab's action name: "pushed to", "opened", "commented on", "accepted", "joined", …
+  target_type:  string,   # "Issue", "MergeRequest", "Milestone", …; of a comment, what was commented on; empty on pushes and membership events
+  target_iid:   ?int,     # the target's number in its project, where it has one
+  target_title: ?string,
+  project_id:   int,      # 0 for events outside a project
+  project_path: ?string,  # null when neither the project nor the item is in the store
+  web_url:      ?string,  # the issue / MR, a pushed branch's commits, else the project; null when unknown
+  ref:          ?string,  # pushes only: the branch or tag
+  commit_count: ?int,     # pushes only
+  commit_title: ?string   # pushes only: the newest commit's title; null when the ref was deleted
+)
+```
+
+```varlink
 type FailedTask (
   id:         int,          # handle for RetryFailure / DismissFailure
   op:         string,       # which write failed ("PostTime", "Close", "AssignSelf", "UnassignSelf")
@@ -239,6 +255,20 @@ distinguished by `source`: `"gitlab"` — timelogs synced from GitLab; `"queued"
 up even while GitLab is unreachable). Events carry the issuable `kind` — time logged
 on merge requests appears here like issue time. Served from local state; never
 errors on cache trouble (degrades to whatever is readable).
+
+### `GetActivity(days: ?int) -> (events: []ActivityEvent)`
+
+The user's contribution events (GitLab's `GET /events`: pushes, comments, opened,
+closed and merged items, memberships) from the last `days` days (default 7), newest
+first. They are the events the sync keeps as evidence for the `"tracked"` population,
+so they reach back `search.tracked_retention_hours` (default 90 days) at most: a
+larger `days` returns what is stored. Events carry no link of their own; `web_url`
+and `project_path` come from the stored issue, merge request and project rows and
+are null for events in projects the store doesn't know (the project row exists for
+member projects only). A comment's text is not stored. Served from the store alone;
+degrades to an empty reply on cache trouble. When the events have never been synced:
+replies with an empty array if a session exists (first sync pending),
+`NotAuthenticated` otherwise.
 
 ### `WhoAmI() -> (host: string, user_id: int, token_expires_at: ?int, token_rotates: bool)`
 

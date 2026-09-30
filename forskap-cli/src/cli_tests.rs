@@ -92,6 +92,7 @@ fn output_only_where_data_is_printed() {
         &["issue", "list"][..],
         &["mr", "view", "1"],
         &["search"],
+        &["activity"],
         &["time", "history"],
         &["auth", "status"],
         &["queue", "list"],

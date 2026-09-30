@@ -163,12 +163,59 @@ pub struct Event {
     pub action_name: String,
     #[serde(default, deserialize_with = "de::nullable")]
     pub target_type: String,
+    /// The target's number within the project; 0 when the event has none
+    /// (a push, joining). On a comment it is the note's id: see [`Self::target`].
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub target_iid: i64,
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub target_title: String,
+    /// Set on pushes only.
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub push_data: PushData,
+    /// Set on comments only.
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub note: NoteRef,
     /// Unix seconds.
     #[serde(default, deserialize_with = "de::timestamp")]
     pub created_at: u64,
 }
 
+/// What a push event pushed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PushData {
+    /// Branch or tag name.
+    #[serde(default, rename = "ref", deserialize_with = "de::nullable")]
+    pub git_ref: String,
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub commit_count: i64,
+    /// Title of the newest commit; empty when the push deleted the ref.
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub commit_title: String,
+}
+
+/// What a comment event commented on. The note's text is not kept.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NoteRef {
+    /// `"Issue"`, `"MergeRequest"`, `"Commit"`, …
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub noteable_type: String,
+    /// 0 where the commented thing has no number (a commit).
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub noteable_iid: i64,
+}
+
 impl Event {
+    /// The kind and number of what the event is about, empty and 0 where
+    /// there is none. A comment's own target is the note, so it answers
+    /// with what was commented on.
+    pub fn target(&self) -> (&str, i64) {
+        if self.note.noteable_type.is_empty() {
+            (&self.target_type, self.target_iid)
+        } else {
+            (&self.note.noteable_type, self.note.noteable_iid)
+        }
+    }
+
     /// Whether the event shows the user working in its project. Membership
     /// changes don't: being added to a project isn't activity in it.
     pub fn is_activity(&self) -> bool {
@@ -303,7 +350,7 @@ impl Resource for Group {
 impl Resource for Event {
     const NAME: &'static str = "events";
     const KEYSPACE: &'static str = "gl_events_v1";
-    const SCHEMA: u32 = 1;
+    const SCHEMA: u32 = 2;
     fn key(&self) -> RowKey {
         (self.created_at, positive(self.id))
     }
@@ -578,6 +625,50 @@ mod tests {
         assert!(!e("created", json!("WikiPage::Meta"), 7).implies_membership());
         assert!(!e("opened", json!("Issue"), 7).implies_membership());
         assert!(!e("created", json!("Project"), 0).implies_membership());
+    }
+
+    #[test]
+    fn events_read_pushes_comments_and_rows_of_the_old_shape() {
+        let push: Event = serde_json::from_value(json!({
+            "id": 1, "project_id": 7, "action_name": "pushed to",
+            "target_type": null, "target_iid": null, "target_title": null,
+            "created_at": "2026-01-02T03:04:05Z",
+            "push_data": {
+                "commit_count": 3, "action": "pushed", "ref_type": "branch",
+                "ref": "main", "commit_title": "Fix it",
+            },
+        }))
+        .unwrap();
+        assert_eq!(push.target(), ("", 0));
+        assert_eq!(push.push_data.git_ref, "main");
+        assert_eq!(push.push_data.commit_count, 3);
+        assert_eq!(push.push_data.commit_title, "Fix it");
+        // The stored form reads back the same.
+        let stored = serde_json::to_vec(&push).unwrap();
+        assert_eq!(serde_json::from_slice::<Event>(&stored).unwrap(), push);
+
+        let comment: Event = serde_json::from_value(json!({
+            "id": 2, "project_id": 7, "action_name": "commented on",
+            "target_type": "DiffNote", "target_iid": 9001, "target_title": "Add x",
+            "created_at": "2026-01-02T03:04:05Z",
+            "note": { "id": 9001, "body": "lgtm", "noteable_type": "MergeRequest", "noteable_iid": 12 },
+        }))
+        .unwrap();
+        assert_eq!(comment.target(), ("MergeRequest", 12));
+
+        // A push that deleted its branch, and a row stored before schema 2.
+        let deleted: Event = serde_json::from_value(json!({
+            "id": 3, "push_data": { "commit_count": 0, "ref": "old", "commit_title": null },
+        }))
+        .unwrap();
+        assert_eq!(deleted.push_data.commit_title, "");
+        let old: Event = serde_json::from_str(
+            r#"{"id":4,"project_id":7,"action_name":"opened","target_type":"Issue","created_at":5}"#,
+        )
+        .unwrap();
+        assert_eq!(old.target(), ("Issue", 0));
+        assert_eq!(old.created_at, 5);
+        assert_eq!(old.push_data, PushData::default());
     }
 
     #[test]

@@ -11,12 +11,13 @@ use varlink::sansio::ServerEvent;
 
 use forskap_api::{
     AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
-    Call_DismissFailure, Call_GetAssignedIssues, Call_GetAssignedMergeRequests, Call_GetFailures,
-    Call_GetHistory, Call_GetSyncJobs, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen,
-    Call_RetryFailure, Call_Search, Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, Close_Args,
-    DismissFailure_Args, GetAssignedIssues_Args, GetAssignedMergeRequests_Args, GetHistory_Args,
-    Login_Args, PostTime_Args, RecordOpen_Args, RetryFailure_Args, Search_Args, UnassignSelf_Args,
-    VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
+    Call_DismissFailure, Call_GetActivity, Call_GetAssignedIssues, Call_GetAssignedMergeRequests,
+    Call_GetFailures, Call_GetHistory, Call_GetSyncJobs, Call_Login, Call_Logout, Call_PostTime,
+    Call_RecordOpen, Call_RetryFailure, Call_Search, Call_UnassignSelf, Call_WhoAmI,
+    ClearCache_Args, Close_Args, DismissFailure_Args, GetActivity_Args, GetAssignedIssues_Args,
+    GetAssignedMergeRequests_Args, GetHistory_Args, Login_Args, PostTime_Args, RecordOpen_Args,
+    RetryFailure_Args, Search_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION,
+    VarlinkInterface as _,
 };
 
 use crate::handlers::Handlers;
@@ -156,6 +157,22 @@ async fn handle_forskapd(
             };
             handlers
                 .get_history(&mut call as &mut dyn Call_GetHistory, args.days)
+                .await?;
+        }
+        "org.thehoster.forskapd.GetActivity" => {
+            // `days` is optional, like `GetHistory`'s.
+            let args: GetActivity_Args = match params {
+                Some(v) => serde_json::from_value(v).map_err(|e| {
+                    varlink::Error(
+                        varlink::ErrorKind::InvalidParameter(e.to_string()),
+                        None,
+                        None,
+                    )
+                })?,
+                None => GetActivity_Args { days: None },
+            };
+            handlers
+                .get_activity(&mut call as &mut dyn Call_GetActivity, args.days)
                 .await?;
         }
         "org.thehoster.forskapd.GetFailures" => {
@@ -482,5 +499,23 @@ mod tests {
             "RecordOpen is missing its dispatch arm or rejected valid args: {:?}",
             reply.error
         );
+    }
+
+    /// Dormant and never synced: the arm answers `NotAuthenticated`, not
+    /// `MethodNotFound`, with and without parameters.
+    #[tokio::test]
+    async fn dispatch_has_an_arm_for_get_activity() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        for params in [None, Some(serde_json::json!({"days": 3}))] {
+            let reply = handle_forskapd("org.thehoster.forskapd.GetActivity", params, &handlers)
+                .await
+                .unwrap()
+                .expect("a reply");
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("org.thehoster.forskapd.NotAuthenticated"),
+                "GetActivity is missing its dispatch arm in handle_forskapd"
+            );
+        }
     }
 }

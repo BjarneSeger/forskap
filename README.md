@@ -68,6 +68,7 @@ forskap search oauth token      # cached search; issues/MRs you open often rank 
 forskap time log 42 1h30m       # log time on issue #42
 forskap time log '!42' 1h30m    # ... on merge request !42 (or: forskap time log 42 1h30m --mr)
 forskap time history            # what you tracked recently (including queued entries)
+forskap activity --days 30      # what you did on GitLab: pushes, comments, opened and merged items
 forskap queue list              # writes that failed permanently; `retry`/`dismiss` them
 forskap sync refresh            # drop the cache and fetch again
 forskap sync jobs               # what the background sync runs now, next, and what failed

@@ -6,11 +6,11 @@ use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 
 use forskap_api::{
-    AsyncCall, Call_ClearCache, Call_Close, Call_GetAssignedIssues, Call_GetAssignedMergeRequests,
-    Call_GetHistory, Call_GetSyncJobs, Call_PostTime, Call_RecordOpen, Call_Search,
-    Call_UnassignSelf, Call_WhoAmI, GetAssignedIssues_Reply, GetAssignedMergeRequests_Reply,
-    GetHistory_Reply, GetSyncJobs_Reply, IssuableKind, Issue, MergeRequest, Search_Reply,
-    SyncJobStatus, VarlinkInterface, WhoAmI_Reply,
+    AsyncCall, Call_ClearCache, Call_Close, Call_GetActivity, Call_GetAssignedIssues,
+    Call_GetAssignedMergeRequests, Call_GetHistory, Call_GetSyncJobs, Call_PostTime,
+    Call_RecordOpen, Call_Search, Call_UnassignSelf, Call_WhoAmI, GetActivity_Reply,
+    GetAssignedIssues_Reply, GetAssignedMergeRequests_Reply, GetHistory_Reply, GetSyncJobs_Reply,
+    IssuableKind, Issue, MergeRequest, Search_Reply, SyncJobStatus, VarlinkInterface, WhoAmI_Reply,
 };
 
 use crate::config::SharedConfig;
@@ -23,7 +23,7 @@ use crate::sync::model::{self, Board, BoardList, LabelRef, RowKey, UserRef};
 use crate::sync::schedule::JobState;
 use crate::sync::store::{RowScope, Stored, SyncStore, View};
 use crate::sync::{Job, SyncHandle};
-use crate::testing::{FakeErr, FakeGitlab, eventually, issue_json};
+use crate::testing::{FakeErr, FakeGitlab, event_json, eventually, issue_json};
 use crate::write::{Write, WriteOp};
 
 const NOT_AUTHENTICATED: &str = "org.thehoster.forskapd.NotAuthenticated";
@@ -348,6 +348,14 @@ async fn history(h: &Handlers, days: Option<i64>) -> Vec<forskap_api::HistoryEve
         .await
         .unwrap();
     reply::<GetHistory_Reply>(&mut call).events
+}
+
+async fn activity(h: &Handlers, days: Option<i64>) -> Vec<forskap_api::ActivityEvent> {
+    let mut call = AsyncCall::default();
+    h.get_activity(&mut call as &mut dyn Call_GetActivity, days)
+        .await
+        .unwrap();
+    reply::<GetActivity_Reply>(&mut call).events
 }
 
 // ── Validators ─────────────────────────────────────────────────────────
@@ -899,6 +907,99 @@ async fn get_history_merges_queued_and_synced_newest_first() {
     assert_eq!(events[1].duration, "30m");
     assert_eq!(events[1].kind, IssuableKind::merge_request);
     assert_eq!(events[2].duration, "1h 30m");
+}
+
+// ── Activity ───────────────────────────────────────────────────────────
+
+fn event_at(id: i64, project_id: i64, action: &str, created_at: u64) -> model::Event {
+    model::Event {
+        id,
+        project_id,
+        action_name: action.into(),
+        created_at,
+        ..Default::default()
+    }
+}
+
+/// Served from the store alone, also while dormant; the project and the
+/// stored item give each event its path and link.
+#[tokio::test]
+async fn get_activity_is_newest_first_in_the_window_and_linked() {
+    let (h, _dir) = dormant_handlers();
+    let now = now_secs();
+    seed(
+        &h,
+        &[model::Project {
+            id: 1,
+            path_with_namespace: "team/api".into(),
+            web_url: "https://gl/team/api".into(),
+            ..Default::default()
+        }],
+    );
+    seed(&h, &[issue(1, 1, "api", "https://gl/team/api/-/issues/1")]);
+    let mut closed = event_at(1, 1, "closed", now - 3 * 86_400);
+    closed.target_type = "Issue".into();
+    closed.target_iid = 1;
+    closed.target_title = "api".into();
+    let mut pushed = event_at(2, 1, "pushed to", now - 3600);
+    pushed.push_data = model::PushData {
+        git_ref: "main".into(),
+        commit_count: 2,
+        commit_title: "Fix it".into(),
+    };
+    let mut elsewhere = event_at(3, 9, "opened", now - 60);
+    elsewhere.target_type = "MergeRequest".into();
+    elsewhere.target_iid = 4;
+    seed(
+        &h,
+        &[
+            closed,
+            pushed,
+            elsewhere,
+            event_at(4, 1, "opened", now - 30 * 86_400),
+        ],
+    );
+    mark_synced(&h, &[Job::Events]);
+
+    let events = activity(&h, None).await;
+    let actions: Vec<&str> = events.iter().map(|e| e.action.as_str()).collect();
+    assert_eq!(
+        actions,
+        ["opened", "pushed to", "closed"],
+        "30 days back is outside the default week"
+    );
+    assert_eq!(events[0].project_path, None, "project 9 is not stored");
+    assert_eq!(events[0].web_url, None);
+    assert_eq!(events[0].target_iid, Some(4));
+    assert_eq!(events[1].r#ref.as_deref(), Some("main"));
+    assert_eq!(events[1].commit_count, Some(2));
+    assert_eq!(events[1].project_path.as_deref(), Some("team/api"));
+    assert_eq!(
+        events[2].web_url.as_deref(),
+        Some("https://gl/team/api/-/issues/1")
+    );
+    assert_eq!(events[2].target_title.as_deref(), Some("api"));
+
+    assert_eq!(activity(&h, Some(60)).await.len(), 4);
+    assert_eq!(activity(&h, Some(0)).await.len(), 0);
+}
+
+/// Never synced: dormant says why, connected replies empty — and neither
+/// reads GitLab.
+#[tokio::test]
+async fn get_activity_never_reads_through() {
+    let (h, _dir) = dormant_handlers();
+    let mut call = AsyncCall::default();
+    h.get_activity(&mut call as &mut dyn Call_GetActivity, None)
+        .await
+        .unwrap();
+    assert_eq!(reply_error(&mut call).as_deref(), Some(NOT_AUTHENTICATED));
+
+    let fake = Arc::new(FakeGitlab::default());
+    fake.serve("events", vec![event_json(1, 7, "opened", now_secs())]);
+    let (h, _dir) = connected_handlers(&fake);
+    assert!(activity(&h, None).await.is_empty());
+    assert_eq!(fake.read_calls(), 0);
 }
 
 // ── ClearCache ─────────────────────────────────────────────────────────
