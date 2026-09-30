@@ -1,10 +1,12 @@
 //! Projections of stored GitLab rows onto the varlink wire types.
 
-use forskap_api::{Group, HistoryEvent, IssuableKind, Issue, MergeRequest, Project};
+use forskap_api::{
+    Group, HistoryEvent, IssuableKind, Issue, MergeRequest, Project, SyncJob, SyncJobStatus,
+};
 
 use crate::gitlab::{Issuable, format_duration};
 use crate::query::graph_status_from;
-use crate::sync::model;
+use crate::sync::{JobInfo, JobStatus, model};
 
 /// `board_labels` are the issue's project board lists, `None` when never
 /// synced (then `graph_status` stays empty).
@@ -78,6 +80,26 @@ pub fn timelog(t: model::Timelog) -> HistoryEvent {
         web_url: t.web_url,
         duration: format_duration(t.time_spent),
         summary: t.summary,
+    }
+}
+
+/// A sync job as the worker reported it; a job that never ran has no
+/// `last_ok`.
+pub fn sync_job(j: JobInfo) -> SyncJob {
+    SyncJob {
+        key: j.key,
+        status: match j.status {
+            JobStatus::Running => SyncJobStatus::running,
+            JobStatus::Demanded => SyncJobStatus::demanded,
+            JobStatus::Due => SyncJobStatus::due,
+            JobStatus::Waiting => SyncJobStatus::waiting,
+            JobStatus::BackingOff => SyncJobStatus::backing_off,
+        },
+        last_ok: Some(j.last_ok as i64).filter(|&at| at > 0),
+        next_due: j.next_due.map(|at| at as i64),
+        running_since: j.running_since.map(|at| at as i64),
+        failures: i64::from(j.failures),
+        last_error: j.last_error,
     }
 }
 

@@ -78,6 +78,18 @@ type Group struct {
 	Web_url string `json:"web_url"`
 }
 
+type SyncJobStatus string
+
+type SyncJob struct {
+	Key           string        `json:"key"`
+	Status        SyncJobStatus `json:"status"`
+	Last_ok       *int64        `json:"last_ok,omitempty"`
+	Next_due      *int64        `json:"next_due,omitempty"`
+	Running_since *int64        `json:"running_since,omitempty"`
+	Failures      int64         `json:"failures"`
+	Last_error    *string       `json:"last_error,omitempty"`
+}
+
 type NotAuthReason string
 
 type GitlabError struct {
@@ -941,6 +953,61 @@ func (m ClearFailures_methods) Upgrade(ctx context.Context, c *varlink.Connectio
 	}, nil
 }
 
+type GetSyncJobs_methods struct{}
+
+func GetSyncJobs() GetSyncJobs_methods { return GetSyncJobs_methods{} }
+
+func (m GetSyncJobs_methods) Call(ctx context.Context, c *varlink.Connection) (jobs_out_ []SyncJob, paused_until_out_ *int64, err_ error) {
+	receive, err_ := m.Send(ctx, c, 0)
+	if err_ != nil {
+		return
+	}
+	jobs_out_, paused_until_out_, _, err_ = receive(ctx)
+	return
+}
+
+func (m GetSyncJobs_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64) (func(ctx context.Context) ([]SyncJob, *int64, uint64, error), error) {
+	receive, err := c.Send(ctx, "org.thehoster.forskapd.GetSyncJobs", nil, flags)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (jobs_out_ []SyncJob, paused_until_out_ *int64, flags uint64, err error) {
+		var out struct {
+			Jobs         []SyncJob `json:"jobs"`
+			Paused_until *int64    `json:"paused_until,omitempty"`
+		}
+		flags, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		jobs_out_ = []SyncJob(out.Jobs)
+		paused_until_out_ = out.Paused_until
+		return
+	}, nil
+}
+
+func (m GetSyncJobs_methods) Upgrade(ctx context.Context, c *varlink.Connection) (func(ctx context.Context) (jobs_out_ []SyncJob, paused_until_out_ *int64, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.GetSyncJobs", nil)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (jobs_out_ []SyncJob, paused_until_out_ *int64, flags uint64, conn varlink.ReadWriterContext, err error) {
+		var out struct {
+			Jobs         []SyncJob `json:"jobs"`
+			Paused_until *int64    `json:"paused_until,omitempty"`
+		}
+		flags, conn, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		jobs_out_ = []SyncJob(out.Jobs)
+		paused_until_out_ = out.Paused_until
+		return
+	}, nil
+}
+
 type Login_methods struct{}
 
 func Login() Login_methods { return Login_methods{} }
@@ -1119,6 +1186,7 @@ type orgthehosterforskapdInterface interface {
 	RetryFailure(ctx context.Context, c VarlinkCall, id_ int64) error
 	DismissFailure(ctx context.Context, c VarlinkCall, id_ int64) error
 	ClearFailures(ctx context.Context, c VarlinkCall) error
+	GetSyncJobs(ctx context.Context, c VarlinkCall) error
 	Login(ctx context.Context, c VarlinkCall, host_ string, token_ string) error
 	Logout(ctx context.Context, c VarlinkCall) error
 	WhoAmI(ctx context.Context, c VarlinkCall) error
@@ -1227,6 +1295,16 @@ func (c *VarlinkCall) ReplyClearFailures(ctx context.Context) error {
 	return c.Reply(ctx, nil)
 }
 
+func (c *VarlinkCall) ReplyGetSyncJobs(ctx context.Context, jobs_ []SyncJob, paused_until_ *int64) error {
+	var out struct {
+		Jobs         []SyncJob `json:"jobs"`
+		Paused_until *int64    `json:"paused_until,omitempty"`
+	}
+	out.Jobs = []SyncJob(jobs_)
+	out.Paused_until = paused_until_
+	return c.Reply(ctx, &out)
+}
+
 func (c *VarlinkCall) ReplyLogin(ctx context.Context) error {
 	return c.Reply(ctx, nil)
 }
@@ -1305,6 +1383,10 @@ func (s *VarlinkInterface) DismissFailure(ctx context.Context, c VarlinkCall, id
 
 func (s *VarlinkInterface) ClearFailures(ctx context.Context, c VarlinkCall) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.ClearFailures")
+}
+
+func (s *VarlinkInterface) GetSyncJobs(ctx context.Context, c VarlinkCall) error {
+	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetSyncJobs")
 }
 
 func (s *VarlinkInterface) Login(ctx context.Context, c VarlinkCall, host_ string, token_ string) error {
@@ -1463,6 +1545,9 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 	case "ClearFailures":
 		return s.orgthehosterforskapdInterface.ClearFailures(ctx, VarlinkCall{call})
 
+	case "GetSyncJobs":
+		return s.orgthehosterforskapdInterface.GetSyncJobs(ctx, VarlinkCall{call})
+
 	case "Login":
 		var in struct {
 			Host  string `json:"host"`
@@ -1563,6 +1648,18 @@ type Group (
   web_url: string
 )
 
+type SyncJobStatus (running, demanded, due, waiting, backing_off)
+
+type SyncJob (
+  key: string,
+  status: SyncJobStatus,
+  last_ok: ?int,
+  next_due: ?int,
+  running_since: ?int,
+  failures: int,
+  last_error: ?string
+)
+
 error GitlabError (message: string)
 
 type NotAuthReason (no_credentials, keychain_error, unreachable, token_rejected, logged_out)
@@ -1596,6 +1693,8 @@ method RetryFailure(id: int) -> ()
 method DismissFailure(id: int) -> ()
 
 method ClearFailures() -> ()
+
+method GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int)
 
 method Login(host: string, token: string) -> ()
 

@@ -65,6 +65,28 @@ type HistoryEvent (
 ```
 
 ```varlink
+type SyncJobStatus (
+  running,      # its fetch is in flight
+  demanded,     # requested ahead of the schedule; runs before anything merely due
+  due,          # its time has come; runs once the worker gets to it
+  waiting,      # not due yet
+  backing_off   # failed; held back until next_due
+)
+
+type SyncJob (
+  key:           string,        # stable job id: "assigned/issues", "timelogs/recent", "events", "project/<id>/issues", …
+  status:        SyncJobStatus,
+  last_ok:       ?int,          # unix seconds, start of the last successful run; absent if it never ran
+  next_due:      ?int,          # unix seconds, when the schedule runs it next (the retry time while backing off);
+                                # absent while running or demanded, before the first run, and for a job that is
+                                # never due again (a fetched project avatar)
+  running_since: ?int,          # unix seconds, only while running
+  failures:      int,           # consecutive failed runs
+  last_error:    ?string        # why the last run failed, until a run succeeds
+)
+```
+
+```varlink
 type FailedTask (
   id:         int,          # handle for RetryFailure / DismissFailure
   op:         string,       # which write failed ("PostTime", "Close", "AssignSelf", "UnassignSelf")
@@ -282,6 +304,23 @@ Deletes one dead-lettered task. `GitlabError` when `id` is unknown.
 ### `ClearFailures() -> ()`
 
 Deletes all dead-lettered tasks.
+
+## Sync status
+
+### `GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int)`
+
+Lists the jobs the sync worker has planned, in the order it runs them: the one in
+flight, the ones demanded ahead of the schedule (a `ClearCache`, a write that just
+landed), the due ones by priority, then the rest by `next_due`. The worker runs one
+job at a time, so a long one in front delays everything behind it.
+
+`paused_until` (unix seconds) is set while a GitLab rate limit (429) holds every
+job back; the statuses then say what runs once the pause is over.
+
+Status, not GitLab data: never errors and is served while dormant. A dormant
+daemon runs nothing, so its jobs stay `due` until a session exists. `last_error`
+is kept in memory only — after a daemon restart a job can be `backing_off` without
+one.
 
 ## Usage statistics
 

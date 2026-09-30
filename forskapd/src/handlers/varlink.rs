@@ -10,9 +10,9 @@ use tracing::{debug, info, instrument, warn};
 use forskap_api::{
     Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close, Call_DismissFailure,
     Call_GetAssignedIssues, Call_GetAssignedMergeRequests, Call_GetFailures, Call_GetHistory,
-    Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure, Call_Search,
-    Call_UnassignSelf, Call_WhoAmI, FailedTask, Group, HistoryEvent, IssuableKind, Issue,
-    MergeRequest, Project, VarlinkInterface,
+    Call_GetSyncJobs, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
+    Call_Search, Call_UnassignSelf, Call_WhoAmI, FailedTask, Group, HistoryEvent, IssuableKind,
+    Issue, MergeRequest, Project, VarlinkInterface,
 };
 
 use crate::error::{DormancyReason, Error};
@@ -33,6 +33,10 @@ use super::{
 
 /// The kind strings `Search` accepts, matching the `ClearCache` scope style.
 const SEARCH_KINDS: [&str; 4] = ["issues", "merge_requests", "projects", "groups"];
+
+/// How long `GetSyncJobs` waits for the worker, which answers between two
+/// awaits even with a fetch in flight.
+const SYNC_JOBS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-kind result cap when the caller doesn't pass a `limit`.
 const DEFAULT_SEARCH_LIMIT: usize = 50;
@@ -712,6 +716,22 @@ impl VarlinkInterface for Handlers {
             Err(e) => warn!(error = %e, "history read failed; returning queued only"),
         }
         call.reply(events)
+    }
+
+    /// Status, not GitLab data: served whatever the session is.
+    #[instrument(skip(self, call))]
+    async fn get_sync_jobs(&self, call: &mut dyn Call_GetSyncJobs) -> varlink::Result<()> {
+        let snapshot = match tokio::time::timeout(SYNC_JOBS_TIMEOUT, self.sync.jobs()).await {
+            Ok(s) => s,
+            Err(_) => {
+                warn!("the sync worker didn't report its jobs in time; returning empty");
+                Default::default()
+            }
+        };
+        call.reply(
+            snapshot.jobs.into_iter().map(wire::sync_job).collect(),
+            snapshot.paused_until.map(|at| at as i64),
+        )
     }
 
     #[instrument(skip(self, call))]

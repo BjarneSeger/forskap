@@ -70,6 +70,7 @@ forskap time log '!42' 1h30m    # ... on merge request !42 (or: forskap time log
 forskap time history            # what you tracked recently (including queued entries)
 forskap queue list              # writes that failed permanently; `retry`/`dismiss` them
 forskap sync refresh            # drop the cache and fetch again
+forskap sync jobs               # what the background sync runs now, next, and what failed
 ```
 
 `forskap issue` and `forskap mr` share their verbs (`list`, `view`, `open`, `close`, `assign`,
