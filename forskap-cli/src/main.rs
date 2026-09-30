@@ -42,6 +42,7 @@ mod migrate;
 mod pick;
 mod refspec;
 mod state;
+mod watch;
 
 use cli::{Cli, Command};
 use refspec::RefKind;

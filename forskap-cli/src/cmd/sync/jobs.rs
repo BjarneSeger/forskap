@@ -7,26 +7,31 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use forskap_api::{SyncJob, SyncJobStatus, VarlinkClientInterface};
+use forskap_api::{GetSyncJobs_Reply, SyncJob, SyncJobStatus, VarlinkClientInterface};
 
-use crate::cli::OutputFormat;
+use crate::cli::{OutputFormat, WatchArgs};
 use crate::friendly::friendly;
-use crate::{client, output};
+use crate::{client, output, watch};
 
-pub async fn run(format: OutputFormat) -> Result<()> {
+pub async fn run(format: OutputFormat, watch: WatchArgs) -> Result<()> {
+    match watch::interval(watch, format)? {
+        Some(every) => watch::run(every, || async { Ok(text(&fetch().await?)) }).await,
+        None => output::emit(format, &fetch().await?, |reply| out!("{}", text(reply))),
+    }
+}
+
+// Connects per call: a watch has to find a restarted daemon again.
+async fn fetch() -> Result<GetSyncJobs_Reply> {
     let client = client::connect_default().await?;
-    let reply = client
+    client
         .get_sync_jobs()
         .call()
         .await
-        .map_err(|e| friendly("GetSyncJobs", e))?;
+        .map_err(|e| friendly("GetSyncJobs", e))
+}
 
-    output::emit(format, &reply, |reply| {
-        out!(
-            "{}",
-            render(&reply.jobs, reply.paused_until, Utc::now().timestamp())
-        )
-    })
+fn text(reply: &GetSyncJobs_Reply) -> String {
+    render(&reply.jobs, reply.paused_until, Utc::now().timestamp())
 }
 
 /// The jobs as an aligned table, a job's last error on a line of its own.

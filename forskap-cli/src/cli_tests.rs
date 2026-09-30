@@ -218,6 +218,28 @@ fn refresh_scopes_combine() {
 }
 
 #[test]
+fn watch_takes_an_optional_interval() {
+    let secs = |args: &[&str]| match ok(args) {
+        Command::Sync {
+            command: SyncCommand::Jobs { watch, .. },
+        }
+        | Command::Queue {
+            command: QueueCommand::List { watch, .. },
+        } => watch.watch,
+        _ => panic!("{args:?} has no --watch"),
+    };
+    assert_eq!(secs(&["sync", "jobs"]), None);
+    assert_eq!(secs(&["sync", "jobs", "-w"]), Some(2));
+    assert_eq!(secs(&["sync", "jobs", "--watch", "10"]), Some(10));
+    assert_eq!(secs(&["queue", "list", "-w5"]), Some(5));
+    assert_eq!(secs(&["queue", "list", "--watch", "-o", "text"]), Some(2));
+
+    assert!(parse(&["sync", "jobs", "--watch", "0"]).is_err());
+    assert!(parse(&["sync", "jobs", "--watch", "soon"]).is_err());
+    assert!(parse(&["issue", "list", "--watch"]).is_err());
+}
+
+#[test]
 fn queue_ids_are_not_negative() {
     assert!(matches!(
         ok(&["queue", "retry", "3"]),
