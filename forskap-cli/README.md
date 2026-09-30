@@ -53,6 +53,8 @@ the project themselves. If the number exists in several projects, a picker
 lists them by project and title; Esc cancels. When not run from a terminal (scripts,
 pipes, launchers) this stays an error asking for `--project`.
 
+`forskap epic` does the same across groups, with `--group`.
+
 ## Config
 The config lives at `$XDG_CONFIG_HOME/` or `$HOME/.config/` under
 `forskap/config.toml`. You can run `forskap config path` to see what it 

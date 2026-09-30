@@ -8,7 +8,8 @@
 //!    re-acting on the epic opened last.
 //! 2. The daemon's search corpus, exact-filtered on the iid, if exactly one
 //!    group has such an epic.
-//! 3. Bail with an explanation rather than guess across groups.
+//! 3. Several groups: a picker on a terminal, else bail with an explanation
+//!    rather than guess.
 
 mod open;
 mod view;
@@ -18,7 +19,8 @@ use forskap_api::{Epic, Group, VarlinkClient, VarlinkClientInterface};
 
 use crate::cli::{EpicArgs, EpicCommand};
 use crate::friendly::friendly;
-use crate::{client, state};
+use crate::item::project_path;
+use crate::{client, pick, state};
 
 /// Generous cap for the corpus lookups: the daemon matches substrings (and
 /// `&5` against titles too), so we over-fetch and exact-filter client-side;
@@ -35,18 +37,33 @@ pub async fn run(command: EpicCommand) -> Result<()> {
 /// Connect, and find the cached epic the target names.
 async fn locate(target: &EpicArgs) -> Result<(VarlinkClient, Epic)> {
     let client = client::connect_default().await?;
-    let group = match target.group.as_deref() {
-        Some(g) => Some(group_id(&client, g).await?),
-        None => None,
-    };
+    let iid = target.iid;
+    if let Some(group) = target.group.as_deref() {
+        let group = group_id(&client, group).await?;
+        let epic = in_group(cached(&client, iid).await?, iid, group)?;
+        return Ok((client, epic));
+    }
     let last = state::load()
         .ok()
         .and_then(|st| st.last_epic)
-        .filter(|last| last.iid == target.iid)
+        .filter(|last| last.iid == iid)
         .map(|last| last.group_id);
-    let cached = cached(&client, target.iid).await?;
-    let epic = pick(cached, target.iid, group, last)?;
-    Ok((client, epic))
+    let found = match matches(cached(&client, iid).await?, iid, last, pick::interactive())? {
+        Matches::Only(epic) => return Ok((client, epic)),
+        Matches::Ask(found) => found,
+    };
+    let message = format!("&{iid} exists in {} groups — which one?", found.len());
+    let picked = tokio::task::spawn_blocking(move || pick::select(&message, pick::by_group(found)))
+        .await??;
+    match picked {
+        Some(epic) => Ok((client, epic)),
+        None => Err(pick::Cancelled.into()),
+    }
+}
+
+/// The group path inside an epic URL (`https://host/groups/<path>/-/epics/<iid>`).
+pub fn group_path(web_url: &str) -> Option<&str> {
+    project_path(web_url)?.strip_prefix("groups/")
 }
 
 /// The cached epics numbered `iid`, one per group that has one.
@@ -65,32 +82,49 @@ async fn cached(client: &VarlinkClient, iid: i64) -> Result<Vec<Epic>> {
 
 /// The epic of one known group, for callers that hold the id pair already.
 pub async fn lookup(client: &VarlinkClient, group_id: i64, iid: i64) -> Result<Epic> {
-    pick(cached(client, iid).await?, iid, Some(group_id), None)
+    in_group(cached(client, iid).await?, iid, group_id)
 }
 
-/// Choose among the cached epics numbered `iid`: the one in `group` when a
-/// group was asked for, else the one in the `last` opened group, else the
-/// only one there is.
-fn pick(mut cached: Vec<Epic>, iid: i64, group: Option<i64>, last: Option<i64>) -> Result<Epic> {
-    let of = |cached: &[Epic], group: i64| cached.iter().position(|e| e.group_id == group);
-    if let Some(group) = group {
-        return match of(&cached, group) {
-            Some(at) => Ok(cached.swap_remove(at)),
-            None => bail!(
-                "&{iid} in group {group} is not in the daemon's caches — epics are synced for \
-                 the groups above the projects in the search corpus, on GitLab instances that \
-                 have them; try `forskap sync refresh --scope search`"
-            ),
-        };
+/// The one of the cached epics numbered `iid` that is in `group`.
+fn in_group(mut cached: Vec<Epic>, iid: i64, group: i64) -> Result<Epic> {
+    match cached.iter().position(|e| e.group_id == group) {
+        Some(at) => Ok(cached.swap_remove(at)),
+        None => bail!(
+            "&{iid} in group {group} is not in the daemon's caches — epics are synced for \
+             the groups above the projects in the search corpus, on GitLab instances that \
+             have them; try `forskap sync refresh --scope search`"
+        ),
     }
-    if let Some(at) = last.and_then(|group| of(&cached, group)) {
-        return Ok(cached.swap_remove(at));
+}
+
+/// What the cached epics carrying the wanted number leave to do.
+#[derive(Debug)]
+enum Matches {
+    Only(Epic),
+    /// Several, and a terminal to ask on.
+    Ask(Vec<Epic>),
+}
+
+/// Choose among the cached epics numbered `iid` when no group was asked for:
+/// the one in the `last` opened group, else the only one there is. Several
+/// are only worth asking about when `interactive`: scripts and launchers
+/// keep getting the error.
+fn matches(
+    mut cached: Vec<Epic>,
+    iid: i64,
+    last: Option<i64>,
+    interactive: bool,
+) -> Result<Matches> {
+    let of_last = |e: &Epic| Some(e.group_id) == last;
+    if let Some(at) = cached.iter().position(of_last) {
+        return Ok(Matches::Only(cached.swap_remove(at)));
     }
-    match cached.len() {
-        1 => Ok(cached.swap_remove(0)),
+    Ok(match cached.len() {
+        1 => Matches::Only(cached.swap_remove(0)),
         0 => bail!("no known epic with the number {iid} — pass --group"),
+        _ if interactive => Matches::Ask(cached),
         many => bail!("epic {iid} is ambiguous across {many} groups — pass --group"),
-    }
+    })
 }
 
 async fn group_id(client: &VarlinkClient, group: &str) -> Result<i64> {
@@ -137,36 +171,60 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_single_match_needs_no_group() {
-        assert_eq!(pick(vec![epic(3, 5)], 5, None, None).unwrap().group_id, 3);
+    /// The group `matches` settled on without asking.
+    fn only(cached: Vec<Epic>, last: Option<i64>, interactive: bool) -> Result<i64> {
+        match matches(cached, 5, last, interactive)? {
+            Matches::Only(epic) => Ok(epic.group_id),
+            Matches::Ask(found) => bail!("asks about {}", found.len()),
+        }
     }
 
     #[test]
-    fn several_groups_want_the_flag() {
+    fn a_single_match_needs_no_group() {
+        for interactive in [true, false] {
+            assert_eq!(only(vec![epic(3, 5)], None, interactive).unwrap(), 3);
+        }
+    }
+
+    #[test]
+    fn several_groups_want_the_flag_or_a_pick() {
         let both = || vec![epic(3, 5), epic(4, 5)];
-        let err = pick(both(), 5, None, None).unwrap_err().to_string();
+        let err = only(both(), None, false).unwrap_err().to_string();
         assert!(err.contains("ambiguous across 2 groups"), "{err}");
         assert!(err.contains("--group"), "{err}");
-        assert_eq!(pick(both(), 5, Some(4), None).unwrap().group_id, 4);
+        assert!(matches!(
+            matches(both(), 5, None, true),
+            Ok(Matches::Ask(found)) if found.len() == 2
+        ));
+        assert_eq!(in_group(both(), 5, 4).unwrap().group_id, 4);
     }
 
     #[test]
     fn the_last_opened_group_breaks_the_tie() {
         let both = || vec![epic(3, 5), epic(4, 5)];
-        assert_eq!(pick(both(), 5, None, Some(4)).unwrap().group_id, 4);
-        // An explicit group still wins, and a last group without such an
-        // epic (any more) doesn't count.
-        assert_eq!(pick(both(), 5, Some(3), Some(4)).unwrap().group_id, 3);
-        assert!(pick(both(), 5, None, Some(9)).is_err());
+        for interactive in [true, false] {
+            assert_eq!(only(both(), Some(4), interactive).unwrap(), 4);
+        }
+        // A last group without such an epic (any more) doesn't count.
+        assert!(only(both(), Some(9), false).is_err());
     }
 
     #[test]
     fn an_unknown_epic_is_an_error() {
-        let err = pick(Vec::new(), 5, None, None).unwrap_err().to_string();
-        assert!(err.contains("no known epic"), "{err}");
-        let err = pick(vec![epic(3, 5)], 5, Some(4), None).unwrap_err();
+        for interactive in [true, false] {
+            let err = only(Vec::new(), None, interactive).unwrap_err().to_string();
+            assert!(err.contains("no known epic"), "{err}");
+        }
+        let err = in_group(vec![epic(3, 5)], 5, 4).unwrap_err();
         assert!(err.to_string().contains("&5 in group 4"), "{err}");
+    }
+
+    #[test]
+    fn group_paths_come_from_the_epic_url() {
+        let url = "https://gl/groups/team/backend/-/epics/5";
+        assert_eq!(group_path(url), Some("team/backend"));
+        assert_eq!(group_path("https://gl/team/api/-/issues/5"), None);
+        assert_eq!(group_path(""), None);
     }
 
     #[test]

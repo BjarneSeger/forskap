@@ -19,6 +19,7 @@ use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
 use forskap_api::{Epic, VarlinkClientInterface};
 
 use crate::cli::Cli;
+use crate::cmd::epic::group_path;
 use crate::item::{Item, project_path};
 use crate::refspec::{self, RefKind};
 use crate::state::{LastEpic, LastIssue};
@@ -239,11 +240,6 @@ fn put_first(known: &mut Vec<Known>, project_id: i64, iid: i64, scope: &str) {
         },
     };
     known.insert(0, first);
-}
-
-/// The group path inside an epic URL (`https://host/groups/<path>/-/epics/<iid>`).
-fn group_path(web_url: &str) -> Option<&str> {
-    project_path(web_url)?.strip_prefix("groups/")
 }
 
 /// The numbers starting with `digits`, written behind `sigil`. A number used
