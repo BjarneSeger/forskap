@@ -7,6 +7,7 @@ use std::path::Path;
 use forskap_api::Search_Reply;
 
 use super::query::Kind;
+use crate::item;
 use crate::refspec::RefKind;
 
 /// One launcher entry. `score` is the daemon's open count.
@@ -116,19 +117,9 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
     out
 }
 
-/// `"https://gl/team/api/-/issues/42"` → `"team/api"`; empty when the URL
-/// doesn't have GitLab's `/-/` separator.
-pub fn project_path(web_url: &str) -> &str {
-    let Some(rest) = web_url
-        .strip_prefix("https://")
-        .or_else(|| web_url.strip_prefix("http://"))
-    else {
-        return "";
-    };
-    let Some((_, path)) = rest.split_once('/') else {
-        return "";
-    };
-    path.split_once("/-/").map_or("", |(p, _)| p)
+/// [`item::project_path`], empty when the URL doesn't give the path away.
+fn project_path(web_url: &str) -> &str {
+    item::project_path(web_url).unwrap_or_default()
 }
 
 /// `"https://gl/groups/team/backend/-/epics/5"` → `"team/backend"`: group
@@ -280,9 +271,10 @@ mod tests {
     }
 
     #[test]
-    fn project_path_needs_the_gitlab_separator() {
+    fn project_path_is_empty_without_a_resource() {
         assert_eq!(project_path("https://gl/team/api/-/issues/42"), "team/api");
         assert_eq!(project_path("http://gl/a/b/c/-/merge_requests/1"), "a/b/c");
+        assert_eq!(project_path("https://gl/team/api/issues/42"), "team/api");
         assert_eq!(project_path("https://gl/team/api"), "");
         assert_eq!(project_path(""), "");
     }

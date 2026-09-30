@@ -78,6 +78,14 @@ pub fn wire(kind: RefKind) -> IssuableKind {
     }
 }
 
+/// The ref kind of a wire enum value.
+pub fn from_wire(kind: &IssuableKind) -> RefKind {
+    match kind {
+        IssuableKind::issue => RefKind::Issue,
+        IssuableKind::merge_request => RefKind::Mr,
+    }
+}
+
 /// The `Search` kind holding this kind's rows.
 pub fn search_kind(kind: RefKind) -> &'static str {
     match kind {
@@ -99,6 +107,11 @@ pub fn sigil(kind: RefKind) -> char {
         RefKind::Issue => '#',
         RefKind::Mr => '!',
     }
+}
+
+/// [`sigil`] of a wire kind.
+pub fn wire_sigil(kind: &IssuableKind) -> char {
+    sigil(from_wire(kind))
 }
 
 #[cfg(test)]

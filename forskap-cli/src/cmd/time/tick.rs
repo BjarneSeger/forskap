@@ -17,7 +17,7 @@ use forskap_api::VarlinkClientInterface;
 
 use super::prompt;
 use crate::cli::TickMode;
-use crate::{client, config, state};
+use crate::{client, config, refspec, state};
 
 pub async fn run(mode: TickMode) -> Result<()> {
     match mode {
@@ -111,10 +111,7 @@ async fn notify_new_failures(st: &mut state::State) {
         } else {
             format!(" ({})", f.detail)
         };
-        let sigil = match f.kind {
-            forskap_api::IssuableKind::merge_request => '!',
-            forskap_api::IssuableKind::issue => '#',
-        };
+        let sigil = refspec::wire_sigil(&f.kind);
         eprintln!(
             "⚠ forskap: queued {} {sigil}{}{} failed — {}",
             f.op, f.iid, detail, f.error
