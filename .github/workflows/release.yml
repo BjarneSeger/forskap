@@ -1,9 +1,17 @@
 name: Release
 
+# Tags publish a release. Pushes to main (and manual runs) do a snapshot
+# build instead: nothing is published, but the build is verified and the
+# kache store is saved — Actions caches are only visible to the ref that
+# saved them and to the default branch, so a tag can never reuse another
+# tag's cache.
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,7 +20,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -25,23 +33,23 @@ jobs:
         uses: mlugg/setup-zig@v2
 
       - name: Install cargo-zigbuild
-        run: cargo install cargo-zigbuild --locked
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: taiki-e/install-action@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          tool: cargo-zigbuild
+
+      # Pinned: the kache version is part of the cache key and of its only
+      # restore prefix, so a floating "latest" would cold-start the cache.
+      - name: Set up kache
+        uses: kunobi-ninja/kache-action@v1
+        with:
+          version: v0.28.1
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean
+          args: ${{ github.ref_type == 'tag' && 'release --clean' || 'release --snapshot --clean' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -5,8 +5,9 @@ project_name: forskap
 before:
   hooks:
     # Render the annotated default config shipped as the package-provided
-    # layer at /usr/share/forskapd/config.toml (see nfpms contents).
-    - sh -c "cargo run --quiet --package forskapd --bin gen-config-template > forskapd/packaging/config.toml"
+    # layer at /usr/share/forskapd/config.toml (see nfpms contents). Built
+    # like the x86_64 forskapd binary below so that build reuses the work.
+    - sh -c "cargo zigbuild --release --target x86_64-unknown-linux-gnu --package forskapd --bin gen-config-template && target/x86_64-unknown-linux-gnu/release/gen-config-template > forskapd/packaging/config.toml"
 
 builds:
   - id: forskapd
