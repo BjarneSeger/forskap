@@ -64,7 +64,11 @@ fn describe(e: &ActivityEvent) -> String {
             _ => format!("{git_ref}: {title}"),
         },
         (Some(git_ref), None) => git_ref.clone(),
-        (None, _) => e.target_title.clone().unwrap_or_default(),
+        // Of a comment: what it says, after the item it is on.
+        (None, _) => match (&e.target_title, &e.description) {
+            (Some(title), Some(text)) => format!("{title} — {text}"),
+            (title, text) => title.clone().or(text.clone()).unwrap_or_default(),
+        },
     };
     let mut line = format!("{:<12}", e.action);
     for part in [item, detail] {
@@ -93,6 +97,7 @@ mod tests {
             r#ref: None,
             commit_count: None,
             commit_title: None,
+            description: None,
         }
     }
 
@@ -105,11 +110,19 @@ mod tests {
         let mut comment = event("commented on", "MergeRequest", Some(12));
         comment.target_title = Some("Add x".into());
         assert_eq!(describe(&comment), "commented on  team/api!12  Add x");
+        comment.description = Some("lgtm".into());
+        assert_eq!(
+            describe(&comment),
+            "commented on  team/api!12  Add x — lgtm"
+        );
+        comment.target_title = None;
+        assert_eq!(describe(&comment), "commented on  team/api!12  lgtm");
 
         let mut push = event("pushed to", "", None);
         push.r#ref = Some("main".into());
         push.commit_count = Some(3);
         push.commit_title = Some("Fix it".into());
+        push.description = push.commit_title.clone();
         assert_eq!(
             describe(&push),
             "pushed to     team/api  main: Fix it (+2 more)"

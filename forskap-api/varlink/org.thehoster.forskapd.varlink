@@ -39,7 +39,8 @@ type ActivityEvent (
   web_url: ?string,
   ref: ?string,
   commit_count: ?int,
-  commit_title: ?string
+  commit_title: ?string,
+  description: ?string
 )
 
 type FailedTask (

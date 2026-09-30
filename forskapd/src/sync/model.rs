@@ -217,9 +217,12 @@ pub struct PushData {
     pub commit_title: String,
 }
 
-/// What a comment event commented on. The note's text is not kept.
+/// What a comment event commented on, and how the comment starts.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NoteRef {
+    /// The note's first line, capped: the full text is never stored.
+    #[serde(default, deserialize_with = "de::excerpt")]
+    pub body: String,
     /// `"Issue"`, `"MergeRequest"`, `"Commit"`, …
     #[serde(default, deserialize_with = "de::nullable")]
     pub noteable_type: String,
@@ -389,7 +392,7 @@ impl Resource for Epic {
 impl Resource for Event {
     const NAME: &'static str = "events";
     const KEYSPACE: &'static str = "gl_events_v1";
-    const SCHEMA: u32 = 2;
+    const SCHEMA: u32 = 3;
     fn key(&self) -> RowKey {
         (self.created_at, positive(self.id))
     }
@@ -437,6 +440,25 @@ mod de {
         T: Default + Deserialize<'de>,
     {
         Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+    }
+
+    /// Longest excerpt kept of a text, in characters.
+    const EXCERPT_CHARS: usize = 200;
+
+    /// The first non-blank line of a text, cut to [`EXCERPT_CHARS`] with a
+    /// closing `…`. Cutting while reading keeps the rest out of the store.
+    pub fn excerpt<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        let text = Option::<String>::deserialize(d)?.unwrap_or_default();
+        let line = text.lines().map(str::trim).find(|l| !l.is_empty());
+        let line = line.unwrap_or_default();
+        // A stored excerpt is within the cap, so reading it back changes nothing.
+        let Some((end, _)) = line.char_indices().nth(EXCERPT_CHARS - 1) else {
+            return Ok(line.to_string());
+        };
+        if line[end..].chars().nth(1).is_none() {
+            return Ok(line.to_string());
+        }
+        Ok(format!("{}…", line[..end].trim_end()))
     }
 
     /// A label array; non-string entries are skipped. Hand-rolled because
@@ -712,8 +734,9 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(comment.target(), ("MergeRequest", 12));
+        assert_eq!(comment.note.body, "lgtm");
 
-        // A push that deleted its branch, and a row stored before schema 2.
+        // A push that deleted its branch, and rows stored before schema 2 and 3.
         let deleted: Event = serde_json::from_value(json!({
             "id": 3, "push_data": { "commit_count": 0, "ref": "old", "commit_title": null },
         }))
@@ -726,6 +749,41 @@ mod tests {
         assert_eq!(old.target(), ("Issue", 0));
         assert_eq!(old.created_at, 5);
         assert_eq!(old.push_data, PushData::default());
+        let old: Event = serde_json::from_str(
+            r#"{"id":5,"created_at":5,"note":{"noteable_type":"Issue","noteable_iid":3}}"#,
+        )
+        .unwrap();
+        assert_eq!(old.target(), ("Issue", 3));
+        assert_eq!(old.note.body, "");
+    }
+
+    #[test]
+    fn a_comment_keeps_only_the_start_of_its_first_line() {
+        let note = |body: Value| -> NoteRef {
+            serde_json::from_value(json!({ "body": body, "noteable_type": "Issue" })).unwrap()
+        };
+        assert_eq!(
+            note(json!("\n  Looks good \r\n\nbut: the rest")).body,
+            "Looks good"
+        );
+        assert_eq!(note(Value::Null).body, "");
+        assert_eq!(note(json!(" \n\n")).body, "");
+
+        // Cut by characters, not bytes: a multi-byte text is not split.
+        let exact = "ä".repeat(200);
+        assert_eq!(note(json!(exact)).body, exact);
+        let long = note(json!(format!("{}\nsecret", "日本".repeat(150)))).body;
+        assert_eq!(long, format!("{}日…", "日本".repeat(99)));
+        assert_eq!(long.chars().count(), 200);
+        // No blank before the mark.
+        let spaced = note(json!(format!("x{}", "ab ".repeat(100)))).body;
+        assert!(spaced.ends_with("ab…"), "{spaced}");
+
+        // What is stored is the excerpt, and it reads back unchanged.
+        let cut = note(json!(format!("{}\nsecret", "x".repeat(300))));
+        let stored = serde_json::to_string(&cut).unwrap();
+        assert!(!stored.contains("secret") && stored.len() < 300, "{stored}");
+        assert_eq!(serde_json::from_str::<NoteRef>(&stored).unwrap(), cut);
     }
 
     #[test]

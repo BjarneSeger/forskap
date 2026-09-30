@@ -1034,9 +1034,12 @@ async fn get_activity_is_newest_first_in_the_window_and_linked() {
         commit_count: 2,
         commit_title: "Fix it".into(),
     };
-    let mut elsewhere = event_at(3, 9, "opened", now - 60);
-    elsewhere.target_type = "MergeRequest".into();
-    elsewhere.target_iid = 4;
+    let mut elsewhere = event_at(3, 9, "commented on", now - 60);
+    elsewhere.note = model::NoteRef {
+        body: "lgtm".into(),
+        noteable_type: "MergeRequest".into(),
+        noteable_iid: 4,
+    };
     seed(
         &h,
         &[
@@ -1052,13 +1055,16 @@ async fn get_activity_is_newest_first_in_the_window_and_linked() {
     let actions: Vec<&str> = events.iter().map(|e| e.action.as_str()).collect();
     assert_eq!(
         actions,
-        ["opened", "pushed to", "closed"],
+        ["commented on", "pushed to", "closed"],
         "30 days back is outside the default week"
     );
     assert_eq!(events[0].project_path, None, "project 9 is not stored");
     assert_eq!(events[0].web_url, None);
     assert_eq!(events[0].target_iid, Some(4));
+    assert_eq!(events[0].description.as_deref(), Some("lgtm"));
     assert_eq!(events[1].r#ref.as_deref(), Some("main"));
+    assert_eq!(events[1].description.as_deref(), Some("Fix it"));
+    assert_eq!(events[2].description, None);
     assert_eq!(events[1].commit_count, Some(2));
     assert_eq!(events[1].project_path.as_deref(), Some("team/api"));
     assert_eq!(

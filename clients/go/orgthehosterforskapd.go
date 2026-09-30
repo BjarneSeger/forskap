@@ -51,6 +51,7 @@ type ActivityEvent struct {
 	Ref          *string `json:"ref,omitempty"`
 	Commit_count *int64  `json:"commit_count,omitempty"`
 	Commit_title *string `json:"commit_title,omitempty"`
+	Description  *string `json:"description,omitempty"`
 }
 
 type FailedTask struct {
@@ -1807,7 +1808,8 @@ type ActivityEvent (
   web_url: ?string,
   ref: ?string,
   commit_count: ?int,
-  commit_title: ?string
+  commit_title: ?string,
+  description: ?string
 )
 
 type FailedTask (
