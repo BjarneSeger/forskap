@@ -11,7 +11,7 @@ use forskap_api::{FailedTask, IssuableKind, VarlinkClientInterface};
 
 use crate::cli::{OutputFormat, QueueCommand, WatchArgs};
 use crate::friendly::friendly;
-use crate::{client, output, watch};
+use crate::{client, output, style, watch};
 
 pub async fn run(command: QueueCommand) -> Result<()> {
     match command {
@@ -88,8 +88,13 @@ fn render(failures: &[FailedTask]) -> String {
             IssuableKind::issue => '#',
         };
         out.push_str(&format!(
-            "[{}] {} {sigil}{}{}  —  {}  ({})\n",
-            f.id, f.op, f.iid, detail, f.error, when
+            "[{}] {} {}{}  —  {}  ({})\n",
+            f.id,
+            f.op,
+            style::reference(sigil, f.iid),
+            detail,
+            style::error(&f.error),
+            when
         ));
     }
     out.push_str(
@@ -116,7 +121,7 @@ mod tests {
             queued_at: 1_799_990_000,
             failed_at: 1_800_000_000,
         };
-        let text = render(&[failure]);
+        let text = render(std::slice::from_ref(&failure));
         assert!(
             text.starts_with(
                 "[3] post_time !42 (1h)  —  403 Forbidden  (2027-01-15T08:00:00+00:00)\n\nretry"
@@ -124,5 +129,14 @@ mod tests {
             "{text}"
         );
         assert_eq!(render(&[]), "no failed writes\n");
+
+        style::force(true);
+        let text = render(&[failure]);
+        assert!(
+            text.starts_with(
+                "[3] post_time \x1b[36m!42\x1b[0m (1h)  —  \x1b[31m403 Forbidden\x1b[0m  (2027"
+            ),
+            "{text}"
+        );
     }
 }

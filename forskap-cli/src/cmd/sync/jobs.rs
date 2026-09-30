@@ -11,7 +11,7 @@ use forskap_api::{GetSyncJobs_Reply, SyncJob, SyncJobStatus, VarlinkClientInterf
 
 use crate::cli::{OutputFormat, WatchArgs};
 use crate::friendly::friendly;
-use crate::{client, output, watch};
+use crate::{client, output, style, watch};
 
 pub async fn run(format: OutputFormat, watch: WatchArgs) -> Result<()> {
     match watch::interval(watch, format)? {
@@ -67,9 +67,12 @@ fn render(jobs: &[SyncJob], paused_until: Option<i64>, now: i64) -> String {
     };
     let (w0, w1, w2) = (width(0), width(1), width(2));
     let line = |[job, status, last, next]: &[String; 4]| {
+        let status = style::state(status);
         format!("{job:<w0$}  {status:<w1$}  {last:<w2$}  {next}\n")
     };
-    out.push_str(&line(&header));
+    let [job, status, last, next] = &header;
+    let header = format!("{job:<w0$}  {status:<w1$}  {last:<w2$}  {next}");
+    out.push_str(&format!("{}\n", style::heading(&header)));
     for (row, job) in rows.iter().zip(jobs) {
         out.push_str(&line(row));
         if let Some(error) = &job.last_error {
@@ -78,7 +81,8 @@ fn render(jobs: &[SyncJob], paused_until: Option<i64>, now: i64) -> String {
                 1 => "failed once: ".to_string(),
                 n => format!("failed {n} times: "),
             };
-            out.push_str(&format!("    {times}{error}\n"));
+            let error = format!("{times}{error}");
+            out.push_str(&format!("    {}\n", style::error(&error)));
         }
     }
     out
@@ -202,6 +206,27 @@ project/9/boards  backing off  never      in 1h 2m
     failed 2 times: 403 Forbidden
 project/7/avatar  waiting      1d 1h ago  -
 "
+        );
+    }
+
+    #[test]
+    fn render_colours_the_header_the_statuses_and_the_errors() {
+        style::force(true);
+        let jobs = [
+            job("events", SyncJobStatus::running),
+            SyncJob {
+                failures: 1,
+                last_error: Some("403 Forbidden".to_string()),
+                ..job("project/9/boards", SyncJobStatus::backing_off)
+            },
+        ];
+        // The columns line up as they do without the escapes.
+        assert_eq!(
+            render(&jobs, None, NOW),
+            "\x1b[1mJOB               STATUS       LAST SYNC  NEXT\x1b[0m\n\
+             events            \x1b[32mrunning    \x1b[0m  never      now\n\
+             project/9/boards  \x1b[31mbacking off\x1b[0m  never      -\n\
+             \x20   \x1b[31mfailed once: 403 Forbidden\x1b[0m\n"
         );
     }
 

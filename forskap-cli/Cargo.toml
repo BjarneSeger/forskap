@@ -17,6 +17,7 @@ carapace_spec_clap.workspace = true
 proptest.workspace = true
 
 [dependencies]
+anstyle.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true

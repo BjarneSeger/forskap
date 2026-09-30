@@ -7,6 +7,7 @@ use super::locate;
 use crate::cli::TargetArgs;
 use crate::friendly::friendly;
 use crate::refspec::{self, RefKind};
+use crate::style;
 
 pub async fn run(kind: RefKind, target: TargetArgs) -> Result<()> {
     let iid = target.iid;
@@ -18,8 +19,8 @@ pub async fn run(kind: RefKind, target: TargetArgs) -> Result<()> {
         .map_err(|e| friendly("UnassignSelf", e))?;
 
     outln!(
-        "unassigned from {}{iid} (project {project_id})",
-        refspec::sigil(kind)
+        "unassigned from {} (project {project_id})",
+        style::reference(refspec::sigil(kind), iid)
     )?;
     Ok(())
 }

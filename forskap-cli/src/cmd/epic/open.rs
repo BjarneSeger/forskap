@@ -9,6 +9,7 @@ use super::locate;
 use crate::cli::EpicArgs;
 use crate::friendly::friendly;
 use crate::state::{self, LastEpic};
+use crate::style;
 
 pub async fn run(target: EpicArgs, no_browser: bool) -> Result<()> {
     let (client, epic) = locate(&target).await?;
@@ -27,7 +28,11 @@ pub async fn run(target: EpicArgs, no_browser: bool) -> Result<()> {
             eprintln!("(couldn't open browser automatically: {e})");
         }
     }
-    outln!("opened &{} {}", epic.iid, epic.web_url)?;
+    outln!(
+        "opened {} {}",
+        style::reference('&', epic.iid),
+        epic.web_url
+    )?;
     Ok(())
 }
 

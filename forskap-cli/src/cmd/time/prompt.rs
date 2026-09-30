@@ -14,7 +14,7 @@ use inquire::Text;
 
 use crate::item::Item;
 use crate::refspec;
-use crate::{client, config, pick, state};
+use crate::{client, config, pick, state, style};
 
 struct PromptAnswers {
     picked: Item,
@@ -130,9 +130,8 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
     state::save(&st).context("saving state")?;
 
     outln!(
-        "logged {duration} on {}{} ({})",
-        refspec::sigil(kind),
-        picked.iid(),
+        "logged {duration} on {} ({})",
+        style::reference(refspec::sigil(kind), picked.iid()),
         picked.title()
     )?;
     Ok(true)

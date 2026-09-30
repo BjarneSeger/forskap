@@ -1006,6 +1006,7 @@ dependencies = [
 name = "forskap-cli"
 version = "0.11.0"
 dependencies = [
+ "anstyle",
  "anyhow",
  "carapace_spec_clap",
  "chrono",

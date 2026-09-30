@@ -10,6 +10,19 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     max_term_width = 100
 )]
 pub struct Cli {
+    /// Colour the text output: state words, headings and item numbers.
+    ///
+    /// `auto` colours only when stdout is a terminal, and not when `NO_COLOR`
+    /// is set; `CLICOLOR_FORCE` colours a pipe as well. Structured output
+    /// (`--output json`) is never coloured.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        value_name = "WHEN",
+        default_value_t = ColorChoice::Auto,
+    )]
+    pub color: ColorChoice,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -76,6 +89,14 @@ pub struct WindowArgs {
     /// How many days back to show, up to the daemon's retention.
     #[arg(long, default_value_t = 7)]
     pub days: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum ColorChoice {
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Subcommand)]

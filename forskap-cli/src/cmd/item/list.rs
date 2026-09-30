@@ -9,8 +9,8 @@ use forskap_api::VarlinkClientInterface;
 
 use crate::cli::OutputFormat;
 use crate::friendly::friendly;
-use crate::refspec::RefKind;
-use crate::{client, output};
+use crate::refspec::{self, RefKind};
+use crate::{client, output, style};
 
 pub async fn run(kind: RefKind, groups: Vec<String>, format: OutputFormat) -> Result<()> {
     let client = client::connect_default().await?;
@@ -25,7 +25,13 @@ pub async fn run(kind: RefKind, groups: Vec<String>, format: OutputFormat) -> Re
                 .map_err(|e| friendly("GetAssignedIssues", e))?;
             output::emit(format, &reply.issues, |issues| {
                 for i in issues {
-                    outln!("#{:<5} {:<8} {}  {}", i.iid, i.state, i.title, i.web_url)?;
+                    outln!(
+                        "{:<6} {:<8} {}  {}",
+                        style::reference(refspec::sigil(kind), i.iid),
+                        style::state(&i.state),
+                        i.title,
+                        i.web_url
+                    )?;
                 }
                 Ok(())
             })
@@ -38,7 +44,13 @@ pub async fn run(kind: RefKind, groups: Vec<String>, format: OutputFormat) -> Re
                 .map_err(|e| friendly("GetAssignedMergeRequests", e))?;
             output::emit(format, &reply.merge_requests, |mrs| {
                 for m in mrs {
-                    outln!("!{:<5} {:<8} {}  {}", m.iid, m.state, m.title, m.web_url)?;
+                    outln!(
+                        "{:<6} {:<8} {}  {}",
+                        style::reference(refspec::sigil(kind), m.iid),
+                        style::state(&m.state),
+                        m.title,
+                        m.web_url
+                    )?;
                 }
                 Ok(())
             })

@@ -10,7 +10,7 @@ use forskap_api::VarlinkClientInterface;
 
 use crate::cmd::project;
 use crate::friendly::friendly;
-use crate::{client, refspec, state};
+use crate::{client, refspec, state, style};
 
 pub async fn run(
     reference: &str,
@@ -46,8 +46,8 @@ pub async fn run(
     state::save(&st).context("saving state")?;
 
     outln!(
-        "logged {duration} on {}{iid} (project {project_id})",
-        refspec::sigil(kind)
+        "logged {duration} on {} (project {project_id})",
+        style::reference(refspec::sigil(kind), iid)
     )?;
     Ok(())
 }

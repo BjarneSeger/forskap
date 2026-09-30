@@ -55,6 +55,13 @@ pipes, launchers) this stays an error asking for `--project`.
 
 `forskap epic` does the same across groups, with `--group`.
 
+### Colour
+On a terminal the text output colours the state words (`opened`, `merged`, a
+sync job's `running`, …), the headings and the item numbers (`#42`, `!7`, `&5`).
+Pipes, scripts and launchers get plain text, and `--output json` is never
+coloured. `--color always` or `--color never` overrules that on any command;
+`NO_COLOR` turns it off and `CLICOLOR_FORCE` on.
+
 ## Config
 The config lives at `$XDG_CONFIG_HOME/` or `$HOME/.config/` under
 `forskap/config.toml`. You can run `forskap config path` to see what it 

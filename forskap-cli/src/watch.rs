@@ -61,6 +61,31 @@ fn size() -> Option<(usize, usize)> {
     terminal_size::terminal_size().map(|(w, h)| (w.0.into(), h.0.into()))
 }
 
+/// Append the first `cols` visible characters of `line`. Its escape
+/// sequences take no column and are all kept, also past the cut: a colour
+/// opened before it is closed by its own reset.
+fn cut(frame: &mut String, line: &str, cols: usize) {
+    let mut visible = 0;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            frame.push(c);
+            // A CSI sequence ends with its first byte from `@` to `~`.
+            let mut csi = false;
+            for c in chars.by_ref() {
+                frame.push(c);
+                if (csi && ('@'..='~').contains(&c)) || (!csi && c != '[') {
+                    break;
+                }
+                csi = true;
+            }
+        } else if visible < cols {
+            frame.push(c);
+            visible += 1;
+        }
+    }
+}
+
 /// `text` as a frame drawn over the previous one, cut to the screen: a line
 /// that wraps or a frame that scrolls would leave the cursor-home short.
 fn paint(text: &str, size: Option<(usize, usize)>) -> String {
@@ -75,7 +100,7 @@ fn paint(text: &str, size: Option<(usize, usize)>) -> String {
     // after the text would eat its last character.
     for line in text.lines().take(shown) {
         frame.push_str(ERASE_LINE);
-        frame.extend(line.chars().take(cols));
+        cut(&mut frame, line, cols);
         frame.push('\n');
     }
     if shown < total {
@@ -127,6 +152,27 @@ mod tests {
         assert_eq!(
             paint("wide line\n", Some((4, 24))),
             "\x1b[H\x1b[Kwide\n\x1b[J"
+        );
+    }
+
+    #[test]
+    fn cut_counts_only_what_is_visible_and_closes_the_colours() {
+        let cut = |line, cols| {
+            let mut out = String::new();
+            super::cut(&mut out, line, cols);
+            out
+        };
+        let line = "\x1b[1mJOB\x1b[0m  \x1b[32mrunning\x1b[0m  now";
+        // Wide enough: untouched, however many escapes it carries.
+        assert_eq!(cut(line, 17), line);
+        // Cut inside a coloured word: the colour is still reset.
+        assert_eq!(cut(line, 8), "\x1b[1mJOB\x1b[0m  \x1b[32mrun\x1b[0m");
+        // Cut before it: its escapes stay whole and show nothing.
+        assert_eq!(cut(line, 3), "\x1b[1mJOB\x1b[0m\x1b[32m\x1b[0m");
+        assert_eq!(cut("äöü", 2), "äö");
+        assert_eq!(
+            paint("\x1b[32mwide\x1b[0m line\n", Some((2, 24))),
+            "\x1b[H\x1b[K\x1b[32mwi\x1b[0m\n\x1b[J"
         );
     }
 }
