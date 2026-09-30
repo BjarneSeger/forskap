@@ -124,6 +124,11 @@ type NotAuthReason string
 
 type SearchKind string
 
+type SearchScope struct {
+	Projects *[]int64  `json:"projects,omitempty"`
+	Groups   *[]string `json:"groups,omitempty"`
+}
+
 type CacheScope string
 
 type GitlabError struct {
@@ -303,8 +308,8 @@ type Search_methods struct{}
 
 func Search() Search_methods { return Search_methods{} }
 
-func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, err_ error) {
-	receive, err_ := m.Send(ctx, c, 0, query_in_, kinds_in_, limit_in_)
+func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64, scope_in_ *SearchScope) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, query_in_, kinds_in_, limit_in_, scope_in_)
 	if err_ != nil {
 		return
 	}
@@ -312,15 +317,17 @@ func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_i
 	return
 }
 
-func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64) (func(ctx context.Context) ([]Issue, []MergeRequest, []Project, []Group, []Epic, uint64, error), error) {
+func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64, scope_in_ *SearchScope) (func(ctx context.Context) ([]Issue, []MergeRequest, []Project, []Group, []Epic, uint64, error), error) {
 	var in struct {
 		Query string        `json:"query"`
 		Kinds *[]SearchKind `json:"kinds,omitempty"`
 		Limit *int64        `json:"limit,omitempty"`
+		Scope *SearchScope  `json:"scope,omitempty"`
 	}
 	in.Query = query_in_
 	in.Kinds = kinds_in_
 	in.Limit = limit_in_
+	in.Scope = scope_in_
 	receive, err := c.Send(ctx, "org.thehoster.forskapd.Search", in, flags)
 	if err != nil {
 		return nil, err
@@ -347,15 +354,17 @@ func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags u
 	}, nil
 }
 
-func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64) (func(ctx context.Context) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64, scope_in_ *SearchScope) (func(ctx context.Context) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
 		Query string        `json:"query"`
 		Kinds *[]SearchKind `json:"kinds,omitempty"`
 		Limit *int64        `json:"limit,omitempty"`
+		Scope *SearchScope  `json:"scope,omitempty"`
 	}
 	in.Query = query_in_
 	in.Kinds = kinds_in_
 	in.Limit = limit_in_
+	in.Scope = scope_in_
 	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.Search", in)
 	if err != nil {
 		return nil, err
@@ -1330,7 +1339,7 @@ func (m WhoAmI_methods) Upgrade(ctx context.Context, c *varlink.Connection) (fun
 type orgthehosterforskapdInterface interface {
 	GetAssignedIssues(ctx context.Context, c VarlinkCall, groups_ *[]string) error
 	GetAssignedMergeRequests(ctx context.Context, c VarlinkCall, groups_ *[]string) error
-	Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64) error
+	Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64, scope_ *SearchScope) error
 	PostTime(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind, duration_ string, summary_ *string) error
 	Close(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	AssignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
@@ -1511,7 +1520,7 @@ func (s *VarlinkInterface) GetAssignedMergeRequests(ctx context.Context, c Varli
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetAssignedMergeRequests")
 }
 
-func (s *VarlinkInterface) Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64) error {
+func (s *VarlinkInterface) Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64, scope_ *SearchScope) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.Search")
 }
 
@@ -1612,12 +1621,13 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 			Query string        `json:"query"`
 			Kinds *[]SearchKind `json:"kinds,omitempty"`
 			Limit *int64        `json:"limit,omitempty"`
+			Scope *SearchScope  `json:"scope,omitempty"`
 		}
 		err := call.GetParameters(&in)
 		if err != nil {
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
-		return s.orgthehosterforskapdInterface.Search(ctx, VarlinkCall{call}, in.Query, in.Kinds, in.Limit)
+		return s.orgthehosterforskapdInterface.Search(ctx, VarlinkCall{call}, in.Query, in.Kinds, in.Limit, in.Scope)
 
 	case "PostTime":
 		var in struct {
@@ -1905,7 +1915,9 @@ method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRe
 
 type SearchKind (issues, merge_requests, projects, groups, epics)
 
-method Search(query: string, kinds: ?[]SearchKind, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)
+type SearchScope (projects: ?[]int, groups: ?[]string)
+
+method Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)
 
 method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
 

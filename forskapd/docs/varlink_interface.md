@@ -239,7 +239,7 @@ namespace exactly like `GetAssignedIssues`. Replies newest-updated first. When t
 list has never been synced: empty list if a session exists, `NotAuthenticated`
 otherwise.
 
-### `Search(query: string, kinds: ?[]SearchKind, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)`
+### `Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)`
 
 Searches the locally cached corpus — a pure cache read, no GitLab round-trip.
 Matching is a case-insensitive substring test on issue/MR/epic titles and labels and
@@ -253,6 +253,20 @@ type SearchKind (issues, merge_requests, projects, groups, epics)
 
 `kinds` restricts the reply to a subset of them (omitted or empty = all five).
 `limit` caps each returned array separately (default 50; must be positive).
+
+```varlink
+type SearchScope (projects: ?[]int, groups: ?[]string)
+```
+
+`scope` narrows every kind to the listed projects and groups, applied before
+`limit` so a scoped search fills its `limit` from the scope alone. An item passes
+if it matches *any* listed criterion: issues and merge requests by their
+`project_id` or by the namespace of their `web_url` lying in a group (subgroups
+included, as in `GetAssignedIssues`); projects by their `id` or their path lying in
+a group; groups by their path; epics by the path of their group. A kind no listed
+criterion can name comes back empty — `projects` alone yields no groups and no
+epics. A scope that is omitted, or whose lists are both omitted or empty, is no
+scope at all.
 
 **Ranking**: issues, MRs and epics are ordered by their `RecordOpen` /
 `RecordEpicOpen` statistics — most opens
