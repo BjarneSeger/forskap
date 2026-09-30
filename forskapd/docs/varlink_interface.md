@@ -175,7 +175,9 @@ type Epic (
   title:      string,
   web_url:    string,
   state:      string,  # "opened" or "closed"
-  open_count: int      # opens recorded through RecordEpicOpen (within usage.retention_hours)
+  open_count: int,     # opens recorded through RecordEpicOpen (within usage.retention_hours)
+  group_path: string   # the group's full path ("team/backend"): the stored group's, else
+                       # the one in web_url; empty when neither gives it
 )
 ```
 

@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use super::locate;
+use super::{group_of, locate};
 use crate::cli::{EpicArgs, OutputFormat};
 use crate::{output, style};
 
@@ -11,7 +11,8 @@ pub async fn run(target: EpicArgs, format: OutputFormat) -> Result<()> {
     output::emit(format, &epic, |e| {
         outln!("{} {}", style::reference('&', e.iid), e.title)?;
         field("state", &style::state(&e.state).to_string())?;
-        field("group", &e.group_id.to_string())?;
+        let group = group_of(e).map_or_else(|| e.group_id.to_string(), str::to_string);
+        field("group", &group)?;
         field("url", &e.web_url)?;
         if e.open_count > 0 {
             field("opened", &format!("{}×", e.open_count))?;

@@ -86,8 +86,21 @@ pub fn group(g: model::Group) -> Group {
     }
 }
 
-pub fn epic(e: model::Epic, open_count: i64) -> Epic {
+/// Epic pages live under `/groups/`, which is no part of the group's path.
+fn group_path(stored: Option<String>, web_url: &str) -> String {
+    stored.and_then(some).unwrap_or_else(|| {
+        let ns = namespace_of(web_url);
+        match ns.strip_prefix("groups/") {
+            Some(path) => path.to_string(),
+            None => ns,
+        }
+    })
+}
+
+/// `group_path` is the stored group's `full_path`, `None` without a row.
+pub fn epic(e: model::Epic, open_count: i64, group_path: Option<String>) -> Epic {
     Epic {
+        group_path: self::group_path(group_path, &e.web_url),
         id: e.id,
         iid: e.iid,
         group_id: e.group_id,
@@ -253,6 +266,23 @@ mod tests {
         assert_eq!(foreign.project_path, "other/big");
         let unknown = issue(model::Issue::default(), None, 0, info(None));
         assert_eq!(unknown.project_path, "");
+    }
+
+    #[test]
+    fn epics_name_the_stored_group_or_the_one_in_their_link() {
+        let item = || model::Epic {
+            web_url: "https://gl/groups/other/big/-/epics/7".into(),
+            ..Default::default()
+        };
+        let stored = epic(item(), 0, Some("team".into()));
+        assert_eq!(stored.group_path, "team");
+        let foreign = epic(item(), 0, None);
+        assert_eq!(
+            foreign.group_path, "other/big",
+            "without the `groups/` prefix"
+        );
+        let unknown = epic(model::Epic::default(), 0, Some(String::new()));
+        assert_eq!(unknown.group_path, "");
     }
 
     #[test]
