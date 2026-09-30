@@ -2,8 +2,8 @@
 
 A [noctalia-shell](https://noctalia.dev) plugin that puts `forskap search` behind the
 launcher prefix `/gl`. Results come from the daemon's cache (instant, works offline),
-activating an issue or merge request opens it in the browser through `forskap issue open` / `forskap mr open` — which
-also counts the open, so what you visit most ranks first. Projects and groups open via
+activating an issue, merge request or epic opens it in the browser through `forskap issue open` / `forskap mr open` /
+`forskap epic open` — which also counts the open, so what you visit most ranks first. Projects and groups open via
 `xdg-open`. Issues, merge requests and projects show the avatar of their project, where
 it has one.
 
@@ -54,14 +54,14 @@ Settings (**Settings → Plugins → Forskap**):
 
 | Input | Result |
 |---|---|
-| `/gl` | Issues/MRs you have opened, most opened first |
-| `/gl oauth` | Everything matching `oauth` (issues, MRs, projects, groups) |
-| `/gl mr oauth` | Merge requests only (`i`/`issue`, `mr`, `p`/`project`, `g`/`group` also work) |
-| `/gl !42` / `/gl #42` | MR / issue number 42 |
+| `/gl` | Issues/MRs/epics you have opened, most opened first |
+| `/gl oauth` | Everything matching `oauth` (issues, MRs, epics, projects, groups) |
+| `/gl mr oauth` | Merge requests only (`i`/`issue`, `mr`, `e`/`epic`, `p`/`project`, `g`/`group` also work) |
+| `/gl !42` / `/gl #42` / `/gl &42` | MR / issue / epic number 42 |
 
 Ranking is the daemon's (`open_count` desc, then last opened, then updated); the
 plugin only forwards it as each row's `score`. With `shell.launcher.categories = true`
-the launcher additionally shows Issues / Merge requests / Projects / Groups filter
+the launcher additionally shows Issues / Merge requests / Epics / Projects / Groups filter
 buttons (`F6` cycles them).
 
 Reset the statistics with `forskap sync refresh --scope usage`.

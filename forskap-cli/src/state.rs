@@ -1,5 +1,6 @@
 //! Persistent client-side state: the last-prompt timestamp, the last item
-//! time was logged on, and the last failed write already reported.
+//! time was logged on, the last epic opened, and the last failed write
+//! already reported.
 //!
 //! Stored as JSON under `$XDG_STATE_HOME/forskap/state.json` (with a
 //! `data_local_dir()` fallback for platforms that don't define a state dir).
@@ -22,6 +23,9 @@ pub struct State {
     /// Item time was last logged on; acting on it again needs no `--project`
     /// (see [`crate::cmd::project`]).
     pub last_issue: Option<LastIssue>,
+    /// Epic last opened; acting on it again needs no `--group` (see
+    /// [`crate::cmd::epic`]).
+    pub last_epic: Option<LastEpic>,
     /// Highest dead-letter failure id already surfaced via the `forskap tick`
     /// notice, so each queued-action failure is reported at most once. See
     /// [`crate::cmd::tick`].
@@ -36,6 +40,12 @@ pub struct LastIssue {
     /// written before MR support readable.
     #[serde(default)]
     pub kind: crate::refspec::RefKind,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+pub struct LastEpic {
+    pub group_id: i64,
+    pub iid: i64,
 }
 
 impl State {

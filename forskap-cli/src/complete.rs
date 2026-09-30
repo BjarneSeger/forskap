@@ -1,4 +1,5 @@
-//! Dynamic shell completion: issue and MR numbers, project paths.
+//! Dynamic shell completion: issue, MR and epic numbers, project and group
+//! paths.
 //!
 //! The scripts `build.rs` writes (and `COMPLETE=<shell> forskap` prints) make
 //! bash, zsh and fish call `forskap` itself on every Tab, with `COMPLETE` set
@@ -15,12 +16,13 @@ use std::time::Duration;
 
 use clap::{Arg, Command, CommandFactory};
 use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
-use forskap_api::VarlinkClientInterface;
+use forskap_api::{Epic, VarlinkClientInterface};
 
 use crate::cli::Cli;
+use crate::cmd::epic::group_path;
 use crate::item::{Item, project_path};
 use crate::refspec::{self, RefKind};
-use crate::state::LastIssue;
+use crate::state::{LastEpic, LastIssue};
 use crate::{client, state};
 
 /// For everything one completion asks the daemon. Cache reads answer in a few
@@ -29,6 +31,9 @@ const BUDGET: Duration = Duration::from_millis(300);
 
 /// The subcommands of `forskap issue` / `forskap mr` that take a number.
 const TARGET_VERBS: [&str; 5] = ["view", "open", "close", "assign", "unassign"];
+
+/// The subcommands of `forskap epic`, which all take a number.
+const EPIC_VERBS: [&str; 2] = ["view", "open"];
 
 /// Answer the shell and exit if this run is a completion request (`COMPLETE`
 /// is set); return otherwise. Must run before anything can print.
@@ -54,6 +59,18 @@ pub fn command() -> Command {
             group
         });
     }
+    cmd = cmd.mut_subcommand("epic", |mut epic| {
+        for verb in EPIC_VERBS {
+            epic = epic.mut_subcommand(verb, |verb| {
+                verb.mut_args(|arg| match arg.get_id().as_str() {
+                    "iid" => completing(arg, epics),
+                    "group" => completing(arg, groups),
+                    _ => arg,
+                })
+            });
+        }
+        epic
+    });
     cmd.mut_subcommand("time", |time| {
         time.mut_subcommand("log", |log| {
             // Not `mut_arg`: it moves the argument behind the others, which
@@ -93,7 +110,15 @@ struct Candidate {
 
 /// `forskap issue|mr <verb> <IID>`.
 fn numbers(kind: RefKind, current: &str) -> Vec<Candidate> {
-    candidates(&known(kind), "", current)
+    candidates(&known(kind), "", current, "project")
+}
+
+/// `forskap epic <verb> <IID>`.
+fn epics(current: &str) -> Vec<Candidate> {
+    let mut rows = Vec::new();
+    within_budget(fetch_epics(&mut rows));
+    let last = state::load().ok().and_then(|st| st.last_epic);
+    candidates(&ranked_epics(last, &rows), "", current, "group")
 }
 
 /// `forskap time log <REF>`.
@@ -102,14 +127,21 @@ fn references(current: &str) -> Vec<Candidate> {
     // line shows in our own arguments, which are that line.
     let mr = std::env::args_os().any(|arg| arg == "--mr");
     let (kind, sigil, digits) = reference(current, mr);
-    candidates(&known(kind), sigil, digits)
+    candidates(&known(kind), sigil, digits, "project")
 }
 
 /// `-p/--project <PROJECT>`.
 fn projects(current: &str) -> Vec<Candidate> {
     let mut found = Vec::new();
     within_budget(fetch_projects(current, &mut found));
-    project_candidates(found, current)
+    path_candidates(found, current)
+}
+
+/// `-g/--group <GROUP>`.
+fn groups(current: &str) -> Vec<Candidate> {
+    let mut found = Vec::new();
+    within_budget(fetch_groups(current, &mut found));
+    path_candidates(found, current)
 }
 
 /// Split a partial `time log` ref into its kind, the sigil to offer the
@@ -130,6 +162,7 @@ fn reference(current: &str, mr: bool) -> (RefKind, &'static str, &str) {
 /// A number worth offering, and where it is from.
 struct Known {
     iid: i64,
+    /// Of an epic, its group.
     project_id: i64,
     /// Project path or title; whatever is known.
     help: String,
@@ -170,24 +203,49 @@ fn ranked(kind: RefKind, last: Option<&LastIssue>, rows: &[Item]) -> Vec<Known> 
         }
     }
     if let Some(last) = last.filter(|last| last.kind == kind) {
-        let is_last = |k: &Known| (k.project_id, k.iid) == (last.project_id, last.issue_iid);
-        let first = match known.iter().position(is_last) {
-            Some(at) => known.remove(at),
-            // Not cached (any more): still the likeliest number.
-            None => Known {
-                iid: last.issue_iid,
-                project_id: last.project_id,
-                help: format!("project {}", last.project_id),
-            },
-        };
-        known.insert(0, first);
+        put_first(&mut known, last.project_id, last.issue_iid, "project");
     }
     known
 }
 
+/// The epics opened before, most used first, behind the one opened last.
+fn ranked_epics(last: Option<LastEpic>, rows: &[Epic]) -> Vec<Known> {
+    let mut known: Vec<Known> = rows
+        .iter()
+        .map(|e| Known {
+            iid: e.iid,
+            project_id: e.group_id,
+            help: match group_path(&e.web_url) {
+                Some(path) => format!("{} ({path})", e.title),
+                None => e.title.clone(),
+            },
+        })
+        .collect();
+    if let Some(last) = last {
+        put_first(&mut known, last.group_id, last.iid, "group");
+    }
+    known
+}
+
+/// Move the number used last to the front. `scope` names what `project_id`
+/// is of when the number isn't cached (any more): still the likeliest one.
+fn put_first(known: &mut Vec<Known>, project_id: i64, iid: i64, scope: &str) {
+    let is_last = |k: &Known| (k.project_id, k.iid) == (project_id, iid);
+    let first = match known.iter().position(is_last) {
+        Some(at) => known.remove(at),
+        None => Known {
+            iid,
+            project_id,
+            help: format!("{scope} {project_id}"),
+        },
+    };
+    known.insert(0, first);
+}
+
 /// The numbers starting with `digits`, written behind `sigil`. A number used
-/// in several projects is offered once, described by its best-ranked item.
-fn candidates(known: &[Known], sigil: &str, digits: &str) -> Vec<Candidate> {
+/// in several projects (or whatever `scope` names) is offered once, described
+/// by its best-ranked item.
+fn candidates(known: &[Known], sigil: &str, digits: &str, scope: &str) -> Vec<Candidate> {
     if !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Vec::new();
     }
@@ -214,24 +272,26 @@ fn candidates(known: &[Known], sigil: &str, digits: &str) -> Vec<Candidate> {
         .map(|(_, mut candidate, others)| {
             match others {
                 0 => {}
-                1 => candidate.help.push_str(" — and in 1 more project"),
+                1 => candidate
+                    .help
+                    .push_str(&format!(" — and in 1 more {scope}")),
                 n => candidate
                     .help
-                    .push_str(&format!(" — and in {n} more projects")),
+                    .push_str(&format!(" — and in {n} more {scope}s")),
             }
             candidate
         })
         .collect()
 }
 
-/// A project path and, if the daemon told, the project's name.
-type ProjectRow = (String, Option<String>);
+/// A project or group path and, if the daemon told, its name.
+type PathRow = (String, Option<String>);
 
 /// The paths starting with `current`, each once. GitLab paths are
 /// case-insensitive.
-fn project_candidates(rows: Vec<ProjectRow>, current: &str) -> Vec<Candidate> {
+fn path_candidates(rows: Vec<PathRow>, current: &str) -> Vec<Candidate> {
     let prefix = current.trim_start_matches('/').to_ascii_lowercase();
-    let mut found: Vec<ProjectRow> = Vec::new();
+    let mut found: Vec<PathRow> = Vec::new();
     for (path, name) in rows {
         if !path.to_ascii_lowercase().starts_with(&prefix) {
             continue;
@@ -298,7 +358,7 @@ async fn fetch_items(kind: RefKind, rows: &mut Vec<Item>) -> Option<()> {
 
 /// The projects of the assigned items, then the cached projects matching
 /// what is typed.
-async fn fetch_projects(current: &str, rows: &mut Vec<ProjectRow>) -> Option<()> {
+async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
     let issues = client.get_assigned_issues(None).call().await.ok()?.issues;
     let urls = issues.iter().map(|i| i.web_url.as_str());
@@ -311,6 +371,29 @@ async fn fetch_projects(current: &str, rows: &mut Vec<ProjectRow>) -> Option<()>
     let kinds = vec!["projects".to_string()];
     let reply = client.search(query, Some(kinds), None).call().await.ok()?;
     rows.extend(reply.projects.into_iter().map(|p| (p.path, Some(p.name))));
+    Some(())
+}
+
+/// The epics opened before, most used first (an empty `Search`).
+async fn fetch_epics(rows: &mut Vec<Epic>) -> Option<()> {
+    let client = client::connect_default().await.ok()?;
+    let kinds = vec!["epics".to_string()];
+    let reply = client
+        .search(String::new(), Some(kinds), None)
+        .call()
+        .await
+        .ok()?;
+    rows.extend(reply.epics);
+    Some(())
+}
+
+/// The cached groups matching what is typed.
+async fn fetch_groups(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
+    let client = client::connect_default().await.ok()?;
+    let query = current.trim_matches('/').to_string();
+    let kinds = vec!["groups".to_string()];
+    let reply = client.search(query, Some(kinds), None).call().await.ok()?;
+    rows.extend(reply.groups.into_iter().map(|g| (g.path, Some(g.name))));
     Some(())
 }
 
@@ -372,12 +455,21 @@ mod tests {
     #[test]
     fn candidates_filter_on_the_typed_digits() {
         let known = ranked(RefKind::Issue, None, &rows());
-        assert_eq!(values(&candidates(&known, "", "")), ["42", "7", "421"]);
-        assert_eq!(values(&candidates(&known, "", "4")), ["42", "421"]);
-        assert_eq!(values(&candidates(&known, "#", "42")), ["#42", "#421"]);
-        assert!(candidates(&known, "", "9").is_empty());
-        assert!(candidates(&known, "", "4x").is_empty());
-        assert!(candidates(&known, "", "-").is_empty());
+        assert_eq!(
+            values(&candidates(&known, "", "", "project")),
+            ["42", "7", "421"]
+        );
+        assert_eq!(
+            values(&candidates(&known, "", "4", "project")),
+            ["42", "421"]
+        );
+        assert_eq!(
+            values(&candidates(&known, "#", "42", "project")),
+            ["#42", "#421"]
+        );
+        assert!(candidates(&known, "", "9", "project").is_empty());
+        assert!(candidates(&known, "", "4x", "project").is_empty());
+        assert!(candidates(&known, "", "-", "project").is_empty());
     }
 
     #[test]
@@ -390,7 +482,7 @@ mod tests {
         ];
         let known = ranked(RefKind::Mr, None, &rows);
         assert_eq!(
-            candidates(&known, "!", "3"),
+            candidates(&known, "!", "3", "project"),
             [
                 Candidate {
                     value: "!3".to_string(),
@@ -405,6 +497,47 @@ mod tests {
     }
 
     #[test]
+    fn epics_rank_behind_the_one_opened_last() {
+        let epic = |group_id, path: &str, iid, title: &str| Epic {
+            id: group_id * 100 + iid,
+            iid,
+            group_id,
+            title: title.to_string(),
+            web_url: format!("https://gitlab.example.com/groups/{path}/-/epics/{iid}"),
+            state: "opened".to_string(),
+            open_count: 1,
+        };
+        let rows = [
+            epic(3, "team", 5, "Accounts"),
+            epic(4, "team/backend", 5, "Billing"),
+            epic(4, "team/backend", 12, "Search"),
+        ];
+        let last = |group_id, iid| Some(LastEpic { group_id, iid });
+
+        let known = ranked_epics(last(4, 12), &rows);
+        assert_eq!(
+            candidates(&known, "", "", "group"),
+            [
+                Candidate {
+                    value: "12".to_string(),
+                    help: "Search (team/backend)".to_string(),
+                },
+                Candidate {
+                    value: "5".to_string(),
+                    help: "Accounts (team) — and in 1 more group".to_string(),
+                },
+            ]
+        );
+        // Not in the cache: offered all the same.
+        let known = ranked_epics(last(9, 7), &rows);
+        assert_eq!(known[0].help, "group 9");
+        assert_eq!(
+            values(&candidates(&known, "", "", "group")),
+            ["7", "5", "12"]
+        );
+    }
+
+    #[test]
     fn reference_follows_the_sigil_then_the_flag() {
         assert_eq!(reference("", false), (RefKind::Issue, "", ""));
         assert_eq!(reference("4", false), (RefKind::Issue, "", "4"));
@@ -415,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn project_candidates_match_the_path_prefix() {
+    fn path_candidates_match_the_path_prefix() {
         let rows = || {
             vec![
                 ("team/api".to_string(), None),
@@ -425,7 +558,7 @@ mod tests {
             ]
         };
         assert_eq!(
-            project_candidates(rows(), "/team/"),
+            path_candidates(rows(), "/team/"),
             [
                 Candidate {
                     value: "team/api".to_string(),
@@ -437,7 +570,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(project_candidates(rows(), "").len(), 3);
-        assert!(project_candidates(rows(), "api").is_empty());
+        assert_eq!(path_candidates(rows(), "").len(), 3);
+        assert!(path_candidates(rows(), "api").is_empty());
     }
 }

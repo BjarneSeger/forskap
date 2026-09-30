@@ -4,8 +4,8 @@ use clap::{CommandFactory, Parser};
 use clap_complete::ArgValueCompleter;
 
 use crate::cli::{
-    Cli, Command, ItemCommand, OutputFormat, QueueCommand, RefreshScope, SyncCommand, TickMode,
-    TimeCommand,
+    Cli, Command, EpicCommand, ItemCommand, OutputFormat, QueueCommand, RefreshScope, SyncCommand,
+    TickMode, TimeCommand,
 };
 
 fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -25,12 +25,13 @@ fn tree_is_well_formed() {
 }
 
 /// The completers are attached by name outside `cli.rs`: a verb added to
-/// `issue`/`mr`, or an argument renamed, must not silently lose its completion.
+/// `issue`/`mr`/`epic`, or an argument renamed, must not silently lose its
+/// completion.
 #[test]
 fn every_number_and_project_argument_completes() {
     fn check(cmd: &clap::Command, path: &str, seen: &mut usize) {
         for arg in cmd.get_arguments() {
-            if ["iid", "reference", "project"].contains(&arg.get_id().as_str()) {
+            if ["iid", "reference", "project", "group"].contains(&arg.get_id().as_str()) {
                 assert!(
                     arg.get::<ArgValueCompleter>().is_some(),
                     "`{path}` has no completer for `{}`",
@@ -48,8 +49,9 @@ fn every_number_and_project_argument_completes() {
     cmd.build();
     let mut seen = 0;
     check(&cmd, "forskap", &mut seen);
-    // Number and project of five verbs in two groups, and of `time log`.
-    assert_eq!(seen, 2 * 5 * 2 + 2);
+    // Number and project of five verbs in two groups and of `time log`,
+    // number and group of the two epic verbs.
+    assert_eq!(seen, 2 * 5 * 2 + 2 + 2 * 2);
 
     // Attaching them must not reorder the positionals.
     let log = cmd.find_subcommand("time").unwrap();
@@ -80,6 +82,39 @@ fn issue_and_mr_share_their_verbs() {
 }
 
 #[test]
+fn epics_are_viewed_and_opened_by_group() {
+    ok(&["epic", "view", "5", "-o", "json"]);
+    ok(&["epic", "open", "5"]);
+    let Command::Epic {
+        command: EpicCommand::Open { target, no_browser },
+    } = ok(&[
+        "epic",
+        "open",
+        "5",
+        "--group",
+        "team/backend",
+        "--no-browser",
+    ])
+    else {
+        panic!("not `epic open`");
+    };
+    assert_eq!(target.iid, 5);
+    assert_eq!(target.group.as_deref(), Some("team/backend"));
+    assert!(no_browser);
+    ok(&["epic", "view", "5", "-g", "12"]);
+
+    // Epics live in groups, and are read-only here.
+    assert!(parse(&["epic", "open", "5", "-p", "team/api"]).is_err());
+    for bad in ["0", "&5", "abc"] {
+        assert!(parse(&["epic", "view", bad]).is_err(), "{bad:?}");
+    }
+    for verb in ["list", "close", "assign", "unassign"] {
+        assert!(parse(&["epic", verb, "5"]).is_err(), "{verb}");
+    }
+    ok(&["search", "--kind", "epics", "roadmap"]);
+}
+
+#[test]
 fn iid_is_a_positive_number() {
     for bad in ["0", "-3", "#42", "!42", "abc"] {
         assert!(parse(&["issue", "close", bad]).is_err(), "{bad:?}");
@@ -91,6 +126,7 @@ fn output_only_where_data_is_printed() {
     for args in [
         &["issue", "list"][..],
         &["mr", "view", "1"],
+        &["epic", "view", "1"],
         &["search"],
         &["activity"],
         &["time", "history"],
@@ -104,6 +140,7 @@ fn output_only_where_data_is_printed() {
     for args in [
         &["issue", "close", "1"][..],
         &["issue", "open", "1"],
+        &["epic", "open", "1"],
         &["time", "log", "1", "30m"],
         &["sync", "refresh"],
         &["queue", "clear"],
@@ -192,7 +229,9 @@ fn queue_ids_are_not_negative() {
 
 #[test]
 fn groups_need_a_subcommand() {
-    for group in ["issue", "mr", "time", "auth", "sync", "queue", "config"] {
+    for group in [
+        "issue", "mr", "epic", "time", "auth", "sync", "queue", "config",
+    ] {
         assert!(parse(&[group]).is_err(), "{group}");
     }
     #[cfg(target_os = "linux")]

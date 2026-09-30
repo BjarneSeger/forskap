@@ -47,10 +47,15 @@ pub enum Target {
         project_id: i64,
         iid: i64,
     },
+    Epic {
+        group_id: i64,
+        iid: i64,
+    },
     Url(String),
 }
 
-/// Flatten a `Search` reply in display order: issues, MRs, projects, groups.
+/// Flatten a `Search` reply in display order: issues, MRs, epics, projects,
+/// groups.
 pub fn rows(reply: &Search_Reply) -> Vec<Row> {
     let mut out = Vec::new();
     for i in &reply.issues {
@@ -73,6 +78,17 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
             score: m.open_count,
             url: m.web_url.clone(),
             avatar: avatar(&m.project_avatar),
+        });
+    }
+    for e in &reply.epics {
+        out.push(Row {
+            id: format!("epic:{}:{}", e.group_id, e.iid),
+            title: format!("&{} {}", e.iid, e.title),
+            subtitle: join(&[group_path(&e.web_url), &e.state]),
+            kind: Kind::Epics,
+            score: e.open_count,
+            url: e.web_url.clone(),
+            avatar: None,
         });
     }
     for p in &reply.projects {
@@ -115,22 +131,37 @@ pub fn project_path(web_url: &str) -> &str {
     path.split_once("/-/").map_or("", |(p, _)| p)
 }
 
+/// `"https://gl/groups/team/backend/-/epics/5"` → `"team/backend"`: group
+/// pages live under `/groups/`, which is no part of the group's path.
+pub fn group_path(web_url: &str) -> &str {
+    let path = project_path(web_url);
+    path.strip_prefix("groups/").unwrap_or(path)
+}
+
 /// Parse an id produced by [`rows`].
 pub fn parse_id(id: &str) -> Option<Target> {
     if let Some(url) = id.strip_prefix("url:") {
         return (!url.is_empty()).then(|| Target::Url(url.to_string()));
     }
     let mut parts = id.splitn(3, ':');
-    let kind = match parts.next()? {
+    let kind = parts.next()?;
+    // The project of an issue or MR, the group of an epic.
+    let owner = parts.next()?.parse().ok()?;
+    let iid = parts.next()?.parse().ok()?;
+    let kind = match kind {
         "issues" => RefKind::Issue,
         "merge_requests" => RefKind::Mr,
+        "epic" => {
+            return Some(Target::Epic {
+                group_id: owner,
+                iid,
+            });
+        }
         _ => return None,
     };
-    let project_id = parts.next()?.parse().ok()?;
-    let iid = parts.next()?.parse().ok()?;
     Some(Target::Issuable {
         kind,
-        project_id,
+        project_id: owner,
         iid,
     })
 }
@@ -147,7 +178,7 @@ fn join(parts: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forskap_api::{Group, Issue, MergeRequest, Project};
+    use forskap_api::{Epic, Group, Issue, MergeRequest, Project};
 
     fn reply() -> Search_Reply {
         Search_Reply {
@@ -188,6 +219,15 @@ mod tests {
                 path: "team".into(),
                 web_url: "https://gl.example.com/groups/team".into(),
             }],
+            epics: vec![Epic {
+                id: 30,
+                iid: 5,
+                group_id: 3,
+                title: "Accounts".into(),
+                web_url: "https://gl.example.com/groups/team/-/epics/5".into(),
+                state: "opened".into(),
+                open_count: 2,
+            }],
         }
     }
 
@@ -200,6 +240,7 @@ mod tests {
             [
                 "issues:7:42",
                 "merge_requests:7:9",
+                "epic:3:5",
                 "url:https://gl.example.com/team/api",
                 "url:https://gl.example.com/groups/team",
             ]
@@ -209,16 +250,19 @@ mod tests {
         assert_eq!(rows[0].score, 3);
         assert_eq!(rows[1].title, "!9 Add OAuth");
         assert_eq!(rows[1].subtitle, "team/api · merged");
-        assert_eq!(rows[2].title, "team/api");
-        assert_eq!(rows[2].subtitle, "API");
-        assert_eq!(rows[3].kind, Kind::Groups);
+        assert_eq!(rows[2].title, "&5 Accounts");
+        assert_eq!(rows[2].subtitle, "team · opened", "no `groups/` prefix");
+        assert_eq!(rows[2].score, 2);
+        assert_eq!(rows[3].title, "team/api");
+        assert_eq!(rows[3].subtitle, "API");
+        assert_eq!(rows[4].kind, Kind::Groups);
     }
 
     #[test]
     fn rows_carry_the_project_avatar() {
         let avatars: Vec<_> = rows(&reply()).into_iter().map(|r| r.avatar).collect();
         let of_project = Some("/cache/avatars/7-a.png".to_string());
-        assert_eq!(avatars, [of_project.clone(), of_project, None, None]);
+        assert_eq!(avatars, [of_project.clone(), of_project, None, None, None]);
     }
 
     #[test]
@@ -244,6 +288,13 @@ mod tests {
     }
 
     #[test]
+    fn group_path_drops_the_groups_prefix() {
+        assert_eq!(group_path("https://gl/groups/team/-/epics/5"), "team");
+        assert_eq!(group_path("https://gl/groups/a/b/-/epics/5"), "a/b");
+        assert_eq!(group_path("https://gl/groups/team"), "");
+    }
+
+    #[test]
     fn ids_round_trip() {
         assert_eq!(
             parse_id("issues:7:42"),
@@ -261,6 +312,14 @@ mod tests {
                 iid: 9
             })
         );
+        assert_eq!(
+            parse_id("epic:3:5"),
+            Some(Target::Epic {
+                group_id: 3,
+                iid: 5
+            })
+        );
+        assert_eq!(parse_id("epic:3"), None);
         assert_eq!(
             parse_id("url:https://gl/a:b"),
             Some(Target::Url("https://gl/a:b".into()))

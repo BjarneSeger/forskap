@@ -82,6 +82,7 @@ async fn run() -> Result<()> {
     match command {
         Command::Issue { command } => cmd::item::run(RefKind::Issue, command).await,
         Command::Mr { command } => cmd::item::run(RefKind::Mr, command).await,
+        Command::Epic { command } => cmd::epic::run(command).await,
         Command::Search {
             query,
             kinds,

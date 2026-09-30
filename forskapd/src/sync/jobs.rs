@@ -13,7 +13,9 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use super::avatars::{self, Avatar, AvatarDir};
-use super::model::{Board, Event, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog};
+use super::model::{
+    Board, Epic, Event, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog,
+};
 use super::schedule::{Cadence, JobState, fingerprint};
 use super::store::{Commit, RowScope, Stored, View};
 use crate::config::Config;
@@ -45,6 +47,9 @@ pub enum Job {
     MemberGroups,
     ProjectIssues(i64),
     ProjectMergeRequests(i64),
+    /// A member group's own epics. Only instances with epics (GitLab
+    /// Premium) answer it.
+    GroupEpics(i64),
     AllIssues,
     AllMergeRequests,
     /// Timelogs inside `history.retention_hours`; prunes older ones.
@@ -66,6 +71,7 @@ impl Job {
             Self::MemberGroups => "member/groups".into(),
             Self::ProjectIssues(p) => format!("project/{p}/issues"),
             Self::ProjectMergeRequests(p) => format!("project/{p}/merge_requests"),
+            Self::GroupEpics(g) => format!("group/{g}/epics"),
             Self::AllIssues => "all/issues".into(),
             Self::AllMergeRequests => "all/merge_requests".into(),
             Self::AllTimelogs => "timelogs/all".into(),
@@ -104,7 +110,14 @@ impl Job {
                 | Self::AllTimelogs
                 | Self::Events
                 | Self::MemberProjects
+                | Self::MemberGroups
         )
+    }
+
+    /// Whether GitLab may lack the feature the job reads. A rejection then
+    /// says "not on this instance" rather than "something is wrong".
+    pub fn optional(&self) -> bool {
+        matches!(self, Self::GroupEpics(_))
     }
 
     pub fn cadence(&self, c: &Config) -> Cadence {
@@ -123,6 +136,7 @@ impl Job {
             | Self::MemberGroups => full_only(c.refresh.slow.interval_secs),
             Self::ProjectIssues(_)
             | Self::ProjectMergeRequests(_)
+            | Self::GroupEpics(_)
             | Self::AllIssues
             | Self::AllMergeRequests => Cadence {
                 every: c.search.partial_interval_secs,
@@ -155,10 +169,11 @@ impl Job {
             Self::ProjectBoards(_) => Board::SCHEMA,
             Self::MemberProjects => Project::SCHEMA,
             Self::MemberGroups => Group::SCHEMA,
+            Self::GroupEpics(_) => Epic::SCHEMA,
             Self::ProjectAvatar(_) => Avatar::SCHEMA,
         });
         match self {
-            Self::ProjectIssues(_) | Self::ProjectMergeRequests(_) => {
+            Self::ProjectIssues(_) | Self::ProjectMergeRequests(_) | Self::GroupEpics(_) => {
                 fingerprint(&[schema, c.search.max_items_per_project])
             }
             Self::RecentTimelogs => fingerprint(&[schema, c.refresh.quick.window_hours]),
@@ -199,7 +214,8 @@ pub struct Windows {
     pub quick: u64,
     pub retention: u64,
     pub tracked: u64,
-    /// Most issues (and most MRs) fetched per project.
+    /// Most issues (and most MRs) fetched per project, and most epics per
+    /// group.
     pub project_cap: usize,
 }
 
@@ -280,14 +296,22 @@ pub async fn fetch(job: Job, ctx: FetchCtx) -> Result<Staged> {
                 project_id,
                 updated_after,
             };
-            project_rows::<Issue>(&ctx, listing, project_id, ASSIGNED_ISSUES).await
+            capped_rows::<Issue>(&ctx, listing, project_id, Some(ASSIGNED_ISSUES)).await
         }
         Job::ProjectMergeRequests(project_id) => {
             let listing = |updated_after| Listing::ProjectMergeRequests {
                 project_id,
                 updated_after,
             };
-            project_rows::<MergeRequest>(&ctx, listing, project_id, ASSIGNED_MERGE_REQUESTS).await
+            let view = Some(ASSIGNED_MERGE_REQUESTS);
+            capped_rows::<MergeRequest>(&ctx, listing, project_id, view).await
+        }
+        Job::GroupEpics(group_id) => {
+            let listing = |updated_after| Listing::GroupEpics {
+                group_id,
+                updated_after,
+            };
+            capped_rows::<Epic>(&ctx, listing, group_id, None).await
         }
         Job::AllIssues => {
             let listing = Listing::AllIssues {
@@ -362,14 +386,15 @@ async fn avatar(ctx: &FetchCtx, project_id: i64) -> Result<Staged> {
     }))
 }
 
-/// One project's issues or MRs, newest first and capped: a huge project
-/// keeps only its most recently updated items, and a full run's reconcile
-/// drops the rest, except for items the assigned view `view` lists.
-async fn project_rows<R: Stored>(
+/// The issues or MRs of one project, or the epics of one group (`owner`),
+/// newest first and capped: a huge one keeps only its most recently updated
+/// items, and a full run's reconcile drops the rest, except for items the
+/// assigned view `view` lists.
+async fn capped_rows<R: Stored>(
     ctx: &FetchCtx,
     listing: impl Fn(Option<chrono::DateTime<chrono::Utc>>) -> Listing,
-    project_id: i64,
-    view: &'static str,
+    owner: i64,
+    view: Option<&'static str>,
 ) -> Result<Staged> {
     let cap = ctx.windows.project_cap;
     let gitlab = &*ctx.gitlab;
@@ -380,10 +405,10 @@ async fn project_rows<R: Stored>(
     let whole = ctx.full || fetched.len() >= cap;
     if fetched.len() >= cap {
         info!(
-            project_id,
+            owner,
             kind = R::NAME,
             cap,
-            "project exceeds search.max_items_per_project; keeping the most recently updated"
+            "more items than search.max_items_per_project; keeping the most recently updated"
         );
     }
     if whole {
@@ -402,19 +427,16 @@ async fn project_rows<R: Stored>(
         fetched.retain(|r| !seen.contains(&r.key()));
         fetched.extend(late);
     }
-    let prefix = project_id.max(0) as u64;
+    let prefix = owner.max(0) as u64;
     Ok(Staged::new(move |c| {
         c.upsert(&fetched)?;
         if whole {
-            // An assigned item older than the cap is still on the list.
             let mut keep: HashSet<RowKey> = fetched.iter().map(Resource::key).collect();
-            keep.extend(
-                c.view(view)?
-                    .unwrap_or_default()
-                    .keys
-                    .into_iter()
-                    .filter(|k| k.0 == prefix),
-            );
+            // An assigned item older than the cap is still on the list.
+            if let Some(view) = view {
+                let listed = c.view(view)?.unwrap_or_default().keys;
+                keep.extend(listed.into_iter().filter(|k| k.0 == prefix));
+            }
             c.remove_where::<R>(RowScope::Prefix(prefix), |k| keep.contains(&k))?;
         }
         Ok(fetched.len())
@@ -555,7 +577,7 @@ pub async fn fetch_rows<R: Resource>(
 mod tests {
     use super::*;
     use crate::sync::store::SyncStore;
-    use crate::testing::{FakeErr, FakeGitlab, PNG, event_json, issue_json};
+    use crate::testing::{FakeErr, FakeGitlab, PNG, epic_json, event_json, issue_json};
     use serde_json::json;
 
     const DAY: u64 = 86_400;
@@ -758,6 +780,33 @@ mod tests {
         run(&s, Job::ProjectIssues(7), ctx(&fake, true, 0)).await;
         assert_eq!(s.issues.keys(RowScope::All).unwrap(), [(7, 1), (7, 3)]);
         assert_eq!(s.issues.get((7, 1)).unwrap().unwrap().title, "moved");
+    }
+
+    /// Epics go through the capped fetch of the project jobs, keyed by their
+    /// group and with no assigned view to spare rows from the reconcile.
+    #[tokio::test]
+    async fn a_groups_epics_are_capped_and_reconciled() {
+        let (s, _d) = store();
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve(
+            "groups/3/epics",
+            vec![
+                epic_json(3, 3, "new"),
+                epic_json(3, 2, "mid"),
+                epic_json(3, 1, "old"),
+            ],
+        );
+        run(&s, Job::GroupEpics(3), ctx(&fake, true, 0)).await;
+        assert_eq!(s.epics.keys(RowScope::All).unwrap(), [(3, 2), (3, 3)]);
+        assert_eq!(fake.limits_to("groups/3/epics"), [Some(2), Some(2)]);
+
+        // A delta that sees only &3 keeps &2; the next full run drops it.
+        fake.serve("groups/3/epics", vec![epic_json(3, 3, "new v2")]);
+        run(&s, Job::GroupEpics(3), ctx(&fake, false, NOW - 3600)).await;
+        assert_eq!(s.epics.keys(RowScope::All).unwrap(), [(3, 2), (3, 3)]);
+        assert_eq!(s.epics.get((3, 3)).unwrap().unwrap().title, "new v2");
+        run(&s, Job::GroupEpics(3), ctx(&fake, true, NOW - 3600)).await;
+        assert_eq!(s.epics.keys(RowScope::All).unwrap(), [(3, 3)]);
     }
 
     #[tokio::test]

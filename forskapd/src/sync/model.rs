@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::gitlab::Issuable;
 
 /// Storage key of a row. Both halves are big-endian encoded, so the first
-/// half is the scan prefix: the project for issues, MRs and boards, the time
-/// for timelogs and events.
+/// half is the scan prefix: the project for issues, MRs and boards, the group
+/// for epics, the time for timelogs and events.
 pub type RowKey = (u64, u64);
 
 /// A GitLab resource the sync layer stores as one row per item.
@@ -148,6 +148,29 @@ pub struct Group {
     pub full_path: String,
     #[serde(default, deserialize_with = "de::nullable")]
     pub web_url: String,
+}
+
+/// `GET /groups/:id/epics`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Epic {
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub id: i64,
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub iid: i64,
+    /// The group the epic itself belongs to.
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub group_id: i64,
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub title: String,
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub web_url: String,
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub state: String,
+    #[serde(default, deserialize_with = "de::labels")]
+    pub labels: Vec<String>,
+    /// Unix seconds.
+    #[serde(default, deserialize_with = "de::timestamp")]
+    pub updated_at: u64,
 }
 
 /// One of the user's own contribution events (`GET /events`): opened
@@ -348,6 +371,18 @@ impl Resource for Group {
     }
     fn is_valid(&self) -> bool {
         self.id > 0
+    }
+}
+
+impl Resource for Epic {
+    const NAME: &'static str = "epics";
+    const KEYSPACE: &'static str = "gl_epics_v1";
+    const SCHEMA: u32 = 1;
+    fn key(&self) -> RowKey {
+        (positive(self.group_id), positive(self.iid))
+    }
+    fn is_valid(&self) -> bool {
+        self.id > 0 && self.iid > 0 && self.group_id > 0
     }
 }
 
@@ -568,6 +603,24 @@ mod tests {
         };
         let back: Timelog = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
         assert_eq!(back, t);
+    }
+
+    #[test]
+    fn epic_reads_a_gitlab_row() {
+        let e: Epic = serde_json::from_value(json!({
+            "id": 30, "iid": 5, "group_id": 3, "parent_id": null,
+            "title": "Accounts", "state": "opened",
+            "web_url": "https://gl/groups/team/-/epics/5",
+            "labels": ["roadmap"], "updated_at": "2026-07-01T10:00:00.000Z",
+        }))
+        .unwrap();
+        assert_eq!(e.key(), (3, 5), "keyed by its group");
+        assert!(e.is_valid());
+        assert_eq!(e.labels, ["roadmap"]);
+        assert_eq!(e.updated_at, 1_782_900_000);
+
+        let groupless: Epic = serde_json::from_value(json!({"id": 30, "iid": 5})).unwrap();
+        assert!(!groupless.is_valid());
     }
 
     #[test]

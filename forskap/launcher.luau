@@ -1,15 +1,16 @@
 -- Noctalia launcher provider for forskapd: `/gl <query>`.
 --
 -- Thin by design, like `forskap` itself: every query is one `forskap search --output
--- json` run, every activation one `forskap issue|mr open` (issues/MRs — which also records
--- the open so the daemon ranks it higher next time) or `xdg-open`
+-- json` run, every activation one `forskap issue|mr|epic open` (issues/MRs/epics — which
+-- also records the open so the daemon ranks it higher next time) or `xdg-open`
 -- (projects/groups). The daemon owns ranking; results are emitted in its
--- order with `score = open_count`, so frequently opened issues and MRs
+-- order with `score = open_count`, so frequently opened issues, MRs and epics
 -- interleave across kinds instead of one kind always sitting on top.
 
 local CATEGORY = {
   issues = "Issues",
   merge_requests = "Merge requests",
+  epics = "Epics",
   projects = "Projects",
   groups = "Groups",
 }
@@ -17,6 +18,7 @@ local CATEGORY = {
 local GLYPH = {
   issues = "circle-dot",
   merge_requests = "git-pull-request",
+  epics = "flag",
   projects = "folder",
   groups = "users",
 }
@@ -27,6 +29,7 @@ local KIND_WORDS = {
   mr = "merge_requests", mrs = "merge_requests",
   p = "projects", project = "projects", projects = "projects",
   g = "groups", group = "groups", groups = "groups",
+  e = "epics", epic = "epics", epics = "epics",
 }
 
 local function trim(s)
@@ -40,6 +43,7 @@ end
 --   "mr"           → "merge_requests", ""        (frequently opened MRs)
 --   "!42"          → "merge_requests", "#42"     (`forskap` only knows the # form)
 --   "#42"          → "issues",         "#42"
+--   "&42"          → "epics",          "&42"
 local function parseQuery(text)
   local t = trim(text or "")
   local word, rest = t:match("^(%S+)%s*(.*)$")
@@ -52,6 +56,9 @@ local function parseQuery(text)
   end
   if t:match("^#%d+$") then
     return "issues", t
+  end
+  if t:match("^&%d+$") then
+    return "epics", t
   end
   return nil, t
 end
@@ -80,6 +87,12 @@ end
 local function projectPath(webUrl)
   local path = (webUrl or ""):match("^https?://[^/]+/(.-)/%-/")
   return path or ""
+end
+
+-- "https://gl/groups/team/-/epics/5" → "team": group pages live under
+-- `/groups/`, which is no part of the group's path.
+local function groupPath(webUrl)
+  return (projectPath(webUrl):gsub("^groups/", ""))
 end
 
 -- The project's avatar as the daemon downloaded it, nil when there is none.
@@ -115,6 +128,19 @@ local function issuableRow(kind, sigil, item)
   }
 end
 
+-- Epics belong to a group: the id carries the group where an issue's carries
+-- the project.
+local function epicRow(item)
+  return {
+    id = string.format("epic:%d:%d", item.group_id, item.iid),
+    title = string.format("&%d %s", item.iid, item.title),
+    subtitle = joinNonEmpty({ groupPath(item.web_url), item.state }),
+    glyph = GLYPH.epics,
+    category = CATEGORY.epics,
+    score = item.open_count or 0,
+  }
+end
+
 local function urlRow(kind, item)
   return {
     id = "url:" .. (item.web_url or ""),
@@ -133,6 +159,9 @@ local function toResults(reply)
   end
   for _, m in ipairs(reply.merge_requests or {}) do
     table.insert(results, issuableRow("merge_requests", "!", m))
+  end
+  for _, e in ipairs(reply.epics or {}) do
+    table.insert(results, epicRow(e))
   end
   for _, p in ipairs(reply.projects or {}) do
     table.insert(results, urlRow("projects", p))
@@ -207,12 +236,13 @@ function onActivate(id)
     end
     return
   end
-  local kind, projectId, iid = id:match("^([%a_]+):(%d+):(%d+)$")
+  -- `ownerId` is the project of an issue or MR, the group of an epic.
+  local kind, ownerId, iid = id:match("^([%a_]+):(%d+):(%d+)$")
   if kind == nil then
     return
   end
-  local group = kind == "merge_requests" and "mr" or "issue"
-  local argv = { forskapPath(), group, "open", iid, "-p", projectId }
+  local group = kind == "merge_requests" and "mr" or kind == "epic" and "epic" or "issue"
+  local argv = { forskapPath(), group, "open", iid, group == "epic" and "-g" or "-p", ownerId }
   noctalia.runAsync(argv, function(result)
     if result.exitCode ~= 0 then
       local why = firstLine(result.stderr)

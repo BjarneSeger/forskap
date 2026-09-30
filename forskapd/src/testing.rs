@@ -390,6 +390,20 @@ pub fn issue_json(project_id: i64, iid: i64, title: &str) -> Value {
     })
 }
 
+/// An epic of the group `group_id` as GitLab's REST API returns it.
+pub fn epic_json(group_id: i64, iid: i64, title: &str) -> Value {
+    serde_json::json!({
+        "id": group_id * 1000 + iid,
+        "iid": iid,
+        "group_id": group_id,
+        "title": title,
+        "web_url": format!("https://gitlab.test/groups/g{group_id}/-/epics/{iid}"),
+        "state": "opened",
+        "labels": [],
+        "updated_at": "2026-07-01T10:00:00Z",
+    })
+}
+
 /// The smallest thing [`crate::sync::avatars::extension`] takes for a PNG.
 pub const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
 
@@ -402,6 +416,16 @@ pub fn project_json(id: i64) -> Value {
         "path_with_namespace": format!("g/p{id}"),
         "web_url": format!("https://gitlab.test/g/p{id}"),
         "avatar_url": null,
+    })
+}
+
+/// A member group at `full_path` as GitLab's listing returns it.
+pub fn group_json(id: i64, full_path: &str) -> Value {
+    serde_json::json!({
+        "id": id,
+        "name": full_path.rsplit('/').next().unwrap_or(full_path),
+        "full_path": full_path,
+        "web_url": format!("https://gitlab.test/groups/{full_path}"),
     })
 }
 

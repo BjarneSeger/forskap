@@ -104,6 +104,16 @@ type SyncJob struct {
 	Last_error    *string       `json:"last_error,omitempty"`
 }
 
+type Epic struct {
+	Id         int64  `json:"id"`
+	Iid        int64  `json:"iid"`
+	Group_id   int64  `json:"group_id"`
+	Title      string `json:"title"`
+	Web_url    string `json:"web_url"`
+	State      string `json:"state"`
+	Open_count int64  `json:"open_count"`
+}
+
 type NotAuthReason string
 
 type GitlabError struct {
@@ -283,16 +293,16 @@ type Search_methods struct{}
 
 func Search() Search_methods { return Search_methods{} }
 
-func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]string, limit_in_ *int64) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, err_ error) {
+func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]string, limit_in_ *int64) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, err_ error) {
 	receive, err_ := m.Send(ctx, c, 0, query_in_, kinds_in_, limit_in_)
 	if err_ != nil {
 		return
 	}
-	issues_out_, merge_requests_out_, projects_out_, groups_out_, _, err_ = receive(ctx)
+	issues_out_, merge_requests_out_, projects_out_, groups_out_, epics_out_, _, err_ = receive(ctx)
 	return
 }
 
-func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, query_in_ string, kinds_in_ *[]string, limit_in_ *int64) (func(ctx context.Context) ([]Issue, []MergeRequest, []Project, []Group, uint64, error), error) {
+func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, query_in_ string, kinds_in_ *[]string, limit_in_ *int64) (func(ctx context.Context) ([]Issue, []MergeRequest, []Project, []Group, []Epic, uint64, error), error) {
 	var in struct {
 		Query string    `json:"query"`
 		Kinds *[]string `json:"kinds,omitempty"`
@@ -305,12 +315,13 @@ func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags u
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, flags uint64, err error) {
+	return func(context.Context) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, flags uint64, err error) {
 		var out struct {
 			Issues         []Issue        `json:"issues"`
 			Merge_requests []MergeRequest `json:"merge_requests"`
 			Projects       []Project      `json:"projects"`
 			Groups         []Group        `json:"groups"`
+			Epics          []Epic         `json:"epics"`
 		}
 		flags, err = receive(ctx, &out)
 		if err != nil {
@@ -321,11 +332,12 @@ func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags u
 		merge_requests_out_ = []MergeRequest(out.Merge_requests)
 		projects_out_ = []Project(out.Projects)
 		groups_out_ = []Group(out.Groups)
+		epics_out_ = []Epic(out.Epics)
 		return
 	}, nil
 }
 
-func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]string, limit_in_ *int64) (func(ctx context.Context) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]string, limit_in_ *int64) (func(ctx context.Context) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
 		Query string    `json:"query"`
 		Kinds *[]string `json:"kinds,omitempty"`
@@ -338,12 +350,13 @@ func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, quer
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, flags uint64, conn varlink.ReadWriterContext, err error) {
+	return func(context.Context) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, flags uint64, conn varlink.ReadWriterContext, err error) {
 		var out struct {
 			Issues         []Issue        `json:"issues"`
 			Merge_requests []MergeRequest `json:"merge_requests"`
 			Projects       []Project      `json:"projects"`
 			Groups         []Group        `json:"groups"`
+			Epics          []Epic         `json:"epics"`
 		}
 		flags, conn, err = receive(ctx, &out)
 		if err != nil {
@@ -354,6 +367,7 @@ func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, quer
 		merge_requests_out_ = []MergeRequest(out.Merge_requests)
 		projects_out_ = []Project(out.Projects)
 		groups_out_ = []Group(out.Groups)
+		epics_out_ = []Epic(out.Epics)
 		return
 	}, nil
 }
@@ -648,6 +662,61 @@ func (m RecordOpen_methods) Upgrade(ctx context.Context, c *varlink.Connection, 
 	in.Iid = iid_in_
 	in.Kind = kind_in_
 	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.RecordOpen", in)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (flags uint64, conn varlink.ReadWriterContext, err error) {
+		flags, conn, err = receive(ctx, nil)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		return
+	}, nil
+}
+
+type RecordEpicOpen_methods struct{}
+
+func RecordEpicOpen() RecordEpicOpen_methods { return RecordEpicOpen_methods{} }
+
+func (m RecordEpicOpen_methods) Call(ctx context.Context, c *varlink.Connection, group_id_in_ int64, iid_in_ int64) (err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, group_id_in_, iid_in_)
+	if err_ != nil {
+		return
+	}
+	_, err_ = receive(ctx)
+	return
+}
+
+func (m RecordEpicOpen_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, group_id_in_ int64, iid_in_ int64) (func(ctx context.Context) (uint64, error), error) {
+	var in struct {
+		Group_id int64 `json:"group_id"`
+		Iid      int64 `json:"iid"`
+	}
+	in.Group_id = group_id_in_
+	in.Iid = iid_in_
+	receive, err := c.Send(ctx, "org.thehoster.forskapd.RecordEpicOpen", in, flags)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (flags uint64, err error) {
+		flags, err = receive(ctx, nil)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		return
+	}, nil
+}
+
+func (m RecordEpicOpen_methods) Upgrade(ctx context.Context, c *varlink.Connection, group_id_in_ int64, iid_in_ int64) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+	var in struct {
+		Group_id int64 `json:"group_id"`
+		Iid      int64 `json:"iid"`
+	}
+	in.Group_id = group_id_in_
+	in.Iid = iid_in_
+	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.RecordEpicOpen", in)
 	if err != nil {
 		return nil, err
 	}
@@ -1253,6 +1322,7 @@ type orgthehosterforskapdInterface interface {
 	AssignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	UnassignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	RecordOpen(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
+	RecordEpicOpen(ctx context.Context, c VarlinkCall, group_id_ int64, iid_ int64) error
 	ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]string) error
 	GetHistory(ctx context.Context, c VarlinkCall, days_ *int64) error
 	GetActivity(ctx context.Context, c VarlinkCall, days_ *int64) error
@@ -1303,17 +1373,19 @@ func (c *VarlinkCall) ReplyGetAssignedMergeRequests(ctx context.Context, merge_r
 	return c.Reply(ctx, &out)
 }
 
-func (c *VarlinkCall) ReplySearch(ctx context.Context, issues_ []Issue, merge_requests_ []MergeRequest, projects_ []Project, groups_ []Group) error {
+func (c *VarlinkCall) ReplySearch(ctx context.Context, issues_ []Issue, merge_requests_ []MergeRequest, projects_ []Project, groups_ []Group, epics_ []Epic) error {
 	var out struct {
 		Issues         []Issue        `json:"issues"`
 		Merge_requests []MergeRequest `json:"merge_requests"`
 		Projects       []Project      `json:"projects"`
 		Groups         []Group        `json:"groups"`
+		Epics          []Epic         `json:"epics"`
 	}
 	out.Issues = []Issue(issues_)
 	out.Merge_requests = []MergeRequest(merge_requests_)
 	out.Projects = []Project(projects_)
 	out.Groups = []Group(groups_)
+	out.Epics = []Epic(epics_)
 	return c.Reply(ctx, &out)
 }
 
@@ -1334,6 +1406,10 @@ func (c *VarlinkCall) ReplyUnassignSelf(ctx context.Context) error {
 }
 
 func (c *VarlinkCall) ReplyRecordOpen(ctx context.Context) error {
+	return c.Reply(ctx, nil)
+}
+
+func (c *VarlinkCall) ReplyRecordEpicOpen(ctx context.Context) error {
 	return c.Reply(ctx, nil)
 }
 
@@ -1441,6 +1517,10 @@ func (s *VarlinkInterface) UnassignSelf(ctx context.Context, c VarlinkCall, proj
 
 func (s *VarlinkInterface) RecordOpen(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.RecordOpen")
+}
+
+func (s *VarlinkInterface) RecordEpicOpen(ctx context.Context, c VarlinkCall, group_id_ int64, iid_ int64) error {
+	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.RecordEpicOpen")
 }
 
 func (s *VarlinkInterface) ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]string) error {
@@ -1584,6 +1664,17 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
 		return s.orgthehosterforskapdInterface.RecordOpen(ctx, VarlinkCall{call}, in.Project_id, in.Iid, in.Kind)
+
+	case "RecordEpicOpen":
+		var in struct {
+			Group_id int64 `json:"group_id"`
+			Iid      int64 `json:"iid"`
+		}
+		err := call.GetParameters(&in)
+		if err != nil {
+			return call.ReplyInvalidParameter(ctx, "parameters")
+		}
+		return s.orgthehosterforskapdInterface.RecordEpicOpen(ctx, VarlinkCall{call}, in.Group_id, in.Iid)
 
 	case "ClearCache":
 		var in struct {
@@ -1770,6 +1861,16 @@ type SyncJob (
   last_error: ?string
 )
 
+type Epic (
+  id: int,
+  iid: int,
+  group_id: int,
+  title: string,
+  web_url: string,
+  state: string,
+  open_count: int
+)
+
 error GitlabError (message: string)
 
 type NotAuthReason (no_credentials, keychain_error, unreachable, token_rejected, logged_out)
@@ -1780,7 +1881,7 @@ method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
 
 method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)
 
-method Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
+method Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)
 
 method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
 
@@ -1791,6 +1892,8 @@ method AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 method UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
 method RecordOpen(project_id: int, iid: int, kind: IssuableKind) -> ()
+
+method RecordEpicOpen(group_id: int, iid: int) -> ()
 
 method ClearCache(scope: ?[]string) -> ()
 

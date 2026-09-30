@@ -1,5 +1,5 @@
-//! Persisted open statistics: how often, and how recently, each issue/MR was
-//! opened through `RecordOpen`. The `Search` handler ranks frequently opened
+//! Persisted open statistics: how often, and how recently, each issue, MR or
+//! epic was opened through `RecordOpen` / `RecordEpicOpen`. The `Search` handler ranks frequently opened
 //! items first from this record; nothing else reads it.
 //!
 //! One JSON record in its own keyspace: a read-modify-write under an internal
@@ -41,12 +41,23 @@ impl UsageRecord {
     pub fn get(&self, kind: Issuable, project_id: i64, iid: i64) -> Option<UsageEntry> {
         self.entries.get(&usage_key(kind, project_id, iid)).copied()
     }
+
+    /// Counters for one epic, if it was ever opened.
+    pub fn get_epic(&self, group_id: i64, iid: i64) -> Option<UsageEntry> {
+        self.entries.get(&epic_usage_key(group_id, iid)).copied()
+    }
 }
 
 /// Record key for an issuable: `issues:<project_id>:<iid>` /
 /// `merge_requests:<project_id>:<iid>`.
 pub fn usage_key(kind: Issuable, project_id: i64, iid: i64) -> String {
     format!("{}:{project_id}:{iid}", kind.path_segment())
+}
+
+/// Record key for an epic: `epics:<group_id>:<iid>`. Its own prefix, so a
+/// group and a project sharing an id don't share counters.
+pub fn epic_usage_key(group_id: i64, iid: i64) -> String {
+    format!("epics:{group_id}:{iid}")
 }
 
 /// fjall-backed store for the single [`UsageRecord`].
@@ -127,6 +138,16 @@ mod tests {
             usage_key(Issuable::MergeRequest, 7, 42),
             "merge_requests:7:42"
         );
+        assert_eq!(epic_usage_key(7, 42), "epics:7:42");
+    }
+
+    #[test]
+    fn epics_count_apart_from_issuables() {
+        let (s, _td) = stats();
+        s.record(&epic_usage_key(1, 2), 100, 0).unwrap();
+        let r = s.snapshot().unwrap();
+        assert_eq!(r.get_epic(1, 2).unwrap().count, 1);
+        assert!(r.get(Issuable::Issue, 1, 2).is_none());
     }
 
     #[test]

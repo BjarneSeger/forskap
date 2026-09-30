@@ -8,8 +8,10 @@ use std::fmt;
 use std::io::IsTerminal;
 
 use anyhow::{Context, Result};
+use forskap_api::Epic;
 use inquire::{InquireError, Select};
 
+use crate::cmd::epic::group_path;
 use crate::item::Item;
 use crate::refspec;
 
@@ -72,18 +74,32 @@ pub fn by_number(items: Vec<Item>) -> Vec<Labeled<Item>> {
 
 /// Items sharing a number, told apart by their project.
 pub fn by_project(items: Vec<Item>) -> Vec<Labeled<Item>> {
-    let projects: Vec<String> = items.iter().map(Item::project).collect();
-    let width = projects
-        .iter()
-        .map(|p| p.chars().count())
-        .max()
-        .unwrap_or(0);
-    items
+    by_place(items, Item::project, Item::title)
+}
+
+/// Epics sharing a number, told apart by their group.
+pub fn by_group(epics: Vec<Epic>) -> Vec<Labeled<Epic>> {
+    let group = |e: &Epic| match group_path(&e.web_url) {
+        Some(path) => path.to_string(),
+        None => format!("group {}", e.group_id),
+    };
+    by_place(epics, group, |e| &e.title)
+}
+
+/// Each value as its place and title, the titles aligned.
+fn by_place<T>(
+    values: Vec<T>,
+    place: impl Fn(&T) -> String,
+    title: impl Fn(&T) -> &str,
+) -> Vec<Labeled<T>> {
+    let places: Vec<String> = values.iter().map(place).collect();
+    let width = places.iter().map(|p| p.chars().count()).max().unwrap_or(0);
+    values
         .into_iter()
-        .zip(projects)
-        .map(|(item, project)| Labeled {
-            label: format!("{project:<width$}  {}", item.title()),
-            value: item,
+        .zip(places)
+        .map(|(value, place)| Labeled {
+            label: format!("{place:<width$}  {}", title(&value)),
+            value,
         })
         .collect()
 }
@@ -123,6 +139,25 @@ mod tests {
             ]
         );
         assert_eq!(choices[1].value.project_id(), 2);
+    }
+
+    #[test]
+    fn by_group_names_the_group_or_its_id() {
+        let epic = |group_id, web_url: &str, title: &str| Epic {
+            id: group_id,
+            iid: 5,
+            group_id,
+            title: title.to_string(),
+            web_url: web_url.to_string(),
+            state: "opened".to_string(),
+            open_count: 0,
+        };
+        let choices = by_group(vec![
+            epic(3, "https://gl/groups/team/backend/-/epics/5", "Accounts"),
+            epic(4, "", "Billing"),
+        ]);
+        let labels: Vec<String> = choices.iter().map(|c| c.to_string()).collect();
+        assert_eq!(labels, ["team/backend  Accounts", "group 4       Billing"]);
     }
 
     #[test]

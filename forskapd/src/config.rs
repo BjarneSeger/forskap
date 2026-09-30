@@ -345,8 +345,9 @@ pub struct SearchConfig {
     #[config(default = 2160)]
     pub tracked_retention_hours: u64,
 
-    /// Most issues and most merge requests kept per corpus project: the most
-    /// recently updated ones. Bounds the sync of very large projects.
+    /// Most issues and most merge requests kept per corpus project, and most
+    /// epics per group: the most recently updated ones. Bounds the sync of
+    /// very large projects.
     /// (1000 by default, at least 100.)
     #[config(default = 1000)]
     pub max_items_per_project: u64,

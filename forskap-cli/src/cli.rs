@@ -57,6 +57,19 @@ pub struct TargetArgs {
     pub project: ProjectArgs,
 }
 
+/// One epic. Epics belong to a group, not a project.
+#[derive(Args)]
+pub struct EpicArgs {
+    /// Number within the group: the `5` of `&5`.
+    #[arg(value_name = "IID", value_parser = clap::value_parser!(i64).range(1..))]
+    pub iid: i64,
+    /// Group, as numeric ID or full path (`team/backend`). If omitted, it is
+    /// the group of the epic you last opened under that number, else the one
+    /// cached group with such an epic.
+    #[arg(short = 'g', long, value_name = "GROUP")]
+    pub group: Option<String>,
+}
+
 #[derive(Args, Clone, Copy)]
 pub struct WindowArgs {
     /// How many days back to show, up to the daemon's retention.
@@ -76,13 +89,22 @@ pub enum Command {
         #[command(subcommand)]
         command: ItemCommand,
     },
-    /// Search the cached issues, merge requests, projects and groups.
+    /// Epics: view, open.
+    ///
+    /// Only on GitLab instances that have epics (Premium and up); synced for
+    /// the groups above the projects in the search corpus.
+    Epic {
+        #[command(subcommand)]
+        command: EpicCommand,
+    },
+    /// Search the cached issues, merge requests, epics, projects and groups.
     ///
     /// Matches titles, labels and project/group paths case-insensitively;
-    /// `#123` finds issues/MRs by number. Items you open often rank first;
-    /// with no query it lists just those.
+    /// `#123` finds issues/MRs by number, `&5` epics. Items you open often
+    /// rank first; with no query it lists just those.
     Search {
-        /// Search text. Omit it to list the frequently opened issues/MRs.
+        /// Search text. Omit it to list the frequently opened issues, MRs and
+        /// epics.
         #[arg(value_name = "QUERY")]
         query: Vec<String>,
         /// Restrict to one or more result kinds. Repeat the flag to combine.
@@ -196,6 +218,28 @@ pub enum ItemCommand {
 }
 
 #[derive(Subcommand)]
+pub enum EpicCommand {
+    /// Show what the cache knows about one.
+    View {
+        #[command(flatten)]
+        target: EpicArgs,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Open one in the browser.
+    ///
+    /// The open is counted, so it ranks higher in `forskap search` and the
+    /// launchers built on it.
+    Open {
+        #[command(flatten)]
+        target: EpicArgs,
+        /// Only count the open and print the URL.
+        #[arg(long)]
+        no_browser: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum TimeCommand {
     /// Log time on an issue or merge request.
     Log {
@@ -277,7 +321,7 @@ pub enum SyncCommand {
 pub enum RefreshScope {
     /// The assigned issue and merge request lists, and the board columns.
     Assigned,
-    /// The search corpus: issues, merge requests, projects, groups.
+    /// The search corpus: issues, merge requests, epics, projects, groups.
     Search,
     /// The logged time.
     History,
@@ -378,4 +422,5 @@ pub enum SearchKind {
     Mrs,
     Projects,
     Groups,
+    Epics,
 }

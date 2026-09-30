@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::avatars::Avatar;
-use super::model::{Board, Event, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog};
+use super::model::{
+    Board, Epic, Event, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog,
+};
 use super::schedule::{JobState, fingerprint};
 use crate::error::Result;
 use crate::write::{Write, WriteOp};
@@ -42,7 +44,8 @@ fn decode(bytes: &[u8]) -> Option<RowKey> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowScope {
     All,
-    /// First half equal (one project's issues, MRs or boards).
+    /// First half equal (one project's issues, MRs or boards, one group's
+    /// epics).
     Prefix(u64),
     /// First half ≥ (timelogs/events at or after a time).
     Since(u64),
@@ -134,6 +137,7 @@ stored!(
     MergeRequest => merge_requests,
     Project => projects,
     Group => groups,
+    Epic => epics,
     Board => boards,
     Event => events,
     Timelog => timelogs,
@@ -194,6 +198,7 @@ pub struct SyncStore {
     pub merge_requests: Table<MergeRequest>,
     pub projects: Table<Project>,
     pub groups: Table<Group>,
+    pub epics: Table<Epic>,
     pub boards: Table<Board>,
     pub events: Table<Event>,
     pub timelogs: Table<Timelog>,
@@ -214,6 +219,7 @@ impl SyncStore {
             merge_requests: Table::open(db)?,
             projects: Table::open(db)?,
             groups: Table::open(db)?,
+            epics: Table::open(db)?,
             boards: Table::open(db)?,
             events: Table::open(db)?,
             timelogs: Table::open(db)?,
@@ -357,6 +363,7 @@ impl Commit<'_> {
         self.remove_where::<MergeRequest>(RowScope::All, |_| false)?;
         self.remove_where::<Project>(RowScope::All, |_| false)?;
         self.remove_where::<Group>(RowScope::All, |_| false)?;
+        self.remove_where::<Epic>(RowScope::All, |_| false)?;
         self.remove_where::<Board>(RowScope::All, |_| false)?;
         self.remove_where::<Event>(RowScope::All, |_| false)?;
         self.remove_where::<Timelog>(RowScope::All, |_| false)?;

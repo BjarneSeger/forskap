@@ -29,7 +29,17 @@ pub fn in_group(namespace: &str, group: &str) -> bool {
 /// Parse an issue/MR-reference query: `"#123"` → `Some(123)`. Anything else —
 /// no leading `#`, non-digits, empty — is not a reference query.
 pub fn parse_iid_query(query: &str) -> Option<i64> {
-    let digits = query.trim().strip_prefix('#')?;
+    parse_reference(query, '#')
+}
+
+/// Parse an epic-reference query: `"&5"` → `Some(5)`, by the rules of
+/// [`parse_iid_query`].
+pub fn parse_epic_query(query: &str) -> Option<i64> {
+    parse_reference(query, '&')
+}
+
+fn parse_reference(query: &str, sigil: char) -> Option<i64> {
+    let digits = query.trim().strip_prefix(sigil)?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -98,6 +108,15 @@ mod tests {
     #[test]
     fn parse_iid_query_rejects_a_bare_hash() {
         assert_eq!(parse_iid_query("#"), None);
+    }
+
+    #[test]
+    fn epic_references_have_their_own_sigil() {
+        assert_eq!(parse_epic_query(" &5 "), Some(5));
+        assert_eq!(parse_epic_query("#5"), None);
+        assert_eq!(parse_iid_query("&5"), None);
+        assert_eq!(parse_epic_query("&"), None);
+        assert_eq!(parse_epic_query("&5a"), None);
     }
 
     proptest! {

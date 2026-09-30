@@ -20,7 +20,8 @@ use forskapd::handlers::{ConnState, Handlers, SessionSlot};
 use forskapd::queue::RetryQueue;
 use forskapd::sync::jobs::ASSIGNED_MERGE_REQUESTS;
 use forskapd::sync::model::{
-    Board, BoardList, Group, Issue, LabelRef, MergeRequest, Project, Resource, Timelog, UserRef,
+    Board, BoardList, Epic, Group, Issue, LabelRef, MergeRequest, Project, Resource, Timelog,
+    UserRef,
 };
 use forskapd::sync::schedule::JobState;
 use forskapd::sync::store::{Stored, SyncStore, View};
@@ -196,6 +197,24 @@ pub fn group(i: u64) -> Group {
     }
 }
 
+pub fn epic(i: u64) -> Epic {
+    let group_id = (i % 10) as i64 + 1;
+    Epic {
+        id: i as i64 + 1,
+        iid: (i / 10) as i64 + 1,
+        group_id,
+        title: title(i, "Epic"),
+        web_url: format!(
+            "https://gl/groups/{}/group{group_id}/-/epics/{}",
+            namespace(i),
+            i / 10 + 1
+        ),
+        state: "opened".into(),
+        labels: label_set(i),
+        updated_at: shuffled(i, 1_000_000) + 1,
+    }
+}
+
 /// A timelog spent uniformly over the 30 days before `now`, shuffled so
 /// generation order is not time order.
 pub fn timelog(i: u64, now: u64) -> Timelog {
@@ -244,13 +263,14 @@ pub fn mark_synced(env: &BenchEnv, jobs: &[Job]) {
 }
 
 /// Seed the full search corpus: `n` issues, `n/2` MRs, `n/50` projects,
-/// `n/100` groups, plus synced boards for every project the issues use, so
+/// `n/100` groups, `n/20` epics, plus synced boards for every project the issues use, so
 /// the per-hit `graph_status` lookup finds something.
 pub fn seed_search_corpus(env: &BenchEnv, n: u64) {
     put(env, &(0..n).map(issue).collect::<Vec<_>>());
     put(env, &(0..n / 2).map(merge_request).collect::<Vec<_>>());
     put(env, &(0..(n / 50).max(1)).map(project).collect::<Vec<_>>());
     put(env, &(0..(n / 100).max(1)).map(group).collect::<Vec<_>>());
+    put(env, &(0..(n / 20).max(1)).map(epic).collect::<Vec<_>>());
     let lists = ["Doing", "Review", "Done"]
         .map(|name| BoardList {
             label: Some(LabelRef { name: name.into() }),

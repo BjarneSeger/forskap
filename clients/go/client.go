@@ -100,16 +100,18 @@ type SearchResults struct {
 	MergeRequests []MergeRequest
 	Projects      []Project
 	Groups        []Group
+	Epics         []Epic
 }
 
 // Search searches the daemon's locally cached corpus (no GitLab round-trip).
 // kinds optionally restricts the reply to a subset of "issues", "merge_requests",
-// "projects", "groups" (nil = all four); limit caps each result set separately
-// (nil = daemon default of 50). Issues and MRs come most-opened first (see
-// RecordOpen); an empty query lists only items with recorded opens.
+// "projects", "groups", "epics" (nil = all five); limit caps each result set
+// separately (nil = daemon default of 50). Issues, MRs and epics come
+// most-opened first (see RecordOpen, RecordEpicOpen); an empty query lists only
+// items with recorded opens. Epics need GitLab Premium or Ultimate.
 func (c *Client) Search(ctx context.Context, query string, kinds *[]string, limit *int64) (SearchResults, error) {
-	issues, mrs, projects, groups, err := Search().Call(ctx, c.conn, query, kinds, limit)
-	return SearchResults{issues, mrs, projects, groups}, err
+	issues, mrs, projects, groups, epics, err := Search().Call(ctx, c.conn, query, kinds, limit)
+	return SearchResults{issues, mrs, projects, groups, epics}, err
 }
 
 // PostTime logs a time-tracking entry on an issue or merge request (per kind).
@@ -141,6 +143,12 @@ func (c *Client) UnassignSelf(ctx context.Context, projectID, iid int64, kind Is
 // the daemon is dormant and never contacts GitLab.
 func (c *Client) RecordOpen(ctx context.Context, projectID, iid int64, kind IssuableKind) error {
 	return RecordOpen().Call(ctx, c.conn, projectID, iid, kind)
+}
+
+// RecordEpicOpen is RecordOpen for an epic, which belongs to a group and is
+// addressed by (groupID, iid).
+func (c *Client) RecordEpicOpen(ctx context.Context, groupID, iid int64) error {
+	return RecordEpicOpen().Call(ctx, c.conn, groupID, iid)
 }
 
 // ClearCache clears the daemon's cache, optionally scoped to the given keys
