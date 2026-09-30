@@ -25,10 +25,32 @@ after 30 minutes when the next cli prompt should appear what you are working on,
 with a list of assigned issues.
 
 ### Completions
-Out of the box, completions are installed for fish, zsh and bash. Completions are
-also provided for carapace, but they need to be manually linked from
+Out of the box, completions are installed for fish, zsh and bash. They are
+dynamic: the shell asks `forskap` on every Tab, so besides commands and flags
+it completes what the daemon has cached — issue and merge request numbers
+(the item you last logged time on, then your assigned ones, then the ones you
+opened before) and project paths for `--project`. fish and zsh show the title
+and project next to each number; bash only the numbers. Without a running
+daemon you still get the commands and flags.
+
+If you didn't install the package, register them from your shell's rc file:
+
+```sh
+source <(COMPLETE=bash forskap)     # ~/.bashrc
+source <(COMPLETE=zsh forskap)      # ~/.zshrc, after compinit
+COMPLETE=fish forskap | source      # ~/.config/fish/config.fish
+```
+
+Completions are also provided for carapace, but they need to be manually linked from
 `/usr/share/carapace/specs/forskap.yaml` to `~/.config/carapace/specs/forskap.yaml`, as
-carapace does not currently support globally installed specs.
+carapace does not currently support globally installed specs. The carapace
+spec is static: commands and flags only. Nushell has no completions of its own.
+
+### Ambiguous numbers
+`forskap issue` / `forskap mr` and `forskap time log` take the number alone and find
+the project themselves. If the number exists in several projects, a picker
+lists them by project and title; Esc cancels. When not run from a terminal (scripts,
+pipes, launchers) this stays an error asking for `--project`.
 
 ## Config
 The config lives at `$XDG_CONFIG_HOME/` or `$HOME/.config/` under

@@ -8,67 +8,16 @@
 //! last-prompt timestamp regardless, so a user dismissing a tick prompt isn't
 //! re-prompted immediately.
 
-use std::fmt;
-
 use anyhow::{Context, Result};
-use forskap_api::{Issue, MergeRequest, VarlinkClientInterface};
-use inquire::{InquireError, Select, Text};
+use forskap_api::VarlinkClientInterface;
+use inquire::Text;
 
-use crate::refspec::{self, RefKind};
-use crate::{client, config, state};
-
-/// One pickable issuable, wrapping the generated structs (which we don't own
-/// and which don't implement `Display`) so `Select` can render them with the
-/// GitLab sigil: `#42` for issues, `!7` for MRs.
-enum Choice {
-    Issue(Issue),
-    Mr(MergeRequest),
-}
-
-impl Choice {
-    fn kind(&self) -> RefKind {
-        match self {
-            Choice::Issue(_) => RefKind::Issue,
-            Choice::Mr(_) => RefKind::Mr,
-        }
-    }
-
-    fn project_id(&self) -> i64 {
-        match self {
-            Choice::Issue(i) => i.project_id,
-            Choice::Mr(m) => m.project_id,
-        }
-    }
-
-    fn iid(&self) -> i64 {
-        match self {
-            Choice::Issue(i) => i.iid,
-            Choice::Mr(m) => m.iid,
-        }
-    }
-
-    fn title(&self) -> &str {
-        match self {
-            Choice::Issue(i) => &i.title,
-            Choice::Mr(m) => &m.title,
-        }
-    }
-}
-
-impl fmt::Display for Choice {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}{:<5} {}",
-            refspec::sigil(self.kind()),
-            self.iid(),
-            self.title()
-        )
-    }
-}
+use crate::item::Item;
+use crate::refspec;
+use crate::{client, config, pick, state};
 
 struct PromptAnswers {
-    picked: Choice,
+    picked: Item,
     duration: String,
     summary: Option<String>,
 }
@@ -119,39 +68,28 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
     let answers = tokio::task::spawn_blocking(move || -> Result<Option<PromptAnswers>> {
         // Issues first (the primary tracking objects), MRs after — the daemon
         // pre-sorts MRs newest-updated first.
-        let choices: Vec<Choice> = issues
+        let choices: Vec<Item> = issues
             .into_iter()
-            .map(Choice::Issue)
-            .chain(mrs.into_iter().map(Choice::Mr))
+            .map(Item::Issue)
+            .chain(mrs.into_iter().map(Item::Mr))
             .collect();
 
-        let picked = match Select::new("What are you working on?", choices).prompt() {
-            Ok(p) => p,
-            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
-                outln!("(skipped)")?;
-                return Ok(None);
-            }
-            Err(e) => return Err(e).context("issue picker"),
+        let question = "What are you working on?";
+        let Some(picked) = pick::select(question, pick::by_number(choices))? else {
+            outln!("(skipped)")?;
+            return Ok(None);
         };
 
-        let duration = match Text::new("Duration:")
+        let duration = Text::new("Duration:")
             .with_initial_value(&suggested)
-            .prompt()
-        {
-            Ok(d) => d,
-            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
-                outln!("(skipped)")?;
-                return Ok(None);
-            }
-            Err(e) => return Err(e).context("duration prompt"),
+            .prompt();
+        let Some(duration) = pick::answered(duration, "duration prompt")? else {
+            outln!("(skipped)")?;
+            return Ok(None);
         };
 
-        let summary = match Text::new("Summary (optional):").prompt() {
-            Ok(s) if s.trim().is_empty() => None,
-            Ok(s) => Some(s),
-            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => None,
-            Err(e) => return Err(e).context("summary prompt"),
-        };
+        let summary = Text::new("Summary (optional):").prompt();
+        let summary = pick::answered(summary, "summary prompt")?.filter(|s| !s.trim().is_empty());
 
         Ok(Some(PromptAnswers {
             picked,
