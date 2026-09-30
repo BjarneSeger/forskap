@@ -11,14 +11,17 @@ type Issue (
   total_time: string,
   graph_status: string,
   open_count: int,
-  project_avatar: string
+  project_avatar: string,
+  project_path: string
 )
 
 type IssuableKind (issue, merge_request)
 
+type HistorySource (gitlab, queued)
+
 type HistoryEvent (
   timestamp: int,
-  source: string,
+  source: HistorySource,
   kind: IssuableKind,
   project_id: int,
   iid: int,
@@ -64,7 +67,8 @@ type MergeRequest (
   state: string,
   assignees: []string,
   open_count: int,
-  project_avatar: string
+  project_avatar: string,
+  project_path: string
 )
 
 type Project (
@@ -114,7 +118,9 @@ method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
 
 method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)
 
-method Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)
+type SearchKind (issues, merge_requests, projects, groups, epics)
+
+method Search(query: string, kinds: ?[]SearchKind, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)
 
 method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
 
@@ -128,7 +134,9 @@ method RecordOpen(project_id: int, iid: int, kind: IssuableKind) -> ()
 
 method RecordEpicOpen(group_id: int, iid: int) -> ()
 
-method ClearCache(scope: ?[]string) -> ()
+type CacheScope (assigned, search, quick, slow, stale, usage)
+
+method ClearCache(scope: ?[]CacheScope) -> ()
 
 method GetHistory(days: ?int) -> (events: []HistoryEvent)
 

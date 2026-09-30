@@ -46,17 +46,33 @@ impl Item {
         }
     }
 
-    /// The project's full path if the URL gives it away, else `project <id>`.
+    /// The project's full path, if known.
+    pub fn project_path(&self) -> Option<&str> {
+        let path = match self {
+            Item::Issue(i) => &i.project_path,
+            Item::Mr(m) => &m.project_path,
+        };
+        project_of(path, self.web_url())
+    }
+
+    /// The project's full path, else `project <id>`.
     pub fn project(&self) -> String {
-        match project_path(self.web_url()) {
+        match self.project_path() {
             Some(path) => path.to_string(),
             None => format!("project {}", self.project_id()),
         }
     }
 }
 
+/// The project path a row carries, else the one in its URL.
+pub fn project_of<'a>(project_path: &'a str, web_url: &'a str) -> Option<&'a str> {
+    Some(project_path)
+        .filter(|p| !p.is_empty())
+        .or_else(|| self::project_path(web_url))
+}
+
 /// The project path inside an issue or MR URL
-/// (`https://host/<path>/-/issues/<iid>`): the rows carry only the project ID.
+/// (`https://host/<path>/-/issues/<iid>`).
 pub fn project_path(web_url: &str) -> Option<&str> {
     let (_, rest) = web_url.split_once("://")?;
     let (_, path) = rest.split_once('/')?;
@@ -73,8 +89,8 @@ pub fn project_path(web_url: &str) -> Option<&str> {
 pub mod testing {
     use super::*;
 
-    /// A row in `project_id` whose URL names `path`; an empty `path` leaves
-    /// the URL out.
+    /// A row in `project_id` at `path`; an empty `path` leaves it and the
+    /// URL out.
     pub fn item(kind: RefKind, project_id: i64, path: &str, iid: i64, title: &str) -> Item {
         let url = |resource: &str| match path {
             "" => String::new(),
@@ -93,6 +109,7 @@ pub mod testing {
                 graph_status: String::new(),
                 open_count: 0,
                 project_avatar: String::new(),
+                project_path: path.to_string(),
             }),
             RefKind::Mr => Item::Mr(MergeRequest {
                 id: project_id * 1000 + iid,
@@ -104,6 +121,7 @@ pub mod testing {
                 assignees: Vec::new(),
                 open_count: 0,
                 project_avatar: String::new(),
+                project_path: path.to_string(),
             }),
         }
     }
@@ -138,5 +156,13 @@ mod tests {
         assert_eq!(named.project(), "team/api");
         let bare = testing::item(RefKind::Issue, 7, "", 3, "t");
         assert_eq!(bare.project(), "project 7");
+    }
+
+    #[test]
+    fn project_of_prefers_the_field_over_the_url() {
+        let url = "https://gitlab.com/old/name/-/issues/1";
+        assert_eq!(project_of("team/api", url), Some("team/api"));
+        assert_eq!(project_of("", url), Some("old/name"));
+        assert_eq!(project_of("", ""), None);
     }
 }

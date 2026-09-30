@@ -31,6 +31,32 @@ const (
 	KindMergeRequest IssuableKind = "merge_request"
 )
 
+// SearchKind values restricting Search to some of its result sets.
+const (
+	SearchIssues        SearchKind = "issues"
+	SearchMergeRequests SearchKind = "merge_requests"
+	SearchProjects      SearchKind = "projects"
+	SearchGroups        SearchKind = "groups"
+	SearchEpics         SearchKind = "epics"
+)
+
+// CacheScope values selecting what ClearCache drops: the assigned lists, the
+// search corpus, the three age bands of the time history, the open statistics.
+const (
+	ScopeAssigned CacheScope = "assigned"
+	ScopeSearch   CacheScope = "search"
+	ScopeQuick    CacheScope = "quick"
+	ScopeSlow     CacheScope = "slow"
+	ScopeStale    CacheScope = "stale"
+	ScopeUsage    CacheScope = "usage"
+)
+
+// HistorySource values telling a synced timelog from a PostTime still queued.
+const (
+	SourceGitlab HistorySource = "gitlab"
+	SourceQueued HistorySource = "queued"
+)
+
 // DefaultAddress resolves the forskapd varlink address using the same
 // precedence as forskap-cli:
 //
@@ -104,12 +130,11 @@ type SearchResults struct {
 }
 
 // Search searches the daemon's locally cached corpus (no GitLab round-trip).
-// kinds optionally restricts the reply to a subset of "issues", "merge_requests",
-// "projects", "groups", "epics" (nil = all five); limit caps each result set
-// separately (nil = daemon default of 50). Issues, MRs and epics come
+// kinds optionally restricts the reply to a subset of the Search* kinds (nil =
+// all five); limit caps each result set separately (nil = daemon default of 50). Issues, MRs and epics come
 // most-opened first (see RecordOpen, RecordEpicOpen); an empty query lists only
 // items with recorded opens. Epics need GitLab Premium or Ultimate.
-func (c *Client) Search(ctx context.Context, query string, kinds *[]string, limit *int64) (SearchResults, error) {
+func (c *Client) Search(ctx context.Context, query string, kinds *[]SearchKind, limit *int64) (SearchResults, error) {
 	issues, mrs, projects, groups, epics, err := Search().Call(ctx, c.conn, query, kinds, limit)
 	return SearchResults{issues, mrs, projects, groups, epics}, err
 }
@@ -151,9 +176,9 @@ func (c *Client) RecordEpicOpen(ctx context.Context, groupID, iid int64) error {
 	return RecordEpicOpen().Call(ctx, c.conn, groupID, iid)
 }
 
-// ClearCache clears the daemon's cache, optionally scoped to the given keys
-// (nil = clear everything).
-func (c *Client) ClearCache(ctx context.Context, scope *[]string) error {
+// ClearCache clears the daemon's cache, optionally only the given Scope* slices
+// (nil = everything but the open statistics).
+func (c *Client) ClearCache(ctx context.Context, scope *[]CacheScope) error {
 	return ClearCache().Call(ctx, c.conn, scope)
 }
 

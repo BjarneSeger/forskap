@@ -23,20 +23,23 @@ type Issue struct {
 	Graph_status   string `json:"graph_status"`
 	Open_count     int64  `json:"open_count"`
 	Project_avatar string `json:"project_avatar"`
+	Project_path   string `json:"project_path"`
 }
 
 type IssuableKind string
 
+type HistorySource string
+
 type HistoryEvent struct {
-	Timestamp  int64        `json:"timestamp"`
-	Source     string       `json:"source"`
-	Kind       IssuableKind `json:"kind"`
-	Project_id int64        `json:"project_id"`
-	Iid        int64        `json:"iid"`
-	Title      string       `json:"title"`
-	Web_url    string       `json:"web_url"`
-	Duration   string       `json:"duration"`
-	Summary    string       `json:"summary"`
+	Timestamp  int64         `json:"timestamp"`
+	Source     HistorySource `json:"source"`
+	Kind       IssuableKind  `json:"kind"`
+	Project_id int64         `json:"project_id"`
+	Iid        int64         `json:"iid"`
+	Title      string        `json:"title"`
+	Web_url    string        `json:"web_url"`
+	Duration   string        `json:"duration"`
+	Summary    string        `json:"summary"`
 }
 
 type ActivityEvent struct {
@@ -76,6 +79,7 @@ type MergeRequest struct {
 	Assignees      []string `json:"assignees"`
 	Open_count     int64    `json:"open_count"`
 	Project_avatar string   `json:"project_avatar"`
+	Project_path   string   `json:"project_path"`
 }
 
 type Project struct {
@@ -116,6 +120,10 @@ type Epic struct {
 }
 
 type NotAuthReason string
+
+type SearchKind string
+
+type CacheScope string
 
 type GitlabError struct {
 	Message string `json:"message"`
@@ -294,7 +302,7 @@ type Search_methods struct{}
 
 func Search() Search_methods { return Search_methods{} }
 
-func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]string, limit_in_ *int64) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, err_ error) {
+func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, err_ error) {
 	receive, err_ := m.Send(ctx, c, 0, query_in_, kinds_in_, limit_in_)
 	if err_ != nil {
 		return
@@ -303,11 +311,11 @@ func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_i
 	return
 }
 
-func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, query_in_ string, kinds_in_ *[]string, limit_in_ *int64) (func(ctx context.Context) ([]Issue, []MergeRequest, []Project, []Group, []Epic, uint64, error), error) {
+func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64) (func(ctx context.Context) ([]Issue, []MergeRequest, []Project, []Group, []Epic, uint64, error), error) {
 	var in struct {
-		Query string    `json:"query"`
-		Kinds *[]string `json:"kinds,omitempty"`
-		Limit *int64    `json:"limit,omitempty"`
+		Query string        `json:"query"`
+		Kinds *[]SearchKind `json:"kinds,omitempty"`
+		Limit *int64        `json:"limit,omitempty"`
 	}
 	in.Query = query_in_
 	in.Kinds = kinds_in_
@@ -338,11 +346,11 @@ func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags u
 	}, nil
 }
 
-func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]string, limit_in_ *int64) (func(ctx context.Context) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64) (func(ctx context.Context) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
-		Query string    `json:"query"`
-		Kinds *[]string `json:"kinds,omitempty"`
-		Limit *int64    `json:"limit,omitempty"`
+		Query string        `json:"query"`
+		Kinds *[]SearchKind `json:"kinds,omitempty"`
+		Limit *int64        `json:"limit,omitempty"`
 	}
 	in.Query = query_in_
 	in.Kinds = kinds_in_
@@ -735,7 +743,7 @@ type ClearCache_methods struct{}
 
 func ClearCache() ClearCache_methods { return ClearCache_methods{} }
 
-func (m ClearCache_methods) Call(ctx context.Context, c *varlink.Connection, scope_in_ *[]string) (err_ error) {
+func (m ClearCache_methods) Call(ctx context.Context, c *varlink.Connection, scope_in_ *[]CacheScope) (err_ error) {
 	receive, err_ := m.Send(ctx, c, 0, scope_in_)
 	if err_ != nil {
 		return
@@ -744,9 +752,9 @@ func (m ClearCache_methods) Call(ctx context.Context, c *varlink.Connection, sco
 	return
 }
 
-func (m ClearCache_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, scope_in_ *[]string) (func(ctx context.Context) (uint64, error), error) {
+func (m ClearCache_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, scope_in_ *[]CacheScope) (func(ctx context.Context) (uint64, error), error) {
 	var in struct {
-		Scope *[]string `json:"scope,omitempty"`
+		Scope *[]CacheScope `json:"scope,omitempty"`
 	}
 	in.Scope = scope_in_
 	receive, err := c.Send(ctx, "org.thehoster.forskapd.ClearCache", in, flags)
@@ -763,9 +771,9 @@ func (m ClearCache_methods) Send(ctx context.Context, c *varlink.Connection, fla
 	}, nil
 }
 
-func (m ClearCache_methods) Upgrade(ctx context.Context, c *varlink.Connection, scope_in_ *[]string) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m ClearCache_methods) Upgrade(ctx context.Context, c *varlink.Connection, scope_in_ *[]CacheScope) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
-		Scope *[]string `json:"scope,omitempty"`
+		Scope *[]CacheScope `json:"scope,omitempty"`
 	}
 	in.Scope = scope_in_
 	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.ClearCache", in)
@@ -1317,14 +1325,14 @@ func (m WhoAmI_methods) Upgrade(ctx context.Context, c *varlink.Connection) (fun
 type orgthehosterforskapdInterface interface {
 	GetAssignedIssues(ctx context.Context, c VarlinkCall, groups_ *[]string) error
 	GetAssignedMergeRequests(ctx context.Context, c VarlinkCall, groups_ *[]string) error
-	Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]string, limit_ *int64) error
+	Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64) error
 	PostTime(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind, duration_ string, summary_ *string) error
 	Close(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	AssignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	UnassignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	RecordOpen(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	RecordEpicOpen(ctx context.Context, c VarlinkCall, group_id_ int64, iid_ int64) error
-	ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]string) error
+	ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]CacheScope) error
 	GetHistory(ctx context.Context, c VarlinkCall, days_ *int64) error
 	GetActivity(ctx context.Context, c VarlinkCall, days_ *int64) error
 	GetFailures(ctx context.Context, c VarlinkCall) error
@@ -1496,7 +1504,7 @@ func (s *VarlinkInterface) GetAssignedMergeRequests(ctx context.Context, c Varli
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetAssignedMergeRequests")
 }
 
-func (s *VarlinkInterface) Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]string, limit_ *int64) error {
+func (s *VarlinkInterface) Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.Search")
 }
 
@@ -1524,7 +1532,7 @@ func (s *VarlinkInterface) RecordEpicOpen(ctx context.Context, c VarlinkCall, gr
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.RecordEpicOpen")
 }
 
-func (s *VarlinkInterface) ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]string) error {
+func (s *VarlinkInterface) ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]CacheScope) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.ClearCache")
 }
 
@@ -1594,9 +1602,9 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 
 	case "Search":
 		var in struct {
-			Query string    `json:"query"`
-			Kinds *[]string `json:"kinds,omitempty"`
-			Limit *int64    `json:"limit,omitempty"`
+			Query string        `json:"query"`
+			Kinds *[]SearchKind `json:"kinds,omitempty"`
+			Limit *int64        `json:"limit,omitempty"`
 		}
 		err := call.GetParameters(&in)
 		if err != nil {
@@ -1679,7 +1687,7 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 
 	case "ClearCache":
 		var in struct {
-			Scope *[]string `json:"scope,omitempty"`
+			Scope *[]CacheScope `json:"scope,omitempty"`
 		}
 		err := call.GetParameters(&in)
 		if err != nil {
@@ -1780,14 +1788,17 @@ type Issue (
   total_time: string,
   graph_status: string,
   open_count: int,
-  project_avatar: string
+  project_avatar: string,
+  project_path: string
 )
 
 type IssuableKind (issue, merge_request)
 
+type HistorySource (gitlab, queued)
+
 type HistoryEvent (
   timestamp: int,
-  source: string,
+  source: HistorySource,
   kind: IssuableKind,
   project_id: int,
   iid: int,
@@ -1833,7 +1844,8 @@ type MergeRequest (
   state: string,
   assignees: []string,
   open_count: int,
-  project_avatar: string
+  project_avatar: string,
+  project_path: string
 )
 
 type Project (
@@ -1883,7 +1895,9 @@ method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
 
 method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)
 
-method Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)
+type SearchKind (issues, merge_requests, projects, groups, epics)
+
+method Search(query: string, kinds: ?[]SearchKind, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)
 
 method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
 
@@ -1897,7 +1911,9 @@ method RecordOpen(project_id: int, iid: int, kind: IssuableKind) -> ()
 
 method RecordEpicOpen(group_id: int, iid: int) -> ()
 
-method ClearCache(scope: ?[]string) -> ()
+type CacheScope (assigned, search, quick, slow, stale, usage)
+
+method ClearCache(scope: ?[]CacheScope) -> ()
 
 method GetHistory(days: ?int) -> (events: []HistoryEvent)
 

@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use forskap_api::VarlinkClientInterface;
+use forskap_api::{HistorySource, VarlinkClientInterface};
 
 use crate::cli::OutputFormat;
 use crate::friendly::friendly;
@@ -25,7 +25,7 @@ pub async fn run(days: u32, format: OutputFormat) -> Result<()> {
             let sigil = refspec::wire_sigil(&e.kind);
             outln!(
                 "{ts}  {:<8}  {:<6}  {:<6}  {}",
-                style::state(&e.source),
+                style::state(source(&e.source)),
                 style::reference(sigil, e.iid),
                 e.duration,
                 e.title
@@ -33,4 +33,11 @@ pub async fn run(days: u32, format: OutputFormat) -> Result<()> {
         }
         Ok(())
     })
+}
+
+fn source(source: &HistorySource) -> &'static str {
+    match source {
+        HistorySource::gitlab => "gitlab",
+        HistorySource::queued => "queued",
+    }
 }

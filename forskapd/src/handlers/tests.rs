@@ -6,12 +6,12 @@ use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 
 use forskap_api::{
-    AsyncCall, Call_ClearCache, Call_Close, Call_GetActivity, Call_GetAssignedIssues,
+    AsyncCall, CacheScope, Call_ClearCache, Call_Close, Call_GetActivity, Call_GetAssignedIssues,
     Call_GetAssignedMergeRequests, Call_GetHistory, Call_GetSyncJobs, Call_PostTime,
     Call_RecordEpicOpen, Call_RecordOpen, Call_Search, Call_UnassignSelf, Call_WhoAmI,
     GetActivity_Reply, GetAssignedIssues_Reply, GetAssignedMergeRequests_Reply, GetHistory_Reply,
-    GetSyncJobs_Reply, IssuableKind, Issue, MergeRequest, Search_Reply, SyncJobStatus,
-    VarlinkInterface, WhoAmI_Reply,
+    GetSyncJobs_Reply, HistorySource, IssuableKind, Issue, MergeRequest, Search_Reply, SearchKind,
+    SyncJobStatus, VarlinkInterface, WhoAmI_Reply,
 };
 
 use crate::config::SharedConfig;
@@ -310,7 +310,7 @@ async fn assigned_mrs(h: &Handlers, groups: Option<Vec<String>>) -> Vec<MergeReq
 async fn run_search(
     h: &Handlers,
     query: &str,
-    kinds: Option<Vec<String>>,
+    kinds: Option<Vec<SearchKind>>,
     limit: Option<i64>,
 ) -> Search_Reply {
     let mut call = AsyncCall::default();
@@ -364,7 +364,7 @@ async fn close(h: &Handlers, project_id: i64, iid: i64, kind: IssuableKind) -> O
     reply_error(&mut call)
 }
 
-async fn clear_cache(h: &Handlers, scope: Option<Vec<String>>) {
+async fn clear_cache(h: &Handlers, scope: Option<Vec<CacheScope>>) {
     let mut call = AsyncCall::default();
     h.clear_cache(&mut call as &mut dyn Call_ClearCache, scope)
         .await
@@ -773,10 +773,10 @@ async fn search_finds_epics_by_title_label_and_reference() {
     assert!(r.issues.is_empty() && r.merge_requests.is_empty());
     assert!(run_search(&h, "#7", None, None).await.epics.is_empty());
 
-    let r = run_search(&h, "i", Some(vec!["epics".into()]), Some(1)).await;
+    let r = run_search(&h, "i", Some(vec![SearchKind::epics]), Some(1)).await;
     assert_eq!(r.epics.iter().map(|e| e.iid).collect::<Vec<_>>(), [8]);
     assert!(r.issues.is_empty() && r.projects.is_empty());
-    let r = run_search(&h, "i", Some(vec!["issues".into()]), None).await;
+    let r = run_search(&h, "i", Some(vec![SearchKind::issues]), None).await;
     assert!(r.epics.is_empty(), "not asked for");
 }
 
@@ -797,7 +797,7 @@ async fn record_epic_open_ranks_the_epic_and_nothing_else() {
     assert_eq!(r.epics[0].open_count, 1);
     assert!(r.issues.is_empty(), "the issue 5/7 was never opened");
 
-    let r = run_search(&h, "i", Some(vec!["epics".into()]), None).await;
+    let r = run_search(&h, "i", Some(vec![SearchKind::epics]), None).await;
     assert_eq!(
         r.epics.iter().map(|e| e.iid).collect::<Vec<_>>(),
         [7, 8],
@@ -814,7 +814,7 @@ async fn record_epic_open_ranks_the_epic_and_nothing_else() {
 async fn search_kinds_filter_and_limit_apply_per_kind() {
     let (h, _dir) = dormant_handlers();
     seed_corpus(&h);
-    let r = run_search(&h, "t", Some(vec!["issues".into()]), Some(1)).await;
+    let r = run_search(&h, "t", Some(vec![SearchKind::issues]), Some(1)).await;
     assert_eq!(
         r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(),
         [20],
@@ -839,7 +839,7 @@ async fn search_ranks_frequently_opened_first() {
     assert_eq!(r.issues[0].open_count, 2);
     assert!(r.merge_requests.is_empty() && r.projects.is_empty());
 
-    let r = run_search(&h, "t", Some(vec!["issues".into()]), None).await;
+    let r = run_search(&h, "t", Some(vec![SearchKind::issues]), None).await;
     assert_eq!(
         r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(),
         [10, 20],
@@ -879,6 +879,37 @@ fn seed_avatars(h: &Handlers) {
 fn avatar_path(dir: &tempfile::TempDir, file: &str) -> String {
     let path = dir.path().join("avatars").join(file);
     path.to_str().unwrap().to_string()
+}
+
+/// The stored project names its items; one without a row (a tracked project
+/// the user is no member of) is named by their link.
+#[tokio::test]
+async fn items_carry_their_projects_path() {
+    let (h, _dir) = dormant_handlers();
+    seed_corpus(&h);
+    seed_assigned_mrs(&h);
+
+    let r = run_search(&h, "oauth", None, None).await;
+    assert_eq!(r.issues[0].project_path, "team/p");
+    assert_eq!(r.merge_requests[0].project_path, "team/p");
+
+    seed(
+        &h,
+        &[model::Project {
+            id: 1,
+            path_with_namespace: "team/moved".into(),
+            ..Default::default()
+        }],
+    );
+    let r = run_search(&h, "oauth", None, None).await;
+    assert_eq!(r.issues[0].project_path, "team/moved");
+    assert_eq!(r.merge_requests[0].project_path, "team/moved");
+    let paths: Vec<String> = assigned_mrs(&h, None)
+        .await
+        .into_iter()
+        .map(|m| m.project_path)
+        .collect();
+    assert_eq!(paths, ["other/x", "team/moved"]);
 }
 
 /// The rows name the files, so a read works without them on disk.
@@ -989,7 +1020,7 @@ async fn get_history_merges_queued_and_synced_newest_first() {
         ["queued mr", "newer", "older"],
         "30 days back is outside"
     );
-    assert_eq!(events[0].source, "queued");
+    assert_eq!(events[0].source, HistorySource::queued);
     assert_eq!(events[0].web_url, "https://gl/g/p/-/merge_requests/5");
     assert_eq!(events[1].duration, "30m");
     assert_eq!(events[1].kind, IssuableKind::merge_request);
@@ -1132,15 +1163,15 @@ async fn clear_cache_history_bands_split_at_the_windows() {
     };
 
     seed_bands(&h);
-    clear_cache(&h, Some(vec!["quick".into()])).await;
+    clear_cache(&h, Some(vec![CacheScope::quick])).await;
     assert_eq!(ids(&h), [3, 2]);
 
     seed_bands(&h);
-    clear_cache(&h, Some(vec!["slow".into()])).await;
+    clear_cache(&h, Some(vec![CacheScope::slow])).await;
     assert_eq!(ids(&h), [3, 1]);
 
     seed_bands(&h);
-    clear_cache(&h, Some(vec!["stale".into()])).await;
+    clear_cache(&h, Some(vec![CacheScope::stale])).await;
     assert_eq!(ids(&h), [2, 1]);
 }
 
@@ -1150,12 +1181,12 @@ async fn clear_cache_scopes_drop_their_slice_and_reset_its_jobs() {
     seed_assigned_issues(&h);
     seed_corpus(&h);
 
-    clear_cache(&h, Some(vec!["issues".into()])).await;
+    clear_cache(&h, Some(vec![CacheScope::assigned])).await;
     assert!(h.sync.store().view(ASSIGNED_ISSUES).unwrap().is_none());
     assert!(!h.sync.has_synced(Job::AssignedIssues));
     assert!(h.sync.has_synced(Job::MemberProjects), "search untouched");
 
-    clear_cache(&h, Some(vec!["search".into()])).await;
+    clear_cache(&h, Some(vec![CacheScope::search])).await;
     assert!(
         h.sync
             .store()
@@ -1184,7 +1215,7 @@ async fn clear_cache_usage_only_when_listed() {
         !h.usage.snapshot().unwrap().entries.is_empty(),
         "user data, not a cache"
     );
-    clear_cache(&h, Some(vec!["usage".into()])).await;
+    clear_cache(&h, Some(vec![CacheScope::usage])).await;
     assert!(h.usage.snapshot().unwrap().entries.is_empty());
 }
 
@@ -1212,10 +1243,10 @@ async fn clear_cache_refills_only_what_it_cleared() {
     let fake = Arc::new(FakeGitlab::default());
     let (h, _dir) = connected_handlers(&fake);
 
-    clear_cache(&h, Some(vec!["usage".into()])).await;
+    clear_cache(&h, Some(vec![CacheScope::usage])).await;
     assert_eq!(fake.read_calls(), 0);
 
-    clear_cache(&h, Some(vec!["issues".into()])).await;
+    clear_cache(&h, Some(vec![CacheScope::assigned])).await;
     assert_eq!(fake.calls_to("issues").len(), 1);
     assert!(fake.timelog_calls().is_empty(), "history untouched");
 }
@@ -1234,7 +1265,7 @@ async fn clear_cache_waits_for_new_board_columns() {
     );
     let (h, _dir) = connected_handlers(&fake);
 
-    clear_cache(&h, Some(vec!["issues".into()])).await;
+    clear_cache(&h, Some(vec![CacheScope::assigned])).await;
     let issues = assigned_issues(&h, None).await;
     assert_eq!(issues[0].graph_status, "Doing");
 }
@@ -1345,7 +1376,16 @@ proptest! {
     #[test]
     fn search_replies_or_rejects_any_arguments_without_touching_gitlab(
         query in ".{0,12}",
-        kinds in proptest::option::of(proptest::collection::vec("[a-z_]{1,14}", 0..3)),
+        kinds in proptest::option::of(proptest::collection::vec(
+            proptest::sample::select(vec![
+                SearchKind::issues,
+                SearchKind::merge_requests,
+                SearchKind::projects,
+                SearchKind::groups,
+                SearchKind::epics,
+            ]),
+            0..3,
+        )),
         limit in proptest::option::of(any::<i64>()),
     ) {
         prop_rt().block_on(async {
@@ -1359,12 +1399,7 @@ proptest! {
                 .unwrap();
             let error = reply_error(&mut call);
 
-            let invalid = matches!(limit, Some(n) if n <= 0)
-                || kinds.iter().flatten().any(|k| {
-                    !["issues", "merge_requests", "projects", "groups", "epics"]
-                        .contains(&k.as_str())
-                });
-            if invalid {
+            if matches!(limit, Some(n) if n <= 0) {
                 assert_eq!(error.as_deref(), Some(GITLAB_ERROR), "bad args are rejected eagerly");
             } else {
                 assert_eq!(error, None, "valid args succeed");
@@ -1395,7 +1430,7 @@ proptest! {
             seed(&h, &issues);
             mark_synced(&h, &[Job::MemberProjects]);
 
-            let r = run_search(&h, &needle, Some(vec!["issues".into()]), Some(limit)).await;
+            let r = run_search(&h, &needle, Some(vec![SearchKind::issues]), Some(limit)).await;
             let expected: Vec<i64> = issues
                 .iter()
                 .filter(|i| i.title.contains(&needle))

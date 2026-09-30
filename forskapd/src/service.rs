@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use serde::de::DeserializeOwned;
 use tracing::{debug, warn};
 use varlink::Reply;
 use varlink::sansio::ServerEvent;
@@ -118,59 +119,53 @@ fn handle_varlink_meta(method: &str, request: &varlink::Request) -> Option<Reply
     }
 }
 
+/// The call's arguments, or the `InvalidParameter` reply saying why they
+/// don't parse (a missing field, an unknown enum value). An omitted
+/// `parameters` block reads as an empty one: a valid call of a method whose
+/// arguments are all optional.
+fn parse_args<T: DeserializeOwned>(params: Option<serde_json::Value>) -> Result<T, Reply> {
+    let params = params.unwrap_or_else(|| serde_json::json!({}));
+    serde_json::from_value(params).map_err(|e| {
+        Reply::error(
+            "org.varlink.service.InvalidParameter",
+            Some(serde_json::json!({"parameter": e.to_string()})),
+        )
+    })
+}
+
 async fn handle_forskapd(
     method: &str,
     params: Option<serde_json::Value>,
     handlers: &Handlers,
 ) -> varlink::Result<Option<Reply>> {
     let mut call = AsyncCall::default();
+    // Returning the error instead would drop the connection without a reply.
+    macro_rules! args {
+        () => {
+            match parse_args(params) {
+                Ok(args) => args,
+                Err(reply) => {
+                    warn!(method, "invalid varlink parameters");
+                    return Ok(Some(reply));
+                }
+            }
+        };
+    }
     match method {
         "org.thehoster.forskapd.ClearCache" => {
-            // `scope` is optional, so an omitted `parameters` block is valid
-            // and means "clear everything".
-            let args: ClearCache_Args = match params {
-                Some(v) => serde_json::from_value(v).map_err(|e| {
-                    varlink::Error(
-                        varlink::ErrorKind::InvalidParameter(e.to_string()),
-                        None,
-                        None,
-                    )
-                })?,
-                None => ClearCache_Args { scope: None },
-            };
+            let args: ClearCache_Args = args!();
             handlers
                 .clear_cache(&mut call as &mut dyn Call_ClearCache, args.scope)
                 .await?;
         }
         "org.thehoster.forskapd.GetHistory" => {
-            // `days` is optional; an omitted `parameters` block falls back to
-            // the default window in the handler.
-            let args: GetHistory_Args = match params {
-                Some(v) => serde_json::from_value(v).map_err(|e| {
-                    varlink::Error(
-                        varlink::ErrorKind::InvalidParameter(e.to_string()),
-                        None,
-                        None,
-                    )
-                })?,
-                None => GetHistory_Args { days: None },
-            };
+            let args: GetHistory_Args = args!();
             handlers
                 .get_history(&mut call as &mut dyn Call_GetHistory, args.days)
                 .await?;
         }
         "org.thehoster.forskapd.GetActivity" => {
-            // `days` is optional, like `GetHistory`'s.
-            let args: GetActivity_Args = match params {
-                Some(v) => serde_json::from_value(v).map_err(|e| {
-                    varlink::Error(
-                        varlink::ErrorKind::InvalidParameter(e.to_string()),
-                        None,
-                        None,
-                    )
-                })?,
-                None => GetActivity_Args { days: None },
-            };
+            let args: GetActivity_Args = args!();
             handlers
                 .get_activity(&mut call as &mut dyn Call_GetActivity, args.days)
                 .await?;
@@ -186,37 +181,13 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.RetryFailure" => {
-            let Some(args_val) = params else {
-                return Ok(Some(Reply::error(
-                    "org.varlink.service.InvalidParameter",
-                    Some(serde_json::json!({"parameter": "parameters"})),
-                )));
-            };
-            let args: RetryFailure_Args = serde_json::from_value(args_val).map_err(|e| {
-                varlink::Error(
-                    varlink::ErrorKind::InvalidParameter(e.to_string()),
-                    None,
-                    None,
-                )
-            })?;
+            let args: RetryFailure_Args = args!();
             handlers
                 .retry_failure(&mut call as &mut dyn Call_RetryFailure, args.id)
                 .await?;
         }
         "org.thehoster.forskapd.DismissFailure" => {
-            let Some(args_val) = params else {
-                return Ok(Some(Reply::error(
-                    "org.varlink.service.InvalidParameter",
-                    Some(serde_json::json!({"parameter": "parameters"})),
-                )));
-            };
-            let args: DismissFailure_Args = serde_json::from_value(args_val).map_err(|e| {
-                varlink::Error(
-                    varlink::ErrorKind::InvalidParameter(e.to_string()),
-                    None,
-                    None,
-                )
-            })?;
+            let args: DismissFailure_Args = args!();
             handlers
                 .dismiss_failure(&mut call as &mut dyn Call_DismissFailure, args.id)
                 .await?;
@@ -227,38 +198,13 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.GetAssignedIssues" => {
-            // Every field of `GetAssignedIssues_Args` is optional, so an
-            // omitted `parameters` block is a valid call (e.g.
-            // `varlinkctl call ... {}`). Default the args when missing.
-            let args: GetAssignedIssues_Args = match params {
-                Some(v) => serde_json::from_value(v).map_err(|e| {
-                    varlink::Error(
-                        varlink::ErrorKind::InvalidParameter(e.to_string()),
-                        None,
-                        None,
-                    )
-                })?,
-                None => GetAssignedIssues_Args { groups: None },
-            };
-
+            let args: GetAssignedIssues_Args = args!();
             handlers
                 .get_assigned_issues(&mut call as &mut dyn Call_GetAssignedIssues, args.groups)
                 .await?;
         }
         "org.thehoster.forskapd.GetAssignedMergeRequests" => {
-            // Same defaulting pattern as `GetAssignedIssues`: every field is
-            // optional, so a missing `parameters` block is a valid call.
-            let args: GetAssignedMergeRequests_Args = match params {
-                Some(v) => serde_json::from_value(v).map_err(|e| {
-                    varlink::Error(
-                        varlink::ErrorKind::InvalidParameter(e.to_string()),
-                        None,
-                        None,
-                    )
-                })?,
-                None => GetAssignedMergeRequests_Args { groups: None },
-            };
-
+            let args: GetAssignedMergeRequests_Args = args!();
             handlers
                 .get_assigned_merge_requests(
                     &mut call as &mut dyn Call_GetAssignedMergeRequests,
@@ -267,21 +213,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.Search" => {
-            // `query` is required, so a missing `parameters` block is an error
-            // (the `PostTime` pattern, not the defaulting one).
-            let Some(args_val) = params else {
-                return Ok(Some(Reply::error(
-                    "org.varlink.service.InvalidParameter",
-                    Some(serde_json::json!({"parameter": "parameters"})),
-                )));
-            };
-            let args: Search_Args = serde_json::from_value(args_val).map_err(|e| {
-                varlink::Error(
-                    varlink::ErrorKind::InvalidParameter(e.to_string()),
-                    None,
-                    None,
-                )
-            })?;
+            let args: Search_Args = args!();
             handlers
                 .search(
                     &mut call as &mut dyn Call_Search,
@@ -292,19 +224,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.PostTime" => {
-            let Some(args_val) = params else {
-                return Ok(Some(Reply::error(
-                    "org.varlink.service.InvalidParameter",
-                    Some(serde_json::json!({"parameter": "parameters"})),
-                )));
-            };
-            let args: PostTime_Args = serde_json::from_value(args_val).map_err(|e| {
-                varlink::Error(
-                    varlink::ErrorKind::InvalidParameter(e.to_string()),
-                    None,
-                    None,
-                )
-            })?;
+            let args: PostTime_Args = args!();
             handlers
                 .post_time(
                     &mut call as &mut dyn Call_PostTime,
@@ -317,19 +237,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.Close" => {
-            let Some(args_val) = params else {
-                return Ok(Some(Reply::error(
-                    "org.varlink.service.InvalidParameter",
-                    Some(serde_json::json!({"parameter": "parameters"})),
-                )));
-            };
-            let args: Close_Args = serde_json::from_value(args_val).map_err(|e| {
-                varlink::Error(
-                    varlink::ErrorKind::InvalidParameter(e.to_string()),
-                    None,
-                    None,
-                )
-            })?;
+            let args: Close_Args = args!();
             handlers
                 .close(
                     &mut call as &mut dyn Call_Close,
@@ -340,19 +248,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.RecordOpen" => {
-            let Some(args_val) = params else {
-                return Ok(Some(Reply::error(
-                    "org.varlink.service.InvalidParameter",
-                    Some(serde_json::json!({"parameter": "parameters"})),
-                )));
-            };
-            let args: RecordOpen_Args = serde_json::from_value(args_val).map_err(|e| {
-                varlink::Error(
-                    varlink::ErrorKind::InvalidParameter(e.to_string()),
-                    None,
-                    None,
-                )
-            })?;
+            let args: RecordOpen_Args = args!();
             handlers
                 .record_open(
                     &mut call as &mut dyn Call_RecordOpen,
@@ -363,19 +259,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.RecordEpicOpen" => {
-            let Some(args_val) = params else {
-                return Ok(Some(Reply::error(
-                    "org.varlink.service.InvalidParameter",
-                    Some(serde_json::json!({"parameter": "parameters"})),
-                )));
-            };
-            let args: RecordEpicOpen_Args = serde_json::from_value(args_val).map_err(|e| {
-                varlink::Error(
-                    varlink::ErrorKind::InvalidParameter(e.to_string()),
-                    None,
-                    None,
-                )
-            })?;
+            let args: RecordEpicOpen_Args = args!();
             handlers
                 .record_epic_open(
                     &mut call as &mut dyn Call_RecordEpicOpen,
@@ -385,19 +269,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.AssignSelf" => {
-            let Some(args_val) = params else {
-                return Ok(Some(Reply::error(
-                    "org.varlink.service.InvalidParameter",
-                    Some(serde_json::json!({"parameter": "parameters"})),
-                )));
-            };
-            let args: AssignSelf_Args = serde_json::from_value(args_val).map_err(|e| {
-                varlink::Error(
-                    varlink::ErrorKind::InvalidParameter(e.to_string()),
-                    None,
-                    None,
-                )
-            })?;
+            let args: AssignSelf_Args = args!();
             handlers
                 .assign_self(
                     &mut call as &mut dyn Call_AssignSelf,
@@ -408,19 +280,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.UnassignSelf" => {
-            let Some(args_val) = params else {
-                return Ok(Some(Reply::error(
-                    "org.varlink.service.InvalidParameter",
-                    Some(serde_json::json!({"parameter": "parameters"})),
-                )));
-            };
-            let args: UnassignSelf_Args = serde_json::from_value(args_val).map_err(|e| {
-                varlink::Error(
-                    varlink::ErrorKind::InvalidParameter(e.to_string()),
-                    None,
-                    None,
-                )
-            })?;
+            let args: UnassignSelf_Args = args!();
             handlers
                 .unassign_self(
                     &mut call as &mut dyn Call_UnassignSelf,
@@ -431,19 +291,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.Login" => {
-            let Some(args_val) = params else {
-                return Ok(Some(Reply::error(
-                    "org.varlink.service.InvalidParameter",
-                    Some(serde_json::json!({"parameter": "parameters"})),
-                )));
-            };
-            let args: Login_Args = serde_json::from_value(args_val).map_err(|e| {
-                varlink::Error(
-                    varlink::ErrorKind::InvalidParameter(e.to_string()),
-                    None,
-                    None,
-                )
-            })?;
+            let args: Login_Args = args!();
             handlers
                 .login(&mut call as &mut dyn Call_Login, args.host, args.token)
                 .await?;
@@ -489,6 +337,64 @@ mod tests {
             Some("org.varlink.service.MethodNotFound"),
             "Search is missing its dispatch arm in handle_forskapd"
         );
+    }
+
+    /// Unparseable arguments are answered, not punished by a dropped
+    /// connection: an enum value the interface doesn't have, a missing
+    /// required field.
+    #[tokio::test]
+    async fn invalid_arguments_get_an_invalid_parameter_reply() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        for (method, params, names) in [
+            (
+                "Search",
+                Some(serde_json::json!({"query": "x", "kinds": ["boards"]})),
+                "boards",
+            ),
+            (
+                "ClearCache",
+                Some(serde_json::json!({"scope": ["everything"]})),
+                "everything",
+            ),
+            (
+                "RecordOpen",
+                Some(serde_json::json!({"project_id": 1, "iid": 2, "kind": "epic"})),
+                "epic",
+            ),
+            ("Search", None, "query"),
+            ("Search", Some(serde_json::json!({"kinds": []})), "query"),
+        ] {
+            let reply = handle_forskapd(
+                &format!("org.thehoster.forskapd.{method}"),
+                params,
+                &handlers,
+            )
+            .await
+            .unwrap()
+            .expect("a reply");
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("org.varlink.service.InvalidParameter"),
+                "{method}"
+            );
+            let parameter = reply.parameters.unwrap()["parameter"].to_string();
+            assert!(parameter.contains(names), "{method}: {parameter}");
+        }
+    }
+
+    /// Every argument of these is optional, so a call without a
+    /// `parameters` block is valid.
+    #[tokio::test]
+    async fn optional_arguments_may_be_omitted() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        for method in ["ClearCache", "GetHistory"] {
+            let reply =
+                handle_forskapd(&format!("org.thehoster.forskapd.{method}"), None, &handlers)
+                    .await
+                    .unwrap()
+                    .expect("a reply");
+            assert!(reply.error.is_none(), "{method}: {:?}", reply.error);
+        }
     }
 
     #[tokio::test]

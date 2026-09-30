@@ -37,7 +37,9 @@ type Issue (
                         # matched against the project's issue board; empty when no
                         # board/label matches
   open_count:   int,    # opens recorded through RecordOpen (within usage.retention_hours)
-  project_avatar: string  # file of the project's avatar, see Project.avatar; empty when none
+  project_avatar: string, # file of the project's avatar, see Project.avatar; empty when none
+  project_path: string    # the project's full path ("team/api"): the stored project's, else
+                          # the one in web_url; empty when neither gives it
 )
 ```
 
@@ -53,7 +55,7 @@ MRs).
 ```varlink
 type HistoryEvent (
   timestamp:  int,          # unix seconds — spent_at for synced entries, enqueue time for queued ones
-  source:     string,       # "gitlab" (synced timelog) | "queued" (pending PostTime in the retry queue)
+  source:     HistorySource, # gitlab (synced timelog) | queued (pending PostTime in the retry queue)
   kind:       IssuableKind, # what the time was logged on
   project_id: int,
   iid:        int,
@@ -131,7 +133,9 @@ type MergeRequest (
   state:      string,   # "opened" | "closed" | "merged" | "locked"
   assignees:  []string, # assignee usernames, captured at the last search sync
   open_count: int,      # opens recorded through RecordOpen (within usage.retention_hours)
-  project_avatar: string  # file of the project's avatar, see Project.avatar; empty when none
+  project_avatar: string, # file of the project's avatar, see Project.avatar; empty when none
+  project_path: string    # the project's full path ("team/api"): the stored project's, else
+                          # the one in web_url; empty when neither gives it
 )
 ```
 
@@ -179,6 +183,11 @@ An epic belongs to a group and is numbered within it, so `(group_id, iid)` addre
 one. Epics are read-only here: `IssuableKind` and the write methods don't cover them.
 
 # Errors
+
+`org.varlink.service.InvalidParameter (parameter: string)` — the call's arguments
+don't fit the method: a required one is missing, or an enum argument (`IssuableKind`,
+`SearchKind`, `CacheScope`) carries a value the interface doesn't have. `parameter`
+says what is wrong.
 
 `GitlabError (message: string)` — GitLab rejected the request (invalid input, API
 error, rate limit), or a local precondition failed (malformed issue reference, invalid
@@ -228,7 +237,7 @@ namespace exactly like `GetAssignedIssues`. Replies newest-updated first. When t
 list has never been synced: empty list if a session exists, `NotAuthenticated`
 otherwise.
 
-### `Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)`
+### `Search(query: string, kinds: ?[]SearchKind, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)`
 
 Searches the locally cached corpus — a pure cache read, no GitLab round-trip.
 Matching is a case-insensitive substring test on issue/MR/epic titles and labels and
@@ -236,10 +245,12 @@ on project/group names and paths; a query of the exact form `#123` additionally
 matches issues and MRs by their per-project number, one of the form `&5` epics by
 their per-group number. Descriptions are not cached and not searched.
 
-`kinds` restricts the reply to a subset of `issues`, `merge_requests`, `projects`,
-`groups`, `epics` (omitted or empty = all five; an unknown kind is an eager
-`GitlabError`). `limit` caps each returned array separately (default 50; must be
-positive).
+```varlink
+type SearchKind (issues, merge_requests, projects, groups, epics)
+```
+
+`kinds` restricts the reply to a subset of them (omitted or empty = all five).
+`limit` caps each returned array separately (default 50; must be positive).
 
 **Ranking**: issues, MRs and epics are ordered by their `RecordOpen` /
 `RecordEpicOpen` statistics — most opens
@@ -274,7 +285,7 @@ session exists (first sync pending), `NotAuthenticated` otherwise.
 ### `GetHistory(days: ?int) -> (events: []HistoryEvent)`
 
 Time-tracking events from the last `days` days (default 7). Merges two sources,
-distinguished by `source`: `"gitlab"` — timelogs synced from GitLab; `"queued"` —
+distinguished by `source`: `gitlab` — timelogs synced from GitLab; `queued` —
 `PostTime` operations still waiting in the retry queue (so freshly logged time shows
 up even while GitLab is unreachable). Events carry the issuable `kind` — time logged
 on merge requests appears here like issue time. Served from local state; never
@@ -398,14 +409,18 @@ MRs. A non-positive `group_id` or `iid` is an eager `GitlabError`.
 
 ## Cache control
 
-### `ClearCache(scope: ?[]string) -> ()`
+### `ClearCache(scope: ?[]CacheScope) -> ()`
+
+```varlink
+type CacheScope (assigned, search, quick, slow, stale, usage)
+```
 
 Clears cached state and makes its sync jobs due at once. Omitted or empty `scope`
-clears everything synced. Otherwise each scope string selects a slice:
+clears everything synced. Otherwise each scope selects a slice:
 
-| scope    | clears                                                         |
-|----------|----------------------------------------------------------------|
-| `issues` | the assigned issue/MR lists and the board columns              |
+| scope      | clears                                                       |
+|------------|--------------------------------------------------------------|
+| `assigned` | the assigned issue/MR lists and the board columns            |
 | `search` | the corpus: issues, MRs, epics, projects, groups, project avatars |
 | `quick`  | history inside the quick window (last `refresh.quick.window_hours`) |
 | `slow`   | history between the retention horizon and the quick window     |
@@ -413,7 +428,7 @@ clears everything synced. Otherwise each scope string selects a slice:
 | `usage`  | the `RecordOpen` / `RecordEpicOpen` statistics — **only when listed explicitly**; the empty "everything" scope leaves them alone (user data, not a cache) |
 
 When a session exists, the reply waits (up to 30 s) until what it cleared is
-re-synced: the assigned lists for `issues`, `search` and the empty scope (plus the
+re-synced: the assigned lists for `assigned`, `search` and the empty scope (plus the
 board columns of their projects that never synced), the recent and full history
 for a history band and the empty scope. Everything else refills in the
 background; `usage` alone makes no GitLab call. Replies success even when

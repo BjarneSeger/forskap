@@ -53,7 +53,7 @@ pub async fn lookup(
     let reply = client
         .search(
             format!("#{iid}"),
-            Some(vec![refspec::search_kind(kind).to_string()]),
+            Some(vec![refspec::search_kind(kind)]),
             Some(LOOKUP_LIMIT),
         )
         .call()
