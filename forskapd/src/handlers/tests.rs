@@ -7,9 +7,10 @@ use tokio::sync::{Notify, RwLock};
 
 use forskap_api::{
     AsyncCall, Call_ClearCache, Call_Close, Call_GetAssignedIssues, Call_GetAssignedMergeRequests,
-    Call_GetHistory, Call_PostTime, Call_RecordOpen, Call_Search, Call_UnassignSelf, Call_WhoAmI,
-    GetAssignedIssues_Reply, GetAssignedMergeRequests_Reply, GetHistory_Reply, IssuableKind, Issue,
-    MergeRequest, Search_Reply, VarlinkInterface, WhoAmI_Reply,
+    Call_GetHistory, Call_GetSyncJobs, Call_PostTime, Call_RecordOpen, Call_Search,
+    Call_UnassignSelf, Call_WhoAmI, GetAssignedIssues_Reply, GetAssignedMergeRequests_Reply,
+    GetHistory_Reply, GetSyncJobs_Reply, IssuableKind, Issue, MergeRequest, Search_Reply,
+    SyncJobStatus, VarlinkInterface, WhoAmI_Reply,
 };
 
 use crate::config::SharedConfig;
@@ -1045,6 +1046,53 @@ async fn clear_cache_waits_for_new_board_columns() {
 }
 
 // ── WhoAmI ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_sync_jobs_lists_the_plan_while_dormant() {
+    let (h, _dir) = dormant_handlers();
+    let mut call = AsyncCall::default();
+    h.get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
+        .await
+        .unwrap();
+    let reply = reply::<GetSyncJobs_Reply>(&mut call);
+
+    assert_eq!(reply.paused_until, None);
+    let job = reply
+        .jobs
+        .iter()
+        .find(|j| j.key == ASSIGNED_ISSUES)
+        .expect("the assigned issues are always planned");
+    assert!(matches!(job.status, SyncJobStatus::due));
+    // Never ran: no times to report rather than the epoch.
+    assert_eq!(
+        (job.last_ok, job.next_due, job.running_since),
+        (None, None, None)
+    );
+    assert_eq!((job.failures, job.last_error.as_deref()), (0, None));
+}
+
+#[tokio::test]
+async fn get_sync_jobs_reports_a_failed_job() {
+    let fake = Arc::new(FakeGitlab::default());
+    fake.fail_next("issues", FakeErr::Rejected);
+    let (h, _dir) = connected_handlers(&fake);
+    h.sync.refresh_now(&[Job::AssignedIssues]).await;
+
+    let mut call = AsyncCall::default();
+    h.get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
+        .await
+        .unwrap();
+    let reply = reply::<GetSyncJobs_Reply>(&mut call);
+    let job = reply
+        .jobs
+        .iter()
+        .find(|j| j.key == ASSIGNED_ISSUES)
+        .expect("the assigned issues");
+    assert!(matches!(job.status, SyncJobStatus::backing_off));
+    assert_eq!(job.failures, 1);
+    assert!(job.next_due.is_some_and(|at| at > now_secs() as i64));
+    assert!(job.last_error.is_some());
+}
 
 async fn who_am_i(h: &Handlers) -> WhoAmI_Reply {
     let mut call = AsyncCall::default();

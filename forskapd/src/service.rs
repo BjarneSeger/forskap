@@ -12,10 +12,10 @@ use varlink::sansio::ServerEvent;
 use forskap_api::{
     AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
     Call_DismissFailure, Call_GetAssignedIssues, Call_GetAssignedMergeRequests, Call_GetFailures,
-    Call_GetHistory, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
-    Call_Search, Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, Close_Args, DismissFailure_Args,
-    GetAssignedIssues_Args, GetAssignedMergeRequests_Args, GetHistory_Args, Login_Args,
-    PostTime_Args, RecordOpen_Args, RetryFailure_Args, Search_Args, UnassignSelf_Args,
+    Call_GetHistory, Call_GetSyncJobs, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen,
+    Call_RetryFailure, Call_Search, Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, Close_Args,
+    DismissFailure_Args, GetAssignedIssues_Args, GetAssignedMergeRequests_Args, GetHistory_Args,
+    Login_Args, PostTime_Args, RecordOpen_Args, RetryFailure_Args, Search_Args, UnassignSelf_Args,
     VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
 };
 
@@ -161,6 +161,11 @@ async fn handle_forskapd(
         "org.thehoster.forskapd.GetFailures" => {
             handlers
                 .get_failures(&mut call as &mut dyn Call_GetFailures)
+                .await?;
+        }
+        "org.thehoster.forskapd.GetSyncJobs" => {
+            handlers
+                .get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
                 .await?;
         }
         "org.thehoster.forskapd.RetryFailure" => {
@@ -444,6 +449,20 @@ mod tests {
             reply.error.as_deref(),
             Some("org.varlink.service.MethodNotFound"),
             "Search is missing its dispatch arm in handle_forskapd"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_has_an_arm_for_get_sync_jobs() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        let reply = handle_forskapd("org.thehoster.forskapd.GetSyncJobs", None, &handlers)
+            .await
+            .unwrap()
+            .expect("a reply");
+        assert!(
+            reply.error.is_none(),
+            "GetSyncJobs is missing its dispatch arm: {:?}",
+            reply.error
         );
     }
 

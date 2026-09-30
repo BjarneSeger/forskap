@@ -25,10 +25,10 @@ use super::model::{Board, Group, Issue, MergeRequest, Project, Resource, RowKey,
 use super::now_secs;
 use super::planner::{self, Plan};
 use super::schedule::{
-    self, JobState, RATE_LIMIT_PAUSE_CAP, REJECTED_BACKOFF_CAP, SERVER_BACKOFF_CAP,
+    self, Cadence, JobState, RATE_LIMIT_PAUSE_CAP, REJECTED_BACKOFF_CAP, SERVER_BACKOFF_CAP,
 };
 use super::store::{Identity, NotedWrite, RowScope, SyncStore};
-use crate::config::SharedConfig;
+use crate::config::{Config, SharedConfig};
 use crate::error::{Error, Result};
 use crate::handlers::{ConnState, Session, SessionSlot};
 use crate::reconnect::KeychainProbe;
@@ -101,6 +101,50 @@ enum Command {
     LoggedIn,
     /// Persist a write GitLab applied (see [`SyncHandle::note_write`]).
     Note(NotedWrite),
+    /// Report the planned jobs (see [`SyncHandle::jobs`]).
+    Snapshot(oneshot::Sender<Snapshot>),
+}
+
+/// Where a planned job stands with the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    /// Its fetch is in flight.
+    Running,
+    /// Requested ahead of the schedule; runs before anything merely due.
+    Demanded,
+    /// Its due time passed; it runs once the worker gets to it.
+    Due,
+    /// Not due yet.
+    Waiting,
+    /// Failed, and held back until its retry time.
+    BackingOff,
+}
+
+/// One planned job, as the worker sees it right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobInfo {
+    pub key: String,
+    pub status: JobStatus,
+    /// Start of the last successful run; 0 means never.
+    pub last_ok: u64,
+    /// When the schedule runs it next, the retry time while it backs off.
+    /// `None` while it runs or is demanded, for a job that never ran and
+    /// for one that is never due again (a fetched avatar).
+    pub next_due: Option<u64>,
+    /// When the running fetch started.
+    pub running_since: Option<u64>,
+    /// Consecutive failures.
+    pub failures: u32,
+    /// Why the last run failed, until a run succeeds. Kept in memory only.
+    pub last_error: Option<String>,
+}
+
+/// The worker's jobs at one moment, in the order it would run them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    pub jobs: Vec<JobInfo>,
+    /// While set and in the future, a 429 holds every job back.
+    pub paused_until: Option<u64>,
 }
 
 /// The handlers' side of the sync layer: read access to the store plus
@@ -189,6 +233,8 @@ impl SyncHandle {
             paused_until: 0,
             rate_limits: 0,
             runs: 0,
+            running: None,
+            errors: HashMap::new(),
             replan: true,
             incomplete: BTreeSet::new(),
             relisted: BTreeSet::new(),
@@ -275,6 +321,15 @@ impl SyncHandle {
         }
     }
 
+    /// The planned jobs as the worker sees them now, in the order it would
+    /// run them. Answered while a job is in flight and while the session is
+    /// dormant; empty once the worker is gone.
+    pub fn jobs(&self) -> impl Future<Output = Snapshot> + Send + 'static {
+        let (reply, wait) = oneshot::channel();
+        let _ = self.tx.send(Command::Snapshot(reply));
+        async move { wait.await.unwrap_or_default() }
+    }
+
     /// Whether `job` has completed at least once.
     pub fn has_synced(&self, job: Job) -> bool {
         match self.store.job_state(&job.key()) {
@@ -339,6 +394,11 @@ struct Worker {
     paused_until: u64,
     rate_limits: u32,
     runs: u64,
+    /// The job whose fetch is in flight, and when it started.
+    running: Option<(Job, u64)>,
+    /// Why each job's last run failed, by state key. Not persisted: the
+    /// persisted [`JobState`] stays `Copy`.
+    errors: HashMap<String, String>,
     replan: bool,
     /// Plan-feeding jobs a clear reset that haven't synced since. Until they
     /// have, their evidence is missing, so a replan only adds jobs.
@@ -451,6 +511,82 @@ impl Worker {
             Command::Wake => {}
             Command::LoggedIn => self.unpark(),
             Command::Note(note) => self.persist_note(note),
+            Command::Snapshot(reply) => {
+                let _ = reply.send(self.snapshot(now_secs()));
+            }
+        }
+    }
+
+    /// When `job` is due by its schedule, with the state that says so.
+    /// Background jobs additionally wait out their startup offset.
+    fn due(&self, job: Job, cfg: &Config) -> (u64, JobState, Cadence) {
+        let key = job.key();
+        let state = self.states.get(&key).copied().unwrap_or_default();
+        let cadence = job.cadence(cfg);
+        let fingerprint = self.plan.fingerprint(job, cfg);
+        let mut at = schedule::due_at(&key, &state, cadence, fingerprint, cfg.sync.jitter);
+        if job.priority() > 0 {
+            at = at.max(self.boot + schedule::startup_offset(&key, cfg.sync.startup_spread_secs));
+        }
+        (at, state, cadence)
+    }
+
+    /// The class a due job competes in (see [`Self::next_job`]).
+    fn class(job: Job, state: &JobState, cadence: Cadence, overdue: u64) -> u8 {
+        // Until the full history first synced, `forskap time history` shows
+        // just the recent window: it ranks with the events till then.
+        if job == Job::AllTimelogs && state.last_ok == 0 {
+            1
+        } else {
+            schedule::aged(job.priority(), overdue, cadence.every)
+        }
+    }
+
+    /// Every planned job as of `now`, in the order [`Self::next_job`] would
+    /// pick them: the running one, the demanded ones, the due ones, then
+    /// the rest by due time.
+    fn snapshot(&self, now: u64) -> Snapshot {
+        let cfg = self.config.read().unwrap();
+        let mut jobs: Vec<((u8, u8, u64, Job), JobInfo)> = self
+            .plan
+            .jobs
+            .iter()
+            .map(|&job| {
+                let (at, state, cadence) = self.due(job, &cfg);
+                let running_since = self.running.filter(|(j, _)| *j == job).map(|(_, at)| at);
+                let (status, order) = if running_since.is_some() {
+                    (JobStatus::Running, (0, 0, 0))
+                } else if self.demand.contains_key(&job) {
+                    (JobStatus::Demanded, (1, job.priority(), 0))
+                } else if at <= now {
+                    let class = Self::class(job, &state, cadence, now - at);
+                    (JobStatus::Due, (2, class, at))
+                } else if state.retry_at > now {
+                    (JobStatus::BackingOff, (3, 0, at))
+                } else {
+                    (JobStatus::Waiting, (3, 0, at))
+                };
+                let scheduled = matches!(
+                    status,
+                    JobStatus::Due | JobStatus::Waiting | JobStatus::BackingOff
+                );
+                let key = job.key();
+                let info = JobInfo {
+                    status,
+                    last_ok: state.last_ok,
+                    next_due: Some(at).filter(|&at| scheduled && at > 0 && at < u64::MAX),
+                    running_since,
+                    failures: state.failures,
+                    last_error: self.errors.get(&key).cloned(),
+                    key,
+                };
+                ((order.0, order.1, order.2, job), info)
+            })
+            .collect();
+        jobs.sort_by_key(|(order, _)| *order);
+        Snapshot {
+            jobs: jobs.into_iter().map(|(_, info)| info).collect(),
+            paused_until: Some(self.paused_until).filter(|&until| until > now),
         }
     }
 
@@ -470,6 +606,7 @@ impl Worker {
     /// Clear every job's backoff, so all of them are due by their schedule
     /// again.
     fn unpark(&mut self) {
+        self.errors.clear();
         let parked: Vec<(String, JobState)> = self
             .states
             .iter()
@@ -511,27 +648,12 @@ impl Worker {
             return Next::Idle(u64::MAX);
         }
         let cfg = self.config.read().unwrap();
-        let (jitter, spread) = (cfg.sync.jitter, cfg.sync.startup_spread_secs);
         let mut best: Option<(u8, u64, Job)> = None;
         let mut soonest = u64::MAX;
         for &job in &self.plan.jobs {
-            let key = job.key();
-            let state = self.states.get(&key).copied().unwrap_or_default();
-            let cadence = job.cadence(&cfg);
-            let fingerprint = self.plan.fingerprint(job, &cfg);
-            let mut at = schedule::due_at(&key, &state, cadence, fingerprint, jitter);
-            if job.priority() > 0 {
-                at = at.max(self.boot + schedule::startup_offset(&key, spread));
-            }
+            let (at, state, cadence) = self.due(job, &cfg);
             if at <= now {
-                // Until the full history first synced, `forskap time history` shows
-                // just the recent window: it ranks with the events till then.
-                let class = if job == Job::AllTimelogs && state.last_ok == 0 {
-                    1
-                } else {
-                    schedule::aged(job.priority(), now - at, cadence.every)
-                };
-                let candidate = (class, at, job);
+                let candidate = (Self::class(job, &state, cadence, now - at), at, job);
                 if best.is_none_or(|b| candidate < b) {
                     best = Some(candidate);
                 }
@@ -567,6 +689,7 @@ impl Worker {
         };
         debug!(job = %key, full, "sync job starting");
         self.runs += 1;
+        self.running = Some((job, started));
 
         // Spawned so a panic is a failed job, not a dead worker; commands
         // keep flowing while it runs, and a clear cancels it before it
@@ -602,6 +725,7 @@ impl Worker {
                 },
             }
         };
+        self.running = None;
         match joined {
             None => {
                 info!(job = %key, "sync job cancelled by a cache clear");
@@ -623,9 +747,14 @@ impl Worker {
                     }
                 }
             }
-            Some(Ok(Err(e))) => self.on_error(&key, state, e, session).await,
+            Some(Ok(Err(e))) => {
+                self.errors.insert(key.clone(), e.to_string());
+                self.on_error(&key, state, e, session).await;
+            }
             Some(Err(e)) => {
                 error!(job = %key, error = %e, "sync job panicked");
+                self.errors
+                    .insert(key.clone(), format!("the job panicked: {e}"));
                 self.back_off(&key, state, REJECTED_BACKOFF_CAP);
             }
         }
@@ -662,6 +791,7 @@ impl Worker {
         match committed {
             Ok(rows) => {
                 self.states.insert(key.to_string(), fresh);
+                self.errors.remove(key);
                 self.incomplete.remove(&job);
                 self.rate_limits = 0;
                 if full {
@@ -676,6 +806,8 @@ impl Worker {
             }
             Err(e) => {
                 warn!(job = %key, error = %e, "storing sync result failed");
+                self.errors
+                    .insert(key.to_string(), format!("storing the result failed: {e}"));
                 self.back_off(key, state, SERVER_BACKOFF_CAP);
                 false
             }
@@ -961,6 +1093,7 @@ impl Worker {
         }
         for key in &reset {
             self.states.remove(key);
+            self.errors.remove(key);
         }
         // A full wipe leaves no corpus a replan could throw away.
         if what != Clear::Everything {
@@ -996,6 +1129,7 @@ impl Worker {
             );
             c.wipe()?;
             self.states.clear();
+            self.errors.clear();
             // Nothing of the other account's plan may survive the replan.
             self.plan = Plan::default();
             self.incomplete.clear();
@@ -1102,6 +1236,7 @@ impl Worker {
             Ok(rows) => {
                 for key in &stale {
                     self.states.remove(key);
+                    self.errors.remove(key);
                 }
                 self.sweep_avatars();
                 (stale.len(), rows)
@@ -1461,6 +1596,144 @@ mod tests {
             &*env.session.read().await,
             ConnState::Connected(_)
         ));
+    }
+
+    /// `job`'s line in the worker's snapshot.
+    async fn info(env: &Env, job: Job) -> JobInfo {
+        let key = job.key();
+        let snapshot = env.sync.jobs().await;
+        let found = snapshot.jobs.into_iter().find(|j| j.key == key);
+        found.unwrap_or_else(|| panic!("{key} is not in the snapshot"))
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_shows_the_job_in_flight_and_the_demand_behind_it() {
+        let fake = Arc::new(FakeGitlab::default());
+        let gate = fake.gate("issues");
+        let before = now_secs();
+        let env = start(connected(&fake, 1));
+        tokio::time::timeout(Duration::from_secs(2), fake.gated.notified())
+            .await
+            .expect("the assigned issues fetch starts");
+        env.sync.refresh_soon(&[Job::MemberGroups]);
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), env.sync.jobs())
+            .await
+            .expect("the snapshot doesn't wait for the fetch");
+        assert_eq!(snapshot.paused_until, None);
+        assert_eq!(snapshot.jobs.len(), BASE.len(), "{snapshot:?}");
+        let running = &snapshot.jobs[0];
+        assert_eq!(running.key, ASSIGNED_ISSUES);
+        assert_eq!(running.status, JobStatus::Running);
+        assert!(running.running_since.is_some_and(|at| at >= before));
+        assert_eq!((running.last_ok, running.next_due), (0, None));
+        // Demanded runs ahead of the jobs that are merely due.
+        let demanded = &snapshot.jobs[1];
+        assert_eq!(demanded.key, Job::MemberGroups.key());
+        assert_eq!(demanded.status, JobStatus::Demanded);
+        for job in &snapshot.jobs[2..] {
+            assert_eq!(job.status, JobStatus::Due, "{job:?}");
+            assert_eq!(job.running_since, None);
+        }
+
+        gate.notify_one();
+        eventually("the assigned issues", || {
+            state(&env, Job::AssignedIssues).last_ok > 0
+        })
+        .await;
+        let done = info(&env, Job::AssignedIssues).await;
+        assert_eq!(done.status, JobStatus::Waiting);
+        assert_eq!(done.running_since, None);
+        assert!(done.last_ok >= before);
+        assert!(
+            done.next_due.is_some_and(|at| at > done.last_ok),
+            "{done:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_shows_a_failed_jobs_backoff_and_error() {
+        let fake = Arc::new(FakeGitlab::default());
+        let now = now_secs();
+        fake.serve("events", vec![event_json(1, 7, "opened", now)]);
+        fake.serve("projects", vec![project_json(7)]);
+        fake.fail_next("projects/7/issues", FakeErr::Rejected);
+        let env = start(connected(&fake, 1));
+        eventually("the rejected fetch", || {
+            state(&env, Job::ProjectIssues(7)).failures == 1
+        })
+        .await;
+
+        let failed = info(&env, Job::ProjectIssues(7)).await;
+        assert_eq!(failed.status, JobStatus::BackingOff);
+        assert_eq!(failed.failures, 1);
+        assert_eq!(
+            failed.next_due,
+            Some(state(&env, Job::ProjectIssues(7)).retry_at)
+        );
+        assert!(failed.last_error.is_some_and(|e| !e.is_empty()));
+        // Nothing runs later than a job that backs off for an hour or more.
+        eventually("the other jobs", || {
+            state(&env, Job::ProjectMergeRequests(7)).last_ok > 0
+        })
+        .await;
+        let merge_requests = info(&env, Job::ProjectMergeRequests(7)).await;
+        assert_eq!(merge_requests.status, JobStatus::Waiting);
+        assert_eq!(
+            (merge_requests.failures, merge_requests.last_error),
+            (0, None)
+        );
+
+        // A new login retries it, and the success clears the error.
+        env.sync.logged_in();
+        eventually("the retry", || {
+            state(&env, Job::ProjectIssues(7)).last_ok > 0
+        })
+        .await;
+        let retried = info(&env, Job::ProjectIssues(7)).await;
+        assert_eq!(retried.status, JobStatus::Waiting);
+        assert_eq!((retried.failures, retried.last_error), (0, None));
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_shows_the_rate_limit_pause() {
+        let fake = Arc::new(FakeGitlab::default());
+        fake.fail_next("issues", FakeErr::Throttled(429));
+        let env = start(connected(&fake, 1));
+        eventually("the rate-limited call", || {
+            !fake.calls_to("issues").is_empty()
+        })
+        .await;
+
+        let mut snapshot = env.sync.jobs().await;
+        for _ in 0..100 {
+            if snapshot.paused_until.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            snapshot = env.sync.jobs().await;
+        }
+        assert!(snapshot.paused_until.is_some_and(|at| at > now_secs()));
+        // Not the job's fault: it stays due and runs first after the pause.
+        let limited = &snapshot.jobs[0];
+        assert_eq!(limited.key, ASSIGNED_ISSUES);
+        assert_eq!((limited.status, limited.failures), (JobStatus::Due, 0));
+        assert!(limited.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_is_served_while_dormant() {
+        let env = start(ConnState::Dormant(DormancyReason::NoCredentials));
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), env.sync.jobs())
+            .await
+            .expect("a dormant worker answers");
+        let mut keys: Vec<String> = snapshot.jobs.iter().map(|j| j.key.clone()).collect();
+        keys.sort();
+        let mut planned: Vec<String> = BASE.iter().map(Job::key).collect();
+        planned.sort();
+        assert_eq!(keys, planned);
+        assert!(snapshot.jobs.iter().all(|j| j.running_since.is_none()));
     }
 
     #[tokio::test]

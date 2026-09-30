@@ -95,6 +95,7 @@ fn output_only_where_data_is_printed() {
         &["time", "history"],
         &["auth", "status"],
         &["queue", "list"],
+        &["sync", "jobs"],
     ] {
         let json = [args, &["-o", "json"]].concat();
         ok(&json);
@@ -169,6 +170,12 @@ fn refresh_scopes_combine() {
     };
     assert!(scopes == [RefreshScope::Assigned, RefreshScope::History]);
     assert!(parse(&["sync", "refresh", "--scope", "quick"]).is_err());
+    assert!(matches!(
+        ok(&["sync", "jobs"]),
+        Command::Sync {
+            command: SyncCommand::Jobs { .. }
+        }
+    ));
 }
 
 #[test]

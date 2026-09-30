@@ -252,6 +252,14 @@ pub enum SyncCommand {
         #[arg(long = "scope", value_enum, value_name = "SCOPE")]
         scopes: Vec<RefreshScope>,
     },
+    /// Show the sync jobs: what runs now, what comes next, what failed.
+    ///
+    /// The daemon runs one job at a time; they are listed in the order it
+    /// runs them.
+    Jobs {
+        #[command(flatten)]
+        output: OutputArgs,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]

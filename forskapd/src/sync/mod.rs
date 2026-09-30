@@ -18,7 +18,7 @@ pub mod schedule;
 pub mod store;
 
 pub use avatars::AvatarDir;
-pub use engine::{Clear, SyncHandle};
+pub use engine::{Clear, JobInfo, JobStatus, Snapshot, SyncHandle};
 pub use jobs::Job;
 
 pub(crate) fn now_secs() -> u64 {

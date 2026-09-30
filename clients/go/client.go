@@ -160,6 +160,13 @@ func (c *Client) GetFailures(ctx context.Context) ([]FailedTask, error) {
 	return GetFailures().Call(ctx, c.conn)
 }
 
+// GetSyncJobs returns the daemon's planned sync jobs in the order its worker
+// runs them, and until when (unix seconds) a GitLab rate limit pauses them all
+// (nil = not paused). Status only: it succeeds while the daemon is dormant.
+func (c *Client) GetSyncJobs(ctx context.Context) (jobs []SyncJob, pausedUntil *int64, err error) {
+	return GetSyncJobs().Call(ctx, c.conn)
+}
+
 // RetryFailure re-enqueues a previously failed task by id.
 func (c *Client) RetryFailure(ctx context.Context, id int64) error {
 	return RetryFailure().Call(ctx, c.conn, id)
