@@ -60,13 +60,8 @@ impl Item {
 pub fn project_path(web_url: &str) -> Option<&str> {
     let (_, rest) = web_url.split_once("://")?;
     let (_, path) = rest.split_once('/')?;
-    // GitLab before 12 had no `/-/` in front of the resource.
-    let end = path.find("/-/").or_else(|| {
-        ["/issues/", "/merge_requests/"]
-            .iter()
-            .find_map(|resource| path.rfind(resource))
-    })?;
-    Some(&path[..end]).filter(|p| !p.is_empty())
+    let (project, _) = path.split_once("/-/")?;
+    Some(project).filter(|p| !p.is_empty())
 }
 
 #[cfg(test)]
@@ -121,10 +116,11 @@ mod tests {
                 "https://gitlab.example.com/a/b/c/-/merge_requests/7",
                 Some("a/b/c"),
             ),
-            ("http://host:8080/team/api/issues/42", Some("team/api")),
+            ("http://host:8080/team/api/-/issues/42", Some("team/api")),
             // A project may itself be called `issues`.
             ("https://host/team/issues/-/issues/1", Some("team/issues")),
-            ("https://host/team/issues/issues/1", Some("team/issues")),
+            // GitLab before 12 had no `/-/`; it is not supported.
+            ("https://host/team/api/issues/42", None),
             ("https://host/team/api", None),
             ("", None),
         ] {
