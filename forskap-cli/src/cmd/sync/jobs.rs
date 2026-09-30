@@ -22,10 +22,10 @@ pub async fn run(format: OutputFormat) -> Result<()> {
         .map_err(|e| friendly("GetSyncJobs", e))?;
 
     output::emit(format, &reply, |reply| {
-        print!(
+        out!(
             "{}",
             render(&reply.jobs, reply.paused_until, Utc::now().timestamp())
-        );
+        )
     })
 }
 
