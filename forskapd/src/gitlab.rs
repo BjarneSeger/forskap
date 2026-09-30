@@ -131,7 +131,8 @@ pub enum Listing {
     /// A project's boards, lists embedded.
     ProjectBoards { project_id: i64 },
     /// The user's own contribution events created after `after` (a date;
-    /// GitLab compares exclusively).
+    /// GitLab compares exclusively). Oldest first: a new event lands behind
+    /// the walk instead of shifting every later page.
     Events { after: Option<chrono::NaiveDate> },
     /// One issue or MR by its iid, for its global id.
     Issuable {
@@ -202,10 +203,11 @@ impl Listing {
                 p
             }
             Self::ProjectBoards { .. } => Vec::new(),
-            Self::Events { after } => after
-                .map(|d| ("after", d.format("%Y-%m-%d").to_string()))
-                .into_iter()
-                .collect(),
+            Self::Events { after } => {
+                let mut p = vec![("sort", "asc".into())];
+                p.extend(after.map(|d| ("after", d.format("%Y-%m-%d").to_string())));
+                p
+            }
             Self::Issuable { iid, .. } => vec![("iids[]", iid.to_string())],
         };
         params.sort();
@@ -479,13 +481,7 @@ impl GitlabApi for GitlabClient {
         listing: &Listing,
         limit: Option<usize>,
     ) -> Result<Vec<serde_json::Value>> {
-        use gitlab::api::{Pagination, paged};
-        let pagination = limit.map_or(Pagination::All, Pagination::Limit);
-        let mut rows =
-            run_paged_query(&self.inner, "list", paged(RestList(listing), pagination)).await?;
-        // The crate stops after the page that reached the limit, not at it.
-        rows.truncate(limit.unwrap_or(usize::MAX));
-        Ok(rows)
+        walk_pages(&self.inner, listing, limit).await
     }
 
     /// Returns entries with `spent_at >= since`, newest first. Catches time
@@ -651,43 +647,107 @@ fn rotated_token_from(raw: &serde_json::Value) -> Result<RotatedToken> {
     })
 }
 
-/// `GET <listing path>` — the one endpoint behind every [`Listing`].
-struct RestList<'a>(&'a Listing);
+/// Rows per page; GitLab's maximum.
+const PER_PAGE: usize = 100;
 
-impl gitlab::api::Endpoint for RestList<'_> {
-    fn method(&self) -> http::Method {
-        http::Method::GET
-    }
-
-    fn endpoint(&self) -> Cow<'static, str> {
-        self.0.path().into()
-    }
-
-    fn parameters(&self) -> gitlab::api::QueryParams<'_> {
-        let mut params = gitlab::api::QueryParams::default();
-        for (k, v) in self.0.params() {
-            params.push(k, v);
-        }
-        params
-    }
+/// One page of a listing as GitLab answered it.
+struct Page {
+    rows: Vec<serde_json::Value>,
+    /// `X-Next-Page` named one.
+    has_next: bool,
 }
 
-impl gitlab::api::Pageable for RestList<'_> {}
-
-/// Run a paged list `query` against `client` into raw JSON, retrying transient
-/// errors with exponential back-off (see [`retry_transient`]).
-async fn run_paged_query<Q>(
-    client: &gitlab::AsyncGitlab,
-    op: &str,
-    query: Q,
+/// Fetch every page of `listing` GitLab announces, at most `limit` rows.
+///
+/// A short page is not the last one: `/events` drops the rows the user may
+/// not see after slicing the page (the `gitlab` crate's paged query stops
+/// there and loses the rest), so only an empty page or a short page without
+/// a successor ends the walk. Pages are retried one at a time.
+async fn walk_pages<C>(
+    client: &C,
+    listing: &Listing,
+    limit: Option<usize>,
 ) -> Result<Vec<serde_json::Value>>
 where
-    Q: gitlab::api::AsyncQuery<Vec<serde_json::Value>, gitlab::AsyncGitlab> + Sync,
+    C: gitlab::api::AsyncClient + Sync,
 {
-    retry_transient(op, || async {
-        query.query_async(client).await.map_err(classify)
-    })
-    .await
+    let mut rows = Vec::new();
+    let mut page = 1u64;
+    loop {
+        let fetched =
+            retry_transient("list", || async { fetch_page(client, listing, page).await }).await?;
+        let empty = fetched.rows.is_empty();
+        let short = fetched.rows.len() < PER_PAGE;
+        rows.extend(fetched.rows);
+        let enough = limit.is_some_and(|l| rows.len() >= l);
+        if empty || enough || (short && !fetched.has_next) {
+            break;
+        }
+        page += 1;
+    }
+    rows.truncate(limit.unwrap_or(usize::MAX));
+    Ok(rows)
+}
+
+/// `GET <listing path>?<listing params>&page=<page>&per_page=100`.
+async fn fetch_page<C>(client: &C, listing: &Listing, page: u64) -> Result<Page>
+where
+    C: gitlab::api::AsyncClient + Sync,
+{
+    let mut url = client.rest_endpoint(&listing.path()).map_err(classify)?;
+    {
+        let mut query = url.query_pairs_mut();
+        for (k, v) in listing.params() {
+            query.append_pair(k, &v);
+        }
+        query.append_pair("page", &page.to_string());
+        query.append_pair("per_page", &PER_PAGE.to_string());
+    }
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(url.as_str())
+        .header(http::header::ACCEPT, "application/json");
+    let rsp = client
+        .rest_async(request, Vec::new())
+        .await
+        .map_err(classify)?;
+    let status = rsp.status();
+    if !status.is_success() {
+        let retry_after = header(&rsp, http::header::RETRY_AFTER.as_str())
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let detail = format!(
+            "{status} on {}: {}",
+            listing.path(),
+            error_message(rsp.body())
+        );
+        return Err(throttled_or_rejected(status.as_u16(), retry_after, detail));
+    }
+    let rows = serde_json::from_slice(rsp.body())
+        .map_err(|e| Error::Gitlab(format!("page {page} of {}: {e}", listing.path())))?;
+    let has_next = header(&rsp, "x-next-page").is_some_and(|v| !v.is_empty());
+    Ok(Page { rows, has_next })
+}
+
+fn header<'a, B>(rsp: &'a http::Response<B>, name: &str) -> Option<&'a str> {
+    rsp.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+}
+
+/// GitLab's `{"message": …}` or `{"error": …}`, else the body itself.
+fn error_message(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| {
+            [&v["message"], &v["error"]]
+                .into_iter()
+                .find(|m| !m.is_null())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| text.chars().take(200).collect())
 }
 
 /// Map a GitLab API error to [`Error::Transient`] for network failures,
@@ -701,8 +761,6 @@ where
     let detail = e.to_string();
     let retry_after = match &e {
         A::Client { .. } => return Error::Transient(detail),
-        // Only the single-request path parses the rate-limit headers; the
-        // paged path reports a 429 as one of the plain status variants.
         A::GitlabRateLimited { retry_after, .. } => Some(*retry_after),
         _ => None,
     };
@@ -1175,6 +1233,162 @@ mod tests {
     #[error("boom")]
     struct Boom;
 
+    /// What the fake answers a page request with, in request order.
+    enum Answer {
+        /// Rows `from..to` as `{"id": n}`, with `X-Next-Page` set or empty.
+        Rows(std::ops::Range<usize>, bool),
+        Status(u16, Option<&'static str>),
+    }
+
+    /// A GitLab that serves canned pages and records every URL asked for.
+    #[derive(Default)]
+    struct PagedFake {
+        answers: std::sync::Mutex<Vec<Answer>>,
+        urls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl PagedFake {
+        fn with(answers: Vec<Answer>) -> Self {
+            Self {
+                answers: std::sync::Mutex::new(answers),
+                ..Default::default()
+            }
+        }
+
+        fn urls(&self) -> Vec<String> {
+            self.urls.lock().unwrap().clone()
+        }
+    }
+
+    impl gitlab::api::RestClient for PagedFake {
+        type Error = Boom;
+
+        fn rest_endpoint(
+            &self,
+            endpoint: &str,
+        ) -> std::result::Result<url::Url, gitlab::api::ApiError<Boom>> {
+            Ok(url::Url::parse("https://gitlab.test/api/v4/")
+                .unwrap()
+                .join(endpoint)
+                .unwrap())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl gitlab::api::AsyncClient for PagedFake {
+        async fn rest_async(
+            &self,
+            request: http::request::Builder,
+            _body: Vec<u8>,
+        ) -> std::result::Result<http::Response<bytes::Bytes>, gitlab::api::ApiError<Boom>>
+        {
+            let request = request.body(()).unwrap();
+            self.urls.lock().unwrap().push(request.uri().to_string());
+            let answer = {
+                let mut answers = self.answers.lock().unwrap();
+                if answers.is_empty() {
+                    Answer::Rows(0..0, false)
+                } else {
+                    answers.remove(0)
+                }
+            };
+            let rsp = match answer {
+                Answer::Rows(range, next) => {
+                    let rows: Vec<_> = range.map(|i| serde_json::json!({"id": i})).collect();
+                    http::Response::builder()
+                        .status(200)
+                        .header("x-next-page", if next { "2" } else { "" })
+                        .body(bytes::Bytes::from(serde_json::to_vec(&rows).unwrap()))
+                }
+                Answer::Status(code, retry_after) => {
+                    let mut rsp = http::Response::builder().status(code);
+                    if let Some(secs) = retry_after {
+                        rsp = rsp.header("retry-after", secs);
+                    }
+                    rsp.body(bytes::Bytes::from_static(br#"{"message":"nope"}"#))
+                }
+            };
+            Ok(rsp.unwrap())
+        }
+    }
+
+    fn ids(rows: &[serde_json::Value]) -> Vec<u64> {
+        rows.iter().map(|r| r["id"].as_u64().unwrap()).collect()
+    }
+
+    const EVENTS: Listing = Listing::Events { after: None };
+
+    /// The regression: `/events` drops invisible rows after slicing the
+    /// page, so page 1 came back with 99 rows and page 2 was never asked
+    /// for.
+    #[tokio::test]
+    async fn a_short_page_with_a_successor_is_followed() {
+        let fake = PagedFake::with(vec![
+            Answer::Rows(0..99, true),
+            Answer::Rows(99..158, false),
+        ]);
+        let rows = walk_pages(&fake, &EVENTS, None).await.unwrap();
+        assert_eq!(ids(&rows), (0..158).collect::<Vec<_>>());
+        assert_eq!(
+            fake.urls(),
+            [
+                "https://gitlab.test/api/v4/events?sort=asc&page=1&per_page=100",
+                "https://gitlab.test/api/v4/events?sort=asc&page=2&per_page=100",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_short_page_without_a_successor_ends_the_walk() {
+        let fake = PagedFake::with(vec![Answer::Rows(0..17, false)]);
+        let rows = walk_pages(&fake, &EVENTS, None).await.unwrap();
+        assert_eq!(rows.len(), 17);
+        assert_eq!(fake.urls().len(), 1);
+    }
+
+    /// GitLab stops counting at 10 000 rows, so a missing successor on a
+    /// full page proves nothing; the empty page after it does.
+    #[tokio::test]
+    async fn a_full_page_is_followed_until_an_empty_one() {
+        let fake = PagedFake::with(vec![Answer::Rows(0..100, false), Answer::Rows(0..0, false)]);
+        let rows = walk_pages(&fake, &EVENTS, None).await.unwrap();
+        assert_eq!(rows.len(), 100);
+        assert_eq!(fake.urls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_limit_ends_the_walk_and_caps_the_rows() {
+        let fake = PagedFake::with(vec![
+            Answer::Rows(0..100, true),
+            Answer::Rows(100..200, true),
+            Answer::Rows(200..300, true),
+        ]);
+        let rows = walk_pages(&fake, &EVENTS, Some(150)).await.unwrap();
+        assert_eq!(ids(&rows), (0..150).collect::<Vec<_>>());
+        assert_eq!(fake.urls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_page_walk_classifies_gitlab_answers() {
+        let fake = PagedFake::with(vec![Answer::Status(429, Some("7"))]);
+        assert!(matches!(
+            walk_pages(&fake, &EVENTS, None).await,
+            Err(Error::Throttled { status: 429, retry_after: Some(d), .. }) if d == Duration::from_secs(7)
+        ));
+
+        let fake = PagedFake::with(vec![Answer::Status(401, None)]);
+        assert!(matches!(
+            walk_pages(&fake, &EVENTS, None).await,
+            Err(Error::Unauthorized(_))
+        ));
+
+        let fake = PagedFake::with(vec![Answer::Status(404, None)]);
+        assert!(matches!(
+            walk_pages(&fake, &EVENTS, None).await,
+            Err(Error::Gitlab(detail)) if detail.contains("404") && detail.contains("nope")
+        ));
+    }
+
     #[test]
     fn classify_splits_network_throttle_and_rejection() {
         use gitlab::api::ApiError as A;
@@ -1324,7 +1538,7 @@ mod tests {
                     after: chrono::NaiveDate::from_ymd_opt(2026, 6, 30),
                 },
                 "events",
-                "after=2026-06-30",
+                "after=2026-06-30&sort=asc",
             ),
             (
                 Listing::Issuable {
