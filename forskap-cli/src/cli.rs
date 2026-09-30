@@ -19,6 +19,7 @@ pub enum OutputFormat {
     #[default]
     Text,
     Json,
+    Yaml,
 }
 
 /// Carried by the commands that print data.

@@ -134,8 +134,9 @@ fn output_only_where_data_is_printed() {
         &["queue", "list"],
         &["sync", "jobs"],
     ] {
-        let json = [args, &["-o", "json"]].concat();
-        ok(&json);
+        for format in ["text", "json", "yaml"] {
+            ok(&[args, &["-o", format]].concat());
+        }
     }
     for args in [
         &["issue", "close", "1"][..],

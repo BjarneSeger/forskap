@@ -79,7 +79,7 @@ forskap sync jobs               # what the background sync runs now, next, and w
 `unassign`) and take the number shown in GitLab. The project is looked up in the
 cache; when a number exists in several projects, name one with `-p`, as full path
 or numeric ID. `forskap epic` has `view` and `open`; epics belong to a group, so an
-ambiguous number takes `-g`. Commands that print data take `-o json`.
+ambiguous number takes `-g`. Commands that print data take `-o json` or `-o yaml`.
 
 ## Config
 
