@@ -1261,24 +1261,25 @@ type WhoAmI_methods struct{}
 
 func WhoAmI() WhoAmI_methods { return WhoAmI_methods{} }
 
-func (m WhoAmI_methods) Call(ctx context.Context, c *varlink.Connection) (host_out_ string, user_id_out_ int64, token_expires_at_out_ *int64, token_rotates_out_ bool, err_ error) {
+func (m WhoAmI_methods) Call(ctx context.Context, c *varlink.Connection) (host_out_ string, user_id_out_ int64, username_out_ string, token_expires_at_out_ *int64, token_rotates_out_ bool, err_ error) {
 	receive, err_ := m.Send(ctx, c, 0)
 	if err_ != nil {
 		return
 	}
-	host_out_, user_id_out_, token_expires_at_out_, token_rotates_out_, _, err_ = receive(ctx)
+	host_out_, user_id_out_, username_out_, token_expires_at_out_, token_rotates_out_, _, err_ = receive(ctx)
 	return
 }
 
-func (m WhoAmI_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64) (func(ctx context.Context) (string, int64, *int64, bool, uint64, error), error) {
+func (m WhoAmI_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64) (func(ctx context.Context) (string, int64, string, *int64, bool, uint64, error), error) {
 	receive, err := c.Send(ctx, "org.thehoster.forskapd.WhoAmI", nil, flags)
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (host_out_ string, user_id_out_ int64, token_expires_at_out_ *int64, token_rotates_out_ bool, flags uint64, err error) {
+	return func(context.Context) (host_out_ string, user_id_out_ int64, username_out_ string, token_expires_at_out_ *int64, token_rotates_out_ bool, flags uint64, err error) {
 		var out struct {
 			Host             string `json:"host"`
 			User_id          int64  `json:"user_id"`
+			Username         string `json:"username"`
 			Token_expires_at *int64 `json:"token_expires_at,omitempty"`
 			Token_rotates    bool   `json:"token_rotates"`
 		}
@@ -1289,21 +1290,23 @@ func (m WhoAmI_methods) Send(ctx context.Context, c *varlink.Connection, flags u
 		}
 		host_out_ = out.Host
 		user_id_out_ = out.User_id
+		username_out_ = out.Username
 		token_expires_at_out_ = out.Token_expires_at
 		token_rotates_out_ = out.Token_rotates
 		return
 	}, nil
 }
 
-func (m WhoAmI_methods) Upgrade(ctx context.Context, c *varlink.Connection) (func(ctx context.Context) (host_out_ string, user_id_out_ int64, token_expires_at_out_ *int64, token_rotates_out_ bool, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m WhoAmI_methods) Upgrade(ctx context.Context, c *varlink.Connection) (func(ctx context.Context) (host_out_ string, user_id_out_ int64, username_out_ string, token_expires_at_out_ *int64, token_rotates_out_ bool, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.WhoAmI", nil)
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (host_out_ string, user_id_out_ int64, token_expires_at_out_ *int64, token_rotates_out_ bool, flags uint64, conn varlink.ReadWriterContext, err error) {
+	return func(context.Context) (host_out_ string, user_id_out_ int64, username_out_ string, token_expires_at_out_ *int64, token_rotates_out_ bool, flags uint64, conn varlink.ReadWriterContext, err error) {
 		var out struct {
 			Host             string `json:"host"`
 			User_id          int64  `json:"user_id"`
+			Username         string `json:"username"`
 			Token_expires_at *int64 `json:"token_expires_at,omitempty"`
 			Token_rotates    bool   `json:"token_rotates"`
 		}
@@ -1314,6 +1317,7 @@ func (m WhoAmI_methods) Upgrade(ctx context.Context, c *varlink.Connection) (fun
 		}
 		host_out_ = out.Host
 		user_id_out_ = out.User_id
+		username_out_ = out.Username
 		token_expires_at_out_ = out.Token_expires_at
 		token_rotates_out_ = out.Token_rotates
 		return
@@ -1480,15 +1484,17 @@ func (c *VarlinkCall) ReplyLogout(ctx context.Context) error {
 	return c.Reply(ctx, nil)
 }
 
-func (c *VarlinkCall) ReplyWhoAmI(ctx context.Context, host_ string, user_id_ int64, token_expires_at_ *int64, token_rotates_ bool) error {
+func (c *VarlinkCall) ReplyWhoAmI(ctx context.Context, host_ string, user_id_ int64, username_ string, token_expires_at_ *int64, token_rotates_ bool) error {
 	var out struct {
 		Host             string `json:"host"`
 		User_id          int64  `json:"user_id"`
+		Username         string `json:"username"`
 		Token_expires_at *int64 `json:"token_expires_at,omitempty"`
 		Token_rotates    bool   `json:"token_rotates"`
 	}
 	out.Host = host_
 	out.User_id = user_id_
+	out.Username = username_
 	out.Token_expires_at = token_expires_at_
 	out.Token_rotates = token_rotates_
 	return c.Reply(ctx, &out)
@@ -1933,7 +1939,7 @@ method Login(host: string, token: string) -> ()
 
 method Logout() -> ()
 
-method WhoAmI() -> (host: string, user_id: int, token_expires_at: ?int, token_rotates: bool)
+method WhoAmI() -> (host: string, user_id: int, username: string, token_expires_at: ?int, token_rotates: bool)
 `
 }
 

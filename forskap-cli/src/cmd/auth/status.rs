@@ -21,11 +21,17 @@ pub async fn run(format: OutputFormat) -> Result<()> {
         &serde_json::json!({
             "host": me.host,
             "user_id": me.user_id,
+            "username": me.username,
             "token_expires_at": me.token_expires_at,
             "token_rotates": me.token_rotates,
         }),
         |_| {
-            outln!("Logged in to {} as user #{}.", me.host, me.user_id)?;
+            outln!(
+                "Logged in to {} as @{} (#{}).",
+                me.host,
+                me.username,
+                me.user_id
+            )?;
             outln!(
                 "{}",
                 token_line(me.token_expires_at, me.token_rotates, Utc::now())

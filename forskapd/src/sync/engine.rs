@@ -1459,6 +1459,7 @@ mod tests {
             gitlab: Arc::clone(fake) as Arc<dyn GitlabApi>,
             host: "gitlab.test".into(),
             user_id,
+            username: "tester".into(),
             token: Default::default(),
         })
     }

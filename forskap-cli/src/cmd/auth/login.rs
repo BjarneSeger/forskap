@@ -56,6 +56,11 @@ pub async fn run(host: String) -> Result<()> {
         .call()
         .await
         .map_err(|e| friendly("WhoAmI", e))?;
-    outln!("Logged in to {} as user #{}.", me.host, me.user_id)?;
+    outln!(
+        "Logged in to {} as @{} (#{}).",
+        me.host,
+        me.username,
+        me.user_id
+    )?;
     Ok(())
 }

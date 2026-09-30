@@ -57,6 +57,8 @@ pub struct GitlabClient {
     /// Required so `assign_self`/`unassign_self` can mutate the issuable's
     /// `assignee_ids` list without an extra round-trip per call.
     current_user_id: i64,
+    /// Login name of the authenticated user, next to the id for `WhoAmI`.
+    current_username: String,
     /// The token `inner` authenticates with.
     token: Token,
 }
@@ -89,6 +91,10 @@ impl GitlabClient {
 
     pub fn current_user_id(&self) -> i64 {
         self.current_user_id
+    }
+
+    pub fn current_username(&self) -> &str {
+        &self.current_username
     }
 }
 
@@ -323,12 +329,19 @@ impl GitlabClient {
         let current_user_id = user["id"].as_i64().ok_or_else(|| {
             Error::Gitlab(format!("GET /user response missing numeric id: {user}"))
         })?;
-        info!(current_user_id, "resolved authenticated GitLab user");
+        let current_username = user["username"]
+            .as_str()
+            .ok_or_else(|| Error::Gitlab(format!("GET /user response missing username: {user}")))?;
+        info!(
+            current_user_id,
+            current_username, "resolved authenticated GitLab user"
+        );
 
         Ok(Self {
             inner,
             host: host.to_string(),
             current_user_id,
+            current_username: current_username.to_string(),
             token: token.clone(),
         })
     }

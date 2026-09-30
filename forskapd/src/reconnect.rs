@@ -457,6 +457,7 @@ mod tests {
             gitlab: Arc::new(FakeGitlab::default()),
             host: "gitlab.example.com".into(),
             user_id: 42,
+            username: "tester".into(),
             token: Default::default(),
         }
     }
@@ -580,6 +581,7 @@ mod tests {
             gitlab: Arc::clone(&client),
             host: "gitlab.example.com".into(),
             user_id: 42,
+            username: "tester".into(),
             token: Default::default(),
         })));
         let signal = Notify::new();
@@ -650,6 +652,7 @@ mod tests {
             gitlab: Arc::clone(&client_b),
             host: "gitlab.example.com".into(),
             user_id: 1,
+            username: "tester".into(),
             token: Default::default(),
         })));
         let signal = Notify::new();

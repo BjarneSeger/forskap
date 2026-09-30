@@ -754,6 +754,7 @@ mod tests {
                 gitlab: Arc::new(FakeGitlab::default()),
                 host: host.into(),
                 user_id: 42,
+                username: "tester".into(),
                 token: token.clone(),
             })
         }
@@ -768,6 +769,7 @@ mod tests {
             gitlab: Arc::clone(fake) as Arc<dyn GitlabApi>,
             host: HOST.into(),
             user_id: 42,
+            username: "tester".into(),
             token: Token::new(token),
         }
     }
