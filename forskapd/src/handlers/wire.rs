@@ -247,7 +247,8 @@ mod tests {
     #[test]
     fn activity_shows_pushes_and_what_a_comment_is_on() {
         let p = project();
-        let mut push = event("pushed to", "", 0);
+        // GitLab sends the project's id as a push's target number.
+        let mut push = event("pushed to", "Project", 7);
         push.push_data = model::PushData {
             git_ref: "feat/x".into(),
             commit_count: 2,
@@ -260,6 +261,7 @@ mod tests {
 
         let push = activity(push, Some(&p), None);
         assert_eq!(push.r#ref.as_deref(), Some("feat/x"));
+        assert_eq!(push.target_iid, None);
         assert_eq!(push.commit_count, Some(2));
         assert_eq!(push.commit_title.as_deref(), Some("Fix it"));
         assert_eq!(

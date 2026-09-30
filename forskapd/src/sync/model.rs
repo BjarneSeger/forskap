@@ -164,7 +164,8 @@ pub struct Event {
     #[serde(default, deserialize_with = "de::nullable")]
     pub target_type: String,
     /// The target's number within the project; 0 when the event has none
-    /// (a push, joining). On a comment it is the note's id: see [`Self::target`].
+    /// (joining). On a comment it is the note's id, on a push the project's:
+    /// see [`Self::target`].
     #[serde(default, deserialize_with = "de::nullable")]
     pub target_iid: i64,
     #[serde(default, deserialize_with = "de::nullable")]
@@ -207,12 +208,15 @@ pub struct NoteRef {
 impl Event {
     /// The kind and number of what the event is about, empty and 0 where
     /// there is none. A comment's own target is the note, so it answers
-    /// with what was commented on.
+    /// with what was commented on. GitLab targets a push at its project and
+    /// sends the project's id as the number, which is none.
     pub fn target(&self) -> (&str, i64) {
-        if self.note.noteable_type.is_empty() {
-            (&self.target_type, self.target_iid)
-        } else {
+        if !self.note.noteable_type.is_empty() {
             (&self.note.noteable_type, self.note.noteable_iid)
+        } else if self.target_type == "Project" {
+            (&self.target_type, 0)
+        } else {
+            (&self.target_type, self.target_iid)
         }
     }
 
