@@ -397,7 +397,10 @@ mod tests {
             event(2, 4, "joined", 500),
             event(3, 5, "pushed new", 500),
             event(4, 6, "commented on", 500),
-            event(5, 7, "created", 500),
+            Event {
+                target_type: "Project".into(),
+                ..event(5, 7, "created", 500)
+            },
             event(6, 8, "created", 50),
         ])
         .unwrap();
