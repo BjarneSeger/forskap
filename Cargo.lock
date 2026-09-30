@@ -1012,6 +1012,7 @@ dependencies = [
  "dirs",
  "forskap-api",
  "inquire",
+ "libc",
  "open",
  "proptest",
  "serde",

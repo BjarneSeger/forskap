@@ -41,6 +41,7 @@ use refspec::RefKind;
 /// startup overhead to the hot `forskap tick` path (fires on every shell prompt).
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    die_on_closed_pipe();
     migrate::run();
     let command = Cli::parse().command;
     if !matches!(command, Command::Tick { .. } | Command::Prompt) {
@@ -67,6 +68,18 @@ async fn main() -> Result<()> {
         Command::Integration { command } => cmd::integration::run(command).await,
         Command::Tick { mode } => cmd::time::tick::run(mode).await,
         Command::Prompt => cmd::time::prompt::run().await,
+    }
+}
+
+/// Rust ignores SIGPIPE, so `forskap issue list | head` would panic in
+/// `println!` once `head` is done. Take the signal's default again: exit
+/// quietly, like any other filter.
+fn die_on_closed_pipe() {
+    // SAFETY: called first in `main`, before another thread exists; setting
+    // a signal's default disposition has no other precondition.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 
