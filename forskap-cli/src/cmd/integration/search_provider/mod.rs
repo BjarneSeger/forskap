@@ -8,7 +8,8 @@
 //! `install` writes, and it exits after [`IDLE`] without a
 //! call, so nothing runs while no launcher is open.
 //!
-//! Everything comes from the daemon (`Search`, `RecordOpen`, `WhoAmI`), the
+//! Everything comes from the daemon (`Search`, `RecordOpen`, `RecordEpicOpen`,
+//! `WhoAmI`), the
 //! same calls the noctalia plugin makes through `forskap search` / `forskap issue open`; the
 //! query grammar ([`query`]) and result ids ([`results`]) are shared with it.
 
@@ -29,7 +30,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use zbus::zvariant::{OwnedValue, Value};
 
 use crate::cli::SearchProviderCommand;
-use crate::cmd::item;
+use crate::cmd::{epic, item};
 use crate::friendly::friendly;
 use crate::{client, config, refspec};
 use results::{Row, Target};
@@ -104,7 +105,7 @@ struct Inner {
     activation_token: Option<String>,
 }
 
-/// A search's rows plus whether the query was an exact `#42`/`!42` form.
+/// A search's rows plus whether the query was an exact `#42`/`!42`/`&42` form.
 pub(super) struct Hits {
     pub rows: Vec<Row>,
     pub exact: bool,
@@ -189,7 +190,8 @@ impl Provider {
     }
 
     /// Open a picked result: `url:` ids go straight to the browser, issuables
-    /// are counted in the daemon first (same order as `forskap issue open`).
+    /// and epics are counted in the daemon first (same order as `forskap issue
+    /// open`).
     async fn activate(&self, id: &str) -> Result<()> {
         match results::parse_id(id).ok_or_else(|| anyhow!("unknown result id {id:?}"))? {
             Target::Url(url) => self.open_url(&url),
@@ -211,6 +213,19 @@ impl Provider {
                     .call()
                     .await
                     .map_err(|e| friendly("RecordOpen", e))?;
+                self.open_url(&url)
+            }
+            Target::Epic { group_id, iid } => {
+                let client = client::connect(&self.socket).await?;
+                let url = match self.cached(id) {
+                    Some(row) => row.url,
+                    None => epic::lookup(&client, group_id, iid).await?.web_url,
+                };
+                client
+                    .record_epic_open(group_id, iid)
+                    .call()
+                    .await
+                    .map_err(|e| friendly("RecordEpicOpen", e))?;
                 self.open_url(&url)
             }
         }

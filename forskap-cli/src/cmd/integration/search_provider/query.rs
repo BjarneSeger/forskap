@@ -12,6 +12,7 @@ pub enum Kind {
     MergeRequests,
     Projects,
     Groups,
+    Epics,
 }
 
 impl Kind {
@@ -22,6 +23,7 @@ impl Kind {
             Kind::MergeRequests => "merge_requests",
             Kind::Projects => "projects",
             Kind::Groups => "groups",
+            Kind::Epics => "epics",
         }
     }
 
@@ -32,6 +34,7 @@ impl Kind {
             Kind::MergeRequests => "emblem-synchronizing-symbolic",
             Kind::Projects => "folder-symbolic",
             Kind::Groups => "system-users-symbolic",
+            Kind::Epics => "user-bookmarks-symbolic",
         }
     }
 
@@ -41,6 +44,7 @@ impl Kind {
             "mr" | "mrs" => Kind::MergeRequests,
             "p" | "project" | "projects" => Kind::Projects,
             "g" | "group" | "groups" => Kind::Groups,
+            "e" | "epic" | "epics" => Kind::Epics,
             _ => return None,
         })
     }
@@ -51,7 +55,8 @@ impl Kind {
 pub struct Parsed {
     pub kind: Option<Kind>,
     pub query: String,
-    /// The query was a bare `#42` / `!42`: the iid match is the exact hit.
+    /// The query was a bare `#42` / `!42` / `&42`: the iid match is the exact
+    /// hit.
     pub exact: bool,
 }
 
@@ -75,6 +80,7 @@ pub fn strip_trigger<'a>(text: &'a str, word: &str) -> Option<&'a str> {
 /// "mr"        → MergeRequests,  ""        (frequently opened MRs)
 /// "!42"       → MergeRequests,  "#42"     (`Search` only knows the # form)
 /// "#42"       → Issues,         "#42"
+/// "&42"       → Epics,          "&42"
 /// ```
 pub fn parse(text: &str) -> Parsed {
     let text = text.trim();
@@ -99,6 +105,13 @@ pub fn parse(text: &str) -> Parsed {
     if text.strip_prefix('#').is_some_and(is_number) {
         return Parsed {
             kind: Some(Kind::Issues),
+            query: text.to_string(),
+            exact: true,
+        };
+    }
+    if text.strip_prefix('&').is_some_and(is_number) {
+        return Parsed {
+            kind: Some(Kind::Epics),
             query: text.to_string(),
             exact: true,
         };
@@ -167,6 +180,8 @@ mod tests {
         assert_eq!(parse("mr"), p(Some(Kind::MergeRequests), "", false));
         assert_eq!(parse("!42"), p(Some(Kind::MergeRequests), "#42", true));
         assert_eq!(parse("#42"), p(Some(Kind::Issues), "#42", true));
+        assert_eq!(parse("&42"), p(Some(Kind::Epics), "&42", true));
+        assert_eq!(parse("e roadmap"), p(Some(Kind::Epics), "roadmap", false));
         assert_eq!(
             parse("  Issues  login  "),
             p(Some(Kind::Issues), "login", false)
@@ -179,6 +194,7 @@ mod tests {
     fn sigil_without_number_is_plain_text() {
         assert_eq!(parse("#abc"), p(None, "#abc", false));
         assert_eq!(parse("!"), p(None, "!", false));
+        assert_eq!(parse("&amp"), p(None, "&amp", false));
     }
 
     #[test]
@@ -231,8 +247,12 @@ mod tests {
             let parsed = parse(&text);
             prop_assert_eq!(parsed.query.trim(), parsed.query.as_str());
             if parsed.exact {
-                prop_assert!(parsed.query.starts_with('#'));
-                prop_assert!(matches!(parsed.kind, Some(Kind::Issues | Kind::MergeRequests)));
+                let sigil = if parsed.kind == Some(Kind::Epics) { '&' } else { '#' };
+                prop_assert!(parsed.query.starts_with(sigil));
+                prop_assert!(matches!(
+                    parsed.kind,
+                    Some(Kind::Issues | Kind::MergeRequests | Kind::Epics)
+                ));
             }
             prop_assert_eq!(strip_trigger(&text, "gl").is_some(), {
                 let t = text.trim_start();

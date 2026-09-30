@@ -1,11 +1,11 @@
 id          = "thehoster/forskap"
 name        = "Forskap"
-version     = "0.4.0"
+version     = "0.5.0"
 plugin_api  = 24 # argument-array form of noctalia.runAsync
 author      = "thehoster"
 license     = "GPL-3.0-only"
 icon        = "brand-gitlab"
-description = "Search GitLab issues, merge requests, projects and groups through forskapd; frequently opened items rank first."
+description = "Search GitLab issues, merge requests, epics, projects and groups through forskapd; frequently opened items rank first."
 tags        = ["gitlab", "launcher", "search"]
 dependencies = ["forskap"]
 
@@ -42,6 +42,10 @@ include_in_global_search = false
   [[launcher_provider.category]]
   label = "Merge requests"
   glyph = "git-pull-request"
+
+  [[launcher_provider.category]]
+  label = "Epics"
+  glyph = "flag"
 
   [[launcher_provider.category]]
   label = "Projects"

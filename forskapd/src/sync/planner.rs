@@ -8,6 +8,9 @@
 //! projects the user is a member of get a corpus: an assigned MR in an
 //! upstream like gitlab-org/gitlab must not pull in its whole history.
 //!
+//! Epics follow the corpus one level up: the member groups a corpus project
+//! lies in get their epics synced.
+//!
 //! Avatars follow the member projects, tracked or not: a project shows its
 //! icon in search either way.
 
@@ -15,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::avatars::Avatar;
 use super::jobs::{ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, Job};
-use super::model::{Board, Event, Issue, MergeRequest, RowKey};
+use super::model::{Board, Epic, Event, Issue, MergeRequest, Project, RowKey};
 use super::schedule::{fingerprint, text_hash};
 use super::store::{Commit, RowScope, SyncStore};
 use crate::config::{Config, SearchPopulation};
@@ -31,6 +34,8 @@ pub struct Plan {
     pub unlisted: BTreeSet<i64>,
     /// Projects whose issues and MRs are synced.
     pub corpus: usize,
+    /// Groups whose epics are synced.
+    pub epic_groups: usize,
     /// The member projects with an avatar, by the hash of its URL.
     pub avatars: BTreeMap<i64, u64>,
 }
@@ -109,25 +114,53 @@ pub fn plan(store: &SyncStore, population: SearchPopulation, tracked_since: u64)
         .filter(|e| e.implies_membership() && !members.contains(&e.project_id))
         .map(|e| e.project_id)
         .collect();
-    let corpus: Vec<i64> = match population {
+    let corpus: BTreeSet<i64> = match population {
         SearchPopulation::All => {
             jobs.extend([Job::AllIssues, Job::AllMergeRequests]);
-            Vec::new()
+            BTreeSet::new()
         }
-        SearchPopulation::Member => members.into_iter().collect(),
+        SearchPopulation::Member => members,
         SearchPopulation::Tracked => tracked.intersection(&members).copied().collect(),
     };
     for &p in &corpus {
         jobs.extend([Job::ProjectIssues(p), Job::ProjectMergeRequests(p)]);
     }
+    // `all` has no per-project corpus: every member group counts.
+    let everywhere = population == SearchPopulation::All;
+    let above = ancestors(projects.iter().filter(|p| corpus.contains(&p.id)));
+    let epic_groups: Vec<i64> = store
+        .groups
+        .scan(RowScope::All)?
+        .into_iter()
+        .filter(|g| everywhere || above.contains(g.full_path.as_str()))
+        .map(|g| g.id)
+        .collect();
+    jobs.extend(epic_groups.iter().map(|&g| Job::GroupEpics(g)));
     Ok(Plan {
         jobs,
         tracked,
         evidence,
         unlisted,
         corpus: corpus.len(),
+        epic_groups: epic_groups.len(),
         avatars,
     })
+}
+
+/// The full paths of every group `projects` lie in, at any depth:
+/// `team/backend/api` is in `team/backend` and in `team`.
+fn ancestors<'a>(projects: impl Iterator<Item = &'a Project>) -> HashSet<&'a str> {
+    let mut groups = HashSet::new();
+    for project in projects {
+        let mut path = project.path_with_namespace.as_str();
+        while let Some((parent, _)) = path.rsplit_once('/') {
+            if !groups.insert(parent) {
+                break;
+            }
+            path = parent;
+        }
+    }
+    groups
 }
 
 /// The projects the view `name` lists.
@@ -190,7 +223,7 @@ fn viewed(store: &SyncStore, name: &str) -> Result<HashSet<RowKey>> {
 
 /// Stage the removal of rows no job in `plan` keeps fresh any more: issues
 /// and MRs of unplanned projects (unless an assigned view lists them),
-/// boards of untracked projects and avatars of projects that lost theirs or
+/// epics of unplanned groups, boards of untracked projects and avatars of projects that lost theirs or
 /// left the memberships (their files go with the worker's sweep). Returns
 /// how many.
 pub fn collect_garbage(commit: &mut Commit<'_>, store: &SyncStore, plan: &Plan) -> Result<usize> {
@@ -207,6 +240,9 @@ pub fn collect_garbage(commit: &mut Commit<'_>, store: &SyncStore, plan: &Plan) 
             kept.contains(&k) || in_corpus(plan, false, k)
         })?;
     }
+    removed += commit.remove_where::<Epic>(RowScope::All, |k| {
+        plan.jobs.contains(&Job::GroupEpics(k.0 as i64))
+    })?;
     removed += commit.remove_where::<Board>(RowScope::All, |k| {
         plan.jobs.contains(&Job::ProjectBoards(k.0 as i64))
     })?;
@@ -246,7 +282,7 @@ pub fn drop_unviewed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::model::{Event, Project, Timelog};
+    use crate::sync::model::{Event, Group, Project, Timelog};
     use crate::sync::store::View;
 
     fn store() -> (SyncStore, tempfile::TempDir) {
@@ -505,6 +541,88 @@ mod tests {
         let all = plan(&s, SearchPopulation::All, 100).unwrap();
         assert!(projects_of(&all).is_empty());
         assert!(all.jobs.contains(&Job::AllIssues) && all.jobs.contains(&Job::AllMergeRequests));
+    }
+
+    fn project_at(id: i64, path: &str) -> Project {
+        Project {
+            id,
+            path_with_namespace: path.into(),
+            ..Default::default()
+        }
+    }
+
+    fn group(id: i64, full_path: &str) -> Group {
+        Group {
+            id,
+            full_path: full_path.into(),
+            ..Default::default()
+        }
+    }
+
+    fn epic_groups_of(plan: &Plan) -> BTreeSet<i64> {
+        plan.jobs
+            .iter()
+            .filter_map(|j| match j {
+                Job::GroupEpics(g) => Some(*g),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Epics are synced for the member groups above a corpus project, at
+    /// any depth; a group that merely shares a path prefix isn't above it.
+    #[test]
+    fn epics_follow_the_groups_above_the_corpus() {
+        let (s, _d) = store();
+        let mut c = s.begin();
+        c.upsert(&[
+            project_at(7, "team/backend/api"),
+            project_at(8, "other/web"),
+        ])
+        .unwrap();
+        c.upsert(&[
+            group(1, "team"),
+            group(2, "team/backend"),
+            group(3, "team/back"),
+            group(4, "other"),
+        ])
+        .unwrap();
+        c.upsert(&[event(1, 7, "opened", 500)]).unwrap();
+        c.commit().unwrap();
+
+        let tracked = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        assert_eq!(epic_groups_of(&tracked), BTreeSet::from([1, 2]));
+        assert_eq!(tracked.epic_groups, 2);
+
+        let member = plan(&s, SearchPopulation::Member, 100).unwrap();
+        assert_eq!(epic_groups_of(&member), BTreeSet::from([1, 2, 4]));
+
+        let all = plan(&s, SearchPopulation::All, 100).unwrap();
+        assert_eq!(epic_groups_of(&all), BTreeSet::from([1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn epics_of_unplanned_groups_are_garbage() {
+        let (s, _d) = store();
+        let epic = |group_id, iid| Epic {
+            id: group_id * 100 + iid,
+            iid,
+            group_id,
+            ..Default::default()
+        };
+        let mut c = s.begin();
+        c.upsert(&[project_at(7, "team/api")]).unwrap();
+        c.upsert(&[group(1, "team"), group(4, "other")]).unwrap();
+        c.upsert(&[event(1, 7, "opened", 500)]).unwrap();
+        c.upsert(&[epic(1, 1), epic(4, 1), epic(9, 1)]).unwrap();
+        c.commit().unwrap();
+
+        let p = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        let mut c = s.begin();
+        let removed = collect_garbage(&mut c, &s, &p).unwrap();
+        c.commit().unwrap();
+        assert_eq!(removed, 2, "4 has no corpus project, 9 is no member group");
+        assert_eq!(s.epics.keys(RowScope::All).unwrap(), [(1, 1)]);
     }
 
     fn with_avatar(id: i64, url: &str) -> Project {

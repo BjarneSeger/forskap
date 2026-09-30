@@ -1,7 +1,7 @@
 //! Projections of stored GitLab rows onto the varlink wire types.
 
 use forskap_api::{
-    ActivityEvent, Group, HistoryEvent, IssuableKind, Issue, MergeRequest, Project, SyncJob,
+    ActivityEvent, Epic, Group, HistoryEvent, IssuableKind, Issue, MergeRequest, Project, SyncJob,
     SyncJobStatus,
 };
 
@@ -66,6 +66,18 @@ pub fn group(g: model::Group) -> Group {
         name: g.name,
         path: g.full_path,
         web_url: g.web_url,
+    }
+}
+
+pub fn epic(e: model::Epic, open_count: i64) -> Epic {
+    Epic {
+        id: e.id,
+        iid: e.iid,
+        group_id: e.group_id,
+        title: e.title,
+        web_url: e.web_url,
+        state: e.state,
+        open_count,
     }
 }
 

@@ -37,6 +37,9 @@ pub struct Cadence {
 pub const SERVER_BACKOFF_CAP: u64 = 3600;
 /// Backoff cap after a permanent rejection (403 on a lost project, …).
 pub const REJECTED_BACKOFF_CAP: u64 = 6 * 3600;
+/// How long a job rests after GitLab rejected a feature the instance may
+/// simply not have (epics without Premium).
+pub const UNAVAILABLE_REST_SECS: u64 = 24 * 3600;
 /// Cap on the worker-wide pause after a 429, `Retry-After` included.
 pub const RATE_LIMIT_PAUSE_CAP: u64 = 3600;
 const BACKOFF_BASE: u64 = 60;

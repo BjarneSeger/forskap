@@ -33,6 +33,7 @@ pub async fn run(
             && reply.merge_requests.is_empty()
             && reply.projects.is_empty()
             && reply.groups.is_empty()
+            && reply.epics.is_empty()
         {
             return outln!(
                 "{}",
@@ -69,6 +70,19 @@ pub async fn run(
                 )?;
             }
         }
+        if !reply.epics.is_empty() {
+            outln!("Epics:")?;
+            for e in &reply.epics {
+                outln!(
+                    "  &{:<5} {:<8} {}  {}{}",
+                    e.iid,
+                    e.state,
+                    e.title,
+                    e.web_url,
+                    opened(e.open_count)
+                )?;
+            }
+        }
         if !reply.projects.is_empty() {
             outln!("Projects:")?;
             for p in &reply.projects {
@@ -100,6 +114,7 @@ fn wire_kind(kind: SearchKind) -> String {
         SearchKind::Mrs => "merge_requests",
         SearchKind::Projects => "projects",
         SearchKind::Groups => "groups",
+        SearchKind::Epics => "epics",
     }
     .to_string()
 }

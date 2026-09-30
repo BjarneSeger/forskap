@@ -122,6 +122,12 @@ pub enum Listing {
     /// Groups the user is a member of (a bare `GET /groups` would include
     /// public non-member groups).
     MemberGroups,
+    /// A group's own epics, all states; `updated_after` for a delta. Needs
+    /// GitLab Premium: other instances answer 403 or 404.
+    GroupEpics {
+        group_id: i64,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    },
     /// A project's boards, lists embedded.
     ProjectBoards { project_id: i64 },
     /// The user's own contribution events created after `after` (a date;
@@ -146,6 +152,7 @@ impl Listing {
             }
             Self::MemberProjects => "projects".into(),
             Self::MemberGroups => "groups".into(),
+            Self::GroupEpics { group_id, .. } => format!("groups/{group_id}/epics"),
             Self::ProjectBoards { project_id } => format!("projects/{project_id}/boards"),
             Self::Events { .. } => "events".into(),
             Self::Issuable {
@@ -183,6 +190,17 @@ impl Listing {
             Self::MemberProjects => vec![("membership", "true".into()), ("simple", "true".into())],
             // 10 = Guest, the lowest membership level.
             Self::MemberGroups => vec![("min_access_level", "10".into())],
+            // A subgroup's epics belong to its own listing, so a group and
+            // its parent never fetch the same ones.
+            Self::GroupEpics { updated_after, .. } => {
+                let mut p = vec![
+                    ("include_descendant_groups", "false".into()),
+                    ("order_by", "updated_at".into()),
+                    ("sort", "desc".into()),
+                ];
+                p.extend(after(updated_after));
+                p
+            }
             Self::ProjectBoards { .. } => Vec::new(),
             Self::Events { after } => after
                 .map(|d| ("after", d.format("%Y-%m-%d").to_string()))
@@ -1287,6 +1305,15 @@ mod tests {
                 "membership=true&simple=true",
             ),
             (Listing::MemberGroups, "groups", "min_access_level=10"),
+            (
+                Listing::GroupEpics {
+                    group_id: 3,
+                    updated_after: t,
+                },
+                "groups/3/epics",
+                "include_descendant_groups=false&order_by=updated_at&sort=desc\
+                 &updated_after=2026-07-01T10:00:00Z",
+            ),
             (
                 Listing::ProjectBoards { project_id: 7 },
                 "projects/7/boards",

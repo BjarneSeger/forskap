@@ -4,7 +4,8 @@
 //! It runs one job at a time: a demanded one first (by priority), else the
 //! planned job that is due, lowest priority class first. Per-job jittered
 //! due times plus a jittered pause between jobs keep requests spread out. A
-//! 429 pauses the whole worker; a 5xx or a rejection backs off only its job;
+//! 429 pauses the whole worker; a 5xx or a rejection backs off only its job
+//! (a rejected epics fetch rests for a day: the instance has no epics);
 //! a network error backs off its job and demotes the session, parking the
 //! worker until the reconnect supervisor wakes it; a 401 parks the session
 //! until `forskap auth login`.
@@ -21,11 +22,12 @@ use tracing::{debug, error, info, warn};
 
 use super::avatars::{Avatar, AvatarDir};
 use super::jobs::{self, ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, FetchCtx, Job, Staged, Windows};
-use super::model::{Board, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog};
+use super::model::{Board, Epic, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog};
 use super::now_secs;
 use super::planner::{self, Plan};
 use super::schedule::{
     self, Cadence, JobState, RATE_LIMIT_PAUSE_CAP, REJECTED_BACKOFF_CAP, SERVER_BACKOFF_CAP,
+    UNAVAILABLE_REST_SECS,
 };
 use super::store::{Identity, NotedWrite, RowScope, SyncStore};
 use crate::config::{Config, SharedConfig};
@@ -48,7 +50,7 @@ pub enum Clear {
     Everything,
     /// The assigned issue/MR views and the board labels.
     Assigned,
-    /// Issues, MRs, projects, groups and the project avatars.
+    /// Issues, MRs, epics, projects, groups and the project avatars.
     Corpus,
     /// Timelogs spent in `[from, until)`.
     Timelogs { from: u64, until: u64 },
@@ -66,6 +68,7 @@ impl Clear {
                 key.starts_with("member/")
                     || key.ends_with("/issues")
                     || key.ends_with("/merge_requests")
+                    || key.ends_with("/epics")
                     || key.ends_with("/avatar")
             }
             Self::Timelogs { .. } => key.starts_with("timelogs/"),
@@ -749,7 +752,7 @@ impl Worker {
             }
             Some(Ok(Err(e))) => {
                 self.errors.insert(key.clone(), e.to_string());
-                self.on_error(&key, state, e, session).await;
+                self.on_error(job, &key, state, e, session).await;
             }
             Some(Err(e)) => {
                 error!(job = %key, error = %e, "sync job panicked");
@@ -952,7 +955,14 @@ impl Worker {
         boards.into_iter().collect()
     }
 
-    async fn on_error(&mut self, key: &str, state: JobState, e: Error, session: &Session) {
+    async fn on_error(
+        &mut self,
+        job: Job,
+        key: &str,
+        state: JobState,
+        e: Error,
+        session: &Session,
+    ) {
         match &e {
             Error::Transient(detail) => {
                 warn!(job = %key, error = %e, "sync fetch failed; GitLab unreachable");
@@ -1006,6 +1016,13 @@ impl Worker {
                 warn!(job = %key, error = %e, "GitLab failed the sync fetch; backing off");
                 self.back_off(key, state, SERVER_BACKOFF_CAP);
             }
+            // Expected wherever GitLab lacks the feature (epics need
+            // Premium): nothing to warn about, and no point asking again
+            // soon.
+            _ if job.optional() => {
+                debug!(job = %key, error = %e, "GitLab doesn't serve this here; resting the job");
+                self.rest(key, state, UNAVAILABLE_REST_SECS);
+            }
             _ => {
                 warn!(job = %key, error = %e, "GitLab rejected the sync fetch; backing off");
                 self.back_off(key, state, REJECTED_BACKOFF_CAP);
@@ -1014,14 +1031,15 @@ impl Worker {
     }
 
     fn back_off(&mut self, key: &str, state: JobState, cap: u64) {
+        let failures = state.failures.saturating_add(1);
+        self.rest(key, state, schedule::backoff(failures, cap));
+    }
+
+    /// Count a failure and hold the job back for about `secs`.
+    fn rest(&mut self, key: &str, state: JobState, secs: u64) {
         let jitter = self.config.read().unwrap().sync.jitter;
         let failures = state.failures.saturating_add(1);
-        let delay = schedule::jittered(
-            schedule::backoff(failures, cap),
-            key,
-            u64::from(failures),
-            jitter,
-        );
+        let delay = schedule::jittered(secs, key, u64::from(failures), jitter);
         let next = JobState {
             failures,
             retry_at: now_secs().saturating_add(delay.max(1)),
@@ -1071,6 +1089,7 @@ impl Worker {
                     c.remove_where::<MergeRequest>(RowScope::All, |_| false)?;
                     c.remove_where::<Project>(RowScope::All, |_| false)?;
                     c.remove_where::<Group>(RowScope::All, |_| false)?;
+                    c.remove_where::<Epic>(RowScope::All, |_| false)?;
                     c.remove_where::<Avatar>(RowScope::All, |_| false)?;
                 }
                 Clear::Timelogs { from, until } => {
@@ -1197,6 +1216,7 @@ impl Worker {
             jobs = plan.jobs.len(),
             tracked = plan.tracked.len(),
             corpus = plan.corpus,
+            epic_groups = plan.epic_groups,
             avatars = plan.avatars.len(),
             from_assignments = plan.evidence.assigned,
             from_events = plan.evidence.events,
@@ -1256,8 +1276,8 @@ mod tests {
     use crate::gitlab::{GitlabApi, Issuable, Listing};
     use crate::sync::model::{Issue, Project};
     use crate::testing::{
-        FakeErr, FakeGitlab, PNG, event_json, eventually, issue_json, project_json,
-        project_json_with_avatar,
+        FakeErr, FakeGitlab, PNG, epic_json, event_json, eventually, group_json, issue_json,
+        project_json, project_json_with_avatar,
     };
     use crate::write::WriteOp;
 
@@ -1734,6 +1754,64 @@ mod tests {
         planned.sort();
         assert_eq!(keys, planned);
         assert!(snapshot.jobs.iter().all(|j| j.running_since.is_none()));
+    }
+
+    /// The member group above a corpus project gets its epics synced once
+    /// both listings are in.
+    #[tokio::test]
+    async fn epics_sync_for_the_groups_above_the_corpus() {
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve("events", vec![event_json(1, 7, "opened", now_secs())]);
+        fake.serve("projects", vec![project_json(7)]);
+        fake.serve("groups", vec![group_json(3, "g"), group_json(4, "other")]);
+        fake.serve("groups/3/epics", vec![epic_json(3, 5, "Accounts")]);
+        let env = start(connected(&fake, 1));
+
+        eventually("the group's epics", || {
+            env.store.epics.get((3, 5)).unwrap().is_some()
+        })
+        .await;
+        assert_eq!(
+            fake.calls_to("groups/3/epics")[0],
+            Listing::GroupEpics {
+                group_id: 3,
+                updated_after: None
+            }
+        );
+        assert!(
+            fake.calls_to("groups/4/epics").is_empty(),
+            "no corpus project lies in `other`"
+        );
+    }
+
+    /// GitLab without epics (no Premium) rejects the listing: the job rests
+    /// for about a day instead of climbing the backoff, and nothing else is
+    /// held up.
+    #[tokio::test]
+    async fn an_instance_without_epics_rests_the_job() {
+        let fake = Arc::new(FakeGitlab::default());
+        let now = now_secs();
+        fake.serve("events", vec![event_json(1, 7, "opened", now)]);
+        fake.serve("projects", vec![project_json(7)]);
+        fake.serve("groups", vec![group_json(3, "g")]);
+        fake.fail_next("groups/3/epics", FakeErr::Rejected);
+        let env = start(connected(&fake, 1));
+
+        eventually("the epics job to rest", || {
+            state(&env, Job::GroupEpics(3)).failures == 1
+                && state(&env, Job::ProjectIssues(7)).last_ok > 0
+        })
+        .await;
+        let resting = state(&env, Job::GroupEpics(3));
+        assert!(
+            resting.retry_at > now + REJECTED_BACKOFF_CAP,
+            "longer than any rejection backoff: {resting:?}"
+        );
+        assert_eq!(fake.calls_to("groups/3/epics").len(), 1);
+        assert!(matches!(
+            &*env.session.read().await,
+            ConnState::Connected(_)
+        ));
     }
 
     #[tokio::test]
@@ -2228,6 +2306,7 @@ mod tests {
             .chain(&[
                 Job::ProjectIssues(7),
                 Job::ProjectBoards(7),
+                Job::GroupEpics(3),
                 Job::AllIssues,
                 Job::ProjectAvatar(7),
             ])
@@ -2255,6 +2334,7 @@ mod tests {
                 "member/projects",
                 "member/groups",
                 "project/7/issues",
+                "group/3/epics",
                 "all/issues",
                 "project/7/avatar"
             ]

@@ -8,9 +8,10 @@ use tokio::sync::{Notify, RwLock};
 use forskap_api::{
     AsyncCall, Call_ClearCache, Call_Close, Call_GetActivity, Call_GetAssignedIssues,
     Call_GetAssignedMergeRequests, Call_GetHistory, Call_GetSyncJobs, Call_PostTime,
-    Call_RecordOpen, Call_Search, Call_UnassignSelf, Call_WhoAmI, GetActivity_Reply,
-    GetAssignedIssues_Reply, GetAssignedMergeRequests_Reply, GetHistory_Reply, GetSyncJobs_Reply,
-    IssuableKind, Issue, MergeRequest, Search_Reply, SyncJobStatus, VarlinkInterface, WhoAmI_Reply,
+    Call_RecordEpicOpen, Call_RecordOpen, Call_Search, Call_UnassignSelf, Call_WhoAmI,
+    GetActivity_Reply, GetAssignedIssues_Reply, GetAssignedMergeRequests_Reply, GetHistory_Reply,
+    GetSyncJobs_Reply, IssuableKind, Issue, MergeRequest, Search_Reply, SyncJobStatus,
+    VarlinkInterface, WhoAmI_Reply,
 };
 
 use crate::config::SharedConfig;
@@ -159,6 +160,19 @@ fn mr(
 
 /// Three assigned issues: two under `team` (one in a subgroup), one under
 /// `other`, listed in that GitLab order.
+fn epic(group_id: i64, iid: i64, title: &str, updated_at: u64) -> model::Epic {
+    model::Epic {
+        id: group_id * 1000 + iid,
+        iid,
+        group_id,
+        title: title.into(),
+        web_url: format!("https://gl/groups/team/-/epics/{iid}"),
+        state: "opened".into(),
+        updated_at,
+        ..Default::default()
+    }
+}
+
 fn seed_assigned_issues(h: &Handlers) {
     seed(
         h,
@@ -207,7 +221,8 @@ fn seed_assigned_mrs(h: &Handlers) {
 }
 
 /// Issues "OAuth token refresh" (1/10) and a labeled one (1/20), MR "Fix
-/// oauth flow" (1/30), project `team/auth-service`, group `team`.
+/// oauth flow" (1/30), project `team/auth-service`, group `team` with the
+/// epics "Identity roadmap" (5/7) and "Billing" (5/8).
 fn seed_corpus(h: &Handlers) {
     let mut labeled = issue(1, 20, "unrelated title", "https://gl/team/p/-/issues/20");
     labeled.labels = vec!["Backend".into()];
@@ -248,6 +263,13 @@ fn seed_corpus(h: &Handlers) {
             full_path: "team".into(),
             web_url: "https://gl/team".into(),
         }],
+    );
+    seed(
+        h,
+        &[
+            epic(5, 7, "Identity roadmap", 100),
+            epic(5, 8, "Billing", 200),
+        ],
     );
     mark_synced(h, &[Job::MemberProjects]);
 }
@@ -309,6 +331,14 @@ async fn run_record_open(h: &Handlers, project_id: i64, iid: i64, kind: Issuable
         .await
         .unwrap();
     assert_eq!(reply_error(&mut call), None);
+}
+
+async fn run_record_epic_open(h: &Handlers, group_id: i64, iid: i64) -> Option<String> {
+    let mut call = AsyncCall::default();
+    h.record_epic_open(&mut call as &mut dyn Call_RecordEpicOpen, group_id, iid)
+        .await
+        .unwrap();
+    reply_error(&mut call)
 }
 
 async fn post_time(h: &Handlers, project_id: i64, iid: i64, kind: IssuableKind) -> Option<String> {
@@ -721,6 +751,63 @@ async fn search_iid_reference_matches_issues_and_mrs() {
     let r = run_search(&h, "#30", None, None).await;
     assert!(r.issues.is_empty());
     assert_eq!(r.merge_requests[0].iid, 30);
+}
+
+#[tokio::test]
+async fn search_finds_epics_by_title_label_and_reference() {
+    let (h, _dir) = dormant_handlers();
+    seed_corpus(&h);
+    let mut labeled = epic(6, 7, "Q3", 50);
+    labeled.labels = vec!["Roadmap".into()];
+    seed(&h, &[labeled]);
+
+    let r = run_search(&h, "ROADMAP", None, None).await;
+    let hits: Vec<_> = r.epics.iter().map(|e| (e.group_id, e.iid)).collect();
+    assert_eq!(hits, [(5, 7), (6, 7)], "title and label, newest first");
+    assert_eq!(r.epics[0].web_url, "https://gl/groups/team/-/epics/7");
+    assert!(r.issues.is_empty() && r.groups.is_empty());
+
+    // `&7` is the epic reference; `#7` stays with issues and MRs.
+    let r = run_search(&h, "&7", None, None).await;
+    assert_eq!(r.epics.len(), 2, "one per group");
+    assert!(r.issues.is_empty() && r.merge_requests.is_empty());
+    assert!(run_search(&h, "#7", None, None).await.epics.is_empty());
+
+    let r = run_search(&h, "i", Some(vec!["epics".into()]), Some(1)).await;
+    assert_eq!(r.epics.iter().map(|e| e.iid).collect::<Vec<_>>(), [8]);
+    assert!(r.issues.is_empty() && r.projects.is_empty());
+    let r = run_search(&h, "i", Some(vec!["issues".into()]), None).await;
+    assert!(r.epics.is_empty(), "not asked for");
+}
+
+/// An epic's opens are counted by its group, apart from the issue of a
+/// project sharing id and number.
+#[tokio::test]
+async fn record_epic_open_ranks_the_epic_and_nothing_else() {
+    let (h, _dir) = dormant_handlers();
+    seed_corpus(&h);
+    seed(
+        &h,
+        &[issue(5, 7, "same ids", "https://gl/team/p/-/issues/7")],
+    );
+    assert_eq!(run_record_epic_open(&h, 5, 7).await, None);
+
+    let r = run_search(&h, "", None, None).await;
+    assert_eq!(r.epics.iter().map(|e| e.iid).collect::<Vec<_>>(), [7]);
+    assert_eq!(r.epics[0].open_count, 1);
+    assert!(r.issues.is_empty(), "the issue 5/7 was never opened");
+
+    let r = run_search(&h, "i", Some(vec!["epics".into()]), None).await;
+    assert_eq!(
+        r.epics.iter().map(|e| e.iid).collect::<Vec<_>>(),
+        [7, 8],
+        "the opened older epic outranks the newer one"
+    );
+
+    for (group_id, iid) in [(0, 7), (5, 0), (-1, 1)] {
+        let error = run_record_epic_open(&h, group_id, iid).await;
+        assert_eq!(error.as_deref(), Some(GITLAB_ERROR));
+    }
 }
 
 #[tokio::test]
@@ -1268,7 +1355,8 @@ proptest! {
 
             let invalid = matches!(limit, Some(n) if n <= 0)
                 || kinds.iter().flatten().any(|k| {
-                    !["issues", "merge_requests", "projects", "groups"].contains(&k.as_str())
+                    !["issues", "merge_requests", "projects", "groups", "epics"]
+                        .contains(&k.as_str())
                 });
             if invalid {
                 assert_eq!(error.as_deref(), Some(GITLAB_ERROR), "bad args are rejected eagerly");

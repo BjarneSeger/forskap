@@ -9,8 +9,8 @@ issue/MR lists and the recent timelog window every few minutes
 (`refresh.quick.interval_secs`), each tracked project's issues and MRs as
 `updated_after` deltas every `search.partial_interval_secs` (default 30 min) with a
 full resync that also reconciles deletions every `search.full_interval_secs`
-(default weekly), and the full timelog history, board columns and project/group
-memberships daily. Read
+(default weekly; the epics of the groups above those projects go the same way),
+and the full timelog history, board columns and project/group memberships daily. Read
 methods serve whatever was last synced from the local store
 (`$XDG_DATA_HOME/forskapd/db/`). Reads never trigger a GitLab round-trip.
 
@@ -161,6 +161,21 @@ type Group (
 )
 ```
 
+```varlink
+type Epic (
+  id:         int,     # global epic ID
+  iid:        int,     # per-group epic number (the "&5" shown in the UI)
+  group_id:   int,     # the group the epic belongs to
+  title:      string,
+  web_url:    string,
+  state:      string,  # "opened" or "closed"
+  open_count: int      # opens recorded through RecordEpicOpen (within usage.retention_hours)
+)
+```
+
+An epic belongs to a group and is numbered within it, so `(group_id, iid)` addresses
+one. Epics are read-only here: `IssuableKind` and the write methods don't cover them.
+
 # Errors
 
 `GitlabError (message: string)` — GitLab rejected the request (invalid input, API
@@ -211,24 +226,26 @@ namespace exactly like `GetAssignedIssues`. Replies newest-updated first. When t
 list has never been synced: empty list if a session exists, `NotAuthenticated`
 otherwise.
 
-### `Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group)`
+### `Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)`
 
 Searches the locally cached corpus — a pure cache read, no GitLab round-trip.
-Matching is a case-insensitive substring test on issue/MR titles and labels and on
-project/group names and paths; a query of the exact form `#123` additionally matches
-issues and MRs by their per-project number. Descriptions are not cached and not
-searched.
+Matching is a case-insensitive substring test on issue/MR/epic titles and labels and
+on project/group names and paths; a query of the exact form `#123` additionally
+matches issues and MRs by their per-project number, one of the form `&5` epics by
+their per-group number. Descriptions are not cached and not searched.
 
 `kinds` restricts the reply to a subset of `issues`, `merge_requests`, `projects`,
-`groups` (omitted or empty = all four; an unknown kind is an eager `GitlabError`).
-`limit` caps each returned array separately (default 50; must be positive).
+`groups`, `epics` (omitted or empty = all five; an unknown kind is an eager
+`GitlabError`). `limit` caps each returned array separately (default 50; must be
+positive).
 
-**Ranking**: issues and MRs are ordered by their `RecordOpen` statistics — most opens
+**Ranking**: issues, MRs and epics are ordered by their `RecordOpen` /
+`RecordEpicOpen` statistics — most opens
 first, ties by most recent open, then newest-updated — so never-opened items keep
 the newest-first order among themselves below the frequently opened ones. Each row
 reports its count as `open_count`. Projects and groups are sorted by path. An empty or
-whitespace-only `query` selects the "frequently opened" view: only issues/MRs with
-at least one recorded open, ranked the same way; projects and groups are empty in
+whitespace-only `query` selects the "frequently opened" view: only issues, MRs and
+epics with at least one recorded open, ranked the same way; projects and groups are empty in
 that mode. The statistics are read once per call and a read failure degrades to the
 plain recency order.
 
@@ -241,6 +258,11 @@ Each project contributes at most its `search.max_items_per_project` most recentl
 updated issues and MRs. `"member"`
 holds every member project's, `"all"` everything the token can see (`"auto"` is an
 alias of `"tracked"`). Projects and groups are always membership-scoped.
+Epics come from the member groups above those projects, at any depth (`"all"`: from
+every member group), each group contributing at most its
+`search.max_items_per_project` most recently updated ones. Epics need GitLab Premium
+or Ultimate: on other instances `epics` is always empty, and the daemon asks each
+group only once a day.
 Issue `graph_status` comes from the synced board columns of the issue's project and
 is empty for projects whose boards were never synced (only those of assigned issues'
 projects and of tracked member projects are).
@@ -365,6 +387,12 @@ reports them as `open_count` (also on `GetAssignedIssues` /
 counts dropped first); both are enforced on write. A non-positive `project_id` or
 `iid` is an eager `GitlabError`. Cleared only by `ClearCache` scope `usage`.
 
+### `RecordEpicOpen(group_id: int, iid: int) -> ()`
+
+`RecordOpen` for an epic, addressed by its group (`forskap epic open`, a launcher
+activation): same bookkeeping, retention and cap, counted apart from issues and
+MRs. A non-positive `group_id` or `iid` is an eager `GitlabError`.
+
 ## Cache control
 
 ### `ClearCache(scope: ?[]string) -> ()`
@@ -375,11 +403,11 @@ clears everything synced. Otherwise each scope string selects a slice:
 | scope    | clears                                                         |
 |----------|----------------------------------------------------------------|
 | `issues` | the assigned issue/MR lists and the board columns              |
-| `search` | the corpus: issues, MRs, projects, groups, project avatars     |
+| `search` | the corpus: issues, MRs, epics, projects, groups, project avatars |
 | `quick`  | history inside the quick window (last `refresh.quick.window_hours`) |
 | `slow`   | history between the retention horizon and the quick window     |
 | `stale`  | history older than `history.retention_hours` (normally already pruned) |
-| `usage`  | the `RecordOpen` statistics — **only when listed explicitly**; the empty "everything" scope leaves them alone (user data, not a cache) |
+| `usage`  | the `RecordOpen` / `RecordEpicOpen` statistics — **only when listed explicitly**; the empty "everything" scope leaves them alone (user data, not a cache) |
 
 When a session exists, the reply waits (up to 30 s) until what it cleared is
 re-synced: the assigned lists for `issues`, `search` and the empty scope (plus the

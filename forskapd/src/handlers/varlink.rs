@@ -11,13 +11,14 @@ use forskap_api::{
     ActivityEvent, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
     Call_DismissFailure, Call_GetActivity, Call_GetAssignedIssues, Call_GetAssignedMergeRequests,
     Call_GetFailures, Call_GetHistory, Call_GetSyncJobs, Call_Login, Call_Logout, Call_PostTime,
-    Call_RecordOpen, Call_RetryFailure, Call_Search, Call_UnassignSelf, Call_WhoAmI, FailedTask,
-    Group, HistoryEvent, IssuableKind, Issue, MergeRequest, Project, VarlinkInterface,
+    Call_RecordEpicOpen, Call_RecordOpen, Call_RetryFailure, Call_Search, Call_UnassignSelf,
+    Call_WhoAmI, Epic, FailedTask, Group, HistoryEvent, IssuableKind, Issue, MergeRequest, Project,
+    VarlinkInterface,
 };
 
 use crate::error::{DormancyReason, Error};
 use crate::gitlab::{GitlabClient, Issuable};
-use crate::query::{in_group, namespace_of, parse_iid_query, text_matches};
+use crate::query::{in_group, namespace_of, parse_epic_query, parse_iid_query, text_matches};
 use crate::secrets::{self, Credentials, Token};
 use crate::sync::jobs::{ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS};
 use crate::sync::model::{self, RowKey};
@@ -32,7 +33,7 @@ use super::{
 };
 
 /// The kind strings `Search` accepts, matching the `ClearCache` scope style.
-const SEARCH_KINDS: [&str; 4] = ["issues", "merge_requests", "projects", "groups"];
+const SEARCH_KINDS: [&str; 5] = ["issues", "merge_requests", "projects", "groups", "epics"];
 
 /// How long `GetSyncJobs` waits for the worker, which answers between two
 /// awaits even with a fetch in flight.
@@ -402,8 +403,9 @@ fn open_count_of(usage: Option<UsageEntry>) -> i64 {
     usage.map_or(0, |u| u.count as i64)
 }
 
-/// Whether an issue/MR matches the search: case-insensitive substring on the
-/// title or any label, or an exact `#iid` reference query.
+/// Whether an issue, MR or epic matches the search: case-insensitive
+/// substring on the title or any label, or an exact reference query (`#iid`,
+/// for an epic `&iid`).
 fn search_item_matches(
     needle: &str,
     iid_query: Option<i64>,
@@ -508,9 +510,9 @@ impl VarlinkInterface for Handlers {
         kinds: Option<Vec<String>>,
         limit: Option<i64>,
     ) -> varlink::Result<()> {
-        // An empty query is the "frequently opened" view: only issues/MRs with
-        // recorded opens, ranked. Projects and groups have no open counts, so
-        // they come back empty in that mode.
+        // An empty query is the "frequently opened" view: only issues, MRs and
+        // epics with recorded opens, ranked. Projects and groups have no open
+        // counts, so they come back empty in that mode.
         let needle = query.trim().to_lowercase();
         let frequent_only = needle.is_empty();
         let limit = match limit {
@@ -531,7 +533,7 @@ impl VarlinkInterface for Handlers {
             self,
             call,
             Job::MemberProjects,
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
         );
 
         let iid_query = parse_iid_query(&query);
@@ -605,14 +607,33 @@ impl VarlinkInterface for Handlers {
             groups = hits.into_iter().map(wire::group).collect();
         }
 
+        let mut epics: Vec<Epic> = Vec::new();
+        if want("epics") {
+            let epic_query = parse_epic_query(&query);
+            let mut hits: Vec<(Option<UsageEntry>, model::Epic)> = self
+                .all::<model::Epic>()
+                .into_iter()
+                .filter(|e| search_item_matches(&needle, epic_query, &e.title, &e.labels, e.iid))
+                .map(|e| (usage.get_epic(e.group_id, e.iid), e))
+                .filter(|(u, _)| !frequent_only || u.is_some())
+                .collect();
+            hits.sort_by_key(|(u, e)| rank_key(*u, e.updated_at));
+            hits.truncate(limit);
+            epics = hits
+                .into_iter()
+                .map(|(u, e)| wire::epic(e, open_count_of(u)))
+                .collect();
+        }
+
         debug!(
             issues = issues.len(),
             merge_requests = merge_requests.len(),
             projects = projects.len(),
             groups = groups.len(),
+            epics = epics.len(),
             "serving search results"
         );
-        call.reply(issues, merge_requests, projects, groups)
+        call.reply(issues, merge_requests, projects, groups, epics)
     }
 
     #[instrument(skip(self, call))]
@@ -916,6 +937,33 @@ impl VarlinkInterface for Handlers {
             .record(&key, now, now.saturating_sub(retention_secs))
         {
             warn!(error = %e, key, "record_open failed");
+            return call.reply_gitlab_error(e.to_string());
+        }
+        debug!(key, "recorded open");
+        call.reply()
+    }
+
+    #[instrument(skip(self, call))]
+    async fn record_epic_open(
+        &self,
+        call: &mut dyn Call_RecordEpicOpen,
+        group_id: i64,
+        iid: i64,
+    ) -> varlink::Result<()> {
+        if group_id <= 0 || iid <= 0 {
+            return call.reply_gitlab_error(format!(
+                "invalid epic reference (group {group_id}, iid {iid})"
+            ));
+        }
+        // Local bookkeeping only, like `RecordOpen`.
+        let retention_secs = self.config.read().unwrap().usage.retention().as_secs();
+        let now = now_secs();
+        let key = crate::usage::epic_usage_key(group_id, iid);
+        if let Err(e) = self
+            .usage
+            .record(&key, now, now.saturating_sub(retention_secs))
+        {
+            warn!(error = %e, key, "record_epic_open failed");
             return call.reply_gitlab_error(e.to_string());
         }
         debug!(key, "recorded open");

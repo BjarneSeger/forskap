@@ -29,8 +29,9 @@ Out of the box, completions are installed for fish, zsh and bash. They are
 dynamic: the shell asks `forskap` on every Tab, so besides commands and flags
 it completes what the daemon has cached — issue and merge request numbers
 (the item you last logged time on, then your assigned ones, then the ones you
-opened before) and project paths for `--project`. fish and zsh show the title
-and project next to each number; bash only the numbers. Without a running
+opened before), epic numbers (the ones you opened before), and project and
+group paths for `--project` and `--group`. fish and zsh show the title and
+project or group next to each number; bash only the numbers. Without a running
 daemon you still get the commands and flags.
 
 If you didn't install the package, register them from your shell's rc file:

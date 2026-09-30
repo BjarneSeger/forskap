@@ -65,6 +65,7 @@ forskap issue view 42           # what the cache knows about issue #42
 forskap issue open 42           # open it in the browser (and count the open)
 forskap mr close 7 -p team/api  # close merge request !7 of that project
 forskap search oauth token      # cached search; issues/MRs you open often rank first
+forskap epic open 5             # open epic &5 in the browser (GitLab Premium and up)
 forskap time log 42 1h30m       # log time on issue #42
 forskap time log '!42' 1h30m    # ... on merge request !42 (or: forskap time log 42 1h30m --mr)
 forskap time history            # what you tracked recently (including queued entries)
@@ -77,7 +78,8 @@ forskap sync jobs               # what the background sync runs now, next, and w
 `forskap issue` and `forskap mr` share their verbs (`list`, `view`, `open`, `close`, `assign`,
 `unassign`) and take the number shown in GitLab. The project is looked up in the
 cache; when a number exists in several projects, name one with `-p`, as full path
-or numeric ID. Commands that print data take `-o json`.
+or numeric ID. `forskap epic` has `view` and `open`; epics belong to a group, so an
+ambiguous number takes `-g`. Commands that print data take `-o json`.
 
 ## Config
 
@@ -96,8 +98,8 @@ available as the [`forskap-api`](forskap-api/README.md) Rust crate or the
 
 [`forskap/`](forskap/README.md) is a
 [noctalia-shell](https://noctalia.dev) launcher provider: type `/gl <query>` to search
-issues, merge requests, projects and groups through `forskap search`, and activate a result
-to open it in the browser via `forskap issue open` / `forskap mr open` — which also counts the open, so the things you
+issues, merge requests, epics, projects and groups through `forskap search`, and activate a result
+to open it in the browser via `forskap issue open` / `forskap mr open` / `forskap epic open` — which also counts the open, so the things you
 visit most float to the top (and `/gl` on its own lists them). Results show the avatar
 of their project. This repository doubles as a noctalia plugin source (`catalog.toml`):
 
