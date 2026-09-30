@@ -90,8 +90,10 @@ async fn run() -> Result<()> {
             query,
             kinds,
             limit,
+            project,
+            groups,
             output,
-        } => cmd::search::run(query, kinds, limit, output.output).await,
+        } => cmd::search::run(query, kinds, limit, project, groups, output.output).await,
         Command::Activity { window, output } => {
             cmd::activity::run(window.days, output.output).await
         }

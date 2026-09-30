@@ -19,7 +19,7 @@ use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
 use forskap_api::{Epic, SearchKind, VarlinkClientInterface};
 
 use crate::cli::Cli;
-use crate::cmd::epic::group_path;
+use crate::cmd::epic::group_of;
 use crate::item::{Item, project_of};
 use crate::refspec::{self, RefKind};
 use crate::state::{LastEpic, LastIssue};
@@ -70,6 +70,13 @@ pub fn command() -> Command {
             });
         }
         epic
+    });
+    cmd = cmd.mut_subcommand("search", |search| {
+        search.mut_args(|arg| match arg.get_id().as_str() {
+            "project" => completing(arg, projects),
+            "groups" => completing(arg, groups),
+            _ => arg,
+        })
     });
     cmd.mut_subcommand("time", |time| {
         time.mut_subcommand("log", |log| {
@@ -215,7 +222,7 @@ fn ranked_epics(last: Option<LastEpic>, rows: &[Epic]) -> Vec<Known> {
         .map(|e| Known {
             iid: e.iid,
             project_id: e.group_id,
-            help: match group_path(&e.web_url) {
+            help: match group_of(e) {
                 Some(path) => format!("{} ({path})", e.title),
                 None => e.title.clone(),
             },
@@ -345,7 +352,7 @@ async fn fetch_items(kind: RefKind, rows: &mut Vec<Item>) -> Option<()> {
     }
     let kinds = vec![refspec::search_kind(kind)];
     let reply = client
-        .search(String::new(), Some(kinds), None)
+        .search(String::new(), Some(kinds), None, None)
         .call()
         .await
         .ok()?;
@@ -376,7 +383,11 @@ async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
 
     let query = current.trim_matches('/').to_string();
     let kinds = vec![SearchKind::projects];
-    let reply = client.search(query, Some(kinds), None).call().await.ok()?;
+    let reply = client
+        .search(query, Some(kinds), None, None)
+        .call()
+        .await
+        .ok()?;
     rows.extend(reply.projects.into_iter().map(|p| (p.path, Some(p.name))));
     Some(())
 }
@@ -386,7 +397,7 @@ async fn fetch_epics(rows: &mut Vec<Epic>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
     let kinds = vec![SearchKind::epics];
     let reply = client
-        .search(String::new(), Some(kinds), None)
+        .search(String::new(), Some(kinds), None, None)
         .call()
         .await
         .ok()?;
@@ -399,7 +410,11 @@ async fn fetch_groups(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
     let query = current.trim_matches('/').to_string();
     let kinds = vec![SearchKind::groups];
-    let reply = client.search(query, Some(kinds), None).call().await.ok()?;
+    let reply = client
+        .search(query, Some(kinds), None, None)
+        .call()
+        .await
+        .ok()?;
     rows.extend(reply.groups.into_iter().map(|g| (g.path, Some(g.name))));
     Some(())
 }
@@ -513,6 +528,7 @@ mod tests {
             web_url: format!("https://gitlab.example.com/groups/{path}/-/epics/{iid}"),
             state: "opened".to_string(),
             open_count: 1,
+            group_path: String::new(),
         };
         let rows = [
             epic(3, "team", 5, "Accounts"),

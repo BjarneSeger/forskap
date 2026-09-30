@@ -13,7 +13,7 @@ use forskap_api::{
     Call_GetFailures, Call_GetHistory, Call_GetSyncJobs, Call_Login, Call_Logout, Call_PostTime,
     Call_RecordEpicOpen, Call_RecordOpen, Call_RetryFailure, Call_Search, Call_UnassignSelf,
     Call_WhoAmI, Epic, FailedTask, Group, HistoryEvent, HistorySource, IssuableKind, Issue,
-    MergeRequest, Project, SearchKind, VarlinkInterface,
+    MergeRequest, Project, SearchKind, SearchScope, VarlinkInterface,
 };
 
 use crate::error::{DormancyReason, Error};
@@ -343,6 +343,67 @@ impl<'a> Projects<'a> {
     }
 }
 
+/// The full path of the epics' groups, each read at most once per request;
+/// `None` without a row.
+struct Groups<'a> {
+    handlers: &'a Handlers,
+    paths: HashMap<i64, Option<String>>,
+}
+
+impl<'a> Groups<'a> {
+    fn new(handlers: &'a Handlers) -> Self {
+        Self {
+            handlers,
+            paths: HashMap::new(),
+        }
+    }
+
+    fn path_of(&mut self, group_id: i64) -> Option<String> {
+        let h = self.handlers;
+        self.paths
+            .entry(group_id)
+            .or_insert_with(|| {
+                let row = h.store().groups.get((group_id.max(0) as u64, 0));
+                row.unwrap_or_else(|e| {
+                    warn!(error = %e, group_id, "group read failed");
+                    None
+                })
+                .map(|g| g.full_path)
+            })
+            .clone()
+    }
+}
+
+/// A search scope with at least one criterion: an item passes when it is in
+/// any listed project or any listed group (subgroups included).
+struct Scope {
+    projects: Vec<i64>,
+    groups: Vec<String>,
+}
+
+impl Scope {
+    /// `None` when `scope` names nothing, which means no filter at all.
+    fn new(scope: Option<SearchScope>) -> Option<Self> {
+        let scope = scope?;
+        let projects = scope.projects.unwrap_or_default();
+        let groups = scope.groups.unwrap_or_default();
+        (!projects.is_empty() || !groups.is_empty()).then_some(Self { projects, groups })
+    }
+
+    fn project(&self, id: i64) -> bool {
+        self.projects.contains(&id)
+    }
+
+    fn group(&self, namespace: &str) -> bool {
+        self.groups.iter().any(|g| in_group(namespace, g))
+    }
+
+    /// An issue or merge request: by its project, else by its URL's namespace.
+    fn item(&self, project_id: i64, web_url: &str) -> bool {
+        self.project(project_id) || (!self.groups.is_empty() && self.group(&namespace_of(web_url)))
+    }
+}
+
 /// Where contribution events happened: their project and the link of the
 /// issue or merge request they are about, each read at most once per
 /// request. Unknown ones stay `None`.
@@ -525,11 +586,13 @@ impl VarlinkInterface for Handlers {
         query: String,
         kinds: Option<Vec<SearchKind>>,
         limit: Option<i64>,
+        scope: Option<SearchScope>,
     ) -> varlink::Result<()> {
         // An empty query is the "frequently opened" view: only issues, MRs and
         // epics with recorded opens, ranked. Projects and groups have no open
         // counts, so they come back empty in that mode.
         let needle = query.trim().to_lowercase();
+        let scope = Scope::new(scope);
         let frequent_only = needle.is_empty();
         let limit = match limit {
             None => DEFAULT_SEARCH_LIMIT,
@@ -556,6 +619,11 @@ impl VarlinkInterface for Handlers {
                 .all::<model::Issue>()
                 .into_iter()
                 .filter(|i| search_item_matches(&needle, iid_query, &i.title, &i.labels, i.iid))
+                .filter(|i| {
+                    scope
+                        .as_ref()
+                        .is_none_or(|s| s.item(i.project_id, &i.web_url))
+                })
                 .map(|i| (usage.get(Issuable::Issue, i.project_id, i.iid), i))
                 .filter(|(u, _)| !frequent_only || u.is_some())
                 .collect();
@@ -577,6 +645,11 @@ impl VarlinkInterface for Handlers {
                 .all::<model::MergeRequest>()
                 .into_iter()
                 .filter(|m| search_item_matches(&needle, iid_query, &m.title, &m.labels, m.iid))
+                .filter(|m| {
+                    scope
+                        .as_ref()
+                        .is_none_or(|s| s.item(m.project_id, &m.web_url))
+                })
                 .map(|m| (usage.get(Issuable::MergeRequest, m.project_id, m.iid), m))
                 .filter(|(u, _)| !frequent_only || u.is_some())
                 .collect();
@@ -595,7 +668,10 @@ impl VarlinkInterface for Handlers {
         if want(SearchKind::projects) && !frequent_only {
             let mut hits = self.all::<model::Project>();
             hits.retain(|p| {
-                text_matches(&needle, &p.name) || text_matches(&needle, &p.path_with_namespace)
+                (text_matches(&needle, &p.name) || text_matches(&needle, &p.path_with_namespace))
+                    && scope
+                        .as_ref()
+                        .is_none_or(|s| s.project(p.id) || s.group(&p.path_with_namespace))
             });
             hits.sort_by(|a, b| a.path_with_namespace.cmp(&b.path_with_namespace));
             hits.truncate(limit);
@@ -611,7 +687,10 @@ impl VarlinkInterface for Handlers {
         let mut groups: Vec<Group> = Vec::new();
         if want(SearchKind::groups) && !frequent_only {
             let mut hits = self.all::<model::Group>();
-            hits.retain(|g| text_matches(&needle, &g.name) || text_matches(&needle, &g.full_path));
+            hits.retain(|g| {
+                (text_matches(&needle, &g.name) || text_matches(&needle, &g.full_path))
+                    && scope.as_ref().is_none_or(|s| s.group(&g.full_path))
+            });
             hits.sort_by(|a, b| a.full_path.cmp(&b.full_path));
             hits.truncate(limit);
             groups = hits.into_iter().map(wire::group).collect();
@@ -620,10 +699,19 @@ impl VarlinkInterface for Handlers {
         let mut epics: Vec<Epic> = Vec::new();
         if want(SearchKind::epics) {
             let epic_query = parse_epic_query(&query);
+            let mut group_info = Groups::new(self);
             let mut hits: Vec<(Option<UsageEntry>, model::Epic)> = self
                 .all::<model::Epic>()
                 .into_iter()
                 .filter(|e| search_item_matches(&needle, epic_query, &e.title, &e.labels, e.iid))
+                .filter(|e| {
+                    scope.as_ref().is_none_or(|s| {
+                        s.group(&wire::group_path(
+                            group_info.path_of(e.group_id),
+                            &e.web_url,
+                        ))
+                    })
+                })
                 .map(|e| (usage.get_epic(e.group_id, e.iid), e))
                 .filter(|(u, _)| !frequent_only || u.is_some())
                 .collect();
@@ -631,7 +719,10 @@ impl VarlinkInterface for Handlers {
             hits.truncate(limit);
             epics = hits
                 .into_iter()
-                .map(|(u, e)| wire::epic(e, open_count_of(u)))
+                .map(|(u, e)| {
+                    let group_path = group_info.path_of(e.group_id);
+                    wire::epic(e, open_count_of(u), group_path)
+                })
                 .collect();
         }
 

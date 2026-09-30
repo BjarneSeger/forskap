@@ -11,7 +11,7 @@ use forskap_api::{
     Call_RecordEpicOpen, Call_RecordOpen, Call_Search, Call_UnassignSelf, Call_WhoAmI,
     GetActivity_Reply, GetAssignedIssues_Reply, GetAssignedMergeRequests_Reply, GetHistory_Reply,
     GetSyncJobs_Reply, HistorySource, IssuableKind, Issue, MergeRequest, Search_Reply, SearchKind,
-    SyncJobStatus, VarlinkInterface, WhoAmI_Reply,
+    SearchScope, SyncJobStatus, VarlinkInterface, WhoAmI_Reply,
 };
 
 use crate::config::SharedConfig;
@@ -314,12 +314,23 @@ async fn run_search(
     kinds: Option<Vec<SearchKind>>,
     limit: Option<i64>,
 ) -> Search_Reply {
+    run_scoped_search(h, query, kinds, limit, None).await
+}
+
+async fn run_scoped_search(
+    h: &Handlers,
+    query: &str,
+    kinds: Option<Vec<SearchKind>>,
+    limit: Option<i64>,
+    scope: Option<SearchScope>,
+) -> Search_Reply {
     let mut call = AsyncCall::default();
     h.search(
         &mut call as &mut dyn Call_Search,
         query.to_string(),
         kinds,
         limit,
+        scope,
     )
     .await
     .unwrap();
@@ -760,12 +771,18 @@ async fn search_finds_epics_by_title_label_and_reference() {
     seed_corpus(&h);
     let mut labeled = epic(6, 7, "Q3", 50);
     labeled.labels = vec!["Roadmap".into()];
+    labeled.web_url = "https://gl/groups/other/-/epics/7".into();
     seed(&h, &[labeled]);
 
     let r = run_search(&h, "ROADMAP", None, None).await;
     let hits: Vec<_> = r.epics.iter().map(|e| (e.group_id, e.iid)).collect();
     assert_eq!(hits, [(5, 7), (6, 7)], "title and label, newest first");
     assert_eq!(r.epics[0].web_url, "https://gl/groups/team/-/epics/7");
+    assert_eq!(r.epics[0].group_path, "team", "from the group row");
+    assert_eq!(
+        r.epics[1].group_path, "other",
+        "no row for group 6: from the link"
+    );
     assert!(r.issues.is_empty() && r.groups.is_empty());
 
     // `&7` is the epic reference; `#7` stays with issues and MRs.
@@ -852,15 +869,176 @@ async fn search_ranks_frequently_opened_first() {
 async fn search_never_synced_is_honest_about_the_session() {
     let (h, _dir) = dormant_handlers();
     let mut call = AsyncCall::default();
-    h.search(&mut call as &mut dyn Call_Search, "x".into(), None, None)
-        .await
-        .unwrap();
+    h.search(
+        &mut call as &mut dyn Call_Search,
+        "x".into(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(reply_error(&mut call).as_deref(), Some(NOT_AUTHENTICATED));
 
     let fake = Arc::new(FakeGitlab::default());
     let (h, _dir) = connected_handlers(&fake);
     let r = run_search(&h, "x", None, None).await;
     assert!(r.issues.is_empty() && r.projects.is_empty());
+}
+
+fn scope(projects: &[i64], groups: &[&str]) -> Option<SearchScope> {
+    Some(SearchScope {
+        projects: Some(projects.to_vec()),
+        groups: Some(groups.iter().map(|g| g.to_string()).collect()),
+    })
+}
+
+/// On top of `seed_corpus`: issue "OAuth elsewhere" (2/40) and MR "oauth
+/// port" (2/41) in `other/x`, project 6 `other/x`, group 6 `other` with the
+/// epic "Identity other" (6/9), and the epic "Identity sub" (7/1) of a
+/// subgroup whose row is missing.
+fn seed_scoped_corpus(h: &Handlers) {
+    seed_corpus(h);
+    let mut elsewhere = issue(2, 40, "OAuth elsewhere", "https://gl/other/x/-/issues/40");
+    elsewhere.updated_at = 300;
+    seed(h, &[elsewhere]);
+    seed(
+        h,
+        &[mr(
+            2,
+            41,
+            "oauth port",
+            "https://gl/other/x/-/merge_requests/41",
+            300,
+        )],
+    );
+    seed(
+        h,
+        &[model::Project {
+            id: 6,
+            name: "x".into(),
+            path_with_namespace: "other/x".into(),
+            web_url: "https://gl/other/x".into(),
+            ..Default::default()
+        }],
+    );
+    seed(
+        h,
+        &[model::Group {
+            id: 6,
+            name: "other".into(),
+            full_path: "other".into(),
+            web_url: "https://gl/other".into(),
+        }],
+    );
+    let mut other = epic(6, 9, "Identity other", 300);
+    other.web_url = "https://gl/groups/other/-/epics/9".into();
+    let mut sub = epic(7, 1, "Identity sub", 300);
+    sub.web_url = "https://gl/groups/team/sub/-/epics/1".into();
+    seed(h, &[other, sub]);
+}
+
+#[tokio::test]
+async fn search_scope_by_project_keeps_only_that_project() {
+    let (h, _dir) = dormant_handlers();
+    seed_scoped_corpus(&h);
+    let r = run_scoped_search(&h, "oauth", None, None, scope(&[1], &[])).await;
+    assert_eq!(r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(), [10]);
+    assert_eq!(
+        r.merge_requests.iter().map(|m| m.iid).collect::<Vec<_>>(),
+        [30]
+    );
+
+    let r = run_scoped_search(&h, "e", None, None, scope(&[4, 6], &[])).await;
+    assert_eq!(
+        r.projects.iter().map(|p| p.id).collect::<Vec<_>>(),
+        [6, 4],
+        "any listed project passes"
+    );
+    assert!(
+        r.groups.is_empty() && r.epics.is_empty(),
+        "a project scope cannot name a group or an epic: {r:?}"
+    );
+}
+
+#[tokio::test]
+async fn search_scope_by_group_covers_subgroups_and_epics() {
+    let (h, _dir) = dormant_handlers();
+    seed_scoped_corpus(&h);
+    let r = run_scoped_search(&h, "t", None, None, scope(&[], &["team"])).await;
+    assert_eq!(
+        r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(),
+        [20, 10],
+        "team/p is under team"
+    );
+    assert_eq!(
+        r.merge_requests.iter().map(|m| m.iid).collect::<Vec<_>>(),
+        [30]
+    );
+    assert_eq!(r.projects.iter().map(|p| p.id).collect::<Vec<_>>(), [4]);
+    assert_eq!(r.groups.iter().map(|g| g.id).collect::<Vec<_>>(), [5]);
+    assert_eq!(
+        r.epics
+            .iter()
+            .map(|e| (e.group_id, e.iid))
+            .collect::<Vec<_>>(),
+        [(7, 1), (5, 7)],
+        "the group row names the epics' group; without a row the URL does"
+    );
+
+    let r = run_scoped_search(&h, "t", None, None, scope(&[], &["tea"])).await;
+    assert!(
+        r.issues.is_empty() && r.projects.is_empty() && r.groups.is_empty() && r.epics.is_empty(),
+        "a shared prefix is not a group: {r:?}"
+    );
+
+    let r = run_scoped_search(&h, "oauth", None, None, scope(&[2], &["team"])).await;
+    assert_eq!(
+        r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(),
+        [40, 10],
+        "a project or a group: either passes"
+    );
+}
+
+#[tokio::test]
+async fn search_scope_applies_before_the_limit() {
+    let (h, _dir) = dormant_handlers();
+    seed_scoped_corpus(&h);
+    let r = run_search(&h, "oauth", Some(vec![SearchKind::issues]), Some(1)).await;
+    assert_eq!(
+        r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(),
+        [40],
+        "unscoped, the newer issue elsewhere wins the one slot"
+    );
+    let r = run_scoped_search(
+        &h,
+        "oauth",
+        Some(vec![SearchKind::issues]),
+        Some(1),
+        scope(&[1], &[]),
+    )
+    .await;
+    assert_eq!(r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(), [10]);
+}
+
+#[tokio::test]
+async fn search_empty_scope_is_no_scope() {
+    let (h, _dir) = dormant_handlers();
+    seed_scoped_corpus(&h);
+    let unscoped = run_search(&h, "i", None, None).await;
+    assert!(!unscoped.issues.is_empty() && !unscoped.epics.is_empty());
+    for empty in [
+        scope(&[], &[]),
+        Some(SearchScope {
+            projects: None,
+            groups: None,
+        }),
+    ] {
+        assert_eq!(
+            run_scoped_search(&h, "i", None, None, empty).await,
+            unscoped
+        );
+    }
 }
 
 // ── Avatars ────────────────────────────────────────────────────────────
@@ -1398,7 +1576,7 @@ proptest! {
             seed_corpus(&h);
 
             let mut call = AsyncCall::default();
-            h.search(&mut call as &mut dyn Call_Search, query.clone(), kinds.clone(), limit)
+            h.search(&mut call as &mut dyn Call_Search, query.clone(), kinds.clone(), limit, None)
                 .await
                 .unwrap();
             let error = reply_error(&mut call);

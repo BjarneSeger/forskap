@@ -136,13 +136,21 @@ local function issuableRow(kind, sigil, item)
   }
 end
 
+-- The group path the epic carries; an older `forskap` has it only in the URL.
+local function epicGroup(item)
+  if item.group_path ~= nil and item.group_path ~= "" then
+    return item.group_path
+  end
+  return groupPath(item.web_url)
+end
+
 -- Epics belong to a group: the id carries the group where an issue's carries
 -- the project.
 local function epicRow(item)
   return {
     id = string.format("epic:%d:%d", item.group_id, item.iid),
     title = string.format("&%d %s", item.iid, item.title),
-    subtitle = joinNonEmpty({ groupPath(item.web_url), item.state }),
+    subtitle = joinNonEmpty({ epicGroup(item), item.state }),
     glyph = GLYPH.epics,
     category = CATEGORY.epics,
     score = item.open_count or 0,

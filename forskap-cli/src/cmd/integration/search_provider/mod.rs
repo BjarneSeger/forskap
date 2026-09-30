@@ -161,7 +161,7 @@ impl Provider {
         let client = client::connect(&self.socket).await?;
         let kinds = parsed.kind.map(|k| vec![wire_kind(k)]);
         let reply = match client
-            .search(parsed.query, kinds, Some(PER_KIND_LIMIT))
+            .search(parsed.query, kinds, Some(PER_KIND_LIMIT), None)
             .call()
             .await
         {

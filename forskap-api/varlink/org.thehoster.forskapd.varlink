@@ -105,7 +105,8 @@ type Epic (
   title: string,
   web_url: string,
   state: string,
-  open_count: int
+  open_count: int,
+  group_path: string
 )
 
 error GitlabError (message: string)
@@ -120,7 +121,9 @@ method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRe
 
 type SearchKind (issues, merge_requests, projects, groups, epics)
 
-method Search(query: string, kinds: ?[]SearchKind, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)
+type SearchScope (projects: ?[]int, groups: ?[]string)
+
+method Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)
 
 method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
 

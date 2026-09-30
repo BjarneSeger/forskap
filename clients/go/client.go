@@ -131,11 +131,14 @@ type SearchResults struct {
 
 // Search searches the daemon's locally cached corpus (no GitLab round-trip).
 // kinds optionally restricts the reply to a subset of the Search* kinds (nil =
-// all five); limit caps each result set separately (nil = daemon default of 50). Issues, MRs and epics come
-// most-opened first (see RecordOpen, RecordEpicOpen); an empty query lists only
-// items with recorded opens. Epics need GitLab Premium or Ultimate.
-func (c *Client) Search(ctx context.Context, query string, kinds *[]SearchKind, limit *int64) (SearchResults, error) {
-	issues, mrs, projects, groups, epics, err := Search().Call(ctx, c.conn, query, kinds, limit)
+// all five); limit caps each result set separately (nil = daemon default of 50);
+// scope keeps only items in any of its projects (by ID) or groups (by path,
+// subgroups included), applied before limit (nil = everything). Issues, MRs
+// and epics come most-opened first (see RecordOpen, RecordEpicOpen); an empty
+// query lists only items with recorded opens. Epics need GitLab Premium or
+// Ultimate.
+func (c *Client) Search(ctx context.Context, query string, kinds *[]SearchKind, limit *int64, scope *SearchScope) (SearchResults, error) {
+	issues, mrs, projects, groups, epics, err := Search().Call(ctx, c.conn, query, kinds, limit, scope)
 	return SearchResults{issues, mrs, projects, groups, epics}, err
 }
 

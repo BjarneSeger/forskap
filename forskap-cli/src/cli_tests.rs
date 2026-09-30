@@ -50,8 +50,8 @@ fn every_number_and_project_argument_completes() {
     let mut seen = 0;
     check(&cmd, "forskap", &mut seen);
     // Number and project of five verbs in two groups and of `time log`,
-    // number and group of the two epic verbs.
-    assert_eq!(seen, 2 * 5 * 2 + 2 + 2 * 2);
+    // number and group of the two epic verbs, project of `search`.
+    assert_eq!(seen, 2 * 5 * 2 + 2 + 2 * 2 + 1);
 
     // Attaching them must not reorder the positionals.
     let log = cmd.find_subcommand("time").unwrap();
@@ -160,9 +160,12 @@ fn search_joins_words_and_bounds_the_limit() {
         query,
         kinds,
         limit,
+        project,
+        groups,
         output,
     } = ok(&[
-        "search", "--output", "json", "--limit", "15", "--kind", "mrs", "foo", "bar",
+        "search", "--output", "json", "--limit", "15", "--kind", "mrs", "-p", "team/api",
+        "--group", "team", "--group", "other", "foo", "bar",
     ])
     else {
         panic!("not `search`");
@@ -170,6 +173,8 @@ fn search_joins_words_and_bounds_the_limit() {
     assert_eq!(query, ["foo", "bar"]);
     assert_eq!(kinds.len(), 1);
     assert_eq!(limit, Some(15));
+    assert_eq!(project.as_deref(), Some("team/api"));
+    assert_eq!(groups, ["team", "other"]);
     assert!(matches!(output.output, OutputFormat::Json));
 
     assert!(parse(&["search", "--limit", "0"]).is_err());

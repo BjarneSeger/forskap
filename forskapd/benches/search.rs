@@ -44,6 +44,7 @@ fn search_handler(c: &mut Criterion) {
                             query.to_string(),
                             kinds,
                             None,
+                            None,
                         )
                         .await
                         .unwrap();

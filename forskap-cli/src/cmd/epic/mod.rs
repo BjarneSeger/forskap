@@ -61,8 +61,15 @@ async fn locate(target: &EpicArgs) -> Result<(VarlinkClient, Epic)> {
     }
 }
 
+/// The group path the epic carries; an older daemon has it only in the URL.
+pub fn group_of(e: &Epic) -> Option<&str> {
+    Some(e.group_path.as_str())
+        .filter(|p| !p.is_empty())
+        .or_else(|| group_path(&e.web_url))
+}
+
 /// The group path inside an epic URL (`https://host/groups/<path>/-/epics/<iid>`).
-pub fn group_path(web_url: &str) -> Option<&str> {
+fn group_path(web_url: &str) -> Option<&str> {
     project_path(web_url)?.strip_prefix("groups/")
 }
 
@@ -73,6 +80,7 @@ async fn cached(client: &VarlinkClient, iid: i64) -> Result<Vec<Epic>> {
             format!("&{iid}"),
             Some(vec![SearchKind::epics]),
             Some(SEARCH_LIMIT),
+            None,
         )
         .call()
         .await
@@ -137,6 +145,7 @@ async fn group_id(client: &VarlinkClient, group: &str) -> Result<i64> {
             path.to_string(),
             Some(vec![SearchKind::groups]),
             Some(SEARCH_LIMIT),
+            None,
         )
         .call()
         .await
@@ -168,6 +177,7 @@ mod tests {
             web_url: format!("https://gl/groups/g{group_id}/-/epics/{iid}"),
             state: "opened".into(),
             open_count: 0,
+            group_path: String::new(),
         }
     }
 
@@ -225,6 +235,18 @@ mod tests {
         assert_eq!(group_path(url), Some("team/backend"));
         assert_eq!(group_path("https://gl/team/api/-/issues/5"), None);
         assert_eq!(group_path(""), None);
+    }
+
+    #[test]
+    fn the_carried_group_path_beats_the_url() {
+        let mut e = epic(3, 5);
+        assert_eq!(group_of(&e), Some("g3"));
+        e.group_path = "team/backend".into();
+        assert_eq!(group_of(&e), Some("team/backend"));
+        e.web_url = String::new();
+        assert_eq!(group_of(&e), Some("team/backend"));
+        e.group_path = String::new();
+        assert_eq!(group_of(&e), None);
     }
 
     #[test]

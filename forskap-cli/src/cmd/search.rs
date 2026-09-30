@@ -5,9 +5,10 @@
 //! serves whatever was last synced — no fetch, effectively free.
 
 use anyhow::Result;
-use forskap_api::{SearchKind as WireKind, VarlinkClientInterface};
+use forskap_api::{SearchKind as WireKind, SearchScope, VarlinkClientInterface};
 
 use crate::cli::{OutputFormat, SearchKind};
+use crate::cmd::project;
 use crate::friendly::friendly;
 use crate::{client, output, style};
 
@@ -15,15 +16,25 @@ pub async fn run(
     query: Vec<String>,
     kinds: Vec<SearchKind>,
     limit: Option<i64>,
+    project: Option<String>,
+    groups: Vec<String>,
     format: OutputFormat,
 ) -> Result<()> {
     let client = client::connect_default().await?;
     let query = query.join(" ");
     let filter = (!kinds.is_empty()).then(|| kinds.iter().map(|k| wire_kind(*k)).collect());
+    let projects = match project {
+        Some(p) => Some(vec![project::by_arg(&client, &p).await?]),
+        None => None,
+    };
+    let scope = (projects.is_some() || !groups.is_empty()).then(|| SearchScope {
+        projects,
+        groups: (!groups.is_empty()).then_some(groups),
+    });
     // No query → the daemon's "frequently opened" view (only items with opens).
     let frequent_only = query.trim().is_empty();
     let reply = client
-        .search(query, filter, limit)
+        .search(query, filter, limit, scope)
         .call()
         .await
         .map_err(|e| friendly("Search", e))?;

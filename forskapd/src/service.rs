@@ -220,6 +220,7 @@ async fn handle_forskapd(
                     args.query,
                     args.kinds,
                     args.limit,
+                    args.scope,
                 )
                 .await?;
         }
