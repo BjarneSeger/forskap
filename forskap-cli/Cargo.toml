@@ -29,6 +29,8 @@ open = "5"
 serde.workspace = true
 serde_json.workspace = true
 serde-saphyr.workspace = true
+# Already in the tree through clap's `wrap_help`.
+terminal_size = "0.4"
 thiserror.workspace = true
 tokio.workspace = true
 varlink.workspace = true

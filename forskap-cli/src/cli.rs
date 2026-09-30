@@ -296,6 +296,23 @@ pub enum AuthCommand {
     },
 }
 
+/// Carried by the views worth keeping an eye on.
+#[derive(Args, Clone, Copy)]
+pub struct WatchArgs {
+    /// Redraw the view every SECS seconds (2 if not given) until Ctrl-C.
+    ///
+    /// Only for the text output.
+    #[arg(
+        short = 'w',
+        long,
+        value_name = "SECS",
+        num_args = 0..=1,
+        default_missing_value = "2",
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
+    pub watch: Option<u64>,
+}
+
 #[derive(Subcommand)]
 pub enum SyncCommand {
     /// Drop cached data and fetch it again.
@@ -315,6 +332,8 @@ pub enum SyncCommand {
     Jobs {
         #[command(flatten)]
         output: OutputArgs,
+        #[command(flatten)]
+        watch: WatchArgs,
     },
 }
 
@@ -336,6 +355,8 @@ pub enum QueueCommand {
     List {
         #[command(flatten)]
         output: OutputArgs,
+        #[command(flatten)]
+        watch: WatchArgs,
     },
     /// Queue a failed write for another attempt.
     Retry {
