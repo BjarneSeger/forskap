@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use forskap_api::Epic;
 use inquire::{InquireError, Select};
 
-use crate::cmd::epic::group_path;
+use crate::cmd::epic::group_of;
 use crate::item::Item;
 use crate::refspec;
 
@@ -79,7 +79,7 @@ pub fn by_project(items: Vec<Item>) -> Vec<Labeled<Item>> {
 
 /// Epics sharing a number, told apart by their group.
 pub fn by_group(epics: Vec<Epic>) -> Vec<Labeled<Epic>> {
-    let group = |e: &Epic| match group_path(&e.web_url) {
+    let group = |e: &Epic| match group_of(e) {
         Some(path) => path.to_string(),
         None => format!("group {}", e.group_id),
     };
@@ -151,6 +151,7 @@ mod tests {
             web_url: web_url.to_string(),
             state: "opened".to_string(),
             open_count: 0,
+            group_path: String::new(),
         };
         let choices = by_group(vec![
             epic(3, "https://gl/groups/team/backend/-/epics/5", "Accounts"),

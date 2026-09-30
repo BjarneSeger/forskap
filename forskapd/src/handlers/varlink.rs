@@ -343,6 +343,37 @@ impl<'a> Projects<'a> {
     }
 }
 
+/// The full path of the epics' groups, each read at most once per request;
+/// `None` without a row.
+struct Groups<'a> {
+    handlers: &'a Handlers,
+    paths: HashMap<i64, Option<String>>,
+}
+
+impl<'a> Groups<'a> {
+    fn new(handlers: &'a Handlers) -> Self {
+        Self {
+            handlers,
+            paths: HashMap::new(),
+        }
+    }
+
+    fn path_of(&mut self, group_id: i64) -> Option<String> {
+        let h = self.handlers;
+        self.paths
+            .entry(group_id)
+            .or_insert_with(|| {
+                let row = h.store().groups.get((group_id.max(0) as u64, 0));
+                row.unwrap_or_else(|e| {
+                    warn!(error = %e, group_id, "group read failed");
+                    None
+                })
+                .map(|g| g.full_path)
+            })
+            .clone()
+    }
+}
+
 /// Where contribution events happened: their project and the link of the
 /// issue or merge request they are about, each read at most once per
 /// request. Unknown ones stay `None`.
@@ -629,9 +660,13 @@ impl VarlinkInterface for Handlers {
                 .collect();
             hits.sort_by_key(|(u, e)| rank_key(*u, e.updated_at));
             hits.truncate(limit);
+            let mut group_info = Groups::new(self);
             epics = hits
                 .into_iter()
-                .map(|(u, e)| wire::epic(e, open_count_of(u)))
+                .map(|(u, e)| {
+                    let group_path = group_info.path_of(e.group_id);
+                    wire::epic(e, open_count_of(u), group_path)
+                })
                 .collect();
         }
 

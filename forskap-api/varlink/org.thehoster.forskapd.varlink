@@ -105,7 +105,8 @@ type Epic (
   title: string,
   web_url: string,
   state: string,
-  open_count: int
+  open_count: int,
+  group_path: string
 )
 
 error GitlabError (message: string)

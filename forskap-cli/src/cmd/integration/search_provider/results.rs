@@ -8,6 +8,7 @@ use forskap_api::Search_Reply;
 
 use super::query;
 use crate::cli::SearchKind;
+use crate::cmd::epic;
 use crate::item;
 use crate::refspec::RefKind;
 
@@ -90,7 +91,7 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
         out.push(Row {
             id: format!("epic:{}:{}", e.group_id, e.iid),
             title: format!("&{} {}", e.iid, e.title),
-            subtitle: join(&[group_path(&e.web_url), &e.state]),
+            subtitle: join(&[epic::group_of(e).unwrap_or_default(), &e.state]),
             kind: SearchKind::Epics,
             score: e.open_count,
             url: e.web_url.clone(),
@@ -125,18 +126,6 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
 /// [`item::project_of`], empty when the path is unknown.
 fn project_of<'a>(project_path: &'a str, web_url: &'a str) -> &'a str {
     item::project_of(project_path, web_url).unwrap_or_default()
-}
-
-/// [`item::project_path`], empty when the URL doesn't give the path away.
-fn project_path(web_url: &str) -> &str {
-    item::project_path(web_url).unwrap_or_default()
-}
-
-/// `"https://gl/groups/team/backend/-/epics/5"` → `"team/backend"`: group
-/// pages live under `/groups/`, which is no part of the group's path.
-pub fn group_path(web_url: &str) -> &str {
-    let path = project_path(web_url);
-    path.strip_prefix("groups/").unwrap_or(path)
 }
 
 /// Parse an id produced by [`rows`].
@@ -231,6 +220,7 @@ mod tests {
                 web_url: "https://gl.example.com/groups/team/-/epics/5".into(),
                 state: "opened".into(),
                 open_count: 2,
+                group_path: "team".into(),
             }],
         }
     }
@@ -255,7 +245,7 @@ mod tests {
         assert_eq!(rows[1].title, "!9 Add OAuth");
         assert_eq!(rows[1].subtitle, "team/api · merged");
         assert_eq!(rows[2].title, "&5 Accounts");
-        assert_eq!(rows[2].subtitle, "team · opened", "no `groups/` prefix");
+        assert_eq!(rows[2].subtitle, "team · opened");
         assert_eq!(rows[2].score, 2);
         assert_eq!(rows[3].title, "team/api");
         assert_eq!(rows[3].subtitle, "API");
@@ -281,21 +271,6 @@ mod tests {
         assert_eq!(row.icon(), query::icon(SearchKind::Issues));
         row.avatar = None;
         assert_eq!(row.icon(), query::icon(SearchKind::Issues));
-    }
-
-    #[test]
-    fn project_path_is_empty_without_a_resource() {
-        assert_eq!(project_path("https://gl/team/api/-/issues/42"), "team/api");
-        assert_eq!(project_path("http://gl/a/b/c/-/merge_requests/1"), "a/b/c");
-        assert_eq!(project_path("https://gl/team/api"), "");
-        assert_eq!(project_path(""), "");
-    }
-
-    #[test]
-    fn group_path_drops_the_groups_prefix() {
-        assert_eq!(group_path("https://gl/groups/team/-/epics/5"), "team");
-        assert_eq!(group_path("https://gl/groups/a/b/-/epics/5"), "a/b");
-        assert_eq!(group_path("https://gl/groups/team"), "");
     }
 
     #[test]

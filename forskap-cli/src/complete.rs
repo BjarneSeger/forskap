@@ -19,7 +19,7 @@ use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
 use forskap_api::{Epic, SearchKind, VarlinkClientInterface};
 
 use crate::cli::Cli;
-use crate::cmd::epic::group_path;
+use crate::cmd::epic::group_of;
 use crate::item::{Item, project_of};
 use crate::refspec::{self, RefKind};
 use crate::state::{LastEpic, LastIssue};
@@ -215,7 +215,7 @@ fn ranked_epics(last: Option<LastEpic>, rows: &[Epic]) -> Vec<Known> {
         .map(|e| Known {
             iid: e.iid,
             project_id: e.group_id,
-            help: match group_path(&e.web_url) {
+            help: match group_of(e) {
                 Some(path) => format!("{} ({path})", e.title),
                 None => e.title.clone(),
             },
@@ -513,6 +513,7 @@ mod tests {
             web_url: format!("https://gitlab.example.com/groups/{path}/-/epics/{iid}"),
             state: "opened".to_string(),
             open_count: 1,
+            group_path: String::new(),
         };
         let rows = [
             epic(3, "team", 5, "Accounts"),

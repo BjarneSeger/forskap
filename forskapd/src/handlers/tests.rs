@@ -760,12 +760,18 @@ async fn search_finds_epics_by_title_label_and_reference() {
     seed_corpus(&h);
     let mut labeled = epic(6, 7, "Q3", 50);
     labeled.labels = vec!["Roadmap".into()];
+    labeled.web_url = "https://gl/groups/other/-/epics/7".into();
     seed(&h, &[labeled]);
 
     let r = run_search(&h, "ROADMAP", None, None).await;
     let hits: Vec<_> = r.epics.iter().map(|e| (e.group_id, e.iid)).collect();
     assert_eq!(hits, [(5, 7), (6, 7)], "title and label, newest first");
     assert_eq!(r.epics[0].web_url, "https://gl/groups/team/-/epics/7");
+    assert_eq!(r.epics[0].group_path, "team", "from the group row");
+    assert_eq!(
+        r.epics[1].group_path, "other",
+        "no row for group 6: from the link"
+    );
     assert!(r.issues.is_empty() && r.groups.is_empty());
 
     // `&7` is the epic reference; `#7` stays with issues and MRs.

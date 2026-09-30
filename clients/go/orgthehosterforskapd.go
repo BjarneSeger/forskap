@@ -117,6 +117,7 @@ type Epic struct {
 	Web_url    string `json:"web_url"`
 	State      string `json:"state"`
 	Open_count int64  `json:"open_count"`
+	Group_path string `json:"group_path"`
 }
 
 type NotAuthReason string
@@ -1888,7 +1889,8 @@ type Epic (
   title: string,
   web_url: string,
   state: string,
-  open_count: int
+  open_count: int,
+  group_path: string
 )
 
 error GitlabError (message: string)
