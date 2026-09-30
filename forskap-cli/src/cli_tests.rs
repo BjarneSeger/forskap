@@ -1,6 +1,7 @@
 //! The argument tree itself: what parses, and what must not.
 
 use clap::{CommandFactory, Parser};
+use clap_complete::ArgValueCompleter;
 
 use crate::cli::{
     Cli, Command, ItemCommand, OutputFormat, QueueCommand, RefreshScope, SyncCommand, TickMode,
@@ -21,6 +22,41 @@ fn ok(args: &[&str]) -> Command {
 #[test]
 fn tree_is_well_formed() {
     Cli::command().debug_assert();
+}
+
+/// The completers are attached by name outside `cli.rs`: a verb added to
+/// `issue`/`mr`, or an argument renamed, must not silently lose its completion.
+#[test]
+fn every_number_and_project_argument_completes() {
+    fn check(cmd: &clap::Command, path: &str, seen: &mut usize) {
+        for arg in cmd.get_arguments() {
+            if ["iid", "reference", "project"].contains(&arg.get_id().as_str()) {
+                assert!(
+                    arg.get::<ArgValueCompleter>().is_some(),
+                    "`{path}` has no completer for `{}`",
+                    arg.get_id()
+                );
+                *seen += 1;
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            check(sub, &format!("{path} {}", sub.get_name()), seen);
+        }
+    }
+    let mut cmd = crate::complete::command();
+    cmd.clone().debug_assert();
+    cmd.build();
+    let mut seen = 0;
+    check(&cmd, "forskap", &mut seen);
+    // Number and project of five verbs in two groups, and of `time log`.
+    assert_eq!(seen, 2 * 5 * 2 + 2);
+
+    // Attaching them must not reorder the positionals.
+    let log = cmd.find_subcommand("time").unwrap();
+    let log = log.find_subcommand("log").unwrap();
+    let positionals: Vec<&str> = log.get_positionals().map(|p| p.get_id().as_str()).collect();
+    assert_eq!(positionals, ["reference", "duration"]);
+    assert_eq!(log.get_positionals().next().unwrap().get_index(), Some(1));
 }
 
 #[test]

@@ -42,7 +42,10 @@ proptest = "1"
 clap = { version = "4.6", features = ["derive", "wrap_help"] }
 inquire = "0.9"
 confique = { version = "0.4.0", default-features = false, features = ["toml"] }
-clap_complete = "4"
+# `unstable-dynamic` (the completion engine behind `COMPLETE=<shell> forskap`)
+# carries no semver promise, so this is pinned exactly: bump it deliberately
+# and re-check `forskap-cli/src/complete.rs` and `build.rs` when doing so.
+clap_complete = { version = "=4.6.11", features = ["unstable-dynamic"] }
 carapace_spec_clap = "1"
 
 # Desktop integration (GNOME Shell search provider / KRunner plugin)

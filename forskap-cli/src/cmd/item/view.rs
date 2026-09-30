@@ -2,8 +2,9 @@
 
 use anyhow::Result;
 
-use super::{Item, locate, lookup};
+use super::{locate, lookup};
 use crate::cli::{OutputFormat, TargetArgs};
+use crate::item::Item;
 use crate::output;
 use crate::refspec::RefKind;
 

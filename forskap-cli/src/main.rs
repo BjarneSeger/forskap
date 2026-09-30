@@ -34,9 +34,12 @@ mod cli;
 mod cli_tests;
 mod client;
 mod cmd;
+mod complete;
 mod config;
 mod friendly;
+mod item;
 mod migrate;
+mod pick;
 mod refspec;
 mod state;
 
@@ -46,12 +49,23 @@ use refspec::RefKind;
 /// Single-thread tokio flavour: each invocation does at most a few varlink
 /// round-trips plus stdin/stdout work, so a multi-thread runtime would just add
 /// startup overhead to the hot `forskap tick` path (fires on every shell prompt).
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
-    match run().await {
+///
+/// Built by hand rather than by `#[tokio::main]` because a shell completion
+/// request is answered first: its completers are synchronous and bring their
+/// own runtime, which can't be started from inside this one.
+fn main() -> ExitCode {
+    complete::run();
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| runtime.block_on(run()));
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         // `forskap issue list | head`: the reader has what it wanted.
         Err(e) if e.is::<output::StdoutClosed>() => ExitCode::SUCCESS,
+        // The picker already showed the dismissal; exit like a Ctrl-C.
+        Err(e) if e.is::<pick::Cancelled>() => ExitCode::from(130),
         Err(e) => {
             eprintln!("Error: {e:?}");
             ExitCode::FAILURE

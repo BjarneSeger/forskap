@@ -1,4 +1,5 @@
-// Included verbatim by build.rs for the completions: clap-only, no crate types.
+// Included verbatim by build.rs for the carapace spec: clap-only, no crate
+// types. The dynamic completers are attached in complete.rs.
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -36,9 +37,12 @@ pub struct OutputArgs {
 
 #[derive(Args)]
 pub struct ProjectArgs {
-    /// Project, as numeric ID or full path (`group/project`). If omitted, it
-    /// is resolved from the item you last logged time on, then your assigned
-    /// items, then the search corpus.
+    /// Project, as numeric ID or full path (`group/project`).
+    ///
+    /// If omitted, it is resolved from the item you last logged time on, then
+    /// your assigned items, then the search corpus. If the number exists in
+    /// several projects, you are asked which one — outside a terminal that is
+    /// an error.
     #[arg(short = 'p', long, value_name = "PROJECT")]
     pub project: Option<String>,
 }

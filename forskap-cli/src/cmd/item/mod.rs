@@ -9,12 +9,13 @@ mod unassign;
 mod view;
 
 use anyhow::{Result, bail};
-use forskap_api::{Issue, MergeRequest, VarlinkClient, VarlinkClientInterface};
+use forskap_api::{VarlinkClient, VarlinkClientInterface};
 
 use crate::cli::{ItemCommand, TargetArgs};
 use crate::client;
 use crate::cmd::project;
 use crate::friendly::friendly;
+use crate::item::Item;
 use crate::refspec::{self, RefKind};
 
 /// Per-kind cap for the `#iid` lookup: titles can match the number too, so
@@ -38,21 +39,6 @@ async fn locate(kind: RefKind, target: &TargetArgs) -> Result<(VarlinkClient, i6
     let project_id =
         project::resolve(&client, kind, target.iid, target.project.project.as_deref()).await?;
     Ok((client, project_id))
-}
-
-/// A cached row of either kind.
-pub enum Item {
-    Issue(Issue),
-    Mr(MergeRequest),
-}
-
-impl Item {
-    pub fn web_url(&self) -> &str {
-        match self {
-            Item::Issue(i) => &i.web_url,
-            Item::Mr(m) => &m.web_url,
-        }
-    }
 }
 
 /// The row from the daemon's caches: the search corpus first, then the
