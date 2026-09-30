@@ -7,7 +7,7 @@
 //! leaves partial data behind. An avatar's file is written in that second
 //! phase too, right before its row.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tracing::{info, warn};
@@ -32,6 +32,24 @@ pub const ASSIGNED_MERGE_REQUESTS: &str = "assigned/merge_requests";
 /// run started, so items updated during that run (or under clock skew) are
 /// fetched again instead of missed. Upserts dedupe the overlap.
 const DELTA_OVERLAP_SECS: u64 = 300;
+
+/// What two fetches in flight must not share: the worker runs one job per
+/// lane at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Lane {
+    /// Everything read from one project.
+    Project(i64),
+    /// A group's epics.
+    Group(i64),
+    /// The cross-project issue listings.
+    Issues,
+    /// The cross-project merge request listings.
+    MergeRequests,
+    /// Both timelog windows: the recent one lies inside the full one.
+    Timelogs,
+    /// A job sharing its rows with no other.
+    Own(Job),
+}
 
 /// Every job the planner can schedule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -88,6 +106,25 @@ impl Job {
             // Decoration: never ahead of data.
             Self::ProjectAvatar(_) => 4,
             _ => 2,
+        }
+    }
+
+    /// The lane the job runs in. Jobs in different lanes write disjoint
+    /// rows, except an assigned list and a project corpus: both store the
+    /// project's assigned items, and [`drop_outdated`] keeps the newer one.
+    pub fn lane(&self) -> Lane {
+        match *self {
+            Self::ProjectBoards(p)
+            | Self::ProjectIssues(p)
+            | Self::ProjectMergeRequests(p)
+            | Self::ProjectAvatar(p) => Lane::Project(p),
+            Self::GroupEpics(g) => Lane::Group(g),
+            // A full `all/*` run reconciles every row, so an assigned list
+            // landing mid-fetch would lose what it just stored.
+            Self::AssignedIssues | Self::AllIssues => Lane::Issues,
+            Self::AssignedMergeRequests | Self::AllMergeRequests => Lane::MergeRequests,
+            Self::RecentTimelogs | Self::AllTimelogs => Lane::Timelogs,
+            Self::Events | Self::MemberProjects | Self::MemberGroups => Lane::Own(*self),
         }
     }
 
@@ -274,22 +311,12 @@ pub async fn fetch(job: Job, ctx: FetchCtx) -> Result<Staged> {
     let gitlab = &*ctx.gitlab;
     match job {
         Job::AssignedIssues => {
-            view::<Issue>(
-                gitlab,
-                Listing::AssignedIssues,
-                ASSIGNED_ISSUES,
-                ctx.started,
-            )
-            .await
+            let listing = Listing::AssignedIssues;
+            view::<Issue>(&ctx, listing, ASSIGNED_ISSUES, Job::ProjectIssues).await
         }
         Job::AssignedMergeRequests => {
-            view::<MergeRequest>(
-                gitlab,
-                Listing::AssignedMergeRequests,
-                ASSIGNED_MERGE_REQUESTS,
-                ctx.started,
-            )
-            .await
+            let (listing, name) = (Listing::AssignedMergeRequests, ASSIGNED_MERGE_REQUESTS);
+            view::<MergeRequest>(&ctx, listing, name, Job::ProjectMergeRequests).await
         }
         Job::ProjectIssues(project_id) => {
             let listing = |updated_after| Listing::ProjectIssues {
@@ -390,7 +417,7 @@ async fn avatar(ctx: &FetchCtx, project_id: i64) -> Result<Staged> {
 /// newest first and capped: a huge one keeps only its most recently updated
 /// items, and a full run's reconcile drops the rest, except for items the
 /// assigned view `view` lists.
-async fn capped_rows<R: Stored>(
+async fn capped_rows<R: Stored + Dated>(
     ctx: &FetchCtx,
     listing: impl Fn(Option<chrono::DateTime<chrono::Utc>>) -> Listing,
     owner: i64,
@@ -428,19 +455,67 @@ async fn capped_rows<R: Stored>(
         fetched.extend(late);
     }
     let prefix = owner.max(0) as u64;
+    let started = ctx.started;
     Ok(Staged::new(move |c| {
+        let rows = fetched.len();
+        let mut keep: HashSet<RowKey> = fetched.iter().map(Resource::key).collect();
+        if let Some(view) = view {
+            let listed = c.view(view)?.unwrap_or_default();
+            let assigned: HashSet<RowKey> =
+                listed.keys.into_iter().filter(|k| k.0 == prefix).collect();
+            // The list was fetched after this run started and landed first.
+            if listed.fetched_at >= started {
+                drop_outdated(c, &mut fetched, |k| Ok(assigned.contains(&k)))?;
+            }
+            // An assigned item older than the cap is still on the list.
+            keep.extend(assigned);
+        }
         c.upsert(&fetched)?;
         if whole {
-            let mut keep: HashSet<RowKey> = fetched.iter().map(Resource::key).collect();
-            // An assigned item older than the cap is still on the list.
-            if let Some(view) = view {
-                let listed = c.view(view)?.unwrap_or_default().keys;
-                keep.extend(listed.into_iter().filter(|k| k.0 == prefix));
-            }
             c.remove_where::<R>(RowScope::Prefix(prefix), |k| keep.contains(&k))?;
         }
-        Ok(fetched.len())
+        Ok(rows)
     }))
+}
+
+/// A row with GitLab's `updated_at`, to tell two fetched versions apart.
+trait Dated {
+    fn updated_at(&self) -> u64;
+}
+
+macro_rules! dated {
+    ($($ty:ty),*) => {$(
+        impl Dated for $ty {
+            fn updated_at(&self) -> u64 {
+                self.updated_at
+            }
+        }
+    )*};
+}
+
+dated!(Issue, MergeRequest, Epic);
+
+/// Take out of `fetched` the rows stored in a newer version, among those
+/// `raced` names: the ones a fetch that started later may have stored while
+/// this one was in flight. Commits land in completion order, so without
+/// this the older read would win.
+fn drop_outdated<R: Stored + Dated>(
+    c: &Commit<'_>,
+    fetched: &mut Vec<R>,
+    mut raced: impl FnMut(RowKey) -> Result<bool>,
+) -> Result<()> {
+    let mut current = Vec::with_capacity(fetched.len());
+    for row in fetched.drain(..) {
+        let key = row.key();
+        let outdated = raced(key)?
+            && c.get::<R>(key)?
+                .is_some_and(|stored| stored.updated_at() > row.updated_at());
+        if !outdated {
+            current.push(row);
+        }
+    }
+    *fetched = current;
+    Ok(())
 }
 
 /// Fetch `listing` as `R` rows; a full run (`reconcile = Some`) also drops
@@ -461,16 +536,30 @@ async fn rows<R: Stored>(
 }
 
 /// Fetch `listing` into the rows plus the view `name` listing their keys.
-async fn view<R: Stored>(
-    gitlab: &dyn GitlabApi,
+/// `corpus` is the job that stores a project's rows of the same kind.
+async fn view<R: Stored + Dated>(
+    ctx: &FetchCtx,
     listing: Listing,
     name: &'static str,
-    started: u64,
+    corpus: fn(i64) -> Job,
 ) -> Result<Staged> {
-    let fetched: Vec<R> = fetch_rows(gitlab, &listing, None, |_| {}).await?;
+    let mut fetched: Vec<R> = fetch_rows(&*ctx.gitlab, &listing, None, |_| {}).await?;
+    let started = ctx.started;
     Ok(Staged::new(move |c| {
-        c.upsert(&fetched)?;
         let keys: Vec<RowKey> = fetched.iter().map(Resource::key).collect();
+        // Projects whose corpus run started after this fetch and landed
+        // first.
+        let mut later: HashMap<u64, bool> = HashMap::new();
+        drop_outdated(c, &mut fetched, |key| {
+            if let Some(&raced) = later.get(&key.0) {
+                return Ok(raced);
+            }
+            let raced = c.job_state(&corpus(key.0 as i64).key())?.last_ok >= started;
+            later.insert(key.0, raced);
+            Ok(raced)
+        })?;
+        c.upsert(&fetched)?;
+        let rows = keys.len();
         c.set_view(
             name,
             &View {
@@ -478,7 +567,7 @@ async fn view<R: Stored>(
                 fetched_at: started,
             },
         )?;
-        Ok(fetched.len())
+        Ok(rows)
     }))
 }
 
@@ -652,6 +741,125 @@ mod tests {
         );
         assert_eq!(view.fetched_at, NOW);
         assert_eq!(s.issues.get((1, 9)).unwrap().unwrap().title, "a");
+    }
+
+    /// Issue #1 of project 7 as GitLab showed it at `hour` o'clock.
+    fn issue_at(hour: u32, title: &str) -> serde_json::Value {
+        let mut issue = issue_json(7, 1, title);
+        issue["updated_at"] = json!(format!("2026-07-01T{hour:02}:00:00Z"));
+        issue
+    }
+
+    /// Commit `staged` as the worker does, with the job's new state.
+    fn land(s: &SyncStore, job: Job, staged: Staged, started: u64) {
+        let mut c = s.begin();
+        staged.apply(&mut c).unwrap();
+        let state = JobState {
+            last_ok: started,
+            ..Default::default()
+        };
+        c.set_job(&job.key(), &state).unwrap();
+        c.commit().unwrap();
+    }
+
+    fn title(s: &SyncStore) -> String {
+        s.issues.get((7, 1)).unwrap().unwrap().title
+    }
+
+    /// Fetches land in the order they finish. A corpus run that started
+    /// before the list but lands after it must not bring the old row back.
+    #[tokio::test]
+    async fn a_corpus_run_landing_after_a_later_list_keeps_the_newer_row() {
+        let (s, _d) = store();
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve(
+            "projects/7/issues",
+            vec![issue_at(9, "stale"), issue_json(7, 2, "two")],
+        );
+        fake.serve("issues", vec![issue_at(11, "fresh")]);
+        let corpus = fetch(Job::ProjectIssues(7), ctx(&fake, true, 0))
+            .await
+            .unwrap();
+        let mut later = ctx(&fake, true, 0);
+        later.started = NOW + 10;
+        let list = fetch(Job::AssignedIssues, later).await.unwrap();
+
+        land(&s, Job::AssignedIssues, list, NOW + 10);
+        land(&s, Job::ProjectIssues(7), corpus, NOW);
+        assert_eq!(title(&s), "fresh");
+        assert_eq!(s.issues.keys(RowScope::All).unwrap(), [(7, 1), (7, 2)]);
+    }
+
+    /// The other way round: the list started first and lands last.
+    #[tokio::test]
+    async fn a_list_landing_after_a_later_corpus_run_keeps_the_newer_row() {
+        let (s, _d) = store();
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve("issues", vec![issue_at(9, "stale")]);
+        fake.serve("projects/7/issues", vec![issue_at(11, "fresh")]);
+        let list = fetch(Job::AssignedIssues, ctx(&fake, true, 0))
+            .await
+            .unwrap();
+        let mut later = ctx(&fake, true, 0);
+        later.started = NOW + 10;
+        let corpus = fetch(Job::ProjectIssues(7), later).await.unwrap();
+
+        land(&s, Job::ProjectIssues(7), corpus, NOW + 10);
+        land(&s, Job::AssignedIssues, list, NOW);
+        assert_eq!(title(&s), "fresh");
+        let view = s.view(ASSIGNED_ISSUES).unwrap().unwrap();
+        assert_eq!(view.keys, [(7, 1)], "the list itself still lands");
+    }
+
+    /// Without such a race the fetched row always wins, whatever its
+    /// `updated_at`: GitLab's timestamps need not be monotonic.
+    #[tokio::test]
+    async fn fetches_in_sequence_overwrite_whatever_is_stored() {
+        let (s, _d) = store();
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve("projects/7/issues", vec![issue_at(11, "corpus")]);
+        fake.serve("issues", vec![issue_at(9, "list")]);
+        let mut earlier = ctx(&fake, true, 0);
+        earlier.started = NOW - 100;
+        let corpus = fetch(Job::ProjectIssues(7), earlier).await.unwrap();
+        land(&s, Job::ProjectIssues(7), corpus, NOW - 100);
+
+        let list = fetch(Job::AssignedIssues, ctx(&fake, true, 0))
+            .await
+            .unwrap();
+        land(&s, Job::AssignedIssues, list, NOW);
+        assert_eq!(title(&s), "list");
+
+        fake.serve("projects/7/issues", vec![issue_at(8, "corpus again")]);
+        let mut after = ctx(&fake, true, 0);
+        after.started = NOW + 100;
+        let corpus = fetch(Job::ProjectIssues(7), after).await.unwrap();
+        land(&s, Job::ProjectIssues(7), corpus, NOW + 100);
+        assert_eq!(title(&s), "corpus again");
+    }
+
+    #[test]
+    fn jobs_reading_the_same_rows_share_a_lane() {
+        let project = [
+            Job::ProjectBoards(7),
+            Job::ProjectIssues(7),
+            Job::ProjectMergeRequests(7),
+            Job::ProjectAvatar(7),
+        ];
+        assert!(project.iter().all(|j| j.lane() == Lane::Project(7)));
+        assert_ne!(Job::ProjectIssues(8).lane(), Lane::Project(7));
+        assert_eq!(Job::RecentTimelogs.lane(), Job::AllTimelogs.lane());
+        assert_eq!(Job::AssignedIssues.lane(), Job::AllIssues.lane());
+        assert_eq!(
+            Job::AssignedMergeRequests.lane(),
+            Job::AllMergeRequests.lane()
+        );
+        // The lists overlap with a project's corpus only in rows, which
+        // `drop_outdated` settles: they don't wait for each other.
+        assert_ne!(Job::AssignedIssues.lane(), Job::ProjectIssues(7).lane());
+        let alone = [Job::Events, Job::MemberProjects, Job::MemberGroups];
+        assert!(alone.iter().all(|j| j.lane() == Lane::Own(*j)));
+        assert_eq!(Job::GroupEpics(3).lane(), Lane::Group(3));
     }
 
     #[tokio::test]

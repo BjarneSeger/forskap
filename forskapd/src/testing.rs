@@ -37,6 +37,8 @@ pub enum FakeErr {
     Unauthorized,
     /// An unusable rotation answer: `Error::RotationLost`.
     Lost,
+    /// A bug: the call panics instead of failing.
+    Panic,
 }
 
 impl FakeErr {
@@ -51,6 +53,7 @@ impl FakeErr {
             Self::Rejected => Error::Gitlab("403 Forbidden".into()),
             Self::Unauthorized => Error::Unauthorized("401 Unauthorized".into()),
             Self::Lost => Error::RotationLost("unreadable answer".into()),
+            Self::Panic => panic!("fake panic"),
         }
     }
 }

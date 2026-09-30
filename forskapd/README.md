@@ -45,7 +45,8 @@ Keys are grouped into TOML tables, one per concern:
 | `[search]` `tracked_retention_hours` | `2160` | How long your activity in a project (an assignment, a push, an issue, MR or comment, a timelog) keeps it in the `"tracked"` population (90 days). Your contribution events are kept for the same time, so it also bounds how far back `forskap activity` reaches. |
 | `[search]` `max_items_per_project` | `1000` | Most issues and most MRs kept per corpus project, and most epics per group — the most recently updated ones (floor 100). Bounds the sync of very large projects. |
 | `[sync]` `jitter` | `0.15` | Random spread applied to every sync interval, as a fraction (0–0.5), so jobs sharing an interval don't hit GitLab together. |
-| `[sync]` `job_gap_ms` | `250` | Pause between two sync jobs (jittered), so a backlog of due jobs trickles out. |
+| `[sync]` `job_gap_ms` | `250` | Pause between starting two sync jobs (jittered), so a backlog of due jobs trickles out. |
+| `[sync]` `max_in_flight` | `2` | Most sync jobs reading from GitLab at once; jobs of the same project go one at a time (floor 1). |
 | `[sync]` `startup_spread_secs` | `60` | Window over which jobs already overdue at startup are spread; the assigned lists and recent timelogs always run at once. |
 | `[usage]` `retention_hours` | `2160` | How long an issue/MR keeps its `RecordOpen` ranking after its last open (90 days); older entries are dropped on the next recorded open. |
 | `[auth]` `rotate` | `"scoped"` | Which tokens are replaced by a fresh one before they expire: `"scoped"` = only tokens with the `self_rotate` scope, `"always"` = also tokens that can rotate through the `api` scope, `"never"` = none. Rotating revokes the token you pasted, which breaks every other tool using it — hence the default. A token without an expiry date is never rotated. |

@@ -1,7 +1,7 @@
 //! `forskap sync jobs` — what the daemon's sync worker is doing.
 //!
-//! The worker runs one job at a time, so a slow one holds the others up.
-//! This lists every planned job in the order the worker runs them: the one
+//! The worker runs a few jobs at a time, so slow ones hold the others up.
+//! This lists every planned job in the order the worker runs them: the ones
 //! in flight, the ones demanded ahead of the schedule, the due ones, then
 //! the rest by their next run. Jobs that are done for good (a fetched avatar
 //! per project) would drown the rest, so they share one line per kind.

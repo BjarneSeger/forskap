@@ -4,7 +4,7 @@ Machine-readable definition: [`forskap-api/varlink/org.thehoster.forskapd.varlin
 — that file is the source of truth; this document explains the behavior behind it.
 
 **Caching model**: the daemon has no TTL. A background sync worker owns freshness:
-it runs one job at a time from a persisted, jittered schedule — the assigned
+it runs a few jobs at a time (`sync.max_in_flight`) from a persisted, jittered schedule — the assigned
 issue/MR lists and the recent timelog window every few minutes
 (`refresh.quick.interval_secs`), each tracked project's issues and MRs as
 `updated_after` deltas every `search.partial_interval_secs` (default 30 min) with a
@@ -363,10 +363,11 @@ Deletes all dead-lettered tasks.
 
 ### `GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int)`
 
-Lists the jobs the sync worker has planned, in the order it runs them: the one in
+Lists the jobs the sync worker has planned, in the order it runs them: the ones in
 flight, the ones demanded ahead of the schedule (a `ClearCache`, a write that just
-landed), the due ones by priority, then the rest by `next_due`. The worker runs one
-job at a time, so a long one in front delays everything behind it.
+landed), the due ones by priority, then the rest by `next_due`. The worker runs up to
+`sync.max_in_flight` jobs at once, one per project, so several can be `running`,
+each with its own `running_since`.
 
 `paused_until` (unix seconds) is set while a GitLab rate limit (429) holds every
 job back; the statuses then say what runs once the pause is over.
