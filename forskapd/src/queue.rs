@@ -946,6 +946,7 @@ mod tests {
                 gitlab,
                 host: "test".to_string(),
                 user_id: 0,
+                username: "tester".into(),
                 token: Default::default(),
             })));
         let (tx, rx) = mpsc::channel(8);
@@ -1096,6 +1097,7 @@ mod tests {
             gitlab: gitlab.clone(),
             host: "test".into(),
             user_id: 0,
+            username: "tester".into(),
             token: Default::default(),
         });
         drain_wake.notify_one();
@@ -1127,6 +1129,7 @@ mod tests {
                 gitlab: gitlab.clone(),
                 host: "test".into(),
                 user_id: 0,
+                username: "tester".into(),
                 token: Default::default(),
             })));
         let settled = Arc::new(std::sync::Mutex::new(Vec::new()));

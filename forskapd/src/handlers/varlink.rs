@@ -1088,7 +1088,13 @@ impl VarlinkInterface for Handlers {
             Ok(s) => {
                 let auth = self.config.read().unwrap().auth;
                 let (token_expires_at, token_rotates) = self.rotation.report(&s.gitlab, &auth);
-                call.reply(s.host, s.user_id, token_expires_at, token_rotates)
+                call.reply(
+                    s.host,
+                    s.user_id,
+                    s.username,
+                    token_expires_at,
+                    token_rotates,
+                )
             }
             Err(e) => {
                 let (reason, detail) = dormant_args(&e);

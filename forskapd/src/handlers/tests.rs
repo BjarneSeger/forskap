@@ -82,6 +82,7 @@ fn connected_handlers(fake: &Arc<FakeGitlab>) -> (Handlers, tempfile::TempDir) {
         gitlab: Arc::clone(fake) as Arc<dyn crate::gitlab::GitlabApi>,
         host: "gitlab.test".into(),
         user_id: 1,
+        username: "tester".into(),
         token: Default::default(),
     }))
 }
@@ -1331,7 +1332,10 @@ async fn who_am_i_reports_the_token_once_it_is_known() {
     let (h, _dir) = connected_handlers(&fake);
 
     let me = who_am_i(&h).await;
-    assert_eq!((me.host.as_str(), me.user_id), ("gitlab.test", 1));
+    assert_eq!(
+        (me.host.as_str(), me.user_id, me.username.as_str()),
+        ("gitlab.test", 1, "tester")
+    );
     assert_eq!((me.token_expires_at, me.token_rotates), (None, false));
 
     let expires = chrono::Utc::now().date_naive() + chrono::Days::new(30);

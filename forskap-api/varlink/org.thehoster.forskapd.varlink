@@ -156,4 +156,4 @@ method Login(host: string, token: string) -> ()
 
 method Logout() -> ()
 
-method WhoAmI() -> (host: string, user_id: int, token_expires_at: ?int, token_rotates: bool)
+method WhoAmI() -> (host: string, user_id: int, username: string, token_expires_at: ?int, token_rotates: bool)

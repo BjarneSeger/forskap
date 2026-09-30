@@ -307,10 +307,11 @@ degrades to an empty reply on cache trouble. When the events have never been syn
 replies with an empty array if a session exists (first sync pending),
 `NotAuthenticated` otherwise.
 
-### `WhoAmI() -> (host: string, user_id: int, token_expires_at: ?int, token_rotates: bool)`
+### `WhoAmI() -> (host: string, user_id: int, username: string, token_expires_at: ?int, token_rotates: bool)`
 
-The connected GitLab host and the authenticated user's ID, answered from the session
-without a round-trip. `NotAuthenticated` when dormant.
+The connected GitLab host and the authenticated user's ID and login name (`username`:
+the `@name` GitLab shows, what `author_username=` filters take), answered from the
+session without a round-trip. `NotAuthenticated` when dormant.
 
 `token_expires_at` is the moment the token expires, in unix seconds; absent when it
 never expires or the daemon hasn't read the token's details yet (it does so in the

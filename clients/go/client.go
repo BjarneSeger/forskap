@@ -232,16 +232,16 @@ func (c *Client) Logout(ctx context.Context) error {
 	return Logout().Call(ctx, c.conn)
 }
 
-// WhoAmI returns the authenticated host and GitLab user id.
-func (c *Client) WhoAmI(ctx context.Context) (host string, userID int64, err error) {
-	host, userID, _, _, err = WhoAmI().Call(ctx, c.conn)
-	return host, userID, err
+// WhoAmI returns the authenticated host, GitLab login name and user id.
+func (c *Client) WhoAmI(ctx context.Context) (host, username string, userID int64, err error) {
+	host, userID, username, _, _, err = WhoAmI().Call(ctx, c.conn)
+	return host, username, userID, err
 }
 
 // TokenStatus returns when the daemon's GitLab token expires (unix seconds;
 // nil if it never does or the daemon doesn't know yet) and whether the daemon
 // rotates it before that. Wraps the varlink method `WhoAmI`.
 func (c *Client) TokenStatus(ctx context.Context) (expiresAt *int64, rotates bool, err error) {
-	_, _, expiresAt, rotates, err = WhoAmI().Call(ctx, c.conn)
+	_, _, _, expiresAt, rotates, err = WhoAmI().Call(ctx, c.conn)
 	return expiresAt, rotates, err
 }

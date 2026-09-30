@@ -41,6 +41,7 @@ pub struct Session {
     pub gitlab: Arc<dyn GitlabApi>,
     pub host: String,
     pub user_id: i64,
+    pub username: String,
     /// The token `gitlab` authenticates with, to tell it from a newer one in
     /// the keychain.
     pub token: Token,
@@ -50,11 +51,13 @@ impl Session {
     pub fn from_client(client: GitlabClient) -> Self {
         let host = client.host().to_string();
         let user_id = client.current_user_id();
+        let username = client.current_username().to_string();
         let token = client.token().clone();
         Self {
             gitlab: Arc::new(client),
             host,
             user_id,
+            username,
             token,
         }
     }
