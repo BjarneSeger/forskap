@@ -7,6 +7,7 @@
 //! it.
 
 use serde::{Deserialize, Serialize};
+use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
 /// Per-job bookkeeping, persisted so a restart inside an interval costs
 /// GitLab nothing.
@@ -88,7 +89,7 @@ pub fn jittered(secs: u64, key: &str, seed: u64, jitter: f64) -> u64 {
 
 /// A deterministic value in `[0, 1)` from `key` and `seed`.
 pub fn unit(key: &str, seed: u64) -> f64 {
-    (splitmix64(fnv1a(key.as_bytes()) ^ seed) >> 11) as f64 / (1u64 << 53) as f64
+    (xxh3_64_with_seed(key.as_bytes(), seed) >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// Seconds to wait before retrying after `failures` consecutive failures:
@@ -118,25 +119,12 @@ pub fn startup_offset(key: &str, window: u64) -> u64 {
 /// Hash a job's sync parameters into a [`JobState::fingerprint`].
 pub fn fingerprint(parts: &[u64]) -> u64 {
     let bytes: Vec<u8> = parts.iter().flat_map(|p| p.to_le_bytes()).collect();
-    splitmix64(fnv1a(&bytes))
+    xxh3_64(&bytes)
 }
 
 /// Hash a text a job syncs by (an avatar's URL), as a [`fingerprint`] part.
 pub fn text_hash(text: &str) -> u64 {
-    splitmix64(fnv1a(text.as_bytes()))
-}
-
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
-    })
-}
-
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
+    xxh3_64(text.as_bytes())
 }
 
 #[cfg(test)]
@@ -250,6 +238,15 @@ mod tests {
         assert_eq!(aged(2, 1_801, 1_800), 1);
         assert_eq!(aged(0, u64::MAX, 60), 0, "never demoted");
         assert_eq!(aged(1, u64::MAX, 60), 1);
+    }
+
+    /// Fingerprints are stored and name the avatar files: a hash that
+    /// changed would resync everything once more.
+    #[test]
+    fn the_hash_is_pinned() {
+        assert_eq!(text_hash(""), 0x2d06_8005_38d3_94c2, "the XXH3 spec's");
+        assert_eq!(fingerprint(&[1, 2]), 571_542_372_673_154_031);
+        assert_eq!(unit("k", 7).to_bits(), 4_595_725_774_607_267_048);
     }
 
     #[test]

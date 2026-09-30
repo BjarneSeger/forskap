@@ -1054,6 +1054,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "varlink",
+ "xxhash-rust",
 ]
 
 [[package]]
