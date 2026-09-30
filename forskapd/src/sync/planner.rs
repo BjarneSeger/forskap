@@ -7,13 +7,18 @@
 //! persisted: the event and timelog windows are the memory. Only tracked
 //! projects the user is a member of get a corpus: an assigned MR in an
 //! upstream like gitlab-org/gitlab must not pull in its whole history.
+//!
+//! Avatars follow the member projects, tracked or not: a project shows its
+//! icon in search either way.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use super::avatars::Avatar;
 use super::jobs::{ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, Job};
 use super::model::{Board, Event, Issue, MergeRequest, RowKey};
+use super::schedule::{fingerprint, text_hash};
 use super::store::{Commit, RowScope, SyncStore};
-use crate::config::SearchPopulation;
+use crate::config::{Config, SearchPopulation};
 use crate::error::Result;
 
 #[derive(Debug, Default, PartialEq)]
@@ -26,6 +31,8 @@ pub struct Plan {
     pub unlisted: BTreeSet<i64>,
     /// Projects whose issues and MRs are synced.
     pub corpus: usize,
+    /// The member projects with an avatar, by the hash of its URL.
+    pub avatars: BTreeMap<i64, u64>,
 }
 
 /// How many tracked projects each source contributed first, for the log.
@@ -55,6 +62,18 @@ impl Plan {
             ..Default::default()
         }
     }
+
+    /// [`Job::fingerprint`] plus what the plan knows: an avatar is valid for
+    /// the URL it was fetched under, so a new one is fetched at once.
+    pub fn fingerprint(&self, job: Job, c: &Config) -> u64 {
+        let base = job.fingerprint(c);
+        match job {
+            Job::ProjectAvatar(p) => {
+                fingerprint(&[base, self.avatars.get(&p).copied().unwrap_or(0)])
+            }
+            _ => base,
+        }
+    }
 }
 
 /// Plan the jobs for `population`, counting activity since `tracked_since`.
@@ -68,13 +87,15 @@ pub fn plan(store: &SyncStore, population: SearchPopulation, tracked_since: u64)
         &events,
         tracked_since,
     )?;
-    let members: BTreeSet<i64> = store
-        .projects
-        .keys(RowScope::All)?
-        .into_iter()
-        .map(|(id, _)| id as i64)
+    let projects = store.projects.scan(RowScope::All)?;
+    let members: BTreeSet<i64> = projects.iter().map(|p| p.id).collect();
+    let avatars: BTreeMap<i64, u64> = projects
+        .iter()
+        .filter(|p| !p.avatar_url.is_empty())
+        .map(|p| (p.id, text_hash(&p.avatar_url)))
         .collect();
     let mut jobs = BTreeSet::from(BASE);
+    jobs.extend(avatars.keys().map(|&p| Job::ProjectAvatar(p)));
     // Board columns are read for the assigned issues and the corpus. A
     // tracked project the user isn't a member of may be gone or closed.
     jobs.extend(
@@ -105,6 +126,7 @@ pub fn plan(store: &SyncStore, population: SearchPopulation, tracked_since: u64)
         evidence,
         unlisted,
         corpus: corpus.len(),
+        avatars,
     })
 }
 
@@ -167,8 +189,10 @@ fn viewed(store: &SyncStore, name: &str) -> Result<HashSet<RowKey>> {
 }
 
 /// Stage the removal of rows no job in `plan` keeps fresh any more: issues
-/// and MRs of unplanned projects (unless an assigned view lists them) and
-/// boards of untracked projects. Returns how many.
+/// and MRs of unplanned projects (unless an assigned view lists them),
+/// boards of untracked projects and avatars of projects that lost theirs or
+/// left the memberships (their files go with the worker's sweep). Returns
+/// how many.
 pub fn collect_garbage(commit: &mut Commit<'_>, store: &SyncStore, plan: &Plan) -> Result<usize> {
     let mut removed = 0;
     if !plan.jobs.contains(&Job::AllIssues) {
@@ -185,6 +209,9 @@ pub fn collect_garbage(commit: &mut Commit<'_>, store: &SyncStore, plan: &Plan) 
     }
     removed += commit.remove_where::<Board>(RowScope::All, |k| {
         plan.jobs.contains(&Job::ProjectBoards(k.0 as i64))
+    })?;
+    removed += commit.remove_where::<Avatar>(RowScope::All, |k| {
+        plan.jobs.contains(&Job::ProjectAvatar(k.0 as i64))
     })?;
     Ok(removed)
 }
@@ -475,6 +502,72 @@ mod tests {
         let all = plan(&s, SearchPopulation::All, 100).unwrap();
         assert!(projects_of(&all).is_empty());
         assert!(all.jobs.contains(&Job::AllIssues) && all.jobs.contains(&Job::AllMergeRequests));
+    }
+
+    fn with_avatar(id: i64, url: &str) -> Project {
+        Project {
+            id,
+            avatar_url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Every member project with an avatar gets its job, tracked or not;
+    /// the job's fingerprint follows the avatar's URL.
+    #[test]
+    fn avatars_follow_the_member_projects() {
+        let (s, _d) = store();
+        let mut c = s.begin();
+        c.upsert(&[with_avatar(7, "https://gl/a.png"), member(8)])
+            .unwrap();
+        c.commit().unwrap();
+        let cfg = crate::config::defaults();
+
+        let before = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        assert!(before.jobs.contains(&Job::ProjectAvatar(7)));
+        assert!(!before.jobs.contains(&Job::ProjectAvatar(8)), "no avatar");
+        assert!(before.tracked.is_empty());
+
+        let again = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        assert_eq!(
+            again.fingerprint(Job::ProjectAvatar(7), &cfg),
+            before.fingerprint(Job::ProjectAvatar(7), &cfg)
+        );
+
+        let mut c = s.begin();
+        c.upsert(&[with_avatar(7, "https://gl/b.png")]).unwrap();
+        c.commit().unwrap();
+        let after = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        assert_eq!(after.jobs, before.jobs);
+        assert_ne!(
+            after.fingerprint(Job::ProjectAvatar(7), &cfg),
+            before.fingerprint(Job::ProjectAvatar(7), &cfg)
+        );
+        assert_eq!(
+            after.fingerprint(Job::MemberProjects, &cfg),
+            Job::MemberProjects.fingerprint(&cfg)
+        );
+    }
+
+    #[test]
+    fn avatars_of_projects_without_one_are_garbage() {
+        let (s, _d) = store();
+        let avatar = |project_id| Avatar {
+            project_id,
+            file: format!("{project_id}-1.png"),
+        };
+        let mut c = s.begin();
+        c.upsert(&[with_avatar(7, "https://gl/a.png"), member(8)])
+            .unwrap();
+        c.upsert(&[avatar(7), avatar(8), avatar(9)]).unwrap();
+        c.commit().unwrap();
+
+        let p = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        let mut c = s.begin();
+        let removed = collect_garbage(&mut c, &s, &p).unwrap();
+        c.commit().unwrap();
+        assert_eq!(removed, 2, "8 lost its avatar, 9 its membership");
+        assert_eq!(s.avatars.keys(RowScope::All).unwrap(), [(7, 0)]);
     }
 
     #[test]

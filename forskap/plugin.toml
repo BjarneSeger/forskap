@@ -1,6 +1,6 @@
 id          = "thehoster/forskap"
 name        = "Forskap"
-version     = "0.3.0"
+version     = "0.4.0"
 plugin_api  = 24 # argument-array form of noctalia.runAsync
 author      = "thehoster"
 license     = "GPL-3.0-only"

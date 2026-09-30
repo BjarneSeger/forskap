@@ -10,7 +10,8 @@ type Issue (
   parent: string,
   total_time: string,
   graph_status: string,
-  open_count: int
+  open_count: int,
+  project_avatar: string
 )
 
 type IssuableKind (issue, merge_request)
@@ -47,14 +48,16 @@ type MergeRequest (
   web_url: string,
   state: string,
   assignees: []string,
-  open_count: int
+  open_count: int,
+  project_avatar: string
 )
 
 type Project (
   id: int,
   name: string,
   path: string,
-  web_url: string
+  web_url: string,
+  avatar: string
 )
 
 type Group (

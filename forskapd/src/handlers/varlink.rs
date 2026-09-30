@@ -278,9 +278,47 @@ impl<'a> BoardLabels<'a> {
     }
 
     /// The wire issue for `i`, with its `graph_status` from the board labels.
-    fn wire(&mut self, i: model::Issue, open_count: i64) -> Issue {
+    fn wire(&mut self, i: model::Issue, open_count: i64, project_avatar: String) -> Issue {
         let labels = self.of(i.project_id).map(<[String]>::to_vec);
-        wire::issue(i, labels.as_deref(), open_count)
+        wire::issue(i, labels.as_deref(), open_count, project_avatar)
+    }
+}
+
+/// Avatar file paths per project, read at most once per request from the
+/// rows the sync wrote; the filesystem is never asked.
+struct Avatars<'a> {
+    handlers: &'a Handlers,
+    by_project: HashMap<i64, String>,
+}
+
+impl<'a> Avatars<'a> {
+    fn new(handlers: &'a Handlers) -> Self {
+        Self {
+            handlers,
+            by_project: HashMap::new(),
+        }
+    }
+
+    /// The absolute path of the project's avatar, empty when it has none.
+    fn of(&mut self, project_id: i64) -> String {
+        let h = self.handlers;
+        self.by_project
+            .entry(project_id)
+            .or_insert_with(|| {
+                let row = h.store().avatars.get((project_id.max(0) as u64, 0));
+                let avatar = row.unwrap_or_else(|e| {
+                    warn!(error = %e, project_id, "avatar read failed");
+                    None
+                });
+                avatar
+                    .filter(|a| !a.file.is_empty())
+                    .map(|a| {
+                        let path = h.sync.avatars().path_of(&a.file);
+                        path.to_string_lossy().into_owned()
+                    })
+                    .unwrap_or_default()
+            })
+            .clone()
     }
 }
 
@@ -351,11 +389,13 @@ impl VarlinkInterface for Handlers {
 
         let usage = self.usage_or_empty();
         let mut boards = BoardLabels::new(self);
+        let mut avatars = Avatars::new(self);
         let issues: Vec<Issue> = rows
             .into_iter()
             .map(|i| {
                 let open = open_count_of(usage.get(Issuable::Issue, i.project_id, i.iid));
-                boards.wire(i, open)
+                let avatar = avatars.of(i.project_id);
+                boards.wire(i, open, avatar)
             })
             .collect();
         debug!(count = issues.len(), "serving assigned issues");
@@ -380,11 +420,13 @@ impl VarlinkInterface for Handlers {
         rows.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
 
         let usage = self.usage_or_empty();
+        let mut avatars = Avatars::new(self);
         let mrs: Vec<MergeRequest> = rows
             .into_iter()
             .map(|m| {
                 let open = open_count_of(usage.get(Issuable::MergeRequest, m.project_id, m.iid));
-                wire::merge_request(m, open)
+                let avatar = avatars.of(m.project_id);
+                wire::merge_request(m, open, avatar)
             })
             .collect();
         debug!(count = mrs.len(), "serving assigned merge requests");
@@ -427,6 +469,7 @@ impl VarlinkInterface for Handlers {
 
         let iid_query = parse_iid_query(&query);
         let usage = self.usage_or_empty();
+        let mut avatars = Avatars::new(self);
 
         let mut issues: Vec<Issue> = Vec::new();
         if want("issues") {
@@ -442,7 +485,10 @@ impl VarlinkInterface for Handlers {
             let mut boards = BoardLabels::new(self);
             issues = hits
                 .into_iter()
-                .map(|(u, i)| boards.wire(i, open_count_of(u)))
+                .map(|(u, i)| {
+                    let avatar = avatars.of(i.project_id);
+                    boards.wire(i, open_count_of(u), avatar)
+                })
                 .collect();
         }
 
@@ -459,7 +505,10 @@ impl VarlinkInterface for Handlers {
             hits.truncate(limit);
             merge_requests = hits
                 .into_iter()
-                .map(|(u, m)| wire::merge_request(m, open_count_of(u)))
+                .map(|(u, m)| {
+                    let avatar = avatars.of(m.project_id);
+                    wire::merge_request(m, open_count_of(u), avatar)
+                })
                 .collect();
         }
 
@@ -471,7 +520,13 @@ impl VarlinkInterface for Handlers {
             });
             hits.sort_by(|a, b| a.path_with_namespace.cmp(&b.path_with_namespace));
             hits.truncate(limit);
-            projects = hits.into_iter().map(wire::project).collect();
+            projects = hits
+                .into_iter()
+                .map(|p| {
+                    let avatar = avatars.of(p.id);
+                    wire::project(p, avatar)
+                })
+                .collect();
         }
 
         let mut groups: Vec<Group> = Vec::new();

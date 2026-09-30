@@ -61,6 +61,7 @@ pub fn dormant_env() -> BenchEnv {
     let reconnect_signal = Arc::new(Notify::new());
     let sync = SyncHandle::spawn(
         Arc::new(SyncStore::open(&db).unwrap()),
+        forskapd::sync::AvatarDir::new(dir.path().join("avatars")),
         Arc::clone(&session),
         Arc::clone(&config),
         Arc::clone(&reconnect_signal),
@@ -182,6 +183,7 @@ pub fn project(i: u64) -> Project {
         name: format!("proj{i}"),
         path_with_namespace: format!("{}/proj{i}", namespace(i)),
         web_url: format!("https://gl/{}/proj{i}", namespace(i)),
+        avatar_url: format!("https://gl/uploads/-/system/project/avatar/{i}/logo.png"),
     }
 }
 

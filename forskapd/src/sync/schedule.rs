@@ -115,6 +115,11 @@ pub fn fingerprint(parts: &[u64]) -> u64 {
     splitmix64(fnv1a(&bytes))
 }
 
+/// Hash a text a job syncs by (an avatar's URL), as a [`fingerprint`] part.
+pub fn text_hash(text: &str) -> u64 {
+    splitmix64(fnv1a(text.as_bytes()))
+}
+
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
         (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)

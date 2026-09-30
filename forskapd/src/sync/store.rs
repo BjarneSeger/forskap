@@ -13,6 +13,7 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use super::avatars::Avatar;
 use super::model::{Board, Event, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog};
 use super::schedule::{JobState, fingerprint};
 use crate::error::Result;
@@ -137,6 +138,7 @@ stored!(
     Event => events,
     Timelog => timelogs,
     NotedWrite => noted,
+    Avatar => avatars,
 );
 
 /// A write GitLab applied at `at`. Kept so views fetched before it are
@@ -196,6 +198,7 @@ pub struct SyncStore {
     pub events: Table<Event>,
     pub timelogs: Table<Timelog>,
     pub noted: Table<NotedWrite>,
+    pub avatars: Table<Avatar>,
     views: Keyspace,
     jobs: Keyspace,
     meta: Keyspace,
@@ -215,6 +218,7 @@ impl SyncStore {
             events: Table::open(db)?,
             timelogs: Table::open(db)?,
             noted: Table::open(db)?,
+            avatars: Table::open(db)?,
             views: ks(VIEWS_KEYSPACE)?,
             jobs: ks(JOBS_KEYSPACE)?,
             meta: ks(META_KEYSPACE)?,
@@ -346,7 +350,8 @@ impl Commit<'_> {
         Ok(())
     }
 
-    /// Drop every row, view and job state; the identity stays.
+    /// Drop every row, view and job state; the identity stays. The avatar
+    /// files go with the worker's next sweep.
     pub fn wipe(&mut self) -> Result<()> {
         self.remove_where::<Issue>(RowScope::All, |_| false)?;
         self.remove_where::<MergeRequest>(RowScope::All, |_| false)?;
@@ -356,6 +361,7 @@ impl Commit<'_> {
         self.remove_where::<Event>(RowScope::All, |_| false)?;
         self.remove_where::<Timelog>(RowScope::All, |_| false)?;
         self.remove_where::<NotedWrite>(RowScope::All, |_| false)?;
+        self.remove_where::<Avatar>(RowScope::All, |_| false)?;
         for ks in [&self.store.views, &self.store.jobs] {
             for guard in ks.iter() {
                 self.batch.remove(ks, guard.key()?);
@@ -481,6 +487,11 @@ mod tests {
         let mut c = s.begin();
         c.upsert(&[issue(1, 1, "a")]).unwrap();
         c.upsert(&[timelog(1, 10)]).unwrap();
+        c.upsert(&[Avatar {
+            project_id: 1,
+            file: "1-1.png".into(),
+        }])
+        .unwrap();
         c.set_view("v", &View::default()).unwrap();
         c.set_job(
             "j",
@@ -498,6 +509,7 @@ mod tests {
         c.commit().unwrap();
         assert!(s.issues.scan(RowScope::All).unwrap().is_empty());
         assert!(s.timelogs.scan(RowScope::All).unwrap().is_empty());
+        assert!(s.avatars.scan(RowScope::All).unwrap().is_empty());
         assert!(s.view("v").unwrap().is_none());
         assert!(s.job_states().unwrap().is_empty());
         assert_eq!(s.identity().unwrap(), Some(me));

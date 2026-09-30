@@ -4,13 +4,15 @@
 //! A job runs in two phases. [`fetch`] talks to GitLab and writes nothing;
 //! it returns a [`Staged`] commit the worker applies in one batch together
 //! with the job's new state. Dropping a fetch mid-flight therefore never
-//! leaves partial data behind.
+//! leaves partial data behind. An avatar's file is written in that second
+//! phase too, right before its row.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use tracing::{info, warn};
 
+use super::avatars::{self, Avatar, AvatarDir};
 use super::model::{Board, Event, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog};
 use super::schedule::{Cadence, JobState, fingerprint};
 use super::store::{Commit, RowScope, Stored, View};
@@ -47,6 +49,8 @@ pub enum Job {
     AllMergeRequests,
     /// Timelogs inside `history.retention_hours`; prunes older ones.
     AllTimelogs,
+    /// A member project's avatar, as a file for the launchers.
+    ProjectAvatar(i64),
 }
 
 impl Job {
@@ -65,6 +69,7 @@ impl Job {
             Self::AllIssues => "all/issues".into(),
             Self::AllMergeRequests => "all/merge_requests".into(),
             Self::AllTimelogs => "timelogs/all".into(),
+            Self::ProjectAvatar(p) => format!("project/{p}/avatar"),
         }
     }
 
@@ -74,6 +79,8 @@ impl Job {
             Self::AssignedIssues | Self::AssignedMergeRequests | Self::RecentTimelogs => 0,
             Self::Events => 1,
             Self::AllTimelogs => 3,
+            // Decoration: never ahead of data.
+            Self::ProjectAvatar(_) => 4,
             _ => 2,
         }
     }
@@ -127,11 +134,16 @@ impl Job {
                 every: c.search.partial_interval_secs,
                 full_every: Some(u64::MAX),
             },
+            // Once per avatar: only a changed fingerprint (its URL) makes
+            // the job due again.
+            Self::ProjectAvatar(_) => full_only(u64::MAX),
         }
     }
 
     /// What a success is valid for; a change (schema bump, wider window)
-    /// makes the job due at once and full.
+    /// makes the job due at once and full. The worker goes through
+    /// [`Plan::fingerprint`](super::planner::Plan::fingerprint), which adds
+    /// what the store tells.
     pub fn fingerprint(&self, c: &Config) -> u64 {
         let schema = u64::from(match self {
             Self::AssignedIssues | Self::ProjectIssues(_) | Self::AllIssues => Issue::SCHEMA,
@@ -143,6 +155,7 @@ impl Job {
             Self::ProjectBoards(_) => Board::SCHEMA,
             Self::MemberProjects => Project::SCHEMA,
             Self::MemberGroups => Group::SCHEMA,
+            Self::ProjectAvatar(_) => Avatar::SCHEMA,
         });
         match self {
             Self::ProjectIssues(_) | Self::ProjectMergeRequests(_) => {
@@ -209,6 +222,9 @@ pub struct FetchCtx {
     /// Unix seconds the run started; becomes `last_ok` on success.
     pub started: u64,
     pub windows: Windows,
+    /// What the run syncs under; becomes the state's fingerprint on success.
+    pub fingerprint: u64,
+    pub avatars: AvatarDir,
 }
 
 impl FetchCtx {
@@ -309,7 +325,41 @@ pub async fn fetch(job: Job, ctx: FetchCtx) -> Result<Staged> {
         Job::Events => events(&ctx).await,
         Job::RecentTimelogs => timelogs(&ctx, ctx.windows.quick, false).await,
         Job::AllTimelogs => timelogs(&ctx, ctx.windows.retention, true).await,
+        Job::ProjectAvatar(project_id) => avatar(&ctx, project_id).await,
     }
+}
+
+/// A project's avatar as a local file. A row is stored either way: without
+/// a file when GitLab has no image a launcher could show, so the job rests
+/// until the avatar changes.
+async fn avatar(ctx: &FetchCtx, project_id: i64) -> Result<Staged> {
+    let image = ctx
+        .gitlab
+        .project_avatar(project_id)
+        .await?
+        .and_then(|bytes| {
+            let ext = avatars::extension(&bytes).filter(|_| bytes.len() <= avatars::MAX_BYTES);
+            if ext.is_none() {
+                warn!(
+                    project_id,
+                    bytes = bytes.len(),
+                    "skipping a project avatar: too large or not a known image format"
+                );
+            }
+            Some((avatars::file_name(project_id, ctx.fingerprint, ext?), bytes))
+        });
+    let dir = ctx.avatars.clone();
+    Ok(Staged::new(move |c| {
+        let file = match image {
+            Some((file, bytes)) => {
+                dir.write(&file, &bytes)?;
+                file
+            }
+            None => String::new(),
+        };
+        c.upsert(&[Avatar { project_id, file }])?;
+        Ok(1)
+    }))
 }
 
 /// One project's issues or MRs, newest first and capped: a huge project
@@ -505,7 +555,7 @@ pub async fn fetch_rows<R: Resource>(
 mod tests {
     use super::*;
     use crate::sync::store::SyncStore;
-    use crate::testing::{FakeGitlab, event_json, issue_json};
+    use crate::testing::{FakeErr, FakeGitlab, PNG, event_json, issue_json};
     use serde_json::json;
 
     const DAY: u64 = 86_400;
@@ -521,6 +571,16 @@ mod tests {
     }
 
     fn ctx(fake: &Arc<FakeGitlab>, full: bool, last_ok: u64) -> FetchCtx {
+        ctx_in(fake, full, last_ok, std::env::temp_dir())
+    }
+
+    /// [`ctx`] writing avatars into `avatars`.
+    fn ctx_in(
+        fake: &Arc<FakeGitlab>,
+        full: bool,
+        last_ok: u64,
+        avatars: impl Into<std::path::PathBuf>,
+    ) -> FetchCtx {
         FetchCtx {
             gitlab: Arc::clone(fake) as Arc<dyn GitlabApi>,
             full,
@@ -535,6 +595,8 @@ mod tests {
                 tracked: 30 * DAY,
                 project_cap: 2,
             },
+            fingerprint: 0xabc,
+            avatars: AvatarDir::new(avatars),
         }
     }
 
@@ -805,6 +867,50 @@ mod tests {
             fake.timelog_calls()[1],
             chrono::DateTime::from_timestamp((NOW - DAY) as i64, 0).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn an_avatar_lands_as_a_file_named_in_its_row() {
+        let (s, d) = store();
+        let dir = d.path().join("avatars");
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve_avatar(7, PNG);
+        run(&s, Job::ProjectAvatar(7), ctx_in(&fake, true, 0, &dir)).await;
+
+        let row = s.avatars.get((7, 0)).unwrap().unwrap();
+        assert_eq!(row.file, "7-0000000000000abc.png");
+        assert_eq!(std::fs::read(dir.join(&row.file)).unwrap(), PNG);
+        assert_eq!(fake.avatar_calls(), [7]);
+    }
+
+    /// No avatar (a 404), an oversized one and an HTML error page all leave
+    /// a row without a file: a success, so the job doesn't run again.
+    #[tokio::test]
+    async fn an_unusable_avatar_leaves_a_row_without_a_file() {
+        let (s, d) = store();
+        let dir = d.path().join("avatars");
+        let fake = Arc::new(FakeGitlab::default());
+        let mut huge = PNG.to_vec();
+        huge.resize(avatars::MAX_BYTES + 1, 0);
+        fake.serve_avatar(8, &huge);
+        fake.serve_avatar(9, b"<html>Sign in</html>");
+        for project in [7, 8, 9] {
+            let job = Job::ProjectAvatar(project);
+            run(&s, job, ctx_in(&fake, true, 0, &dir)).await;
+            let row = s.avatars.get((project as u64, 0)).unwrap().unwrap();
+            assert_eq!(row.file, "", "project {project}");
+        }
+        assert!(!dir.exists(), "nothing was written");
+    }
+
+    #[tokio::test]
+    async fn a_failed_avatar_download_stores_nothing() {
+        let (s, d) = store();
+        let fake = Arc::new(FakeGitlab::default());
+        fake.fail_next("projects/7/avatar", FakeErr::Rejected);
+        let failed = fetch(Job::ProjectAvatar(7), ctx_in(&fake, true, 0, d.path())).await;
+        assert!(failed.is_err());
+        assert!(s.avatars.get((7, 0)).unwrap().is_none());
     }
 
     #[test]

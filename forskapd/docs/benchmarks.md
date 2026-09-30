@@ -11,7 +11,7 @@ after every mutation, so a bench would measure the disk, not the code).
 | Target | Covers |
 |---|---|
 | `search` | The `Search` handler over a seeded corpus (1k/10k/50k entries): needle-miss scans, ~1% hit scans with the per-hit board lookup, all-kinds scans, `#iid` reference queries. Plus the pure matchers `text_matches`/`parse_iid_query`. |
-| `storage` | Raw `KvStore` full scans (fjall iteration + per-entry JSON decode), the sync store's table scan and batch upsert, the timelog window scan and band clear, and full-run reconciles (whole table and one project's key range). |
+| `storage` | Raw `KvStore` full scans (fjall iteration + per-entry JSON decode), the sync store's table scan and batch upsert, the timelog window scan and band clear, full-run reconciles (whole table and one project's key range), and the sync plan over 1k/10k member projects with an avatar each. |
 | `handlers` | `GetAssignedMergeRequests` (view → point reads, with and without group filter) and `GetHistory` (timelog window scan). |
 
 Handler benches drive the real varlink surface: the generated `AsyncCall`

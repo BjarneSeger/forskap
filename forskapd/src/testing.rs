@@ -4,8 +4,9 @@
 //! rows (empty by default), one-shot failures can be queued in front, and a
 //! path can be gated to hold its next call until released. Every call is
 //! recorded for assertions. Writes succeed unless a failure is queued, and
-//! can all be held behind one gate to observe them in flight. The token calls
-//! fail like reads, by their path ([`TOKEN_PATH`], [`ROTATE_PATH`]).
+//! can all be held behind one gate to observe them in flight. The token and
+//! avatar calls fail like reads, by their path ([`TOKEN_PATH`],
+//! [`ROTATE_PATH`], `projects/<id>/avatar`).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -69,6 +70,9 @@ pub struct FakeGitlab {
     /// The row limit of each call in `calls`.
     limits: Mutex<Vec<Option<usize>>>,
     timelog_calls: Mutex<Vec<chrono::DateTime<chrono::Utc>>>,
+    avatars: Mutex<HashMap<i64, Vec<u8>>>,
+    /// The project of every avatar download.
+    avatar_calls: Mutex<Vec<i64>>,
     write_failures: Mutex<VecDeque<FakeErr>>,
     writes: Mutex<Vec<WriteCall>>,
     /// Holds every write while set; see [`FakeGitlab::gate_writes`].
@@ -131,6 +135,19 @@ impl FakeGitlab {
 
     pub fn serve_timelogs(&self, rows: Vec<Timelog>) {
         *self.timelogs.lock().unwrap() = rows;
+    }
+
+    /// Serve `image` as the project's avatar; a project without one is a 404.
+    pub fn serve_avatar(&self, project_id: i64, image: &[u8]) {
+        self.avatars
+            .lock()
+            .unwrap()
+            .insert(project_id, image.to_vec());
+    }
+
+    /// The project of every avatar download so far.
+    pub fn avatar_calls(&self) -> Vec<i64> {
+        self.avatar_calls.lock().unwrap().clone()
     }
 
     pub fn serve_token(&self, info: TokenInfo) {
@@ -202,9 +219,11 @@ impl FakeGitlab {
         self.timelog_calls.lock().unwrap().clone()
     }
 
-    /// Every read so far: listings plus timelog queries.
+    /// Every read so far: listings, timelog queries and avatar downloads.
     pub fn read_calls(&self) -> usize {
-        self.calls.lock().unwrap().len() + self.timelog_calls.lock().unwrap().len()
+        self.calls.lock().unwrap().len()
+            + self.timelog_calls.lock().unwrap().len()
+            + self.avatar_calls.lock().unwrap().len()
     }
 
     pub fn writes(&self) -> Vec<WriteCall> {
@@ -270,6 +289,14 @@ impl GitlabApi for FakeGitlab {
     async fn list_timelogs(&self, since: chrono::DateTime<chrono::Utc>) -> Result<Vec<Timelog>> {
         self.timelog_calls.lock().unwrap().push(since);
         Ok(self.timelogs.lock().unwrap().clone())
+    }
+
+    async fn project_avatar(&self, project_id: i64) -> Result<Option<Vec<u8>>> {
+        self.avatar_calls.lock().unwrap().push(project_id);
+        if let Some(err) = self.next_failure(&format!("projects/{project_id}/avatar")) {
+            return Err(err.error());
+        }
+        Ok(self.avatars.lock().unwrap().get(&project_id).cloned())
     }
 
     async fn add_spent_time(
@@ -363,14 +390,27 @@ pub fn issue_json(project_id: i64, iid: i64, title: &str) -> Value {
     })
 }
 
-/// A member project as GitLab's `simple=true` listing returns it.
+/// The smallest thing [`crate::sync::avatars::extension`] takes for a PNG.
+pub const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// A member project as GitLab's `simple=true` listing returns it, without an
+/// avatar.
 pub fn project_json(id: i64) -> Value {
     serde_json::json!({
         "id": id,
         "name": format!("p{id}"),
         "path_with_namespace": format!("g/p{id}"),
         "web_url": format!("https://gitlab.test/g/p{id}"),
+        "avatar_url": null,
     })
+}
+
+/// [`project_json`] with the avatar `file` uploaded.
+pub fn project_json_with_avatar(id: i64, file: &str) -> Value {
+    let mut project = project_json(id);
+    project["avatar_url"] =
+        format!("https://gitlab.test/uploads/-/system/project/avatar/{id}/{file}").into();
+    project
 }
 
 /// One of the user's contribution events, created `created_at` (unix secs).

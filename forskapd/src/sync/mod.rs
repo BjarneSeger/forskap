@@ -7,7 +7,9 @@
 //! - [`planner`]: which jobs to keep scheduled (the tracked projects).
 //! - [`schedule`]: jittered due times and backoff, as pure functions.
 //! - [`engine`]: the single worker running it all, and the handlers' handle.
+//! - [`avatars`]: the project avatar files and the rows naming them.
 
+pub mod avatars;
 pub mod engine;
 pub mod jobs;
 pub mod model;
@@ -15,6 +17,7 @@ pub mod planner;
 pub mod schedule;
 pub mod store;
 
+pub use avatars::AvatarDir;
 pub use engine::{Clear, SyncHandle};
 pub use jobs::Job;
 

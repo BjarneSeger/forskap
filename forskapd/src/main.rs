@@ -11,7 +11,7 @@ use forskapd::handlers::{ConnState, Handlers, Session, SessionSlot};
 use forskapd::queue::{RetryQueue, SettleHook};
 use forskapd::service::ServiceHandler;
 use forskapd::sync::store::SyncStore;
-use forskapd::sync::{Job, SyncHandle};
+use forskapd::sync::{AvatarDir, Job, SyncHandle};
 use forskapd::usage::UsageStats;
 use forskapd::write::Write;
 use forskapd::{config, db, migrate, reconnect, reload, rotate, secrets, server};
@@ -73,6 +73,11 @@ async fn main() -> Result<()> {
         }
     }
     let db_dir = data_dir.join("db");
+    // Re-fetchable, hence the cache directory; launchers read the files.
+    let avatar_dir = dirs::cache_dir()
+        .unwrap_or_else(|| "~/.cache".into())
+        .join("forskapd")
+        .join("avatars");
 
     // Credentials come only from the OS keychain (set via `forskap auth login`). The
     // daemon never refuses to start: any failure here leaves it *dormant*
@@ -117,6 +122,7 @@ async fn main() -> Result<()> {
     // which the handlers serve from.
     let sync = SyncHandle::spawn(
         store,
+        AvatarDir::new(avatar_dir),
         Arc::clone(&session),
         Arc::clone(&config),
         Arc::clone(&reconnect_signal),

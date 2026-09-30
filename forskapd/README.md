@@ -72,6 +72,13 @@ daemon rotates up to a day earlier than configured, by a random share of its own
 two of them rarely rotate before the keychain has synchronized. If they do, the
 later rotation revokes the new token and `forskap auth login` is needed.
 
+### Project avatars
+
+The avatars of the projects you are a member of are downloaded to
+`$XDG_CACHE_HOME/forskapd/avatars/`, for the launchers to show. Each is fetched once
+and again when the project's avatar changes; `forskap sync refresh --scope search`
+fetches all of them again. Needs GitLab 16.9 or newer.
+
 Logging can be set by changing the `FORSKAPD_LOG` environment variable to
 `trace`, `debug`, `info`, `warn` or `error` (ordered from most to least verbose)
 

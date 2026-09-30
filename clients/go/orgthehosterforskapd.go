@@ -12,16 +12,17 @@ import (
 // Generated type declarations
 
 type Issue struct {
-	Id           int64  `json:"id"`
-	Iid          int64  `json:"iid"`
-	Project_id   int64  `json:"project_id"`
-	Title        string `json:"title"`
-	Web_url      string `json:"web_url"`
-	State        string `json:"state"`
-	Parent       string `json:"parent"`
-	Total_time   string `json:"total_time"`
-	Graph_status string `json:"graph_status"`
-	Open_count   int64  `json:"open_count"`
+	Id             int64  `json:"id"`
+	Iid            int64  `json:"iid"`
+	Project_id     int64  `json:"project_id"`
+	Title          string `json:"title"`
+	Web_url        string `json:"web_url"`
+	State          string `json:"state"`
+	Parent         string `json:"parent"`
+	Total_time     string `json:"total_time"`
+	Graph_status   string `json:"graph_status"`
+	Open_count     int64  `json:"open_count"`
+	Project_avatar string `json:"project_avatar"`
 }
 
 type IssuableKind string
@@ -51,14 +52,15 @@ type FailedTask struct {
 }
 
 type MergeRequest struct {
-	Id         int64    `json:"id"`
-	Iid        int64    `json:"iid"`
-	Project_id int64    `json:"project_id"`
-	Title      string   `json:"title"`
-	Web_url    string   `json:"web_url"`
-	State      string   `json:"state"`
-	Assignees  []string `json:"assignees"`
-	Open_count int64    `json:"open_count"`
+	Id             int64    `json:"id"`
+	Iid            int64    `json:"iid"`
+	Project_id     int64    `json:"project_id"`
+	Title          string   `json:"title"`
+	Web_url        string   `json:"web_url"`
+	State          string   `json:"state"`
+	Assignees      []string `json:"assignees"`
+	Open_count     int64    `json:"open_count"`
+	Project_avatar string   `json:"project_avatar"`
 }
 
 type Project struct {
@@ -66,6 +68,7 @@ type Project struct {
 	Name    string `json:"name"`
 	Path    string `json:"path"`
 	Web_url string `json:"web_url"`
+	Avatar  string `json:"avatar"`
 }
 
 type Group struct {
@@ -1503,7 +1506,8 @@ type Issue (
   parent: string,
   total_time: string,
   graph_status: string,
-  open_count: int
+  open_count: int,
+  project_avatar: string
 )
 
 type IssuableKind (issue, merge_request)
@@ -1540,14 +1544,16 @@ type MergeRequest (
   web_url: string,
   state: string,
   assignees: []string,
-  open_count: int
+  open_count: int,
+  project_avatar: string
 )
 
 type Project (
   id: int,
   name: string,
   path: string,
-  web_url: string
+  web_url: string,
+  avatar: string
 )
 
 type Group (

@@ -1,8 +1,9 @@
 //! GitLab API access — the only module that knows about the `gitlab` crate.
 //!
 //! Wraps `gitlab::AsyncGitlab`: one paginated endpoint for every read
-//! ([`Listing`]), the GraphQL timelog query, and the write endpoints the crate
-//! doesn't ship (`add_spent_time`, `close`, assignment, token rotation).
+//! ([`Listing`]), the GraphQL timelog query, the project avatar download, and
+//! the write endpoints the crate doesn't ship (`add_spent_time`, `close`,
+//! assignment, token rotation).
 
 use std::borrow::Cow;
 use std::future::Future;
@@ -233,6 +234,10 @@ pub trait GitlabApi: Send + Sync {
     /// whose issue or MR the user can no longer read comes with `iid` 0: it
     /// exists, but its details are gone.
     async fn list_timelogs(&self, since: chrono::DateTime<chrono::Utc>) -> Result<Vec<Timelog>>;
+
+    /// A project's avatar image as uploaded; `None` when GitLab has none to
+    /// serve (no avatar, or an instance older than 16.9 without the endpoint).
+    async fn project_avatar(&self, project_id: i64) -> Result<Option<Vec<u8>>>;
 
     /// Scopes and lifetime of the token this client authenticates with.
     async fn token_info(&self) -> Result<TokenInfo>;
@@ -496,6 +501,19 @@ impl GitlabApi for GitlabClient {
     }
 
     #[instrument(skip(self))]
+    async fn project_avatar(&self, project_id: i64) -> Result<Option<Vec<u8>>> {
+        let endpoint = gitlab::api::raw(ProjectAvatarEndpoint { project_id });
+        retry_transient("fetch avatar", || async {
+            match endpoint.query_async(&self.inner).await {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if status_of(&e) == Some(404) => Ok(None),
+                Err(e) => Err(classify(e)),
+            }
+        })
+        .await
+    }
+
+    #[instrument(skip(self))]
     async fn token_info(&self) -> Result<TokenInfo> {
         let raw: serde_json::Value = SelfTokenEndpoint
             .query_async(&self.inner)
@@ -512,7 +530,7 @@ impl GitlabApi for GitlabClient {
             .query_async(&self.inner)
             .await
             .map_err(|e| {
-                let refused = has_status(&e);
+                let refused = status_of(&e).is_some();
                 match classify(e) {
                     // No status to tell a refusal by: GitLab may have rotated.
                     Error::Gitlab(detail) if !refused => Error::RotationLost(detail),
@@ -520,6 +538,22 @@ impl GitlabApi for GitlabClient {
                 }
             })?;
         rotated_token_from(&raw)
+    }
+}
+
+/// `GET /projects/:id/avatar`: the image itself, readable with the token
+/// where the avatar's upload URL needs a browser session.
+struct ProjectAvatarEndpoint {
+    project_id: i64,
+}
+
+impl gitlab::api::Endpoint for ProjectAvatarEndpoint {
+    fn method(&self) -> http::Method {
+        http::Method::GET
+    }
+
+    fn endpoint(&self) -> Cow<'static, str> {
+        format!("projects/{}/avatar", self.project_id).into()
     }
 }
 
@@ -647,35 +681,34 @@ where
 {
     use gitlab::api::ApiError as A;
     let detail = e.to_string();
-    let (status, retry_after) = match &e {
+    let retry_after = match &e {
         A::Client { .. } => return Error::Transient(detail),
         // Only the single-request path parses the rate-limit headers; the
         // paged path reports a 429 as one of the plain status variants.
-        A::GitlabRateLimited { retry_after, .. } => (429, Some(*retry_after)),
-        A::GitlabService { status, .. }
-        | A::GitlabWithStatus { status, .. }
-        | A::GitlabObjectWithStatus { status, .. }
-        | A::GitlabUnrecognizedWithStatus { status, .. } => (status.as_u16(), None),
-        _ => return Error::Gitlab(detail),
+        A::GitlabRateLimited { retry_after, .. } => Some(*retry_after),
+        _ => None,
     };
-    throttled_or_rejected(status, retry_after, detail)
+    match status_of(&e) {
+        Some(status) => throttled_or_rejected(status, retry_after, detail),
+        None => Error::Gitlab(detail),
+    }
 }
 
-/// Whether GitLab answered with an HTTP status, as opposed to a failure
-/// before the request or while reading the answer.
-fn has_status<E>(e: &gitlab::api::ApiError<E>) -> bool
+/// The HTTP status GitLab answered with; `None` for a failure before the
+/// request or while reading the answer.
+fn status_of<E>(e: &gitlab::api::ApiError<E>) -> Option<u16>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
     use gitlab::api::ApiError as A;
-    matches!(
-        e,
-        A::GitlabRateLimited { .. }
-            | A::GitlabService { .. }
-            | A::GitlabWithStatus { .. }
-            | A::GitlabObjectWithStatus { .. }
-            | A::GitlabUnrecognizedWithStatus { .. }
-    )
+    match e {
+        A::GitlabRateLimited { .. } => Some(429),
+        A::GitlabService { status, .. }
+        | A::GitlabWithStatus { status, .. }
+        | A::GitlabObjectWithStatus { status, .. }
+        | A::GitlabUnrecognizedWithStatus { status, .. } => Some(status.as_u16()),
+        _ => None,
+    }
 }
 
 /// [`Error::Throttled`] for 429/5xx, [`Error::Unauthorized`] for 401,
@@ -1377,6 +1410,15 @@ mod tests {
             let removed = compute_new_assignees(&added, self_id, false).expect("present → change");
             prop_assert_eq!(removed, current);
         }
+    }
+
+    #[test]
+    fn the_avatar_endpoint_renders_its_path() {
+        use gitlab::api::Endpoint;
+
+        let avatar = ProjectAvatarEndpoint { project_id: 7 };
+        assert_eq!(avatar.endpoint(), "projects/7/avatar");
+        assert_eq!(avatar.method(), http::Method::GET);
     }
 
     #[test]
