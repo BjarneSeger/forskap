@@ -14,6 +14,6 @@ pub async fn run() -> Result<()> {
         .call()
         .await
         .map_err(|e| friendly("Logout", e))?;
-    println!("Logged out.");
+    outln!("Logged out.")?;
     Ok(())
 }

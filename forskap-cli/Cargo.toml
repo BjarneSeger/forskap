@@ -27,11 +27,9 @@ inquire.workspace = true
 open = "5"
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 varlink.workspace = true
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus.workspace = true

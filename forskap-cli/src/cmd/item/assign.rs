@@ -17,9 +17,9 @@ pub async fn run(kind: RefKind, target: TargetArgs) -> Result<()> {
         .await
         .map_err(|e| friendly("AssignSelf", e))?;
 
-    println!(
+    outln!(
         "assigned to {}{iid} (project {project_id})",
         refspec::sigil(kind)
-    );
+    )?;
     Ok(())
 }

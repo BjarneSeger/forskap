@@ -7,12 +7,20 @@
 //!
 //! [`forskapd`]: ../../forskapd/README.md
 
+// A closed stdout must not panic: print with `out!` / `outln!`.
+#![warn(clippy::print_stdout)]
+
 use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::path::Path;
+use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::Parser;
+
+// First, so the modules below see `out!` / `outln!`.
+#[macro_use]
+mod output;
 
 /// Clap-derived command-line surface.
 ///
@@ -29,7 +37,6 @@ mod cmd;
 mod config;
 mod friendly;
 mod migrate;
-mod output;
 mod refspec;
 mod state;
 
@@ -40,8 +47,19 @@ use refspec::RefKind;
 /// round-trips plus stdin/stdout work, so a multi-thread runtime would just add
 /// startup overhead to the hot `forskap tick` path (fires on every shell prompt).
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
-    die_on_closed_pipe();
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        // `forskap issue list | head`: the reader has what it wanted.
+        Err(e) if e.is::<output::StdoutClosed>() => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     migrate::run();
     let command = Cli::parse().command;
     if !matches!(command, Command::Tick { .. } | Command::Prompt) {
@@ -60,26 +78,11 @@ async fn main() -> Result<()> {
         Command::Auth { command } => cmd::auth::run(command).await,
         Command::Sync { command } => cmd::sync::run(command).await,
         Command::Queue { command } => cmd::queue::run(command).await,
-        Command::Config { command } => {
-            cmd::config::run(command);
-            Ok(())
-        }
+        Command::Config { command } => cmd::config::run(command),
         #[cfg(target_os = "linux")]
         Command::Integration { command } => cmd::integration::run(command).await,
         Command::Tick { mode } => cmd::time::tick::run(mode).await,
         Command::Prompt => cmd::time::prompt::run().await,
-    }
-}
-
-/// Rust ignores SIGPIPE, so `forskap issue list | head` would panic in
-/// `println!` once `head` is done. Take the signal's default again: exit
-/// quietly, like any other filter.
-fn die_on_closed_pipe() {
-    // SAFETY: called first in `main`, before another thread exists; setting
-    // a signal's default disposition has no other precondition.
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 

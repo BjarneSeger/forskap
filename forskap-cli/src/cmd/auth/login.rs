@@ -17,11 +17,11 @@ pub async fn run(host: String) -> Result<()> {
         "https://{host}/-/user_settings/personal_access_tokens?name=forskapd&scopes=api,read_user,self_rotate"
     );
 
-    println!("Opening {url}");
-    println!(
+    outln!("Opening {url}")?;
+    outln!(
         "Generate a token with the `api`, `read_user` and `self_rotate` scopes, then paste it below."
-    );
-    println!("With `self_rotate` the daemon renews the token before it expires.");
+    )?;
+    outln!("With `self_rotate` the daemon renews the token before it expires.")?;
     if let Err(e) = open::that(&url) {
         eprintln!("(couldn't open browser automatically: {e})");
         eprintln!("Open the URL above manually.");
@@ -56,6 +56,6 @@ pub async fn run(host: String) -> Result<()> {
         .call()
         .await
         .map_err(|e| friendly("WhoAmI", e))?;
-    println!("Logged in to {} as user #{}.", me.host, me.user_id);
+    outln!("Logged in to {} as user #{}.", me.host, me.user_id)?;
     Ok(())
 }

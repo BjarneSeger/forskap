@@ -25,11 +25,11 @@ pub async fn run(format: OutputFormat) -> Result<()> {
             "token_rotates": me.token_rotates,
         }),
         |_| {
-            println!("Logged in to {} as user #{}.", me.host, me.user_id);
-            println!(
+            outln!("Logged in to {} as user #{}.", me.host, me.user_id)?;
+            outln!(
                 "{}",
                 token_line(me.token_expires_at, me.token_rotates, Utc::now())
-            );
+            )
         },
     )
 }

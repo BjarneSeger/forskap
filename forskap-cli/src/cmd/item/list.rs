@@ -25,8 +25,9 @@ pub async fn run(kind: RefKind, groups: Vec<String>, format: OutputFormat) -> Re
                 .map_err(|e| friendly("GetAssignedIssues", e))?;
             output::emit(format, &reply.issues, |issues| {
                 for i in issues {
-                    println!("#{:<5} {:<8} {}  {}", i.iid, i.state, i.title, i.web_url);
+                    outln!("#{:<5} {:<8} {}  {}", i.iid, i.state, i.title, i.web_url)?;
                 }
+                Ok(())
             })
         }
         RefKind::Mr => {
@@ -37,8 +38,9 @@ pub async fn run(kind: RefKind, groups: Vec<String>, format: OutputFormat) -> Re
                 .map_err(|e| friendly("GetAssignedMergeRequests", e))?;
             output::emit(format, &reply.merge_requests, |mrs| {
                 for m in mrs {
-                    println!("!{:<5} {:<8} {}  {}", m.iid, m.state, m.title, m.web_url);
+                    outln!("!{:<5} {:<8} {}  {}", m.iid, m.state, m.title, m.web_url)?;
                 }
+                Ok(())
             })
         }
     }
