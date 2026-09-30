@@ -45,9 +45,9 @@ pub async fn run(
     });
     state::save(&st).context("saving state")?;
 
-    println!(
+    outln!(
         "logged {duration} on {}{iid} (project {project_id})",
         refspec::sigil(kind)
-    );
+    )?;
     Ok(())
 }

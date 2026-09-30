@@ -17,9 +17,9 @@ pub async fn run(kind: RefKind, target: TargetArgs) -> Result<()> {
         .await
         .map_err(|e| friendly("Close", e))?;
 
-    println!(
+    outln!(
         "closed {}{iid} (project {project_id})",
         refspec::sigil(kind)
-    );
+    )?;
     Ok(())
 }

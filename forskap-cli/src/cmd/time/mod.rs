@@ -22,9 +22,6 @@ pub async fn run(command: TimeCommand) -> Result<()> {
         } => log::run(&reference, duration, mr, project.project, summary).await,
         TimeCommand::Prompt => prompt::run().await,
         TimeCommand::History { window, output } => history::run(window.days, output.output).await,
-        TimeCommand::Hook { shell } => {
-            hook::run(shell);
-            Ok(())
-        }
+        TimeCommand::Hook { shell } => hook::run(shell),
     }
 }

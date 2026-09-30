@@ -66,13 +66,13 @@ pub fn run(prefix: Option<PathBuf>) -> Result<()> {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         fs::write(&dst, body.replace(PACKAGED_BIN, exe))
             .with_context(|| format!("writing {}", dst.display()))?;
-        println!("wrote {}", dst.display());
+        outln!("wrote {}", dst.display())?;
     }
 
     for rel in LEGACY_FILES {
         let old = prefix.join(rel);
         match fs::remove_file(&old) {
-            Ok(()) => println!("removed {}", old.display()),
+            Ok(()) => outln!("removed {}", old.display())?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e).with_context(|| format!("removing {}", old.display())),
         }
@@ -80,7 +80,7 @@ pub fn run(prefix: Option<PathBuf>) -> Result<()> {
 
     let data_dirs = xdg_data_dirs();
     if !data_dirs.iter().any(|d| same_dir(d, &prefix)) {
-        println!(
+        outln!(
             "note: GNOME Shell loads search providers only from $XDG_DATA_DIRS ({}), \
              not from {}; KRunner and D-Bus activation work from there.",
             data_dirs
@@ -89,13 +89,13 @@ pub fn run(prefix: Option<PathBuf>) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(":"),
             prefix.display()
-        );
+        )?;
     }
-    println!(
+    outln!(
         "Reload the bus with `busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
          org.freedesktop.DBus ReloadConfig`; GNOME Shell picks the provider up at the next \
          login, KRunner after `kquitapp6 krunner`."
-    );
+    )?;
     Ok(())
 }
 

@@ -26,10 +26,14 @@ pub async fn run(days: u32, format: OutputFormat) -> Result<()> {
                 IssuableKind::merge_request => '!',
                 IssuableKind::issue => '#',
             };
-            println!(
+            outln!(
                 "{ts}  {:<8}  {sigil}{:<5}  {:<6}  {}",
-                e.source, e.iid, e.duration, e.title
-            );
+                e.source,
+                e.iid,
+                e.duration,
+                e.title
+            )?;
         }
+        Ok(())
     })
 }

@@ -34,7 +34,7 @@ pub async fn run(
             && reply.projects.is_empty()
             && reply.groups.is_empty()
         {
-            println!(
+            return outln!(
                 "{}",
                 if frequent_only {
                     "no frequently opened items yet (see `forskap issue open`)"
@@ -42,46 +42,46 @@ pub async fn run(
                     "no matches"
                 }
             );
-            return;
         }
         if !reply.issues.is_empty() {
-            println!("Issues:");
+            outln!("Issues:")?;
             for i in &reply.issues {
-                println!(
+                outln!(
                     "  #{:<5} {:<8} {}  {}{}",
                     i.iid,
                     i.state,
                     i.title,
                     i.web_url,
                     opened(i.open_count)
-                );
+                )?;
             }
         }
         if !reply.merge_requests.is_empty() {
-            println!("Merge requests:");
+            outln!("Merge requests:")?;
             for m in &reply.merge_requests {
-                println!(
+                outln!(
                     "  !{:<5} {:<8} {}  {}{}",
                     m.iid,
                     m.state,
                     m.title,
                     m.web_url,
                     opened(m.open_count)
-                );
+                )?;
             }
         }
         if !reply.projects.is_empty() {
-            println!("Projects:");
+            outln!("Projects:")?;
             for p in &reply.projects {
-                println!("  {}  {}", p.path, p.web_url);
+                outln!("  {}  {}", p.path, p.web_url)?;
             }
         }
         if !reply.groups.is_empty() {
-            println!("Groups:");
+            outln!("Groups:")?;
             for g in &reply.groups {
-                println!("  {}  {}", g.path, g.web_url);
+                outln!("  {}  {}", g.path, g.web_url)?;
             }
         }
+        Ok(())
     })
 }
 

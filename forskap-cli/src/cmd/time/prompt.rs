@@ -107,7 +107,7 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
         .merge_requests;
 
     if issues.is_empty() && mrs.is_empty() {
-        println!("no assigned issues or merge requests");
+        outln!("no assigned issues or merge requests")?;
         return Ok(false);
     }
 
@@ -128,7 +128,7 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
         let picked = match Select::new("What are you working on?", choices).prompt() {
             Ok(p) => p,
             Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
-                println!("(skipped)");
+                outln!("(skipped)")?;
                 return Ok(None);
             }
             Err(e) => return Err(e).context("issue picker"),
@@ -140,7 +140,7 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
         {
             Ok(d) => d,
             Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
-                println!("(skipped)");
+                outln!("(skipped)")?;
                 return Ok(None);
             }
             Err(e) => return Err(e).context("duration prompt"),
@@ -191,11 +191,11 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
     });
     state::save(&st).context("saving state")?;
 
-    println!(
+    outln!(
         "logged {duration} on {}{} ({})",
         refspec::sigil(kind),
         picked.iid(),
         picked.title()
-    );
+    )?;
     Ok(true)
 }

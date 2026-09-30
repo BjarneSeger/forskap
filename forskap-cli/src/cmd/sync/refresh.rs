@@ -42,14 +42,14 @@ pub async fn run(mut scopes: Vec<RefreshScope>) -> Result<()> {
         .map_err(|e| friendly("ClearCache", e))?;
 
     if scopes.is_empty() {
-        println!("cache cleared");
+        outln!("cache cleared")?;
     } else {
         let names: Vec<_> = scopes
             .iter()
             .filter_map(|s| s.to_possible_value())
             .map(|v| v.get_name().to_string())
             .collect();
-        println!("cleared: {}", names.join(", "));
+        outln!("cleared: {}", names.join(", "))?;
     }
     Ok(())
 }

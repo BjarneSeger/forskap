@@ -7,12 +7,20 @@
 //!
 //! [`forskapd`]: ../../forskapd/README.md
 
+// A closed stdout must not panic: print with `out!` / `outln!`.
+#![warn(clippy::print_stdout)]
+
 use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::path::Path;
+use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::Parser;
+
+// First, so the modules below see `out!` / `outln!`.
+#[macro_use]
+mod output;
 
 /// Clap-derived command-line surface.
 ///
@@ -29,7 +37,6 @@ mod cmd;
 mod config;
 mod friendly;
 mod migrate;
-mod output;
 mod refspec;
 mod state;
 
@@ -40,7 +47,19 @@ use refspec::RefKind;
 /// round-trips plus stdin/stdout work, so a multi-thread runtime would just add
 /// startup overhead to the hot `forskap tick` path (fires on every shell prompt).
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        // `forskap issue list | head`: the reader has what it wanted.
+        Err(e) if e.is::<output::StdoutClosed>() => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     migrate::run();
     let command = Cli::parse().command;
     if !matches!(command, Command::Tick { .. } | Command::Prompt) {
@@ -59,10 +78,7 @@ async fn main() -> Result<()> {
         Command::Auth { command } => cmd::auth::run(command).await,
         Command::Sync { command } => cmd::sync::run(command).await,
         Command::Queue { command } => cmd::queue::run(command).await,
-        Command::Config { command } => {
-            cmd::config::run(command);
-            Ok(())
-        }
+        Command::Config { command } => cmd::config::run(command),
         #[cfg(target_os = "linux")]
         Command::Integration { command } => cmd::integration::run(command).await,
         Command::Tick { mode } => cmd::time::tick::run(mode).await,

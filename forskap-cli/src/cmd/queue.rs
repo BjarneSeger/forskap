@@ -24,7 +24,7 @@ pub async fn run(command: QueueCommand) -> Result<()> {
                 .call()
                 .await
                 .map_err(|e| friendly("RetryFailure", e))?;
-            println!("re-enqueued failed write {id}");
+            outln!("re-enqueued failed write {id}")?;
             Ok(())
         }
         QueueCommand::Dismiss { id } => {
@@ -33,7 +33,7 @@ pub async fn run(command: QueueCommand) -> Result<()> {
                 .call()
                 .await
                 .map_err(|e| friendly("DismissFailure", e))?;
-            println!("dismissed failed write {id}");
+            outln!("dismissed failed write {id}")?;
             Ok(())
         }
         QueueCommand::Clear => {
@@ -42,7 +42,7 @@ pub async fn run(command: QueueCommand) -> Result<()> {
                 .call()
                 .await
                 .map_err(|e| friendly("ClearFailures", e))?;
-            println!("cleared all failed writes");
+            outln!("cleared all failed writes")?;
             Ok(())
         }
     }
@@ -57,8 +57,7 @@ async fn list(client: &VarlinkClient, format: OutputFormat) -> Result<()> {
 
     output::emit(format, &reply.failures, |failures| {
         if failures.is_empty() {
-            println!("no failed writes");
-            return;
+            return outln!("no failed writes");
         }
         for f in failures {
             let when = DateTime::<Utc>::from_timestamp(f.failed_at, 0)
@@ -73,14 +72,19 @@ async fn list(client: &VarlinkClient, format: OutputFormat) -> Result<()> {
                 IssuableKind::merge_request => '!',
                 IssuableKind::issue => '#',
             };
-            println!(
+            outln!(
                 "[{}] {} {sigil}{}{}  —  {}  ({})",
-                f.id, f.op, f.iid, detail, f.error, when
-            );
+                f.id,
+                f.op,
+                f.iid,
+                detail,
+                f.error,
+                when
+            )?;
         }
-        println!(
+        outln!(
             "\nretry with `forskap queue retry <id>`, drop with `forskap queue dismiss <id>`, \
              or `forskap queue clear`"
-        );
+        )
     })
 }

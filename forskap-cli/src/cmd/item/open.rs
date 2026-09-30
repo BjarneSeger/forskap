@@ -29,6 +29,6 @@ pub async fn run(kind: RefKind, target: TargetArgs, no_browser: bool) -> Result<
             eprintln!("(couldn't open browser automatically: {e})");
         }
     }
-    println!("opened {}{iid} {web_url}", refspec::sigil(kind));
+    outln!("opened {}{iid} {web_url}", refspec::sigil(kind))?;
     Ok(())
 }
