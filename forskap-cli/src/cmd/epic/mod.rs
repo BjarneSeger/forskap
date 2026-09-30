@@ -80,6 +80,7 @@ async fn cached(client: &VarlinkClient, iid: i64) -> Result<Vec<Epic>> {
             format!("&{iid}"),
             Some(vec![SearchKind::epics]),
             Some(SEARCH_LIMIT),
+            None,
         )
         .call()
         .await
@@ -144,6 +145,7 @@ async fn group_id(client: &VarlinkClient, group: &str) -> Result<i64> {
             path.to_string(),
             Some(vec![SearchKind::groups]),
             Some(SEARCH_LIMIT),
+            None,
         )
         .call()
         .await

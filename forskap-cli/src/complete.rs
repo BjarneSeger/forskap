@@ -71,6 +71,13 @@ pub fn command() -> Command {
         }
         epic
     });
+    cmd = cmd.mut_subcommand("search", |search| {
+        search.mut_args(|arg| match arg.get_id().as_str() {
+            "project" => completing(arg, projects),
+            "groups" => completing(arg, groups),
+            _ => arg,
+        })
+    });
     cmd.mut_subcommand("time", |time| {
         time.mut_subcommand("log", |log| {
             // Not `mut_arg`: it moves the argument behind the others, which
@@ -345,7 +352,7 @@ async fn fetch_items(kind: RefKind, rows: &mut Vec<Item>) -> Option<()> {
     }
     let kinds = vec![refspec::search_kind(kind)];
     let reply = client
-        .search(String::new(), Some(kinds), None)
+        .search(String::new(), Some(kinds), None, None)
         .call()
         .await
         .ok()?;
@@ -376,7 +383,11 @@ async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
 
     let query = current.trim_matches('/').to_string();
     let kinds = vec![SearchKind::projects];
-    let reply = client.search(query, Some(kinds), None).call().await.ok()?;
+    let reply = client
+        .search(query, Some(kinds), None, None)
+        .call()
+        .await
+        .ok()?;
     rows.extend(reply.projects.into_iter().map(|p| (p.path, Some(p.name))));
     Some(())
 }
@@ -386,7 +397,7 @@ async fn fetch_epics(rows: &mut Vec<Epic>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
     let kinds = vec![SearchKind::epics];
     let reply = client
-        .search(String::new(), Some(kinds), None)
+        .search(String::new(), Some(kinds), None, None)
         .call()
         .await
         .ok()?;
@@ -399,7 +410,11 @@ async fn fetch_groups(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
     let query = current.trim_matches('/').to_string();
     let kinds = vec![SearchKind::groups];
-    let reply = client.search(query, Some(kinds), None).call().await.ok()?;
+    let reply = client
+        .search(query, Some(kinds), None, None)
+        .call()
+        .await
+        .ok()?;
     rows.extend(reply.groups.into_iter().map(|g| (g.path, Some(g.name))));
     Some(())
 }

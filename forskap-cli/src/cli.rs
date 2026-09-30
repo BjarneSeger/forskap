@@ -135,6 +135,15 @@ pub enum Command {
         /// Maximum results per kind.
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
         limit: Option<i64>,
+        /// Restrict to one project, as numeric ID or full path
+        /// (`group/project`). Only issues, merge requests and the project
+        /// itself can match.
+        #[arg(short = 'p', long, value_name = "PROJECT")]
+        project: Option<String>,
+        /// Restrict to the given GitLab group, subgroups included. Repeat the
+        /// flag for several; with `--project`, either matches.
+        #[arg(long = "group", value_name = "GROUP")]
+        groups: Vec<String>,
         #[command(flatten)]
         output: OutputArgs,
     },

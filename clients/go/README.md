@@ -69,7 +69,8 @@ Daemon-side errors surface as typed values you match with `errors.As`:
 
 Optional varlink parameters are pointers; pass `nil` to omit them
 (e.g. `c.GetHistory(ctx, nil)` for the daemon's default window,
-`c.Search(ctx, "query", nil, nil)` for all kinds with the default limit, or
+`c.Search(ctx, "query", nil, nil, nil)` for all kinds, the default limit and no
+project/group scope, or
 `c.PostTime(ctx, pid, iid, forskap.KindIssue, "1h", &summary)`). The varlink
 `Close` method maps to `c.CloseIssuable` — the Go name `Close` is taken by the
 connection releaser. Enum values come from constants: `KindIssue` /

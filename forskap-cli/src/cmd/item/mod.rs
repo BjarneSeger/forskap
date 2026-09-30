@@ -9,7 +9,7 @@ mod unassign;
 mod view;
 
 use anyhow::{Result, bail};
-use forskap_api::{VarlinkClient, VarlinkClientInterface};
+use forskap_api::{SearchScope, VarlinkClient, VarlinkClientInterface};
 
 use crate::cli::{ItemCommand, TargetArgs};
 use crate::client;
@@ -17,10 +17,6 @@ use crate::cmd::project;
 use crate::friendly::friendly;
 use crate::item::Item;
 use crate::refspec::{self, RefKind};
-
-/// Per-kind cap for the `#iid` lookup: titles can match the number too, so
-/// the default 50 could truncate before the exact filter.
-const LOOKUP_LIMIT: i64 = 500;
 
 pub async fn run(kind: RefKind, command: ItemCommand) -> Result<()> {
     match command {
@@ -50,11 +46,17 @@ pub async fn lookup(
     project_id: i64,
     iid: i64,
 ) -> Result<Item> {
+    // Scoped to the project: a title can contain `#iid` too, so exact-filter.
+    let scope = SearchScope {
+        projects: Some(vec![project_id]),
+        groups: None,
+    };
     let reply = client
         .search(
             format!("#{iid}"),
             Some(vec![refspec::search_kind(kind)]),
-            Some(LOOKUP_LIMIT),
+            None,
+            Some(scope),
         )
         .call()
         .await
@@ -63,12 +65,12 @@ pub async fn lookup(
         RefKind::Issue => reply
             .issues
             .into_iter()
-            .find(|i| i.project_id == project_id && i.iid == iid)
+            .find(|i| i.iid == iid)
             .map(Item::Issue),
         RefKind::Mr => reply
             .merge_requests
             .into_iter()
-            .find(|m| m.project_id == project_id && m.iid == iid)
+            .find(|m| m.iid == iid)
             .map(Item::Mr),
     };
     if let Some(item) = from_corpus.filter(|i| !i.web_url().is_empty()) {

@@ -87,7 +87,7 @@ pub fn group(g: model::Group) -> Group {
 }
 
 /// Epic pages live under `/groups/`, which is no part of the group's path.
-fn group_path(stored: Option<String>, web_url: &str) -> String {
+pub fn group_path(stored: Option<String>, web_url: &str) -> String {
     stored.and_then(some).unwrap_or_else(|| {
         let ns = namespace_of(web_url);
         match ns.strip_prefix("groups/") {

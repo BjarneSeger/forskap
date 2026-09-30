@@ -39,7 +39,9 @@ pub async fn resolve(
     }
 }
 
-async fn by_arg(client: &VarlinkClient, project: &str) -> Result<i64> {
+/// The project ID behind a `--project` value: a number as is, a path looked
+/// up in the cached projects.
+pub async fn by_arg(client: &VarlinkClient, project: &str) -> Result<i64> {
     if let Ok(id) = project.parse() {
         return Ok(id);
     }
@@ -49,6 +51,7 @@ async fn by_arg(client: &VarlinkClient, project: &str) -> Result<i64> {
             path.to_string(),
             Some(vec![SearchKind::projects]),
             Some(SEARCH_LIMIT),
+            None,
         )
         .call()
         .await
@@ -107,6 +110,7 @@ async fn by_iid(client: &VarlinkClient, kind: RefKind, iid: i64) -> Result<i64> 
             format!("#{iid}"),
             Some(vec![refspec::search_kind(kind)]),
             Some(SEARCH_LIMIT),
+            None,
         )
         .call()
         .await
