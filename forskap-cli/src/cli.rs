@@ -351,6 +351,10 @@ pub enum SyncCommand {
     /// The daemon runs one job at a time; they are listed in the order it
     /// runs them.
     Jobs {
+        /// List every job. By default the ones that are done for good (a
+        /// fetched project avatar) share one line per kind.
+        #[arg(short, long)]
+        all: bool,
         #[command(flatten)]
         output: OutputArgs,
         #[command(flatten)]

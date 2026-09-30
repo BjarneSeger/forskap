@@ -10,6 +10,6 @@ use crate::cli::SyncCommand;
 pub async fn run(command: SyncCommand) -> Result<()> {
     match command {
         SyncCommand::Refresh { scopes } => refresh::run(scopes).await,
-        SyncCommand::Jobs { output, watch } => jobs::run(output.output, watch).await,
+        SyncCommand::Jobs { all, output, watch } => jobs::run(all, output.output, watch).await,
     }
 }
