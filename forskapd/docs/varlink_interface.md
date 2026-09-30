@@ -297,7 +297,9 @@ The user's contribution events (GitLab's `GET /events`: pushes, comments, opened
 closed and merged items, memberships) from the last `days` days (default 7), newest
 first. They are the events the sync keeps as evidence for the `"tracked"` population,
 so they reach back `search.tracked_retention_hours` (default 90 days) at most: a
-larger `days` returns what is stored. Events carry no link of their own; `web_url`
+larger `days` returns what is stored. The sync walks every page GitLab announces:
+`/events` drops the rows the user may not see after slicing a page, so a short page
+is not the last one. Events carry no link of their own; `web_url`
 and `project_path` come from the stored issue, merge request and project rows and
 are null for events in projects the store doesn't know (the project row exists for
 member projects only). A comment's text is not stored. Served from the store alone;
