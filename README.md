@@ -86,6 +86,9 @@ On a terminal the text output colours state words, headings and item numbers;
 their text view every SECS seconds (2 by default) until Ctrl-C; while the daemon
 is away the watch shows the error and keeps trying.
 
+`forskap sync jobs` puts the jobs that are done for good (a fetched avatar per
+project) on one line per kind; `-a`/`--all` lists each.
+
 ## Config
 
 The CLI config lives at the path shown by `forskap config path`; get an annotated default

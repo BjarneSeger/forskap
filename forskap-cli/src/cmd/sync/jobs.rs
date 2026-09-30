@@ -3,7 +3,8 @@
 //! The worker runs one job at a time, so a slow one holds the others up.
 //! This lists every planned job in the order the worker runs them: the one
 //! in flight, the ones demanded ahead of the schedule, the due ones, then
-//! the rest by their next run.
+//! the rest by their next run. Jobs that are done for good (a fetched avatar
+//! per project) would drown the rest, so they share one line per kind.
 
 use anyhow::Result;
 use chrono::Utc;
@@ -13,10 +14,12 @@ use crate::cli::{OutputFormat, WatchArgs};
 use crate::friendly::friendly;
 use crate::{client, output, style, watch};
 
-pub async fn run(format: OutputFormat, watch: WatchArgs) -> Result<()> {
+pub async fn run(all: bool, format: OutputFormat, watch: WatchArgs) -> Result<()> {
     match watch::interval(watch, format)? {
-        Some(every) => watch::run(every, || async { Ok(text(&fetch().await?)) }).await,
-        None => output::emit(format, &fetch().await?, |reply| out!("{}", text(reply))),
+        Some(every) => watch::run(every, || async { Ok(text(&fetch().await?, all)) }).await,
+        None => output::emit(format, &fetch().await?, |reply| {
+            out!("{}", text(reply, all))
+        }),
     }
 }
 
@@ -30,12 +33,73 @@ async fn fetch() -> Result<GetSyncJobs_Reply> {
         .map_err(|e| friendly("GetSyncJobs", e))
 }
 
-fn text(reply: &GetSyncJobs_Reply) -> String {
-    render(&reply.jobs, reply.paused_until, Utc::now().timestamp())
+fn text(reply: &GetSyncJobs_Reply, all: bool) -> String {
+    render(&reply.jobs, reply.paused_until, Utc::now().timestamp(), all)
+}
+
+/// One line of the table: a job, or the settled jobs of one kind.
+struct Row<'a> {
+    cells: [String; 4],
+    error: Option<(&'a str, i64)>,
+}
+
+/// A job with nothing left to do and nothing to report: it ran, and is
+/// never due again.
+fn settled(job: &SyncJob) -> bool {
+    job.status == SyncJobStatus::waiting
+        && job.last_ok.is_some()
+        && job.next_due.is_none()
+        && job.last_error.is_none()
+}
+
+/// The key with its ids blanked: `project/7/avatar` is a `project/*/avatar`.
+fn kind(key: &str) -> String {
+    let blank = |part| match part {
+        "" => part,
+        id if id.bytes().all(|b| b.is_ascii_digit()) => "*",
+        _ => part,
+    };
+    key.split('/').map(blank).collect::<Vec<_>>().join("/")
+}
+
+/// A row per job, in order; unless `all`, the settled jobs of a kind share
+/// the row of the first, under their count and latest sync.
+fn rows(jobs: &[SyncJob], now: i64, all: bool) -> Vec<Row<'_>> {
+    let ago = |at: i64| format!("{} ago", span(now - at));
+    let mut rows: Vec<Row> = Vec::with_capacity(jobs.len());
+    // Kind, row, count and latest sync of each group.
+    let mut groups: Vec<(String, usize, usize, i64)> = Vec::new();
+    for job in jobs {
+        if !all && settled(job) {
+            let (kind, synced) = (kind(&job.key), job.last_ok.unwrap_or(0));
+            if let Some(group) = groups.iter_mut().find(|g| g.0 == kind) {
+                group.2 += 1;
+                group.3 = group.3.max(synced);
+                continue;
+            }
+            groups.push((kind, rows.len(), 1, synced));
+        }
+        rows.push(Row {
+            cells: [
+                job.key.clone(),
+                status(job).to_string(),
+                job.last_ok.map_or_else(|| "never".to_string(), ago),
+                next(job, now),
+            ],
+            error: job.last_error.as_deref().map(|e| (e, job.failures)),
+        });
+    }
+    for (kind, row, count, synced) in groups {
+        if count > 1 {
+            rows[row].cells[0] = format!("{kind} ({count})");
+            rows[row].cells[2] = ago(synced);
+        }
+    }
+    rows
 }
 
 /// The jobs as an aligned table, a job's last error on a line of its own.
-fn render(jobs: &[SyncJob], paused_until: Option<i64>, now: i64) -> String {
+fn render(jobs: &[SyncJob], paused_until: Option<i64>, now: i64, all: bool) -> String {
     if jobs.is_empty() {
         return "no sync jobs planned\n".to_string();
     }
@@ -46,24 +110,11 @@ fn render(jobs: &[SyncJob], paused_until: Option<i64>, now: i64) -> String {
             span(until - now)
         ));
     }
-    let rows: Vec<[String; 4]> = jobs
-        .iter()
-        .map(|j| {
-            [
-                j.key.clone(),
-                status(j).to_string(),
-                j.last_ok.map_or_else(
-                    || "never".to_string(),
-                    |at| format!("{} ago", span(now - at)),
-                ),
-                next(j, now),
-            ]
-        })
-        .collect();
+    let rows = rows(jobs, now, all);
     let header = ["JOB", "STATUS", "LAST SYNC", "NEXT"].map(str::to_string);
     let width = |col: usize| {
-        let cells = rows.iter().chain([&header]).map(|r| r[col].chars().count());
-        cells.max().unwrap_or(0)
+        let cells = rows.iter().map(|r| &r.cells).chain([&header]);
+        cells.map(|r| r[col].chars().count()).max().unwrap_or(0)
     };
     let (w0, w1, w2) = (width(0), width(1), width(2));
     let line = |[job, status, last, next]: &[String; 4]| {
@@ -73,10 +124,10 @@ fn render(jobs: &[SyncJob], paused_until: Option<i64>, now: i64) -> String {
     let [job, status, last, next] = &header;
     let header = format!("{job:<w0$}  {status:<w1$}  {last:<w2$}  {next}");
     out.push_str(&format!("{}\n", style::heading(&header)));
-    for (row, job) in rows.iter().zip(jobs) {
-        out.push_str(&line(row));
-        if let Some(error) = &job.last_error {
-            let times = match job.failures {
+    for row in &rows {
+        out.push_str(&line(&row.cells));
+        if let Some((error, failures)) = row.error {
+            let times = match failures {
                 0 => String::new(),
                 1 => "failed once: ".to_string(),
                 n => format!("failed {n} times: "),
@@ -193,7 +244,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            render(&jobs, Some(NOW + 240), NOW),
+            render(&jobs, Some(NOW + 240), NOW, false),
             "\
 paused by a GitLab rate limit for another 4m
 
@@ -222,7 +273,7 @@ project/7/avatar  waiting      1d 1h ago  -
         ];
         // The columns line up as they do without the escapes.
         assert_eq!(
-            render(&jobs, None, NOW),
+            render(&jobs, None, NOW, false),
             "\x1b[1mJOB               STATUS       LAST SYNC  NEXT\x1b[0m\n\
              events            \x1b[32mrunning    \x1b[0m  never      now\n\
              project/9/boards  \x1b[31mbacking off\x1b[0m  never      -\n\
@@ -233,7 +284,51 @@ project/7/avatar  waiting      1d 1h ago  -
     #[test]
     fn render_leaves_out_a_pause_that_is_over() {
         let jobs = [job("events", SyncJobStatus::due)];
-        assert!(render(&jobs, Some(NOW - 1), NOW).starts_with("JOB"));
-        assert_eq!(render(&[], None, NOW), "no sync jobs planned\n");
+        assert!(render(&jobs, Some(NOW - 1), NOW, false).starts_with("JOB"));
+        assert_eq!(render(&[], None, NOW, false), "no sync jobs planned\n");
+    }
+
+    #[test]
+    fn settled_jobs_of_a_kind_share_a_line() {
+        let avatar = |project: i64, ago: i64| SyncJob {
+            last_ok: Some(NOW - ago),
+            ..job(&format!("project/{project}/avatar"), SyncJobStatus::waiting)
+        };
+        let jobs = [
+            SyncJob {
+                last_ok: Some(NOW - 60),
+                next_due: Some(NOW + 60),
+                ..job("events", SyncJobStatus::waiting)
+            },
+            avatar(7, 600),
+            // Still to fetch, or failing: worth a line of its own.
+            job("project/8/avatar", SyncJobStatus::due),
+            avatar(9, 120),
+            SyncJob {
+                next_due: Some(NOW + 3600),
+                failures: 1,
+                last_error: Some("403 Forbidden".to_string()),
+                ..job("project/10/avatar", SyncJobStatus::backing_off)
+            },
+            avatar(11, 300),
+        ];
+        assert_eq!(
+            render(&jobs, None, NOW, false),
+            "\
+JOB                   STATUS       LAST SYNC  NEXT
+events                waiting      1m ago     in 1m
+project/*/avatar (3)  waiting      2m ago     -
+project/8/avatar      due          never      now
+project/10/avatar     backing off  never      in 1h
+    failed once: 403 Forbidden
+"
+        );
+        let every = render(&jobs, None, NOW, true);
+        assert_eq!(every.lines().count(), 1 + jobs.len() + 1, "{every}");
+        assert!(every.contains("project/11/avatar"), "{every}");
+
+        // One settled job keeps its name.
+        let single = render(&jobs[..2], None, NOW, false);
+        assert!(single.contains("project/7/avatar "), "{single}");
     }
 }
