@@ -395,10 +395,16 @@ pub struct SyncConfig {
     #[config(default = 0.15)]
     pub jitter: f64,
 
-    /// Pause between two sync jobs, in milliseconds (jittered like the
-    /// intervals), so a backlog of due jobs trickles out. (250 ms by default.)
+    /// Pause between starting two sync jobs, in milliseconds (jittered like
+    /// the intervals), so a backlog of due jobs trickles out. (250 ms by
+    /// default.)
     #[config(default = 250)]
     pub job_gap_ms: u64,
+
+    /// Most sync jobs reading from GitLab at once. Jobs of the same project
+    /// always go one at a time. (2 by default; at least 1.)
+    #[config(default = 2)]
+    pub max_in_flight: u64,
 
     /// Seconds over which jobs already overdue at startup are spread out. The
     /// assigned issue/MR lists and recent timelogs always run at once. (1 min
@@ -410,6 +416,13 @@ pub struct SyncConfig {
 impl SyncConfig {
     pub fn job_gap(&self) -> Duration {
         Duration::from_millis(self.job_gap_ms)
+    }
+
+    /// Most fetches in flight at once; never below one.
+    pub fn max_in_flight(&self) -> usize {
+        usize::try_from(self.max_in_flight)
+            .unwrap_or(usize::MAX)
+            .max(1)
     }
 }
 
@@ -558,7 +571,8 @@ fn normalize_refresh(refresh: &mut RefreshConfig) {
 }
 
 /// Keep the jitter a fraction that can't push an interval to zero or double
-/// it, and the job gap short enough not to stall the queue.
+/// it, the job gap short enough not to stall the queue, and at least one
+/// fetch allowed.
 fn normalize_sync(sync: &mut SyncConfig) {
     if !(0.0..=0.5).contains(&sync.jitter) {
         let clamped = if sync.jitter.is_nan() {
@@ -578,6 +592,10 @@ fn normalize_sync(sync: &mut SyncConfig) {
             "sync.job_gap_ms above 60000 would stall the sync queue; capping to 60000"
         );
         sync.job_gap_ms = 60_000;
+    }
+    if sync.max_in_flight == 0 {
+        warn!("sync.max_in_flight of 0 would never sync anything; flooring to 1");
+        sync.max_in_flight = 1;
     }
 }
 
@@ -736,13 +754,20 @@ mod tests {
 
     proptest! {
         #[test]
-        fn normalize_sync_keeps_jitter_a_sane_fraction(jitter in any::<f64>(), gap in any::<u64>()) {
+        fn normalize_sync_keeps_jitter_a_sane_fraction(
+            jitter in any::<f64>(),
+            gap in any::<u64>(),
+            flights in any::<u64>(),
+        ) {
             let mut s = defaults().sync;
             s.jitter = jitter;
             s.job_gap_ms = gap;
+            s.max_in_flight = flights;
             normalize_sync(&mut s);
             prop_assert!((0.0..=0.5).contains(&s.jitter));
             prop_assert!(s.job_gap_ms <= 60_000);
+            prop_assert_eq!(s.max_in_flight, flights.max(1));
+            prop_assert!(s.max_in_flight() >= 1);
             if (0.0..=0.5).contains(&jitter) {
                 prop_assert_eq!(s.jitter, jitter, "in-range values are left untouched");
             }

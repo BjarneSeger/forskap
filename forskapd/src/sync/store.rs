@@ -327,6 +327,16 @@ impl Commit<'_> {
         self.store.view(name)
     }
 
+    /// The row at `key` as committed, without this batch's changes.
+    pub fn get<R: Stored>(&self, key: RowKey) -> Result<Option<R>> {
+        self.store.table::<R>().get(key)
+    }
+
+    /// The state of the job keyed `key` as committed.
+    pub fn job_state(&self, key: &str) -> Result<JobState> {
+        self.store.job_state(key)
+    }
+
     pub fn set_view(&mut self, name: &str, view: &View) -> Result<()> {
         self.batch
             .insert(&self.store.views, name, serde_json::to_vec(view)?);

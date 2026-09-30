@@ -348,8 +348,8 @@ pub enum SyncCommand {
     },
     /// Show the sync jobs: what runs now, what comes next, what failed.
     ///
-    /// The daemon runs one job at a time; they are listed in the order it
-    /// runs them.
+    /// The daemon runs a few jobs at a time; they are listed in the order
+    /// it runs them.
     Jobs {
         /// List every job. By default the ones that are done for good (a
         /// fetched project avatar) share one line per kind.
