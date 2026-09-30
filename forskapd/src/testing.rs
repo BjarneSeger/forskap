@@ -421,6 +421,8 @@ pub fn event_json(id: i64, project_id: i64, action: &str, created_at: u64) -> Va
         "project_id": project_id,
         "action_name": action,
         "target_type": null,
+        "target_iid": null,
+        "target_title": null,
         "created_at": at.to_rfc3339(),
     })
 }

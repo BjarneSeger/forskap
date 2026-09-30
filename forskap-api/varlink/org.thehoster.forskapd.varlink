@@ -28,6 +28,20 @@ type HistoryEvent (
   summary: string
 )
 
+type ActivityEvent (
+  timestamp: int,
+  action: string,
+  target_type: string,
+  target_iid: ?int,
+  target_title: ?string,
+  project_id: int,
+  project_path: ?string,
+  web_url: ?string,
+  ref: ?string,
+  commit_count: ?int,
+  commit_title: ?string
+)
+
 type FailedTask (
   id: int,
   op: string,
@@ -104,6 +118,8 @@ method RecordOpen(project_id: int, iid: int, kind: IssuableKind) -> ()
 method ClearCache(scope: ?[]string) -> ()
 
 method GetHistory(days: ?int) -> (events: []HistoryEvent)
+
+method GetActivity(days: ?int) -> (events: []ActivityEvent)
 
 method GetFailures() -> (failures: []FailedTask)
 

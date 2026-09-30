@@ -39,6 +39,20 @@ type HistoryEvent struct {
 	Summary    string       `json:"summary"`
 }
 
+type ActivityEvent struct {
+	Timestamp    int64   `json:"timestamp"`
+	Action       string  `json:"action"`
+	Target_type  string  `json:"target_type"`
+	Target_iid   *int64  `json:"target_iid,omitempty"`
+	Target_title *string `json:"target_title,omitempty"`
+	Project_id   int64   `json:"project_id"`
+	Project_path *string `json:"project_path,omitempty"`
+	Web_url      *string `json:"web_url,omitempty"`
+	Ref          *string `json:"ref,omitempty"`
+	Commit_count *int64  `json:"commit_count,omitempty"`
+	Commit_title *string `json:"commit_title,omitempty"`
+}
+
 type FailedTask struct {
 	Id         int64        `json:"id"`
 	Op         string       `json:"op"`
@@ -757,6 +771,65 @@ func (m GetHistory_methods) Upgrade(ctx context.Context, c *varlink.Connection, 
 	}, nil
 }
 
+type GetActivity_methods struct{}
+
+func GetActivity() GetActivity_methods { return GetActivity_methods{} }
+
+func (m GetActivity_methods) Call(ctx context.Context, c *varlink.Connection, days_in_ *int64) (events_out_ []ActivityEvent, err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, days_in_)
+	if err_ != nil {
+		return
+	}
+	events_out_, _, err_ = receive(ctx)
+	return
+}
+
+func (m GetActivity_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, days_in_ *int64) (func(ctx context.Context) ([]ActivityEvent, uint64, error), error) {
+	var in struct {
+		Days *int64 `json:"days,omitempty"`
+	}
+	in.Days = days_in_
+	receive, err := c.Send(ctx, "org.thehoster.forskapd.GetActivity", in, flags)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (events_out_ []ActivityEvent, flags uint64, err error) {
+		var out struct {
+			Events []ActivityEvent `json:"events"`
+		}
+		flags, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		events_out_ = []ActivityEvent(out.Events)
+		return
+	}, nil
+}
+
+func (m GetActivity_methods) Upgrade(ctx context.Context, c *varlink.Connection, days_in_ *int64) (func(ctx context.Context) (events_out_ []ActivityEvent, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+	var in struct {
+		Days *int64 `json:"days,omitempty"`
+	}
+	in.Days = days_in_
+	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.GetActivity", in)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (events_out_ []ActivityEvent, flags uint64, conn varlink.ReadWriterContext, err error) {
+		var out struct {
+			Events []ActivityEvent `json:"events"`
+		}
+		flags, conn, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		events_out_ = []ActivityEvent(out.Events)
+		return
+	}, nil
+}
+
 type GetFailures_methods struct{}
 
 func GetFailures() GetFailures_methods { return GetFailures_methods{} }
@@ -1182,6 +1255,7 @@ type orgthehosterforskapdInterface interface {
 	RecordOpen(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]string) error
 	GetHistory(ctx context.Context, c VarlinkCall, days_ *int64) error
+	GetActivity(ctx context.Context, c VarlinkCall, days_ *int64) error
 	GetFailures(ctx context.Context, c VarlinkCall) error
 	RetryFailure(ctx context.Context, c VarlinkCall, id_ int64) error
 	DismissFailure(ctx context.Context, c VarlinkCall, id_ int64) error
@@ -1272,6 +1346,14 @@ func (c *VarlinkCall) ReplyGetHistory(ctx context.Context, events_ []HistoryEven
 		Events []HistoryEvent `json:"events"`
 	}
 	out.Events = []HistoryEvent(events_)
+	return c.Reply(ctx, &out)
+}
+
+func (c *VarlinkCall) ReplyGetActivity(ctx context.Context, events_ []ActivityEvent) error {
+	var out struct {
+		Events []ActivityEvent `json:"events"`
+	}
+	out.Events = []ActivityEvent(events_)
 	return c.Reply(ctx, &out)
 }
 
@@ -1367,6 +1449,10 @@ func (s *VarlinkInterface) ClearCache(ctx context.Context, c VarlinkCall, scope_
 
 func (s *VarlinkInterface) GetHistory(ctx context.Context, c VarlinkCall, days_ *int64) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetHistory")
+}
+
+func (s *VarlinkInterface) GetActivity(ctx context.Context, c VarlinkCall, days_ *int64) error {
+	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetActivity")
 }
 
 func (s *VarlinkInterface) GetFailures(ctx context.Context, c VarlinkCall) error {
@@ -1519,6 +1605,16 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 		}
 		return s.orgthehosterforskapdInterface.GetHistory(ctx, VarlinkCall{call}, in.Days)
 
+	case "GetActivity":
+		var in struct {
+			Days *int64 `json:"days,omitempty"`
+		}
+		err := call.GetParameters(&in)
+		if err != nil {
+			return call.ReplyInvalidParameter(ctx, "parameters")
+		}
+		return s.orgthehosterforskapdInterface.GetActivity(ctx, VarlinkCall{call}, in.Days)
+
 	case "GetFailures":
 		return s.orgthehosterforskapdInterface.GetFailures(ctx, VarlinkCall{call})
 
@@ -1609,6 +1705,20 @@ type HistoryEvent (
   summary: string
 )
 
+type ActivityEvent (
+  timestamp: int,
+  action: string,
+  target_type: string,
+  target_iid: ?int,
+  target_title: ?string,
+  project_id: int,
+  project_path: ?string,
+  web_url: ?string,
+  ref: ?string,
+  commit_count: ?int,
+  commit_title: ?string
+)
+
 type FailedTask (
   id: int,
   op: string,
@@ -1685,6 +1795,8 @@ method RecordOpen(project_id: int, iid: int, kind: IssuableKind) -> ()
 method ClearCache(scope: ?[]string) -> ()
 
 method GetHistory(days: ?int) -> (events: []HistoryEvent)
+
+method GetActivity(days: ?int) -> (events: []ActivityEvent)
 
 method GetFailures() -> (failures: []FailedTask)
 

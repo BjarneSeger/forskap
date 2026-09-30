@@ -8,11 +8,11 @@ use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 
 use forskap_api::{
-    Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close, Call_DismissFailure,
-    Call_GetAssignedIssues, Call_GetAssignedMergeRequests, Call_GetFailures, Call_GetHistory,
-    Call_GetSyncJobs, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
-    Call_Search, Call_UnassignSelf, Call_WhoAmI, FailedTask, Group, HistoryEvent, IssuableKind,
-    Issue, MergeRequest, Project, VarlinkInterface,
+    ActivityEvent, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
+    Call_DismissFailure, Call_GetActivity, Call_GetAssignedIssues, Call_GetAssignedMergeRequests,
+    Call_GetFailures, Call_GetHistory, Call_GetSyncJobs, Call_Login, Call_Logout, Call_PostTime,
+    Call_RecordOpen, Call_RetryFailure, Call_Search, Call_UnassignSelf, Call_WhoAmI, FailedTask,
+    Group, HistoryEvent, IssuableKind, Issue, MergeRequest, Project, VarlinkInterface,
 };
 
 use crate::error::{DormancyReason, Error};
@@ -323,6 +323,69 @@ impl<'a> Avatars<'a> {
                     .unwrap_or_default()
             })
             .clone()
+    }
+}
+
+/// Where contribution events happened: their project and the link of the
+/// issue or merge request they are about, each read at most once per
+/// request. Unknown ones stay `None`.
+struct Places<'a> {
+    handlers: &'a Handlers,
+    projects: HashMap<i64, Option<model::Project>>,
+    items: HashMap<(bool, RowKey), Option<String>>,
+}
+
+impl<'a> Places<'a> {
+    fn new(handlers: &'a Handlers) -> Self {
+        Self {
+            handlers,
+            projects: HashMap::new(),
+            items: HashMap::new(),
+        }
+    }
+
+    /// The `web_url` of the stored issue or merge request `e` is about.
+    fn item_url(&mut self, e: &model::Event) -> Option<String> {
+        let (kind, iid) = e.target();
+        let is_mr = match kind {
+            // Work items share the issues' numbers.
+            "Issue" | "WorkItem" => false,
+            "MergeRequest" => true,
+            _ => return None,
+        };
+        if e.project_id <= 0 || iid <= 0 {
+            return None;
+        }
+        let key = (e.project_id as u64, iid as u64);
+        let store = self.handlers.store();
+        self.items
+            .entry((is_mr, key))
+            .or_insert_with(|| {
+                let url = if is_mr {
+                    store.merge_requests.get(key).map(|m| m.map(|m| m.web_url))
+                } else {
+                    store.issues.get(key).map(|i| i.map(|i| i.web_url))
+                };
+                url.unwrap_or_else(|e| {
+                    warn!(error = %e, "item read failed; activity event left unlinked");
+                    None
+                })
+            })
+            .clone()
+    }
+
+    /// The wire event for `e`.
+    fn wire(&mut self, e: model::Event) -> ActivityEvent {
+        let item_url = self.item_url(&e);
+        let store = self.handlers.store();
+        let project = self.projects.entry(e.project_id).or_insert_with(|| {
+            let row = store.projects.get((e.project_id.max(0) as u64, 0));
+            row.unwrap_or_else(|err| {
+                warn!(error = %err, project_id = e.project_id, "project read failed");
+                None
+            })
+        });
+        wire::activity(e, project.as_ref(), item_url)
     }
 }
 
@@ -732,6 +795,31 @@ impl VarlinkInterface for Handlers {
             snapshot.jobs.into_iter().map(wire::sync_job).collect(),
             snapshot.paused_until.map(|at| at as i64),
         )
+    }
+
+    #[instrument(skip(self, call))]
+    async fn get_activity(
+        &self,
+        call: &mut dyn Call_GetActivity,
+        days: Option<i64>,
+    ) -> varlink::Result<()> {
+        reply_if_cold!(self, call, Job::Events, (Vec::new()));
+
+        let days = days.unwrap_or(7).max(0) as u64;
+        let cutoff = now_secs().saturating_sub(days.saturating_mul(86_400));
+        let rows = self
+            .store()
+            .events
+            .scan(RowScope::Since(cutoff))
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "activity read failed; returning empty");
+                Vec::new()
+            });
+        let mut places = Places::new(self);
+        // Stored oldest first; reply newest first.
+        let events: Vec<ActivityEvent> = rows.into_iter().rev().map(|e| places.wire(e)).collect();
+        debug!(count = events.len(), "serving activity");
+        call.reply(events)
     }
 
     #[instrument(skip(self, call))]

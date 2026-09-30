@@ -94,6 +94,17 @@ pub enum Command {
         #[command(flatten)]
         output: OutputArgs,
     },
+    /// Show what you did on GitLab recently: pushes, comments, and the
+    /// issues and merge requests you opened, closed or merged.
+    ///
+    /// These are your contribution events as the daemon syncs them; how far
+    /// back they reach is its `search.tracked_retention_hours`.
+    Activity {
+        #[command(flatten)]
+        window: WindowArgs,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
     /// Time tracking: log time, review it, and the shell reminder.
     Time {
         #[command(subcommand)]

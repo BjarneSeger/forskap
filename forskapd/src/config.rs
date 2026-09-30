@@ -339,8 +339,9 @@ pub struct SearchConfig {
 
     /// How long, in hours, your activity in a project keeps it in the
     /// `"tracked"` population after the last time you touched it (an
-    /// assignment, a push, an issue, MR or comment, a timelog). (90 days by
-    /// default.)
+    /// assignment, a push, an issue, MR or comment, a timelog). Your
+    /// contribution events are kept for the same time, so this is also how
+    /// far back `forskap activity` reaches. (90 days by default.)
     #[config(default = 2160)]
     pub tracked_retention_hours: u64,
 
