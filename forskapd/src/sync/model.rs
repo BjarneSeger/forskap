@@ -182,7 +182,8 @@ impl Event {
         self.project_id > 0
             && match self.action_name.as_str() {
                 "joined" | "pushed to" | "pushed new" => true,
-                "created" => self.target_type.is_empty(),
+                // Targeted at the project itself; older GitLab sent no target.
+                "created" => matches!(self.target_type.as_str(), "" | "Project"),
                 _ => false,
             }
     }
@@ -442,7 +443,7 @@ mod de {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn issue_reads_a_gitlab_row() {
@@ -559,6 +560,24 @@ mod tests {
             !e("opened", 0).is_activity(),
             "group-level events have no project"
         );
+    }
+
+    #[test]
+    fn creating_a_project_implies_membership() {
+        let e = |action: &str, target_type: Value, project_id| -> Event {
+            serde_json::from_value(json!({
+                "id": 1, "project_id": project_id, "action_name": action,
+                "target_type": target_type, "target_id": 7, "target_iid": 7,
+                "target_title": "Api Tests", "created_at": "2026-01-02T03:04:05Z",
+            }))
+            .unwrap()
+        };
+        // gitlab.com's shape, and the target-less one of older versions.
+        assert!(e("created", json!("Project"), 7).implies_membership());
+        assert!(e("created", Value::Null, 7).implies_membership());
+        assert!(!e("created", json!("WikiPage::Meta"), 7).implies_membership());
+        assert!(!e("opened", json!("Issue"), 7).implies_membership());
+        assert!(!e("created", json!("Project"), 0).implies_membership());
     }
 
     #[test]
