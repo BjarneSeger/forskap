@@ -170,52 +170,76 @@ mod tests {
 #[cfg(not(target_os = "macos"))]
 mod platform {
     use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use oo7::Keyring;
+    use tokio::sync::Mutex;
 
     use super::{Credentials, Error, Result, SERVICE, decode, encode};
-    use oo7::Keyring;
+
+    /// The daemon's one Secret Service client. Every `Keyring::new` is a new
+    /// D-Bus connection whose first call is OpenSession, and gnome-keyring 50
+    /// can abort on exactly that (upstream #190) — one client per daemon life
+    /// keeps that to the start. Cleared after a failed call so the next one
+    /// reconnects, e.g. to a daemon that was replaced after a crash.
+    static KEYRING: Mutex<Option<Arc<Keyring>>> = Mutex::const_new(None);
 
     fn attributes(service: &'static str) -> HashMap<&'static str, &'static str> {
         HashMap::from([("service", service)])
     }
 
-    async fn open() -> Result<Keyring> {
-        let kr = Keyring::new()
-            .await
-            .map_err(|e| Error::Secrets(e.to_string()))?;
-        kr.unlock()
-            .await
-            .map_err(|e| Error::Secrets(e.to_string()))?;
-        Ok(kr)
+    fn secrets(e: impl std::fmt::Display) -> Error {
+        Error::Secrets(e.to_string())
+    }
+
+    async fn open() -> Result<Arc<Keyring>> {
+        let mut slot = KEYRING.lock().await;
+        if slot.is_none() {
+            *slot = Some(Arc::new(Keyring::new().await.map_err(secrets)?));
+        }
+        Ok(Arc::clone(slot.as_ref().expect("filled above")))
+    }
+
+    async fn forget() {
+        *KEYRING.lock().await = None;
+    }
+
+    async fn with_keyring<T>(op: impl AsyncFnOnce(&Keyring) -> oo7::Result<T>) -> Result<T> {
+        let kr = open().await?;
+        let result = async {
+            kr.unlock().await?;
+            op(&kr).await
+        }
+        .await;
+        if result.is_err() {
+            forget().await;
+        }
+        result.map_err(secrets)
     }
 
     pub async fn load(service: &'static str) -> Result<Option<Credentials>> {
-        let kr = open().await?;
-        let items = kr
-            .search_items(&attributes(service))
-            .await
-            .map_err(|e| Error::Secrets(e.to_string()))?;
-        let Some(item) = items.first() else {
-            return Ok(None);
-        };
-        let secret = item
-            .secret()
-            .await
-            .map_err(|e| Error::Secrets(e.to_string()))?;
-        Ok(Some(decode(&secret)?))
+        let secret = with_keyring(async |kr| {
+            let items = kr.search_items(&attributes(service)).await?;
+            match items.first() {
+                Some(item) => item.secret().await.map(Some),
+                None => Ok(None),
+            }
+        })
+        .await?;
+        secret.map(|s| decode(&s)).transpose()
     }
 
     pub async fn store(creds: &Credentials) -> Result<()> {
-        let kr = open().await?;
         let payload = encode(creds)?;
-        kr.create_item("forskapd credentials", &attributes(SERVICE), payload, true)
-            .await
-            .map_err(|e| Error::Secrets(e.to_string()))
+        with_keyring(async |kr| {
+            kr.create_item("forskapd credentials", &attributes(SERVICE), payload, true)
+                .await
+                .map(drop)
+        })
+        .await
     }
 
     pub async fn delete(service: &'static str) -> Result<()> {
-        let kr = open().await?;
-        kr.delete(&attributes(service))
-            .await
-            .map_err(|e| Error::Secrets(e.to_string()))
+        with_keyring(async |kr| kr.delete(&attributes(service)).await).await
     }
 }

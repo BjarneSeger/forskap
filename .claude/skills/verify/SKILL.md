@@ -42,3 +42,25 @@ RUST_LOG=info ./target/debug/forskapd > $S/daemon.log 2>&1 &
   plant fakes there to test the cleanup path.
 - Daemon starts dormant (still serving) if the keychain has no credentials;
   reads then serve whatever is cached.
+
+## Private keyring (never the real one)
+
+`gnome-keyring-daemon --unlock` operates on `$XDG_DATA_HOME/keyrings/login.keyring`
+and `$XDG_RUNTIME_DIR/keyring/control`. Run with the real dirs it re-keys the
+**real** login keyring to the password you feed it and overwrites the real
+`service=forskapd` item. Only ever start it inside `dbus-run-session` with every
+XDG dir pointed at the scratch dir, in the same shell so the bus dies with it:
+
+```bash
+[ "${XDG_DATA_HOME:-$HOME/.local/share}" != "$HOME/.local/share" ] || { echo "refusing: real XDG_DATA_HOME"; exit 1; }
+dbus-run-session -- bash -c '
+  eval $(echo -n "test-pw" | gnome-keyring-daemon --unlock --components=secrets --daemonize)
+  printf "%s" "{\"host\":\"localhost:8930\",\"token\":\"…\"}" \
+    | secret-tool store --label "forskapd credentials" service forskapd
+  ./target/debug/forskapd > $XDG_DATA_HOME/../daemon.log 2>&1 & D=$!
+  # … drive the CLI here …
+  kill $D $(pgrep -f "gnome-keyring-daemon --unlock")
+'
+```
+
+Afterwards `stat ~/.local/share/keyrings/login.keyring` must show an unchanged mtime.
