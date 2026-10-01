@@ -217,8 +217,8 @@ mod tests {
     }
 
     proptest! {
-        /// Events use `u64::MAX` for "never full again", avatars for "never
-        /// again": jitter must not turn that into a time.
+        /// Avatars use `u64::MAX` for "never again": jitter must not turn
+        /// that into a time.
         #[test]
         fn a_never_cadence_stays_never(
             key in "[a-z]{1,8}",

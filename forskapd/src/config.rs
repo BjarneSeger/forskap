@@ -337,7 +337,8 @@ pub struct SearchConfig {
     pub partial_interval_secs: u64,
 
     /// Seconds between full search-cache resyncs, which also remove deleted
-    /// items. (7 days by default.)
+    /// items, and between full walks of your contribution events. (7 days by
+    /// default.)
     #[config(default = 604800)]
     pub full_interval_secs: u64,
 
