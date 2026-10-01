@@ -2,6 +2,13 @@ version: 2
 
 project_name: forskap
 
+git:
+  # The Go binding is tagged `clients/go/v*` in this repo; those are not
+  # releases of this project, and a version with slashes breaks the artifact
+  # paths.
+  ignore_tags:
+    - "clients/go/*"
+
 before:
   hooks:
     # Render the annotated default config shipped as the package-provided
