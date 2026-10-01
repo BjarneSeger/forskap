@@ -245,6 +245,8 @@ func (c *Client) GetFailures(ctx context.Context) ([]FailedTask, error) {
 // GetSyncJobs returns the daemon's planned sync jobs in the order its worker
 // runs them, and until when (unix seconds) a GitLab rate limit pauses them all
 // (nil = not paused). Status only: it succeeds while the daemon is dormant.
+// A job whose Unavailable is true is one GitLab refuses for good, asked again
+// once a day; Unavailable is nil from a daemon older than v0.28.0.
 func (c *Client) GetSyncJobs(ctx context.Context) (jobs []SyncJob, pausedUntil *int64, err error) {
 	return GetSyncJobs().Call(ctx, c.conn)
 }

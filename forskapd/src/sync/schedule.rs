@@ -24,6 +24,13 @@ pub struct JobState {
     /// What the last success synced under (resource schema, windows); a
     /// mismatch forces the next run to be full.
     pub fingerprint: u64,
+    /// Consecutive refusals of the job's listing (a 403 or 404; see
+    /// `Job::refused_by`), which make the job unavailable from
+    /// `Job::unavailable_after` on. Failures that say nothing about the
+    /// listing (network, 429, 5xx, 401) leave it; a success or any other
+    /// answer clears it. Absent from states stored before it existed.
+    #[serde(default)]
+    pub rejections: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,9 +45,13 @@ pub struct Cadence {
 pub const SERVER_BACKOFF_CAP: u64 = 3600;
 /// Backoff cap after a permanent rejection (403 on a lost project, …).
 pub const REJECTED_BACKOFF_CAP: u64 = 6 * 3600;
-/// How long a job rests after GitLab rejected a feature the instance may
-/// simply not have (epics without Premium).
+/// How long an unavailable job rests between attempts: one GitLab refuses
+/// for good (a feature switched off in a project, epics without Premium).
 pub const UNAVAILABLE_REST_SECS: u64 = 24 * 3600;
+/// Refusals in a row that make a per-project job unavailable. Three, not
+/// one: a project being moved or a permission changing can refuse a fetch
+/// or two before it serves again.
+pub const UNAVAILABLE_AFTER: u32 = 3;
 /// Cap on the worker-wide pause after a 429, `Retry-After` included.
 pub const RATE_LIMIT_PAUSE_CAP: u64 = 3600;
 const BACKOFF_BASE: u64 = 60;
@@ -247,6 +258,36 @@ mod tests {
         assert_eq!(text_hash(""), 0x2d06_8005_38d3_94c2, "the XXH3 spec's");
         assert_eq!(fingerprint(&[1, 2]), 571_542_372_673_154_031);
         assert_eq!(unit("k", 7).to_bits(), 4_595_725_774_607_267_048);
+    }
+
+    /// States persist: one stored before the refusals were counted reads as
+    /// none, and an older daemon reading a newer one skips the count.
+    #[test]
+    fn a_state_stored_before_the_refusal_count_reads_as_none() {
+        let old: JobState = serde_json::from_str(
+            r#"{"last_ok":5,"last_full":5,"failures":2,"retry_at":9,"fingerprint":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            old,
+            JobState {
+                last_ok: 5,
+                last_full: 5,
+                failures: 2,
+                retry_at: 9,
+                fingerprint: 1,
+                rejections: 0,
+            }
+        );
+        let counted = JobState {
+            rejections: 3,
+            ..old
+        };
+        let stored = serde_json::to_vec(&counted).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<JobState>(&stored).unwrap(),
+            counted
+        );
     }
 
     #[test]

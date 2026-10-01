@@ -16,10 +16,10 @@ use super::avatars::{self, Avatar, AvatarDir};
 use super::model::{
     Board, Epic, Event, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog,
 };
-use super::schedule::{Cadence, JobState, fingerprint};
+use super::schedule::{Cadence, JobState, UNAVAILABLE_AFTER, fingerprint};
 use super::store::{Commit, RowScope, Stored, View};
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::gitlab::{GitlabApi, Issuable, Listing};
 use crate::write::{Write, WriteOp};
 
@@ -179,10 +179,46 @@ impl Job {
         )
     }
 
-    /// Whether GitLab may lack the feature the job reads. A rejection then
-    /// says "not on this instance" rather than "something is wrong".
-    pub fn optional(&self) -> bool {
-        matches!(self, Self::GroupEpics(_))
+    /// How many refusals in a row (see [`Self::refused_by`]) make GitLab's
+    /// answer final: the job is then unavailable, rests for a day at a time
+    /// and fails quietly. `None` for the account-wide listings: GitLab
+    /// refusing one of them means something is wrong with the session, which
+    /// must stay loud.
+    pub fn unavailable_after(&self) -> Option<u32> {
+        match self {
+            // An instance without epics (no Premium) refuses every group
+            // alike: the first refusal says it all.
+            Self::GroupEpics(_) => Some(1),
+            // A feature switched off in one project, or one the account may
+            // not see there.
+            Self::ProjectIssues(_)
+            | Self::ProjectMergeRequests(_)
+            | Self::ProjectBoards(_)
+            | Self::ProjectAvatar(_) => Some(UNAVAILABLE_AFTER),
+            _ => None,
+        }
+    }
+
+    /// Whether `e` is GitLab refusing the job's listing: a 403 or a 404 for
+    /// a job that can be unavailable at all. The epics, which an instance
+    /// may lack altogether, count any rejection, as they always did.
+    pub fn refused_by(&self, e: &Error) -> bool {
+        match e {
+            Error::Rejected { .. } | Error::Gitlab(_) if matches!(self, Self::GroupEpics(_)) => {
+                true
+            }
+            Error::Rejected {
+                status: 403 | 404, ..
+            } => self.unavailable_after().is_some(),
+            _ => false,
+        }
+    }
+
+    /// Whether the job in `state` is unavailable: GitLab refused it
+    /// [`Self::unavailable_after`] times in a row.
+    pub fn unavailable(&self, state: &JobState) -> bool {
+        self.unavailable_after()
+            .is_some_and(|after| state.rejections >= after)
     }
 
     pub fn cadence(&self, c: &Config) -> Cadence {
@@ -1053,6 +1089,81 @@ mod tests {
         let alone = [Job::Events, Job::MemberProjects, Job::MemberGroups];
         assert!(alone.iter().all(|j| j.lane() == Lane::Own(*j)));
         assert_eq!(Job::GroupEpics(3).lane(), Lane::Group(3));
+    }
+
+    /// Only the per-project and per-group listings can be unavailable, and
+    /// only a 403 or 404 refuses them; the epics any rejection, from the
+    /// first one.
+    #[test]
+    fn which_jobs_can_be_unavailable_and_what_refuses_them() {
+        let refused = |status| FakeErr::RejectedWith(status).error();
+        let per_project = [
+            Job::ProjectIssues(7),
+            Job::ProjectMergeRequests(7),
+            Job::ProjectBoards(7),
+            Job::ProjectAvatar(7),
+        ];
+        for job in per_project {
+            assert_eq!(job.unavailable_after(), Some(3), "{job:?}");
+            assert!(job.refused_by(&refused(403)), "{job:?}");
+            assert!(job.refused_by(&refused(404)), "{job:?}");
+            for other in [
+                refused(400),
+                refused(422),
+                Error::Gitlab("unreadable page".into()),
+                FakeErr::Transient.error(),
+                FakeErr::Throttled(429).error(),
+                FakeErr::Throttled(503).error(),
+                FakeErr::Unauthorized.error(),
+            ] {
+                assert!(!job.refused_by(&other), "{job:?}: {other}");
+            }
+        }
+
+        let epics = Job::GroupEpics(3);
+        assert_eq!(epics.unavailable_after(), Some(1));
+        for rejection in [
+            refused(403),
+            refused(404),
+            refused(400),
+            Error::Gitlab("x".into()),
+        ] {
+            assert!(epics.refused_by(&rejection), "{rejection}");
+        }
+        assert!(!epics.refused_by(&FakeErr::Throttled(503).error()));
+        assert!(!epics.refused_by(&FakeErr::Transient.error()));
+
+        let account_wide = [
+            Job::AssignedIssues,
+            Job::AssignedMergeRequests,
+            Job::RecentTimelogs,
+            Job::AllTimelogs,
+            Job::Events,
+            Job::MemberProjects,
+            Job::MemberGroups,
+            Job::AllIssues,
+            Job::AllMergeRequests,
+            Job::RecentAuthoredIssues,
+            Job::RecentAssignedIssues,
+        ];
+        let forever = JobState {
+            rejections: u32::MAX,
+            ..JobState::default()
+        };
+        for job in account_wide {
+            assert_eq!(job.unavailable_after(), None, "{job:?}");
+            assert!(!job.refused_by(&refused(403)), "{job:?}");
+            assert!(!job.unavailable(&forever), "{job:?}");
+        }
+
+        let after = |rejections| JobState {
+            rejections,
+            ..JobState::default()
+        };
+        assert!(!Job::ProjectBoards(7).unavailable(&after(2)));
+        assert!(Job::ProjectBoards(7).unavailable(&after(3)));
+        assert!(!epics.unavailable(&after(0)));
+        assert!(epics.unavailable(&after(1)));
     }
 
     #[tokio::test]

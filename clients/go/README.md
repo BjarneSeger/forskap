@@ -18,7 +18,7 @@ go get github.com/BjarneSeger/forskap/clients/go
 
 Releases are tagged `clients/go/vX.Y.Z` and carry the version of the
 [`forskap-api`](../../forskap-api/README.md) crate they were generated from, so a
-version names one state of the interface. Append `@v0.27.0` to pin one.
+version names one state of the interface. Append `@v0.28.0` to pin one.
 
 The generated package is named after the interface, so import it under an alias:
 
@@ -83,6 +83,12 @@ connection releaser. Enum values come from constants: `KindIssue` /
 `KindMergeRequest` for an `IssuableKind`, `Search*` for the kinds of `Search`,
 `Scope*` for the scopes of `ClearCache`, `RoleAuthor` / `RoleAssignee` and
 `StateOpened` / `StateClosed` for the role and the states of `ListIssues`.
+
+Optional fields of a reply are pointers as well, `nil` when the daemon left them
+out. `c.GetSyncJobs` sets `SyncJob.Unavailable` on every job since `v0.28.0`: `true`
+for a job GitLab refuses for good (a project's merge requests or boards switched off,
+epics without GitLab Premium), which the daemon only asks once a day — no failure to
+report. It is `nil` from an older daemon, which doesn't tell.
 
 `c.ListIssues` lists your own issues across projects, closed ones included,
 newest-updated first; each carries its epic's URL as `Parent`. It reaches back

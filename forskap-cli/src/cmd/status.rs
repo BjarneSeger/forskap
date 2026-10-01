@@ -22,7 +22,7 @@ use serde::Serialize;
 
 use crate::cli::{OutputFormat, WatchArgs};
 use crate::cmd::auth::status::{expiry, token_line};
-use crate::cmd::sync::jobs::{failure, kind, pause, span};
+use crate::cmd::sync::jobs::{self, failure, kind, pause, span};
 use crate::{client, config, friendly, output, style, watch};
 
 /// The CLI's own version, which the daemon's should match.
@@ -80,7 +80,7 @@ async fn check(socket: &str) -> Report {
 pub struct Unhealthy;
 
 /// What the exit status says: only an error is a failure, so a warning
-/// (a project with merge requests switched off) doesn't fail a prompt.
+/// (a sync job GitLab keeps failing) doesn't fail a prompt.
 fn outcome(report: &Report) -> Result<()> {
     match report.level {
         Level::Error => Err(Unhealthy.into()),
@@ -360,7 +360,8 @@ struct SyncFacts {
     overdue: Vec<String>,
     /// Instance-wide lists with no successful run yet.
     never_synced: Vec<String>,
-    /// Failing jobs for something GitLab only has in its paid tiers (epics).
+    /// Jobs GitLab refuses for good (a feature switched off in a project,
+    /// epics without GitLab Premium); the daemon asks again once a day.
     unavailable: Vec<String>,
 }
 
@@ -623,11 +624,37 @@ impl Finding {
     }
 }
 
-/// Whether GitLab may lack what the job reads, the daemon's
-/// `Job::optional`: epics need GitLab Premium, and the daemon expects their
-/// fetch to be rejected elsewhere.
-fn optional(key: &str) -> bool {
-    kind(key) == "group/*/epics"
+/// Whether the job's last runs failed, or it backs off after failing.
+fn troubled(job: &SyncJob) -> bool {
+    job.status == SyncJobStatus::backing_off || (job.failures > 0 && job.last_error.is_some())
+}
+
+/// Whether GitLab refuses the job for good, as the daemon says. A daemon too
+/// old to say (no `unavailable`) is judged as it always was: a failing
+/// epics listing is one, they need GitLab Premium.
+fn unavailable(job: &SyncJob) -> bool {
+    match job.unavailable {
+        Some(_) => jobs::unavailable(job),
+        None => kind(&job.key) == "group/*/epics" && troubled(job),
+    }
+}
+
+/// The unavailable jobs in a few words: a kind with several under its
+/// count, a lone one by its key.
+fn refusals(unavailable: &[&SyncJob]) -> String {
+    let mut kinds: Vec<(String, &str, usize)> = Vec::new();
+    for job in unavailable {
+        let kind = kind(&job.key);
+        match kinds.iter_mut().find(|k| k.0 == kind) {
+            Some(k) => k.2 += 1,
+            None => kinds.push((kind, &job.key, 1)),
+        }
+    }
+    let named = kinds.iter().map(|(kind, key, n)| match n {
+        1 => key.to_string(),
+        n => format!("{kind} ({n})"),
+    });
+    named.collect::<Vec<_>>().join(", ")
 }
 
 fn sync(a: &Answers, link: Link, now: i64) -> Check<SyncFacts> {
@@ -638,12 +665,11 @@ fn sync(a: &Answers, link: Link, now: i64) -> Check<SyncFacts> {
     let jobs = &reply.jobs;
     let running = |j: &&SyncJob| j.status == SyncJobStatus::running;
 
-    let (unavailable, failing): (Vec<&SyncJob>, Vec<&SyncJob>) = jobs
+    let unavailable: Vec<&SyncJob> = jobs.iter().filter(|j| unavailable(j)).collect();
+    let failing: Vec<&SyncJob> = jobs
         .iter()
-        .filter(|j| {
-            j.status == SyncJobStatus::backing_off || (j.failures > 0 && j.last_error.is_some())
-        })
-        .partition(|j| optional(&j.key));
+        .filter(|j| troubled(j) && !unavailable.iter().any(|u| u.key == j.key))
+        .collect();
     let hanging: Vec<(&SyncJob, i64)> = jobs
         .iter()
         .filter(running)
@@ -663,7 +689,7 @@ fn sync(a: &Answers, link: Link, now: i64) -> Check<SyncFacts> {
     let never_synced: Vec<&SyncJob> = jobs
         .iter()
         .filter(|j| j.last_ok.is_none() && kind(&j.key) == j.key)
-        .filter(|j| !failing.iter().any(|f| f.key == j.key))
+        .filter(|j| !failing.iter().chain(&unavailable).any(|f| f.key == j.key))
         .collect();
     let paused = pause(reply.paused_until, now);
 
@@ -757,11 +783,18 @@ fn sync(a: &Answers, link: Link, now: i64) -> Check<SyncFacts> {
         }
         if !unavailable.is_empty() {
             let n = unavailable.len();
-            let groups = if n == 1 { "group" } else { "groups" };
-            findings.push(Finding::new(
-                Level::Ok,
-                format!("epics unavailable for {n} {groups}: they need GitLab Premium"),
-            ));
+            let (jobs, them) = if n == 1 {
+                ("job", "it")
+            } else {
+                ("jobs", "them")
+            };
+            let line = format!(
+                "{n} {jobs} unavailable, GitLab refuses {them}: {}",
+                refusals(&unavailable)
+            );
+            let epics = unavailable.iter().any(|j| kind(&j.key) == "group/*/epics");
+            let why = epics.then(|| "Epics need GitLab Premium or Ultimate.".to_string());
+            findings.push(Finding::new(Level::Ok, line).details(why.into_iter().collect()));
         }
         if !never_synced.is_empty() {
             let keys: Vec<&str> = never_synced.iter().map(|j| j.key.as_str()).collect();
@@ -971,6 +1004,21 @@ mod tests {
             running_since: None,
             failures: 0,
             last_error: None,
+            // What a daemon too old to say sends; the same as `false` for
+            // anything but the epics.
+            unavailable: None,
+        }
+    }
+
+    /// A job GitLab refuses for good, as a daemon that says so reports it:
+    /// resting for most of a day, its failures and error kept.
+    fn refused(key: &str, error: &str) -> SyncJob {
+        SyncJob {
+            next_due: Some(NOW + 80_000),
+            failures: 3,
+            last_error: Some(error.to_string()),
+            unavailable: Some(true),
+            ..job(key, SyncJobStatus::waiting)
         }
     }
 
@@ -1321,9 +1369,60 @@ mod tests {
         assert!(outcome(&report).is_ok());
     }
 
-    /// The owner's account: two projects with a feature switched off.
+    /// The owner's account: two projects with a feature switched off, which
+    /// the daemon gave up on: a note under an `ok` sync check.
     #[test]
-    fn features_switched_off_in_a_project_stay_a_warning() {
+    fn features_switched_off_in_a_project_are_only_noted() {
+        let forbidden = "GitLab error: gitlab server error (403 Forbidden): 403 Forbidden";
+        let mut all = vec![fresh("assigned/issues"), fresh("assigned/merge_requests")];
+        all.extend((1..=55).map(|p| fresh(&format!("project/{p}/avatar"))));
+        all.push(refused("project/60/merge_requests", forbidden));
+        all.push(refused("project/61/boards", forbidden));
+        let answers = Answers {
+            jobs: jobs(all),
+            ..healthy()
+        };
+        let report = report(&answers);
+        assert_eq!(levels(&report), [Level::Ok; 4]);
+        let sync = &report.checks.sync;
+        assert_eq!(sync.summary, "59 jobs, none failing");
+        assert_eq!(
+            sync.details,
+            [
+                "2 jobs unavailable, GitLab refuses them: project/60/merge_requests, \
+                 project/61/boards"
+            ]
+        );
+        let facts = sync.facts.as_ref().unwrap();
+        assert!(facts.failing.is_empty());
+        assert_eq!(
+            facts.unavailable,
+            ["project/60/merge_requests", "project/61/boards"]
+        );
+        assert_eq!(report.level, Level::Ok);
+        assert!(outcome(&report).is_ok());
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["level"], "ok");
+        assert_eq!(json["checks"]["sync"]["failing"], serde_json::json!([]));
+        assert_eq!(
+            json["checks"]["sync"]["unavailable"],
+            serde_json::json!(["project/60/merge_requests", "project/61/boards"])
+        );
+        assert!(render(&report).ends_with(
+            "\
+sync     ok       59 jobs, none failing
+                  2 jobs unavailable, GitLab refuses them: project/60/merge_requests, project/61/boards
+queue    ok       no failed writes
+
+healthy
+"
+        ));
+    }
+
+    /// The same two jobs from a daemon too old to tell them apart: they fail
+    /// as they always did.
+    #[test]
+    fn a_daemon_too_old_to_say_still_reports_them_failing() {
         let forbidden = "GitLab error: gitlab server error (403 Forbidden): 403 Forbidden";
         let mut all = vec![fresh("assigned/issues"), fresh("assigned/merge_requests")];
         all.extend((1..=55).map(|p| fresh(&format!("project/{p}/avatar"))));
@@ -1339,29 +1438,98 @@ mod tests {
             [Level::Ok, Level::Ok, Level::Warning, Level::Ok]
         );
         assert_eq!(report.checks.sync.summary, "2 of 59 jobs failing");
+        let facts = report.checks.sync.facts.as_ref().unwrap();
+        assert!(facts.unavailable.is_empty());
         assert!(outcome(&report).is_ok());
     }
 
+    /// Several of a kind are counted, a lone one named; one whose error the
+    /// daemon lost in a restart is still one; a job that fails for real
+    /// next to them still warns.
     #[test]
-    fn epics_gitlab_does_not_serve_are_only_noted() {
+    fn unavailable_jobs_are_noted_by_kind_beside_the_failing_ones() {
+        let forbidden = "GitLab error: 403 Forbidden";
         let answers = Answers {
             jobs: jobs(vec![
                 fresh("assigned/issues"),
-                failing("group/3/epics", 1, "GitLab error: 404 Not Found"),
-                failing("group/4/epics", 1, "GitLab error: 403 Forbidden"),
+                refused("project/61/boards", forbidden),
+                SyncJob {
+                    last_error: None,
+                    ..refused("project/62/boards", forbidden)
+                },
+                refused("project/60/merge_requests", forbidden),
+                failing("project/9/issues", 1, "GitLab error: 400 Bad Request"),
             ]),
             ..healthy()
         };
         let sync = report(&answers).checks.sync;
-        assert_eq!(sync.level, Level::Ok);
-        assert_eq!(sync.summary, "3 jobs, none failing");
+        assert_eq!(sync.level, Level::Warning);
+        assert_eq!(sync.summary, "1 of 5 jobs failing");
         assert_eq!(
             sync.details,
-            ["epics unavailable for 2 groups: they need GitLab Premium"]
+            [
+                "project/9/issues: failed once: GitLab error: 400 Bad Request",
+                "3 jobs unavailable, GitLab refuses them: project/*/boards (2), \
+                 project/60/merge_requests",
+            ]
         );
         let facts = sync.facts.unwrap();
-        assert!(facts.failing.is_empty());
-        assert_eq!(facts.unavailable, ["group/3/epics", "group/4/epics"]);
+        assert_eq!(facts.failing, ["project/9/issues"]);
+        assert_eq!(
+            facts.unavailable,
+            [
+                "project/61/boards",
+                "project/62/boards",
+                "project/60/merge_requests"
+            ]
+        );
+    }
+
+    #[test]
+    fn epics_gitlab_does_not_serve_are_only_noted() {
+        // From a daemon that says so, and from one too old to: by their key,
+        // as before.
+        for (three, four) in [
+            (
+                refused("group/3/epics", "GitLab error: 404 Not Found"),
+                refused("group/4/epics", "GitLab error: 403 Forbidden"),
+            ),
+            (
+                failing("group/3/epics", 1, "GitLab error: 404 Not Found"),
+                failing("group/4/epics", 1, "GitLab error: 403 Forbidden"),
+            ),
+        ] {
+            let answers = Answers {
+                jobs: jobs(vec![fresh("assigned/issues"), three, four]),
+                ..healthy()
+            };
+            let sync = report(&answers).checks.sync;
+            assert_eq!(sync.level, Level::Ok);
+            assert_eq!(sync.summary, "3 jobs, none failing");
+            assert_eq!(
+                sync.details,
+                [
+                    "2 jobs unavailable, GitLab refuses them: group/*/epics (2)",
+                    "Epics need GitLab Premium or Ultimate.",
+                ]
+            );
+            let facts = sync.facts.unwrap();
+            assert!(facts.failing.is_empty());
+            assert_eq!(facts.unavailable, ["group/3/epics", "group/4/epics"]);
+        }
+
+        // A daemon that says so decides: an epics job it still retries (a
+        // 5xx) fails like any other.
+        let answers = Answers {
+            jobs: jobs(vec![SyncJob {
+                unavailable: Some(false),
+                ..failing("group/3/epics", 1, "GitLab unavailable (502)")
+            }]),
+            ..healthy()
+        };
+        let sync = report(&answers).checks.sync;
+        assert_eq!(sync.level, Level::Warning);
+        assert_eq!(sync.facts.unwrap().failing, ["group/3/epics"]);
     }
 
     #[test]
@@ -1750,6 +1918,7 @@ unhealthy: 1 error, 3 skipped
         assert_eq!(checks["sync"]["jobs"]["backing_off"], 1);
         assert_eq!(checks["sync"]["jobs"]["total"], 2);
         assert_eq!(checks["sync"]["failing"][0], "project/9/boards");
+        assert_eq!(checks["sync"]["unavailable"], serde_json::json!([]));
         assert_eq!(checks["queue"]["failed_writes"], 0);
         assert_eq!(checks["queue"]["details"], serde_json::json!([]));
 

@@ -131,7 +131,8 @@ pub fn timelog(t: model::Timelog) -> HistoryEvent {
 }
 
 /// A sync job as the worker reported it; a job that never ran has no
-/// `last_ok`.
+/// `last_ok`. `unavailable` is on every job, so a client tells this daemon
+/// from one too old to say.
 pub fn sync_job(j: JobInfo) -> SyncJob {
     SyncJob {
         key: j.key,
@@ -147,6 +148,7 @@ pub fn sync_job(j: JobInfo) -> SyncJob {
         running_since: j.running_since.map(|at| at as i64),
         failures: i64::from(j.failures),
         last_error: j.last_error,
+        unavailable: Some(j.unavailable),
     }
 }
 
@@ -261,6 +263,58 @@ mod tests {
             created_at: 100,
             ..Default::default()
         }
+    }
+
+    fn info(key: &str, status: JobStatus) -> JobInfo {
+        JobInfo {
+            key: key.into(),
+            status,
+            last_ok: 0,
+            next_due: None,
+            running_since: None,
+            failures: 0,
+            last_error: None,
+            unavailable: false,
+        }
+    }
+
+    /// An unavailable job says so on the wire and keeps its schedule and its
+    /// error; every other job carries an explicit `false`.
+    #[test]
+    fn a_sync_job_says_whether_it_is_unavailable() {
+        let refused = sync_job(JobInfo {
+            last_ok: 0,
+            next_due: Some(1_800_086_400),
+            failures: 3,
+            last_error: Some("GitLab error: 403 Forbidden".into()),
+            unavailable: true,
+            ..info("project/9/boards", JobStatus::Waiting)
+        });
+        assert_eq!(refused.unavailable, Some(true));
+        assert_eq!(refused.status, SyncJobStatus::waiting);
+        assert_eq!(refused.next_due, Some(1_800_086_400));
+        assert_eq!(refused.failures, 3);
+        assert_eq!(
+            refused.last_error.as_deref(),
+            Some("GitLab error: 403 Forbidden")
+        );
+        assert_eq!(refused.last_ok, None);
+        let json = serde_json::to_value(&refused).unwrap();
+        assert_eq!(json["unavailable"], true);
+
+        let failing = sync_job(JobInfo {
+            failures: 1,
+            last_error: Some("GitLab error: 403 Forbidden".into()),
+            ..info("project/9/boards", JobStatus::BackingOff)
+        });
+        assert_eq!(failing.unavailable, Some(false));
+        assert_eq!(failing.status, SyncJobStatus::backing_off);
+        let json = serde_json::to_value(&failing).unwrap();
+        assert_eq!(json["unavailable"], false);
+        assert_eq!(
+            sync_job(info("events", JobStatus::Running)).unavailable,
+            Some(false)
+        );
     }
 
     #[test]

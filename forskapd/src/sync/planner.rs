@@ -15,6 +15,12 @@
 //!
 //! Avatars follow the member projects, tracked or not: a project shows its
 //! icon in search either way.
+//!
+//! A project's own settings leave jobs out: GitLab refuses to list the
+//! issues or boards of a project whose issues are switched off, and the
+//! merge requests of one whose merge requests (or repository) are. Only
+//! what its member row says counts; a project without one, or one that
+//! doesn't say, is planned as usual.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -40,6 +46,9 @@ pub struct Plan {
     pub epic_groups: usize,
     /// The member projects with an avatar, by the hash of its URL.
     pub avatars: BTreeMap<i64, u64>,
+    /// The jobs left out because their project has the feature they read
+    /// switched off.
+    pub switched_off: BTreeSet<Job>,
 }
 
 /// How many tracked projects each source contributed first, for the log.
@@ -103,16 +112,36 @@ pub fn plan(store: &SyncStore, population: SearchPopulation, tracked_since: u64)
         .filter(|p| !p.avatar_url.is_empty())
         .map(|p| (p.id, text_hash(&p.avatar_url)))
         .collect();
+    let no_issues: HashSet<i64> = projects
+        .iter()
+        .filter(|p| p.issues_disabled())
+        .map(|p| p.id)
+        .collect();
+    let no_merge_requests: HashSet<i64> = projects
+        .iter()
+        .filter(|p| p.merge_requests_disabled())
+        .map(|p| p.id)
+        .collect();
+    let switched_off = |job: &Job| match *job {
+        Job::ProjectIssues(p) | Job::ProjectBoards(p) => no_issues.contains(&p),
+        Job::ProjectMergeRequests(p) => no_merge_requests.contains(&p),
+        _ => false,
+    };
     let mut jobs = BTreeSet::from(BASE);
+    let mut left_out = BTreeSet::new();
+    let mut plan_unless_off = |jobs: &mut BTreeSet<Job>, job: Job| {
+        if switched_off(&job) {
+            left_out.insert(job);
+        } else {
+            jobs.insert(job);
+        }
+    };
     jobs.extend(avatars.keys().map(|&p| Job::ProjectAvatar(p)));
     // Board columns are read for the assigned issues and the corpus. A
     // tracked project the user isn't a member of may be gone or closed.
-    jobs.extend(
-        assigned_issues
-            .iter()
-            .chain(tracked.intersection(&members))
-            .map(|&p| Job::ProjectBoards(p)),
-    );
+    for &p in assigned_issues.iter().chain(tracked.intersection(&members)) {
+        plan_unless_off(&mut jobs, Job::ProjectBoards(p));
+    }
     let unlisted = events
         .iter()
         .filter(|e| e.implies_membership() && !members.contains(&e.project_id))
@@ -127,7 +156,8 @@ pub fn plan(store: &SyncStore, population: SearchPopulation, tracked_since: u64)
         SearchPopulation::Tracked => tracked.intersection(&members).copied().collect(),
     };
     for &p in &corpus {
-        jobs.extend([Job::ProjectIssues(p), Job::ProjectMergeRequests(p)]);
+        plan_unless_off(&mut jobs, Job::ProjectIssues(p));
+        plan_unless_off(&mut jobs, Job::ProjectMergeRequests(p));
     }
     // `all` has no per-project corpus: every member group counts.
     let everywhere = population == SearchPopulation::All;
@@ -148,6 +178,7 @@ pub fn plan(store: &SyncStore, population: SearchPopulation, tracked_since: u64)
         corpus: corpus.len(),
         epic_groups: epic_groups.len(),
         avatars,
+        switched_off: left_out,
     })
 }
 
@@ -813,6 +844,166 @@ mod tests {
         c.commit().unwrap();
         assert_eq!(removed, 2, "8 lost its avatar, 9 its membership");
         assert_eq!(s.avatars.keys(RowScope::All).unwrap(), [(7, 0)]);
+    }
+
+    /// A member project with `feature` (`"issues"`, `"merge_requests"`,
+    /// `"repository"`) switched off.
+    fn without(id: i64, feature: &str) -> Project {
+        let mut p = member(id);
+        let off = "disabled".to_string();
+        match feature {
+            "issues" => p.issues_access_level = off,
+            "merge_requests" => p.merge_requests_access_level = off,
+            "repository" => p.repository_access_level = off,
+            other => panic!("no feature {other}"),
+        }
+        p
+    }
+
+    /// The per-project jobs `plan` holds for project `p`, by kind.
+    fn per_project(plan: &Plan, p: i64) -> [bool; 3] {
+        [
+            plan.jobs.contains(&Job::ProjectIssues(p)),
+            plan.jobs.contains(&Job::ProjectMergeRequests(p)),
+            plan.jobs.contains(&Job::ProjectBoards(p)),
+        ]
+    }
+
+    #[test]
+    fn a_feature_switched_off_leaves_its_jobs_out() {
+        let (s, _d) = store();
+        let mut c = s.begin();
+        c.upsert(&[
+            without(1, "merge_requests"),
+            without(2, "issues"),
+            member(3),
+            without(4, "repository"),
+            // Members only: the account may be one, so it is planned.
+            Project {
+                issues_access_level: "private".into(),
+                merge_requests_access_level: "private".into(),
+                ..member(5)
+            },
+            // An instance from before the access levels.
+            Project {
+                issues_enabled: Some(false),
+                merge_requests_enabled: Some(true),
+                ..member(6)
+            },
+        ])
+        .unwrap();
+        let events: Vec<Event> = (1..=6).map(|p| event(p, p, "opened", 500)).collect();
+        c.upsert(&events).unwrap();
+        c.commit().unwrap();
+
+        for population in [SearchPopulation::Tracked, SearchPopulation::Member] {
+            let plan = plan(&s, population, 100).unwrap();
+            // [issues, merge requests, boards]
+            assert_eq!(per_project(&plan, 1), [true, false, true], "{population:?}");
+            assert_eq!(
+                per_project(&plan, 2),
+                [false, true, false],
+                "{population:?}"
+            );
+            assert_eq!(per_project(&plan, 3), [true, true, true], "{population:?}");
+            assert_eq!(per_project(&plan, 4), [true, false, true], "{population:?}");
+            assert_eq!(per_project(&plan, 5), [true, true, true], "{population:?}");
+            assert_eq!(
+                per_project(&plan, 6),
+                [false, true, false],
+                "{population:?}"
+            );
+            assert_eq!(
+                plan.switched_off,
+                BTreeSet::from([
+                    Job::ProjectMergeRequests(1),
+                    Job::ProjectIssues(2),
+                    Job::ProjectBoards(2),
+                    Job::ProjectMergeRequests(4),
+                    Job::ProjectIssues(6),
+                    Job::ProjectBoards(6),
+                ]),
+                "{population:?}"
+            );
+            // Still a corpus project: its epics and its avatar don't care.
+            assert_eq!(plan.corpus, 6, "{population:?}");
+        }
+    }
+
+    /// Boards are read for the assigned issues' projects too: one that
+    /// switched its issues off has none, one without a member row is
+    /// planned as before.
+    #[test]
+    fn boards_of_assigned_issues_follow_the_projects_issues() {
+        let (s, _d) = store();
+        let mut c = s.begin();
+        c.upsert(&[without(2, "issues"), member(3)]).unwrap();
+        c.set_view(ASSIGNED_ISSUES, &listing(&[(2, 1), (3, 1), (9, 1)]))
+            .unwrap();
+        c.commit().unwrap();
+
+        let plan = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        assert!(!plan.jobs.contains(&Job::ProjectBoards(2)));
+        assert!(plan.jobs.contains(&Job::ProjectBoards(3)));
+        assert!(
+            plan.jobs.contains(&Job::ProjectBoards(9)),
+            "no row: unknown"
+        );
+        // The assignment tracks it, so it is in the corpus too.
+        assert_eq!(
+            plan.switched_off,
+            BTreeSet::from([Job::ProjectBoards(2), Job::ProjectIssues(2)])
+        );
+    }
+
+    /// The member listing brings the setting: a project switching its
+    /// issues off loses its issue and board jobs and their rows (but the
+    /// items a view lists), and switching them back on brings the jobs back.
+    #[test]
+    fn switching_a_feature_off_and_on_again_drops_and_returns_its_jobs() {
+        let (s, _d) = store();
+        let mut c = s.begin();
+        c.upsert(&[member(2)]).unwrap();
+        c.upsert(&[event(1, 2, "opened", 500)]).unwrap();
+        c.upsert(&[issue(2, 1), issue(2, 2)]).unwrap();
+        c.upsert(&[Board {
+            id: 1,
+            project_id: 2,
+            ..Default::default()
+        }])
+        .unwrap();
+        c.set_view(RECENT_AUTHORED_ISSUES, &listing(&[(2, 2)]))
+            .unwrap();
+        c.commit().unwrap();
+        let on = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        assert_eq!(per_project(&on, 2), [true, true, true]);
+
+        let mut c = s.begin();
+        c.upsert(&[without(2, "issues")]).unwrap();
+        c.commit().unwrap();
+        let off = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        assert_eq!(per_project(&off, 2), [false, true, false]);
+        let mut c = s.begin();
+        let removed = collect_garbage(&mut c, &s, &off).unwrap();
+        c.commit().unwrap();
+        assert_eq!(removed, 2, "issue #1 and the board");
+        assert_eq!(
+            s.issues.keys(RowScope::All).unwrap(),
+            [(2, 2)],
+            "a view still lists #2"
+        );
+        assert!(s.boards.keys(RowScope::All).unwrap().is_empty());
+
+        let mut c = s.begin();
+        c.upsert(&[Project {
+            issues_access_level: "enabled".into(),
+            ..member(2)
+        }])
+        .unwrap();
+        c.commit().unwrap();
+        let again = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        assert_eq!(again.jobs, on.jobs);
+        assert!(again.switched_off.is_empty());
     }
 
     #[test]

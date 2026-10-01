@@ -110,6 +110,7 @@ type SyncJob struct {
 	Running_since *int64        `json:"running_since,omitempty"`
 	Failures      int64         `json:"failures"`
 	Last_error    *string       `json:"last_error,omitempty"`
+	Unavailable   *bool         `json:"unavailable,omitempty"`
 }
 
 type Epic struct {
@@ -2105,7 +2106,8 @@ type SyncJob (
   next_due: ?int,
   running_since: ?int,
   failures: int,
-  last_error: ?string
+  last_error: ?string,
+  unavailable: ?bool
 )
 
 type Epic (

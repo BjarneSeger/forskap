@@ -2023,6 +2023,7 @@ async fn get_sync_jobs_lists_the_plan_while_dormant() {
         (None, None, None)
     );
     assert_eq!((job.failures, job.last_error.as_deref()), (0, None));
+    assert_eq!(job.unavailable, Some(false));
 }
 
 #[tokio::test]
@@ -2046,6 +2047,63 @@ async fn get_sync_jobs_reports_a_failed_job() {
     assert_eq!(job.failures, 1);
     assert!(job.next_due.is_some_and(|at| at > now_secs() as i64));
     assert!(job.last_error.is_some());
+    assert_eq!(
+        job.unavailable,
+        Some(false),
+        "an account-wide list never is"
+    );
+}
+
+/// A job GitLab refused three times in a row is unavailable on the wire:
+/// `waiting` for its next try about a day out, its failures and error kept.
+/// Every other job says `false`, so a client tells this daemon from one too
+/// old to say.
+#[tokio::test]
+async fn get_sync_jobs_reports_an_unavailable_job() {
+    let fake = Arc::new(FakeGitlab::default());
+    fake.serve("issues", vec![issue_json(7, 1, "assigned")]);
+    for _ in 0..3 {
+        fake.fail_next("projects/7/boards", FakeErr::Rejected);
+    }
+    let (h, _dir) = connected_handlers(&fake);
+    // The assigned list plans its project's boards and waits for them: the
+    // first refusal.
+    h.sync.refresh_now(&[Job::AssignedIssues]).await;
+    for _ in 0..2 {
+        h.sync.refresh_now(&[Job::ProjectBoards(7)]).await;
+    }
+    assert_eq!(fake.calls_to("projects/7/boards").len(), 3);
+
+    let mut call = AsyncCall::default();
+    h.get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
+        .await
+        .unwrap();
+    let reply = reply::<GetSyncJobs_Reply>(&mut call);
+    let find = |key: &str| {
+        let job = reply.jobs.iter().find(|j| j.key == key);
+        job.unwrap_or_else(|| panic!("{key} in {:?}", reply.jobs))
+    };
+    let boards = find("project/7/boards");
+    assert_eq!(boards.unavailable, Some(true), "{boards:?}");
+    assert!(
+        matches!(boards.status, SyncJobStatus::waiting),
+        "{boards:?}"
+    );
+    assert_eq!(boards.failures, 3);
+    let six_hours = 6 * 3600;
+    assert!(
+        boards
+            .next_due
+            .is_some_and(|at| at > now_secs() as i64 + six_hours),
+        "{boards:?}"
+    );
+    assert!(
+        boards
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("403"))
+    );
+    assert_eq!(find(ASSIGNED_ISSUES).unavailable, Some(false));
 }
 
 async fn who_am_i(h: &Handlers) -> WhoAmI_Reply {

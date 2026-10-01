@@ -42,8 +42,15 @@ reconnect).
   downloads. `project_json_with_avatar(id, file)` is a member project with one.
 - Assert on traffic with `calls()`, `calls_to(path)`, `timelog_calls()`,
   `read_calls()` — e.g. "a read never touches GitLab" is `read_calls() == 0`.
-- `FakeErr::{Transient, Throttled(status), Rejected, Unauthorized}` build the
-  matching `Error` (`Unauthorized` is a 401: a dead token).
+- `FakeErr::{Transient, Throttled(status), Rejected, RejectedWith(status),
+  Unauthorized}` build the matching `Error` (`Unauthorized` is a 401: a dead token).
+  `Rejected` is GitLab's 403 Forbidden, `RejectedWith(404 | 400 | 422 | …)` a
+  rejection with another status; both are `Error::Rejected { status, .. }`, whose
+  status the sync engine counts refusals (403/404) by. A failure without a status
+  (an unreadable page) is a plain `Error::Gitlab`.
+- `project_json(id)` is a member project with every feature on;
+  `project_json_without(id, "issues" | "merge_requests" | "repository")` one with
+  that feature switched off, for the planner's feature levels.
 - JSON builders `issue_json`, `event_json`; `eventually(what, || cond)` polls up to 2 s.
 
 ## Handler tests (`src/handlers/tests.rs`)
@@ -86,6 +93,14 @@ is `Ok`; "did not fire" → `.is_err()`.
   keeps the avatar files in `dir`, for tests that restart or look at them.
   `start_on_demand(store, state)` runs only demanded jobs, for tests of what reaches
   the store beside the fetches (`land_issue`); `seed_views` writes their views.
+  A failed job retries only after its backoff (a minute and up): to drive several
+  attempts, queue that many `fail_next`s, wait for the scheduled one
+  (`first_failure`) and demand the rest with `rerun(&env, job)`, which runs it ahead
+  of its backoff and waits for the outcome. `serve_tracked_project` plans project 7's
+  jobs. To assert on what the worker *logs* (a warning or only a debug line),
+  `let (logs, _guard) = Logs::capture();` before starting it, then
+  `logs.count("WARN", &job.key())` / `logs.said(level, key, "message")`: a
+  `#[tokio::test]` runs the worker on its own thread, where the capture applies.
 
 ## Dry-run tests (`src/daemon.rs`, `src/demo.rs`)
 

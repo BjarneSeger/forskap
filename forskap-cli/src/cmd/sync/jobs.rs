@@ -4,7 +4,9 @@
 //! This lists every planned job in the order the worker runs them: the ones
 //! in flight, the ones demanded ahead of the schedule, the due ones, then
 //! the rest by their next run. Jobs that are done for good (a fetched avatar
-//! per project) would drown the rest, so they share one line per kind.
+//! per project) would drown the rest, so they share one line per kind, and so
+//! do the jobs GitLab refuses for good (a project's merge requests switched
+//! off): those are no failures to fix, and the daemon asks again once a day.
 
 use anyhow::Result;
 use chrono::Utc;
@@ -37,10 +39,21 @@ fn text(reply: &GetSyncJobs_Reply, all: bool) -> String {
     render(&reply.jobs, reply.paused_until, Utc::now().timestamp(), all)
 }
 
-/// One line of the table: a job, or the settled jobs of one kind.
+/// One line of the table: a job, or the settled or unavailable jobs of one
+/// kind, with what is said beneath it.
 struct Row<'a> {
     cells: [String; 4],
-    error: Option<(&'a str, i64)>,
+    below: Option<Below<'a>>,
+}
+
+/// The line beneath a row.
+enum Below<'a> {
+    /// Why it fails, and how often it did.
+    Failure(&'a str, i64),
+    /// Why GitLab refuses it, where the daemon still knows.
+    Refused(Option<&'a str>),
+    /// Several refused jobs share the row.
+    RefusedAll,
 }
 
 /// A job with nothing left to do and nothing to report: it ran, and is
@@ -50,6 +63,19 @@ fn settled(job: &SyncJob) -> bool {
         && job.last_ok.is_some()
         && job.next_due.is_none()
         && job.last_error.is_none()
+}
+
+/// A job GitLab refuses for good, as the daemon says; one too old to say
+/// has none.
+pub fn unavailable(job: &SyncJob) -> bool {
+    job.unavailable == Some(true)
+}
+
+/// What jobs share a row, by kind, unless `--all`.
+#[derive(PartialEq)]
+enum Share {
+    Settled,
+    Unavailable,
 }
 
 /// The key with its ids blanked: `project/7/avatar` is a `project/*/avatar`.
@@ -62,23 +88,60 @@ pub fn kind(key: &str) -> String {
     key.split('/').map(blank).collect::<Vec<_>>().join("/")
 }
 
+/// The jobs of one kind sharing a row.
+struct Group {
+    share: Share,
+    kind: String,
+    row: usize,
+    count: usize,
+    /// The latest sync of any of them, 0 for none.
+    synced: i64,
+    /// The soonest next run of any of them.
+    next: Option<i64>,
+}
+
 /// A row per job, in order; unless `all`, the settled jobs of a kind share
-/// the row of the first, under their count and latest sync.
+/// the row of the first, under their count and latest sync, and so do the
+/// unavailable ones, under their soonest next attempt.
 fn rows(jobs: &[SyncJob], now: i64, all: bool) -> Vec<Row<'_>> {
     let ago = |at: i64| format!("{} ago", span(now - at));
     let mut rows: Vec<Row> = Vec::with_capacity(jobs.len());
-    // Kind, row, count and latest sync of each group.
-    let mut groups: Vec<(String, usize, usize, i64)> = Vec::new();
+    let mut groups: Vec<Group> = Vec::new();
     for job in jobs {
-        if !all && settled(job) {
+        let share = if resting(job) {
+            Some(Share::Unavailable)
+        } else if settled(job) {
+            Some(Share::Settled)
+        } else {
+            None
+        };
+        if let Some(share) = share.filter(|_| !all) {
             let (kind, synced) = (kind(&job.key), job.last_ok.unwrap_or(0));
-            if let Some(group) = groups.iter_mut().find(|g| g.0 == kind) {
-                group.2 += 1;
-                group.3 = group.3.max(synced);
+            let group = groups
+                .iter_mut()
+                .find(|g| g.share == share && g.kind == kind);
+            if let Some(group) = group {
+                group.count += 1;
+                group.synced = group.synced.max(synced);
+                group.next = group.next.into_iter().chain(job.next_due).min();
                 continue;
             }
-            groups.push((kind, rows.len(), 1, synced));
+            groups.push(Group {
+                share,
+                kind,
+                row: rows.len(),
+                count: 1,
+                synced,
+                next: job.next_due,
+            });
         }
+        let below = if unavailable(job) {
+            Some(Below::Refused(job.last_error.as_deref()))
+        } else {
+            job.last_error
+                .as_deref()
+                .map(|e| Below::Failure(e, job.failures))
+        };
         rows.push(Row {
             cells: [
                 job.key.clone(),
@@ -86,13 +149,20 @@ fn rows(jobs: &[SyncJob], now: i64, all: bool) -> Vec<Row<'_>> {
                 job.last_ok.map_or_else(|| "never".to_string(), ago),
                 next(job, now),
             ],
-            error: job.last_error.as_deref().map(|e| (e, job.failures)),
+            below,
         });
     }
-    for (kind, row, count, synced) in groups {
-        if count > 1 {
-            rows[row].cells[0] = format!("{kind} ({count})");
-            rows[row].cells[2] = ago(synced);
+    for group in groups.into_iter().filter(|g| g.count > 1) {
+        let row = &mut rows[group.row];
+        row.cells[0] = format!("{} ({})", group.kind, group.count);
+        if group.synced > 0 {
+            row.cells[2] = ago(group.synced);
+        }
+        if group.share == Share::Unavailable {
+            row.cells[3] = group
+                .next
+                .map_or_else(|| "-".to_string(), |at| when(at, now));
+            row.below = Some(Below::RefusedAll);
         }
     }
     rows
@@ -123,12 +193,32 @@ fn render(jobs: &[SyncJob], paused_until: Option<i64>, now: i64, all: bool) -> S
     out.push_str(&format!("{}\n", style::heading(&header)));
     for row in &rows {
         out.push_str(&line(&row.cells));
-        if let Some((error, failures)) = row.error {
-            let error = failure(failures, Some(error));
-            out.push_str(&format!("    {}\n", style::error(&error)));
+        match row.below {
+            Some(Below::Failure(error, failures)) => {
+                let error = failure(failures, Some(error));
+                out.push_str(&format!("    {}\n", style::error(&error)));
+            }
+            Some(Below::Refused(error)) => {
+                let why = refused(error);
+                out.push_str(&format!("    {}\n", style::note(&why)));
+            }
+            Some(Below::RefusedAll) => {
+                let why = "refused by GitLab; `--all` lists each";
+                out.push_str(&format!("    {}\n", style::note(why)));
+            }
+            None => {}
         }
     }
     out
+}
+
+/// Why GitLab refuses a job, as far as the daemon still knows: its last
+/// error is gone after a restart.
+fn refused(error: Option<&str>) -> String {
+    match error {
+        Some(error) => format!("refused by GitLab: {error}"),
+        None => "refused by GitLab".to_string(),
+    }
 }
 
 /// The rate-limit pause, while it lasts.
@@ -156,7 +246,16 @@ pub fn failure(failures: i64, error: Option<&str>) -> String {
     }
 }
 
+/// An unavailable job that isn't being tried again right now.
+fn resting(job: &SyncJob) -> bool {
+    let trying = matches!(job.status, SyncJobStatus::running | SyncJobStatus::demanded);
+    unavailable(job) && !trying
+}
+
 fn status(job: &SyncJob) -> &'static str {
+    if resting(job) {
+        return "unavailable";
+    }
     match job.status {
         SyncJobStatus::running => "running",
         SyncJobStatus::demanded => "demanded",
@@ -175,10 +274,18 @@ fn next(job: &SyncJob, now: i64) -> String {
         },
         (SyncJobStatus::demanded, _) => "next".to_string(),
         (SyncJobStatus::due, _) => "now".to_string(),
-        (_, Some(at)) if at > now => format!("in {}", span(at - now)),
-        (_, Some(_)) => "now".to_string(),
+        (_, Some(at)) => when(at, now),
         // Nothing left to do until what it syncs changes (an avatar).
         (_, None) => "-".to_string(),
+    }
+}
+
+/// A time to come relative to `now`: `in 3h 5m`, or `now` once it passed.
+fn when(at: i64, now: i64) -> String {
+    if at > now {
+        format!("in {}", span(at - now))
+    } else {
+        "now".to_string()
     }
 }
 
@@ -211,7 +318,135 @@ mod tests {
             running_since: None,
             failures: 0,
             last_error: None,
+            // What a daemon too old to say sends.
+            unavailable: None,
         }
+    }
+
+    /// A job GitLab refuses for good, resting until `next_in` from now.
+    fn refused_job(key: &str, next_in: i64) -> SyncJob {
+        SyncJob {
+            next_due: Some(NOW + next_in),
+            failures: 3,
+            last_error: Some("GitLab error: 403 Forbidden".to_string()),
+            unavailable: Some(true),
+            ..job(key, SyncJobStatus::waiting)
+        }
+    }
+
+    /// The owner's account: boards and merge requests switched off in a
+    /// few projects, next to a job that fails for real.
+    fn refusals() -> Vec<SyncJob> {
+        vec![
+            SyncJob {
+                last_ok: Some(NOW - 60),
+                next_due: Some(NOW + 60),
+                unavailable: Some(false),
+                ..job("events", SyncJobStatus::waiting)
+            },
+            refused_job("project/61/boards", 80_000),
+            refused_job("project/60/merge_requests", 86_000),
+            refused_job("project/62/boards", 70_000),
+            SyncJob {
+                next_due: Some(NOW + 3600),
+                failures: 1,
+                last_error: Some("GitLab error: 403 Forbidden".to_string()),
+                unavailable: Some(false),
+                ..job("project/9/issues", SyncJobStatus::backing_off)
+            },
+        ]
+    }
+
+    /// Refused jobs are no failures: they say `unavailable` and why, without
+    /// a count, and share a line per kind like the settled ones, under their
+    /// soonest next attempt.
+    #[test]
+    fn unavailable_jobs_say_so_and_share_a_line_per_kind() {
+        assert_eq!(
+            render(&refusals(), None, NOW, false),
+            "\
+JOB                        STATUS       LAST SYNC  NEXT
+events                     waiting      1m ago     in 1m
+project/*/boards (2)       unavailable  never      in 19h 26m
+    refused by GitLab; `--all` lists each
+project/60/merge_requests  unavailable  never      in 23h 53m
+    refused by GitLab: GitLab error: 403 Forbidden
+project/9/issues           backing off  never      in 1h
+    failed once: GitLab error: 403 Forbidden
+"
+        );
+    }
+
+    #[test]
+    fn all_lists_each_unavailable_job_with_its_reason() {
+        let every = render(&refusals(), None, NOW, true);
+        assert!(
+            every.contains(
+                "\
+project/61/boards          unavailable  never      in 22h 13m
+    refused by GitLab: GitLab error: 403 Forbidden
+"
+            ),
+            "{every}"
+        );
+        assert!(
+            every.contains("project/62/boards          unavailable  never      in 19h 26m\n"),
+            "{every}"
+        );
+        assert!(!every.contains("--all"), "{every}");
+        assert!(!every.contains("failed 3 times"), "{every}");
+        // A header, five jobs and a line beneath each but the events.
+        assert_eq!(every.lines().count(), 1 + 5 + 4, "{every}");
+    }
+
+    #[test]
+    fn an_unavailable_job_tried_again_or_after_a_restart_keeps_a_line() {
+        let jobs = [
+            // Demanded: being tried again, so it isn't resting.
+            SyncJob {
+                status: SyncJobStatus::running,
+                running_since: Some(NOW - 2),
+                ..refused_job("project/61/boards", 0)
+            },
+            // The daemon restarted: no error kept.
+            SyncJob {
+                last_error: None,
+                ..refused_job("project/62/boards", 3600)
+            },
+        ];
+        assert_eq!(
+            render(&jobs, None, NOW, false),
+            "\
+JOB                STATUS       LAST SYNC  NEXT
+project/61/boards  running      never      for 2s
+    refused by GitLab: GitLab error: 403 Forbidden
+project/62/boards  unavailable  never      in 1h
+    refused by GitLab
+"
+        );
+    }
+
+    /// A daemon too old to say sends no `unavailable`: its refused jobs show
+    /// as the failures it reports them as.
+    #[test]
+    fn without_the_field_refused_jobs_fail_as_before() {
+        let old: Vec<SyncJob> = refusals()
+            .into_iter()
+            .map(|j| SyncJob {
+                unavailable: None,
+                status: if j.failures > 0 {
+                    SyncJobStatus::backing_off
+                } else {
+                    j.status
+                },
+                ..j
+            })
+            .collect();
+        let text = render(&old, None, NOW, false);
+        assert!(!text.contains("unavailable"), "{text}");
+        assert!(!text.contains("refused"), "{text}");
+        assert_eq!(text.matches("failed 3 times").count(), 3, "{text}");
+        assert!(text.contains("project/62/boards"), "{text}");
     }
 
     #[test]

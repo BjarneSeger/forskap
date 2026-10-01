@@ -49,8 +49,11 @@ pub enum FakeErr {
     Transient,
     /// 429/5xx: `Error::Throttled` with this status.
     Throttled(u16),
-    /// A permanent rejection: `Error::Gitlab`.
+    /// A permanent rejection, GitLab's 403 Forbidden: `Error::Rejected`.
     Rejected,
+    /// A permanent rejection with this status (404, 400, 422, …):
+    /// `Error::Rejected`.
+    RejectedWith(u16),
     /// A dead token: `Error::Unauthorized`.
     Unauthorized,
     /// An unusable rotation answer: `Error::RotationLost`.
@@ -68,7 +71,16 @@ impl FakeErr {
                 retry_after: None,
                 detail: "busy".into(),
             },
-            Self::Rejected => Error::Gitlab("403 Forbidden".into()),
+            Self::Rejected => Self::RejectedWith(403).error(),
+            Self::RejectedWith(status) => Error::Rejected {
+                status,
+                detail: match status {
+                    403 => "403 Forbidden".into(),
+                    404 => "404 Not Found".into(),
+                    400 => "400 Bad Request".into(),
+                    _ => format!("{status} refused"),
+                },
+            },
             Self::Unauthorized => Error::Unauthorized("401 Unauthorized".into()),
             Self::Lost => Error::RotationLost("unreadable answer".into()),
             Self::Panic => panic!("fake panic"),
@@ -454,7 +466,7 @@ pub fn epic_json(group_id: i64, iid: i64, title: &str) -> Value {
 pub const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 /// A member project as GitLab's listing returns it (the fields the daemon
-/// mirrors), without an avatar and not archived.
+/// mirrors), without an avatar, not archived and with every feature on.
 pub fn project_json(id: i64) -> Value {
     serde_json::json!({
         "id": id,
@@ -463,7 +475,23 @@ pub fn project_json(id: i64) -> Value {
         "web_url": format!("https://gitlab.test/g/p{id}"),
         "avatar_url": null,
         "archived": false,
+        "issues_enabled": true,
+        "merge_requests_enabled": true,
+        "issues_access_level": "enabled",
+        "merge_requests_access_level": "enabled",
+        "repository_access_level": "enabled",
     })
+}
+
+/// [`project_json`] with the feature `feature` (`"issues"`,
+/// `"merge_requests"`, `"repository"`) switched off, as GitLab shows it.
+pub fn project_json_without(id: i64, feature: &str) -> Value {
+    let mut project = project_json(id);
+    project[format!("{feature}_access_level")] = "disabled".into();
+    if feature != "repository" {
+        project[format!("{feature}_enabled")] = false.into();
+    }
+    project
 }
 
 /// A member group at `full_path` as GitLab's listing returns it.
