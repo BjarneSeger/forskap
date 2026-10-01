@@ -3,17 +3,16 @@ name: Homebrew
 # Installs the formula of this repository's tap with Homebrew, runs
 # `brew test` and, on macOS, the daemon as a launchd service. Two modes:
 #
-# - `checkout` (pushes and pull requests): the checkout is built with cargo,
-#   packed like a release archive and installed through the formula the
-#   release workflow would render for it, so a change is tried on macOS
-#   before it is released.
+# - `checkout` (pull requests): the checkout is built with cargo, packed like
+#   a release archive and installed through the formula the release workflow
+#   would render for it, so a change is tried on macOS before it is merged.
+#   Not on pushes to main: the pull request tried the merge already, and
+#   release.yml builds macOS there.
 # - `stable` (manual runs, and the release workflow after it rendered the
 #   formula for a tag): the formula as committed, downloading the release it
 #   names, the way a user gets it.
 on:
-  push:
-    branches:
-      - main
+  pull_request:
     paths:
       - "Formula/**"
       - ".github/workflows/brew.yml"
@@ -28,18 +27,6 @@ on:
       - "Cargo.lock"
       - "*/Cargo.toml"
       # Writes the completion files the formula installs.
-      - "forskap-cli/build.rs"
-      - "forskap-cli/src/complete/nushell.nu"
-  pull_request:
-    paths:
-      - "Formula/**"
-      - ".github/workflows/brew.yml"
-      - ".github/scripts/package-release.sh"
-      - ".github/scripts/render-formula.sh"
-      - ".goreleaser.yaml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "*/Cargo.toml"
       - "forskap-cli/build.rs"
       - "forskap-cli/src/complete/nushell.nu"
   workflow_dispatch:
