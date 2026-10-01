@@ -362,10 +362,22 @@ impl GitlabClient {
     }
 
     pub async fn connect(host: &str, token: &Token) -> Result<Self> {
-        let inner = gitlab::GitlabBuilder::new(host.to_string(), token.expose().to_string())
-            .build_async()
-            .await
-            .map_err(classify_build)?;
+        let builder = gitlab::GitlabBuilder::new(host.to_string(), token.expose().to_string());
+        Self::connect_with(&builder, host, token).await
+    }
+
+    /// [`GitlabClient::connect`] through a prepared builder: a test's local
+    /// server speaks plain HTTP.
+    ///
+    /// The builder makes the HTTP client itself. That client asks for gzip
+    /// and decodes it because `Cargo.toml` switches reqwest's `gzip` feature
+    /// on; nothing in here has to.
+    async fn connect_with(
+        builder: &gitlab::GitlabBuilder,
+        host: &str,
+        token: &Token,
+    ) -> Result<Self> {
+        let inner = builder.build_async().await.map_err(classify_build)?;
 
         let user: serde_json::Value = CurrentUserEndpoint
             .query_async(&inner)
@@ -1495,6 +1507,202 @@ mod tests {
             walk_pages(&fake, &EVENTS, None).await,
             Err(Error::Gitlab(detail)) if detail.contains("404") && detail.contains("nope")
         ));
+    }
+
+    /// One request as [`LocalGitlab`] saw it.
+    struct Asked {
+        /// Path and query.
+        target: String,
+        accept_encoding: Option<String>,
+    }
+
+    impl Asked {
+        fn accepts_gzip(&self) -> bool {
+            self.accept_encoding
+                .as_deref()
+                .is_some_and(|v| v.split(',').any(|e| e.trim() == "gzip"))
+        }
+    }
+
+    /// A GitLab on a local port for the real client to talk HTTP to. Like a
+    /// real one it gzips an answer only for a request that accepts it, and it
+    /// records what it was asked.
+    struct LocalGitlab {
+        addr: std::net::SocketAddr,
+        asked: std::sync::Arc<std::sync::Mutex<Vec<Asked>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl LocalGitlab {
+        fn start() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let server = Self {
+                addr: listener.local_addr().unwrap(),
+                asked: Default::default(),
+                stop: Default::default(),
+            };
+            let (asked, stop) = (server.asked.clone(), server.stop.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    // A broken connection fails the client's call, which the
+                    // test reports.
+                    let _ = stream.and_then(|s| Self::answer(s, &asked));
+                }
+            });
+            server
+        }
+
+        /// Answer the one request of a connection, then close it.
+        fn answer(
+            mut stream: std::net::TcpStream,
+            asked: &std::sync::Mutex<Vec<Asked>>,
+        ) -> std::io::Result<()> {
+            use std::io::{Read, Write};
+
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            // Every request here is a GET: it ends with its headers.
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            let head = String::from_utf8_lossy(&head);
+            let mut lines = head.lines();
+            // The `gitlab` crate ends a URL without parameters in `?`.
+            let target = lines
+                .next()
+                .and_then(|request_line| request_line.split(' ').nth(1))
+                .unwrap_or_default()
+                .trim_end_matches('?')
+                .to_string();
+            let accept_encoding = lines
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
+                .map(|(_, value)| value.trim().to_string());
+            let request = Asked {
+                target,
+                accept_encoding,
+            };
+
+            let (status, next_page, plain) = Self::canned(&request.target);
+            let (encoding, body) = if request.accepts_gzip() {
+                ("Content-Encoding: gzip\r\n", gzip(&plain))
+            } else {
+                ("", plain)
+            };
+            asked.lock().unwrap().push(request);
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\n{encoding}Content-Length: {}\r\n\
+                 X-Next-Page: {next_page}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )?;
+            stream.write_all(&body)
+        }
+
+        /// Status, `X-Next-Page` and the plain body for a request.
+        fn canned(target: &str) -> (&'static str, &'static str, Vec<u8>) {
+            let json = |v: serde_json::Value| serde_json::to_vec(&v).unwrap();
+            let rows =
+                |ids: &[u64]| json(ids.iter().map(|id| serde_json::json!({"id": id})).collect());
+            match target {
+                "/api/v4/user" => (
+                    "200 OK",
+                    "",
+                    json(serde_json::json!({"id": 7, "username": "ada"})),
+                ),
+                "/api/v4/events?sort=asc&page=1&per_page=100" => ("200 OK", "2", rows(&[1, 2])),
+                "/api/v4/events?sort=asc&page=2&per_page=100" => ("200 OK", "", rows(&[3])),
+                "/api/v4/projects/7/avatar" => ("200 OK", "", image()),
+                _ => (
+                    "404 Not Found",
+                    "",
+                    json(serde_json::json!({"message": format!("nothing at {target}")})),
+                ),
+            }
+        }
+
+        fn asked(&self) -> std::sync::MutexGuard<'_, Vec<Asked>> {
+            self.asked.lock().unwrap()
+        }
+    }
+
+    impl Drop for LocalGitlab {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Wakes the accept the thread is waiting in.
+            let _ = std::net::TcpStream::connect(self.addr);
+        }
+    }
+
+    fn gzip(plain: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(plain).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// An avatar holding every byte value: a body that is not text.
+    fn image() -> Vec<u8> {
+        [crate::testing::PNG, &(0..=u8::MAX).collect::<Vec<_>>()].concat()
+    }
+
+    /// The `gitlab` crate builds the HTTP client, and it compresses only
+    /// because `Cargo.toml` switches a reqwest feature on for it. If a
+    /// dependency bump drops that, nothing fails: the daemon just downloads
+    /// every listing in full again. Hence the check on the wire.
+    #[tokio::test]
+    async fn the_real_client_asks_for_gzip_and_decodes_the_answers() {
+        let server = LocalGitlab::start();
+        let host = server.addr.to_string();
+        let mut builder = gitlab::GitlabBuilder::new(host.clone(), "token");
+        builder.insecure();
+
+        let conversation = async {
+            let client = GitlabClient::connect_with(&builder, &host, &Token::new("token"))
+                .await
+                .unwrap();
+            let rows = client.list(&EVENTS, None).await.unwrap();
+            let avatar = client.project_avatar(7).await.unwrap();
+            (client, rows, avatar)
+        };
+        let (client, rows, avatar) = tokio::time::timeout(Duration::from_secs(5), conversation)
+            .await
+            .expect("the local server answers");
+
+        let asked = server.asked();
+        let without_gzip: Vec<_> = asked
+            .iter()
+            .filter(|request| !request.accepts_gzip())
+            .map(|request| (&request.target, &request.accept_encoding))
+            .collect();
+        assert!(
+            without_gzip.is_empty(),
+            "asked for without `Accept-Encoding: gzip`: {without_gzip:?}"
+        );
+        // The connection check, the listing with its second page (the
+        // `X-Next-Page` of a decoded answer is still read) and the avatar.
+        let targets: Vec<_> = asked.iter().map(|r| r.target.as_str()).collect();
+        for target in [
+            "/api/v4/user",
+            "/api/v4/events?sort=asc&page=1&per_page=100",
+            "/api/v4/events?sort=asc&page=2&per_page=100",
+            "/api/v4/projects/7/avatar",
+        ] {
+            assert!(targets.contains(&target), "{target} not in {targets:?}");
+        }
+
+        assert_eq!(client.current_username(), "ada");
+        assert_eq!(ids(&rows), [1, 2, 3]);
+        assert_eq!(avatar, Some(image()));
     }
 
     #[test]
