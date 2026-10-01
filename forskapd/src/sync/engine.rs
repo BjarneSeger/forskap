@@ -7,12 +7,16 @@
 //! priority), else to the planned job that is due, lowest priority class
 //! first. Per-job jittered due times plus a jittered pause between launches
 //! keep requests spread out. A 429 stops the launches for its pause; a 5xx
-//! or a rejection backs off only its job (a rejected epics fetch rests for a
-//! day: the instance has no epics); a network error backs off its job and
-//! demotes the session, parking the worker until the reconnect supervisor
-//! wakes it; a 401 parks the session until `forskap auth login`. Fetches
-//! still in flight then finish on their own: what they fetched lands, and a
-//! failure of the session already given up counts for nothing.
+//! or a rejection backs off only its job; a network error backs off its job
+//! and demotes the session, parking the worker until the reconnect
+//! supervisor wakes it; a 401 parks the session until `forskap auth login`.
+//! Fetches still in flight then finish on their own: what they fetched
+//! lands, and a failure of the session already given up counts for nothing.
+//!
+//! A per-project or per-group listing GitLab refuses (403/404) three times
+//! in a row is unavailable (an epics listing at its first rejection: the
+//! instance has no epics): it rests a day at a time and fails quietly, until
+//! a run succeeds, a login clears every backoff or a cache clear resets it.
 //!
 //! One row comes from outside the fetches: an issue the handlers just
 //! created ([`SyncHandle::land_issue`]). The worker stores it like a fetched
@@ -141,7 +145,7 @@ pub enum JobStatus {
     Demanded,
     /// Its due time passed; it runs once the worker gets to it.
     Due,
-    /// Not due yet.
+    /// Not due yet; for an unavailable job, resting until its next attempt.
     Waiting,
     /// Failed, and held back until its retry time.
     BackingOff,
@@ -164,6 +168,9 @@ pub struct JobInfo {
     pub failures: u32,
     /// Why the last run failed, until a run succeeds. Kept in memory only.
     pub last_error: Option<String>,
+    /// GitLab refused it for good (see [`Job::unavailable`]): it rests a day
+    /// at a time, and its status is no `BackingOff`.
+    pub unavailable: bool,
 }
 
 /// The worker's jobs at one moment, in the order it would run them.
@@ -653,6 +660,7 @@ impl Worker {
                 let (at, state, cadence) = self.due(job, &cfg);
                 let flight = self.flights.values().find(|f| f.job == job);
                 let running_since = flight.map(|f| f.started);
+                let unavailable = job.unavailable(&state);
                 let (status, order) = if let Some(since) = running_since {
                     (JobStatus::Running, (0, 0, since))
                 } else if self.demand.contains_key(&job) {
@@ -660,9 +668,11 @@ impl Worker {
                 } else if at <= now {
                     let class = Self::class(job, &state, cadence, now - at);
                     (JobStatus::Due, (2, class, at))
-                } else if state.retry_at > now {
+                } else if state.retry_at > now && !unavailable {
                     (JobStatus::BackingOff, (3, 0, at))
                 } else {
+                    // An unavailable job rests rather than backs off: it is
+                    // no failure waiting to heal.
                     (JobStatus::Waiting, (3, 0, at))
                 };
                 let scheduled = matches!(
@@ -677,6 +687,7 @@ impl Worker {
                     running_since,
                     failures: state.failures,
                     last_error: self.errors.get(&key).cloned(),
+                    unavailable,
                     key,
                 };
                 ((order.0, order.1, order.2, job), info)
@@ -773,18 +784,20 @@ impl Worker {
         }
     }
 
-    /// Clear every job's backoff, so all of them are due by their schedule
-    /// again.
+    /// Clear every job's backoff and refusal count, so all of them are due
+    /// by their schedule again: a new token may see what the old one
+    /// couldn't.
     fn unpark(&mut self) {
         self.errors.clear();
         let parked: Vec<(String, JobState)> = self
             .states
             .iter()
-            .filter(|(_, s)| s.failures > 0 || s.retry_at > 0)
+            .filter(|(_, s)| s.failures > 0 || s.retry_at > 0 || s.rejections > 0)
             .map(|(k, s)| {
                 let state = JobState {
                     failures: 0,
                     retry_at: 0,
+                    rejections: 0,
                     ..*s
                 };
                 (k.clone(), state)
@@ -974,6 +987,7 @@ impl Worker {
             failures: 0,
             retry_at: 0,
             fingerprint,
+            rejections: 0,
         };
         let committed = (|| -> Result<usize> {
             let mut c = self.store.begin();
@@ -1001,7 +1015,12 @@ impl Worker {
                 warn!(job = %key, error = %e, "storing sync result failed");
                 self.errors
                     .insert(key.to_string(), format!("storing the result failed: {e}"));
-                self.back_off(key, state, SERVER_BACKOFF_CAP);
+                // GitLab served it: whatever it refused before, it doesn't now.
+                let served = JobState {
+                    rejections: 0,
+                    ..state
+                };
+                self.back_off(key, served, SERVER_BACKOFF_CAP);
                 false
             }
         }
@@ -1237,22 +1256,62 @@ impl Worker {
                     warn!(job = %key, pause_secs = pause, "GitLab rate limit hit; pausing the sync");
                 }
             }
+            // Neither these nor the network errors above say anything about
+            // whether GitLab serves the listing: a refusal count goes on
+            // past them.
             Error::Throttled { .. } => {
                 warn!(job = %key, error = %e, "GitLab failed the sync fetch; backing off");
                 self.back_off(key, state, SERVER_BACKOFF_CAP);
             }
-            // Expected wherever GitLab lacks the feature (epics need
-            // Premium): nothing to warn about, and no point asking again
-            // soon.
-            _ if job.optional() => {
-                debug!(job = %key, error = %e, "GitLab doesn't serve this here; resting the job");
-                self.rest(key, state, UNAVAILABLE_REST_SECS);
-            }
-            _ => {
-                warn!(job = %key, error = %e, "GitLab rejected the sync fetch; backing off");
-                self.back_off(key, state, REJECTED_BACKOFF_CAP);
-            }
+            _ => self.rejected(job, key, state, &e),
         }
+    }
+
+    /// GitLab answered the fetch and won't serve it. A job that can be
+    /// unavailable counts the refusals in a row (403/404, see
+    /// [`Job::refused_by`]); from [`Job::unavailable_after`] of them on it
+    /// is unavailable: GitLab refuses it for good (a feature switched off
+    /// in the project, epics without Premium), so it rests a day at a time
+    /// and fails at debug level. Before that, and for every other
+    /// rejection, it backs off and warns: that may be something to fix.
+    /// A rejection that is no refusal starts the count over.
+    fn rejected(&mut self, job: Job, key: &str, state: JobState, e: &Error) {
+        let Some(after) = job.unavailable_after() else {
+            warn!(job = %key, error = %e, "GitLab rejected the sync fetch; backing off");
+            self.back_off(key, state, REJECTED_BACKOFF_CAP);
+            return;
+        };
+        if !job.refused_by(e) {
+            warn!(job = %key, error = %e, "GitLab rejected the sync fetch; backing off");
+            let answered = JobState {
+                rejections: 0,
+                ..state
+            };
+            self.back_off(key, answered, REJECTED_BACKOFF_CAP);
+            return;
+        }
+        let rejections = state.rejections.saturating_add(1);
+        let counted = JobState {
+            rejections,
+            ..state
+        };
+        if rejections < after {
+            warn!(job = %key, error = %e, rejections, "GitLab rejected the sync fetch; backing off");
+            self.back_off(key, counted, REJECTED_BACKOFF_CAP);
+            return;
+        }
+        if rejections == after && after > 1 {
+            info!(
+                job = %key,
+                error = %e,
+                rejections,
+                rest_secs = UNAVAILABLE_REST_SECS,
+                "GitLab keeps refusing this sync fetch; treating it as unavailable and asking once a day"
+            );
+        } else {
+            debug!(job = %key, error = %e, rejections, "GitLab doesn't serve this here; resting the job");
+        }
+        self.rest(key, counted, UNAVAILABLE_REST_SECS);
     }
 
     fn back_off(&mut self, key: &str, state: JobState, cap: u64) {
@@ -1462,12 +1521,17 @@ impl Worker {
             from_assignments = plan.evidence.assigned,
             from_events = plan.evidence.events,
             from_timelogs = plan.evidence.timelogs,
+            switched_off = plan.switched_off.len(),
             added,
             dropped,
             states_removed,
             rows_removed,
             "sync plan updated"
         );
+        if plan.switched_off != self.plan.switched_off {
+            let keys: Vec<String> = plan.switched_off.iter().map(Job::key).collect();
+            debug!(jobs = ?keys, "not planned: their projects have the feature switched off");
+        }
         self.plan = plan;
         let planned = &self.plan.jobs;
         self.demand.retain(|job, _| planned.contains(job));
@@ -2078,6 +2142,7 @@ mod tests {
     /// held up.
     #[tokio::test]
     async fn an_instance_without_epics_rests_the_job() {
+        let (logs, _guard) = Logs::capture();
         let fake = Arc::new(FakeGitlab::default());
         let now = now_secs();
         fake.serve("events", vec![event_json(1, 7, "opened", now)]);
@@ -2101,6 +2166,491 @@ mod tests {
             &*env.session.read().await,
             ConnState::Connected(_)
         ));
+        // Unavailable at the first rejection, and quiet about it.
+        assert_eq!(resting.rejections, 1);
+        let epics = info(&env, Job::GroupEpics(3)).await;
+        assert!(epics.unavailable, "{epics:?}");
+        assert_eq!(epics.status, JobStatus::Waiting);
+        assert_eq!(epics.next_due, Some(resting.retry_at));
+        assert!(epics.last_error.is_some());
+        assert_eq!(logs.count("WARN", "group/3/epics"), 0, "{}", logs.text());
+        assert_eq!(logs.count("INFO", "group/3/epics"), 0, "{}", logs.text());
+        assert!(logs.text().contains("GitLab doesn't serve this here"));
+    }
+
+    /// What the worker logs on the test's thread, where a `#[tokio::test]`
+    /// runs it and its fetches.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Logs {
+            self.clone()
+        }
+    }
+
+    impl Logs {
+        /// Capture everything from debug up until the guard drops.
+        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+            let logs = Logs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .finish();
+            (logs, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+
+        /// The lines at `level` about the job keyed `key`.
+        fn count(&self, level: &str, key: &str) -> usize {
+            self.said(level, key, "")
+        }
+
+        /// The lines at `level` about the job keyed `key` that say `what`.
+        fn said(&self, level: &str, key: &str, what: &str) -> usize {
+            let (job, level) = (format!("job={key}"), format!(" {level} "));
+            let text = self.text();
+            let about_job = |l: &&str| l.split(' ').any(|word| word == job);
+            text.lines()
+                .filter(about_job)
+                .filter(|l| l.contains(&level) && l.contains(what))
+                .count()
+        }
+    }
+
+    /// Project 7, tracked through an event and listed as a member, so its
+    /// jobs are planned once the worker read both.
+    fn serve_tracked_project(fake: &FakeGitlab) {
+        fake.serve("events", vec![event_json(1, 7, "opened", now_secs())]);
+        fake.serve("projects", vec![project_json(7)]);
+    }
+
+    /// Run `job` once more, ahead of its backoff, and wait for the run.
+    async fn rerun(env: &Env, job: Job) {
+        tokio::time::timeout(Duration::from_secs(2), env.sync.refresh_now(&[job]))
+            .await
+            .expect("the demanded run");
+    }
+
+    /// Wait for `job`'s first scheduled run to have failed.
+    async fn first_failure(env: &Env, job: Job) {
+        eventually(&format!("{} to fail", job.key()), || {
+            state(env, job).failures >= 1
+        })
+        .await;
+    }
+
+    /// The third 403 in a row makes a per-project job unavailable: it rests
+    /// a day instead of backing off, its snapshot says so, and its later
+    /// refusals only log at debug level. Two refusals aren't enough.
+    #[tokio::test]
+    async fn three_refusals_in_a_row_make_a_project_job_unavailable() {
+        let (logs, _guard) = Logs::capture();
+        let fake = Arc::new(FakeGitlab::default());
+        serve_tracked_project(&fake);
+        for _ in 0..4 {
+            fake.fail_next("projects/7/boards", FakeErr::Rejected);
+        }
+        let job = Job::ProjectBoards(7);
+        let key = job.key();
+        let env = start(connected(&fake, 1));
+
+        first_failure(&env, job).await;
+        rerun(&env, job).await;
+        let twice = state(&env, job);
+        assert_eq!((twice.failures, twice.rejections), (2, 2));
+        assert!(
+            twice.retry_at < now_secs() + REJECTED_BACKOFF_CAP,
+            "{twice:?}"
+        );
+        let failing = info(&env, job).await;
+        assert!(!failing.unavailable, "two refusals: {failing:?}");
+        assert_eq!(failing.status, JobStatus::BackingOff);
+        assert_eq!(logs.count("WARN", &key), 2, "{}", logs.text());
+
+        rerun(&env, job).await;
+        let now = now_secs();
+        let thrice = state(&env, job);
+        assert_eq!((thrice.failures, thrice.rejections), (3, 3));
+        assert!(
+            thrice.retry_at > now + REJECTED_BACKOFF_CAP,
+            "rests about a day: {thrice:?}"
+        );
+        let unavailable = info(&env, job).await;
+        assert!(unavailable.unavailable, "{unavailable:?}");
+        assert_eq!(unavailable.status, JobStatus::Waiting);
+        assert_eq!(unavailable.next_due, Some(thrice.retry_at));
+        assert_eq!(unavailable.failures, 3);
+        assert!(
+            unavailable
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("403")),
+            "{unavailable:?}"
+        );
+        assert_eq!(logs.count("WARN", &key), 2, "{}", logs.text());
+        assert_eq!(logs.count("INFO", &key), 1, "said once: {}", logs.text());
+
+        // From now on it fails quietly.
+        rerun(&env, job).await;
+        assert_eq!(state(&env, job).rejections, 4);
+        assert!(info(&env, job).await.unavailable);
+        assert_eq!(logs.count("WARN", &key), 2, "{}", logs.text());
+        assert_eq!(logs.count("INFO", &key), 1, "{}", logs.text());
+        assert_eq!(
+            logs.said("DEBUG", &key, "GitLab doesn't serve this here"),
+            1,
+            "{}",
+            logs.text()
+        );
+        assert!(matches!(
+            &*env.session.read().await,
+            ConnState::Connected(_)
+        ));
+    }
+
+    /// A 404 (a project GitLab hides, a route an instance lacks) refuses
+    /// like a 403.
+    #[tokio::test]
+    async fn a_not_found_counts_like_a_forbidden() {
+        let fake = Arc::new(FakeGitlab::default());
+        serve_tracked_project(&fake);
+        for err in [
+            FakeErr::RejectedWith(404),
+            FakeErr::Rejected,
+            FakeErr::RejectedWith(404),
+        ] {
+            fake.fail_next("projects/7/merge_requests", err);
+        }
+        let job = Job::ProjectMergeRequests(7);
+        let env = start(connected(&fake, 1));
+
+        first_failure(&env, job).await;
+        rerun(&env, job).await;
+        rerun(&env, job).await;
+        assert_eq!(state(&env, job).rejections, 3);
+        assert!(info(&env, job).await.unavailable);
+    }
+
+    /// Network errors, 5xx and 429 don't say whether GitLab serves the
+    /// listing: they don't count as refusals, and they don't start the
+    /// count over either, so refusals around an outage still add up. Two
+    /// network errors and a 403 are one refusal.
+    #[tokio::test]
+    async fn failures_that_say_nothing_about_the_listing_neither_count_nor_reset() {
+        let fake = Arc::new(FakeGitlab::default());
+        serve_tracked_project(&fake);
+        for err in [
+            FakeErr::Transient,
+            FakeErr::Transient,
+            FakeErr::Rejected,
+            FakeErr::Throttled(503),
+            FakeErr::Rejected,
+            FakeErr::Throttled(502),
+            FakeErr::Rejected,
+        ] {
+            fake.fail_next("projects/7/issues", err);
+        }
+        let job = Job::ProjectIssues(7);
+        let env = start(connected(&fake, 1));
+        // What the reconnect supervisor would do once the network error
+        // demoted the session.
+        let reconnect = || async {
+            eventually("the demotion", || {
+                matches!(
+                    env.session.try_read().as_deref(),
+                    Ok(ConnState::Dormant(DormancyReason::Unreachable { .. }))
+                )
+            })
+            .await;
+            *env.session.write().await = connected(&fake, 1);
+            env.sync.wake();
+        };
+
+        first_failure(&env, job).await;
+        reconnect().await;
+        rerun(&env, job).await;
+        reconnect().await;
+        assert_eq!(state(&env, job).failures, 2);
+        assert_eq!(state(&env, job).rejections, 0, "network errors");
+        rerun(&env, job).await;
+        let once = state(&env, job);
+        assert_eq!((once.failures, once.rejections), (3, 1));
+        assert!(!info(&env, job).await.unavailable, "one refusal, not three");
+
+        rerun(&env, job).await;
+        assert_eq!(state(&env, job).rejections, 1, "a 503 leaves the count");
+        rerun(&env, job).await;
+        assert_eq!(state(&env, job).rejections, 2);
+        rerun(&env, job).await;
+        assert_eq!(state(&env, job).rejections, 2, "a 502 too");
+        assert!(!info(&env, job).await.unavailable);
+        rerun(&env, job).await;
+        let done = state(&env, job);
+        assert_eq!((done.failures, done.rejections), (7, 3));
+        assert!(info(&env, job).await.unavailable);
+    }
+
+    /// A 400 (or a 422, …) is GitLab answering the request, not refusing
+    /// the listing: it backs off like any rejection, never makes the job
+    /// unavailable, and starts the refusal count over.
+    #[tokio::test]
+    async fn a_bad_request_never_makes_a_job_unavailable() {
+        let (logs, _guard) = Logs::capture();
+        let fake = Arc::new(FakeGitlab::default());
+        serve_tracked_project(&fake);
+        for err in [
+            FakeErr::Rejected,
+            FakeErr::Rejected,
+            FakeErr::RejectedWith(400),
+            FakeErr::Rejected,
+            FakeErr::RejectedWith(400),
+            FakeErr::RejectedWith(422),
+            FakeErr::RejectedWith(400),
+        ] {
+            fake.fail_next("projects/7/boards", err);
+        }
+        let job = Job::ProjectBoards(7);
+        let env = start(connected(&fake, 1));
+
+        first_failure(&env, job).await;
+        rerun(&env, job).await;
+        assert_eq!(state(&env, job).rejections, 2);
+        rerun(&env, job).await;
+        assert_eq!(state(&env, job).rejections, 0, "the 400 starts over");
+        rerun(&env, job).await;
+        assert_eq!(state(&env, job).rejections, 1);
+        for _ in 0..3 {
+            rerun(&env, job).await;
+            let s = state(&env, job);
+            assert_eq!(s.rejections, 0, "{s:?}");
+            assert!(s.retry_at <= now_secs() + REJECTED_BACKOFF_CAP, "{s:?}");
+            assert!(!info(&env, job).await.unavailable);
+        }
+        assert_eq!(state(&env, job).failures, 7);
+        assert_eq!(logs.count("WARN", &job.key()), 7, "{}", logs.text());
+    }
+
+    /// Make project 7's boards unavailable: three 403s in a row.
+    async fn boards_unavailable(fake: &Arc<FakeGitlab>) -> Env {
+        serve_tracked_project(fake);
+        for _ in 0..3 {
+            fake.fail_next("projects/7/boards", FakeErr::Rejected);
+        }
+        let env = start(connected(fake, 1));
+        let job = Job::ProjectBoards(7);
+        first_failure(&env, job).await;
+        rerun(&env, job).await;
+        rerun(&env, job).await;
+        assert!(info(&env, job).await.unavailable);
+        env
+    }
+
+    #[tokio::test]
+    async fn a_success_makes_an_unavailable_job_available_again() {
+        let fake = Arc::new(FakeGitlab::default());
+        let env = boards_unavailable(&fake).await;
+        let job = Job::ProjectBoards(7);
+
+        // The feature is back: the next run (a day later, or demanded) lands.
+        rerun(&env, job).await;
+        let served = state(&env, job);
+        assert!(served.last_ok > 0, "{served:?}");
+        assert_eq!(
+            (served.failures, served.rejections, served.retry_at),
+            (0, 0, 0)
+        );
+        let available = info(&env, job).await;
+        assert!(!available.unavailable);
+        assert_eq!(available.status, JobStatus::Waiting);
+        assert_eq!((available.failures, available.last_error), (0, None));
+    }
+
+    /// `forskap auth login` clears every backoff: a new token may see what
+    /// the old one couldn't, so the refusals start over too.
+    #[tokio::test]
+    async fn a_login_makes_an_unavailable_job_available_again() {
+        let fake = Arc::new(FakeGitlab::default());
+        let env = boards_unavailable(&fake).await;
+        let job = Job::ProjectBoards(7);
+
+        env.sync.logged_in();
+        eventually("the rerun", || state(&env, job).last_ok > 0).await;
+        let s = state(&env, job);
+        assert_eq!((s.failures, s.rejections, s.retry_at), (0, 0, 0));
+        assert!(!info(&env, job).await.unavailable);
+        assert_eq!(fake.calls_to("projects/7/boards").len(), 4);
+    }
+
+    /// A cache clear that drops a job's rows resets its state: what was
+    /// unavailable runs at once. The boards go with the assigned lists, the
+    /// issues and merge requests with the corpus.
+    #[tokio::test]
+    async fn a_clear_resetting_an_unavailable_job_runs_it_again() {
+        let fake = Arc::new(FakeGitlab::default());
+        let env = boards_unavailable(&fake).await;
+        let job = Job::ProjectBoards(7);
+
+        // The corpus is not the boards' slice.
+        tokio::time::timeout(Duration::from_secs(2), env.sync.clear(Clear::Corpus))
+            .await
+            .unwrap();
+        assert_eq!(state(&env, job).rejections, 3);
+
+        tokio::time::timeout(Duration::from_secs(2), env.sync.clear(Clear::Assigned))
+            .await
+            .unwrap();
+        eventually("the boards to run again", || state(&env, job).last_ok > 0).await;
+        let s = state(&env, job);
+        assert_eq!((s.failures, s.rejections), (0, 0));
+        assert!(!info(&env, job).await.unavailable);
+    }
+
+    /// A changed fingerprint (a reload changing `search.max_items_per_project`,
+    /// a schema bump) makes the next run full, but never cuts a backoff
+    /// short: an unavailable job stays so until its rest is over.
+    #[tokio::test]
+    async fn a_changed_fingerprint_leaves_an_unavailable_job_resting() {
+        let fake = Arc::new(FakeGitlab::default());
+        serve_tracked_project(&fake);
+        for _ in 0..3 {
+            fake.fail_next("projects/7/issues", FakeErr::Rejected);
+        }
+        let env = start(connected(&fake, 1));
+        let job = Job::ProjectIssues(7);
+        first_failure(&env, job).await;
+        rerun(&env, job).await;
+        rerun(&env, job).await;
+        let resting = state(&env, job);
+        assert!(info(&env, job).await.unavailable);
+
+        env.config.write().unwrap().search.max_items_per_project += 1;
+        env.sync.reconfigure();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(state(&env, job), resting);
+        let after = info(&env, job).await;
+        assert!(after.unavailable);
+        assert_eq!(after.next_due, Some(resting.retry_at));
+        assert_eq!(fake.calls_to("projects/7/issues").len(), 3);
+    }
+
+    /// Job states persist, the refusal count with them: after a restart an
+    /// unavailable job stays one, and its next refusal stays quiet.
+    #[tokio::test]
+    async fn an_unavailable_job_stays_quiet_after_a_restart() {
+        let (logs, _guard) = Logs::capture();
+        let (store, _dir) = open_store();
+        let fake = Arc::new(FakeGitlab::default());
+        serve_tracked_project(&fake);
+        for _ in 0..3 {
+            fake.fail_next("projects/7/boards", FakeErr::Rejected);
+        }
+        let job = Job::ProjectBoards(7);
+        let first = start_on(Arc::clone(&store), connected(&fake, 1));
+        first_failure(&first, job).await;
+        rerun(&first, job).await;
+        rerun(&first, job).await;
+        let before = state(&first, job);
+        assert_eq!(before.rejections, 3);
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let warned = logs.count("WARN", &job.key());
+
+        let again = Arc::new(FakeGitlab::default());
+        serve_tracked_project(&again);
+        again.fail_next("projects/7/boards", FakeErr::Rejected);
+        let second = start_on(store, connected(&again, 1));
+        let restarted = snapshot_when(&second, "the plan after the restart", |s| {
+            s.jobs.iter().any(|j| j.key == job.key())
+        })
+        .await;
+        let line = restarted.jobs.iter().find(|j| j.key == job.key()).unwrap();
+        assert!(line.unavailable, "{line:?}");
+        assert_eq!(line.status, JobStatus::Waiting);
+        assert_eq!(line.next_due, Some(before.retry_at));
+        assert_eq!(line.last_error, None, "kept in memory only");
+        assert!(
+            again.calls_to("projects/7/boards").is_empty(),
+            "still resting"
+        );
+
+        rerun(&second, job).await;
+        assert_eq!(state(&second, job).rejections, 4);
+        assert_eq!(logs.count("WARN", &job.key()), warned, "{}", logs.text());
+        assert!(info(&second, job).await.unavailable);
+    }
+
+    /// GitLab refusing an account-wide listing means something is wrong
+    /// with the session: it backs off and warns every time, and is never
+    /// unavailable.
+    #[tokio::test]
+    async fn an_account_wide_listing_never_becomes_unavailable() {
+        let (logs, _guard) = Logs::capture();
+        let fake = Arc::new(FakeGitlab::default());
+        for _ in 0..4 {
+            fake.fail_next("merge_requests", FakeErr::Rejected);
+        }
+        let job = Job::AssignedMergeRequests;
+        let env = start(connected(&fake, 1));
+
+        first_failure(&env, job).await;
+        for _ in 0..3 {
+            rerun(&env, job).await;
+        }
+        let s = state(&env, job);
+        assert_eq!((s.failures, s.rejections), (4, 0));
+        assert!(s.retry_at <= now_secs() + REJECTED_BACKOFF_CAP, "{s:?}");
+        let line = info(&env, job).await;
+        assert!(!line.unavailable);
+        assert_eq!(line.status, JobStatus::BackingOff);
+        assert_eq!(logs.count("WARN", &job.key()), 4, "{}", logs.text());
+    }
+
+    /// A project with its merge requests switched off gets no merge request
+    /// job, so GitLab is never asked; switching them back on brings the job
+    /// back with the next member listing.
+    #[tokio::test]
+    async fn a_project_without_merge_requests_is_never_asked_for_them() {
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve("events", vec![event_json(1, 7, "opened", now_secs())]);
+        fake.serve(
+            "projects",
+            vec![crate::testing::project_json_without(7, "merge_requests")],
+        );
+        let env = start(connected(&fake, 1));
+
+        eventually("the project's issues", || {
+            state(&env, Job::ProjectIssues(7)).last_ok > 0
+                && state(&env, Job::ProjectBoards(7)).last_ok > 0
+        })
+        .await;
+        let planned = env.sync.jobs().await;
+        let mrs = Job::ProjectMergeRequests(7).key();
+        assert!(!planned.jobs.iter().any(|j| j.key == mrs), "{planned:?}");
+        assert!(fake.calls_to("projects/7/merge_requests").is_empty());
+
+        fake.serve("projects", vec![project_json(7)]);
+        rerun(&env, Job::MemberProjects).await;
+        eventually("the merge requests", || {
+            state(&env, Job::ProjectMergeRequests(7)).last_ok > 0
+        })
+        .await;
+        assert!(!fake.calls_to("projects/7/merge_requests").is_empty());
     }
 
     #[tokio::test]

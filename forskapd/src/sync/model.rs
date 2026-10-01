@@ -139,6 +139,54 @@ pub struct Project {
     /// schema 3 reads as `false`.
     #[serde(default, deserialize_with = "de::nullable")]
     pub archived: bool,
+    /// Who may use the project's issues, and with them its issue boards:
+    /// `"disabled"`, `"private"` (members only) or `"enabled"`. Empty where
+    /// GitLab didn't say: an instance from before the access levels, or a
+    /// row stored before schema 4.
+    #[serde(default, deserialize_with = "de::lenient")]
+    pub issues_access_level: String,
+    /// The same for its merge requests.
+    #[serde(default, deserialize_with = "de::lenient")]
+    pub merge_requests_access_level: String,
+    /// The same for its repository, without which there are no merge
+    /// requests either.
+    #[serde(default, deserialize_with = "de::lenient")]
+    pub repository_access_level: String,
+    /// The flag instances had before `issues_access_level` (deprecated
+    /// since); `None` where absent.
+    #[serde(default, deserialize_with = "de::lenient")]
+    pub issues_enabled: Option<bool>,
+    /// The same for `merge_requests_access_level`.
+    #[serde(default, deserialize_with = "de::lenient")]
+    pub merge_requests_enabled: Option<bool>,
+}
+
+impl Project {
+    /// Whether the project says its issues are switched off: then neither
+    /// its issues nor its issue boards can be read. What it doesn't say
+    /// doesn't switch anything off.
+    pub fn issues_disabled(&self) -> bool {
+        disabled(&self.issues_access_level, self.issues_enabled)
+    }
+
+    /// Whether the project says its merge requests are switched off, or its
+    /// repository, which they need.
+    pub fn merge_requests_disabled(&self) -> bool {
+        disabled(
+            &self.merge_requests_access_level,
+            self.merge_requests_enabled,
+        ) || disabled(&self.repository_access_level, None)
+    }
+}
+
+/// A feature's access level, or the legacy flag where the level is missing,
+/// says it is off.
+fn disabled(level: &str, enabled: Option<bool>) -> bool {
+    match level {
+        "disabled" => true,
+        "" => enabled == Some(false),
+        _ => false,
+    }
 }
 
 /// `GET /groups`.
@@ -361,7 +409,8 @@ impl Resource for MergeRequest {
 impl Resource for Project {
     const NAME: &'static str = "projects";
     const KEYSPACE: &'static str = "gl_projects_v1";
-    const SCHEMA: u32 = 3;
+    /// 4: the feature access levels.
+    const SCHEMA: u32 = 4;
     fn key(&self) -> RowKey {
         (positive(self.id), 0)
     }
@@ -447,6 +496,17 @@ mod de {
         T: Default + Deserialize<'de>,
     {
         Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+    }
+
+    /// Like [`nullable`], and a value of another type reads as the default
+    /// too: a field the daemon can do without must not cost the whole row.
+    pub fn lenient<'de, D, T>(d: D) -> Result<T, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Default + serde::de::DeserializeOwned,
+    {
+        let value = Option::<Value>::deserialize(d)?.unwrap_or_default();
+        Ok(serde_json::from_value(value).unwrap_or_default())
     }
 
     /// Longest excerpt kept of a text, in characters.
@@ -690,6 +750,92 @@ mod tests {
         for none in [json!({"id": 7, "archived": null}), json!({"id": 7})] {
             let p: Project = serde_json::from_value(none).unwrap();
             assert!(!p.archived);
+        }
+    }
+
+    /// gitlab.com's full representation carries both the access levels and
+    /// the deprecated flags; the levels decide.
+    #[test]
+    fn project_reads_its_feature_levels() {
+        let full = |issues: &str, mrs: &str, repository: &str| -> Project {
+            serde_json::from_value(json!({
+                "id": 7, "name": "API", "path_with_namespace": "team/api",
+                "issues_enabled": issues != "disabled",
+                "merge_requests_enabled": mrs != "disabled",
+                "issues_access_level": issues,
+                "merge_requests_access_level": mrs,
+                "repository_access_level": repository,
+                "wiki_access_level": "disabled",
+                "builds_access_level": "enabled",
+            }))
+            .unwrap()
+        };
+        let on = full("enabled", "private", "enabled");
+        assert_eq!(on.issues_access_level, "enabled");
+        assert_eq!(on.merge_requests_access_level, "private");
+        assert_eq!(on.issues_enabled, Some(true));
+        assert!(!on.issues_disabled() && !on.merge_requests_disabled());
+        // Members only is still on: the account may be one.
+        assert!(!full("private", "private", "private").issues_disabled());
+
+        let no_issues = full("disabled", "enabled", "enabled");
+        assert!(no_issues.issues_disabled());
+        assert!(!no_issues.merge_requests_disabled());
+        let no_mrs = full("enabled", "disabled", "enabled");
+        assert!(!no_mrs.issues_disabled());
+        assert!(no_mrs.merge_requests_disabled());
+        // No repository, no merge requests.
+        assert!(full("enabled", "enabled", "disabled").merge_requests_disabled());
+
+        // The stored form reads back the same.
+        let stored = serde_json::to_vec(&no_mrs).unwrap();
+        assert_eq!(serde_json::from_slice::<Project>(&stored).unwrap(), no_mrs);
+    }
+
+    /// An instance from before the access levels only has the flags.
+    #[test]
+    fn project_reads_the_legacy_feature_flags() {
+        let legacy = |issues: bool, mrs: bool| -> Project {
+            serde_json::from_value(json!({
+                "id": 7, "issues_enabled": issues, "merge_requests_enabled": mrs,
+            }))
+            .unwrap()
+        };
+        assert!(legacy(false, true).issues_disabled());
+        assert!(!legacy(false, true).merge_requests_disabled());
+        assert!(!legacy(true, false).issues_disabled());
+        assert!(legacy(true, false).merge_requests_disabled());
+        assert!(
+            !legacy(true, true).issues_disabled() && !legacy(true, true).merge_requests_disabled()
+        );
+    }
+
+    /// What the project doesn't say switches nothing off: a row stored
+    /// before schema 4, a representation without the fields, nulls, and
+    /// values of another type, which must not cost the row either.
+    #[test]
+    fn unknown_feature_levels_switch_nothing_off() {
+        let old: Project = serde_json::from_str(
+            r#"{"id":7,"name":"API","path_with_namespace":"team/api","web_url":"","avatar_url":"","archived":true}"#,
+        )
+        .unwrap();
+        assert!(old.archived);
+        assert_eq!(old.issues_access_level, "");
+        assert_eq!(old.issues_enabled, None);
+        assert!(!old.issues_disabled() && !old.merge_requests_disabled());
+        for odd in [
+            json!({"id": 7}),
+            json!({"id": 7, "issues_access_level": null, "issues_enabled": null,
+                   "merge_requests_access_level": null, "merge_requests_enabled": null}),
+            json!({"id": 7, "issues_access_level": 0, "issues_enabled": "no",
+                   "merge_requests_access_level": ["disabled"], "merge_requests_enabled": 0,
+                   "repository_access_level": {"level": "disabled"}}),
+            json!({"id": 7, "issues_access_level": "someday", "merge_requests_access_level": "public"}),
+        ] {
+            let p: Project = serde_json::from_value(odd.clone()).unwrap();
+            assert!(p.is_valid(), "{odd}");
+            assert!(!p.issues_disabled(), "{odd}");
+            assert!(!p.merge_requests_disabled(), "{odd}");
         }
     }
 

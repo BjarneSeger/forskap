@@ -1760,6 +1760,42 @@ mod tests {
         }
     }
 
+    /// The rejections carry their status since the sync tells a refused
+    /// listing by it; a write treats every status alike, as before: a 403
+    /// (or 404, 400, 422) is GitLab's final word, dead-lettered at once with
+    /// the error as it always read.
+    #[test]
+    fn verdict_dead_letters_a_refused_write_whatever_its_status() {
+        let post = WriteOp::PostTime {
+            duration: "1h".into(),
+            summary: None,
+            issuable_id: None,
+        };
+        let ops = [
+            post,
+            WriteOp::Close,
+            WriteOp::AssignSelf,
+            WriteOp::UnassignSelf,
+        ];
+        let window = Duration::from_secs(60);
+        for status in [403, 404, 400, 422] {
+            for op in &ops {
+                let e = FakeErr::RejectedWith(status).error();
+                assert!(!e.is_retryable(op.idempotent()), "{status} {op:?}");
+                match verdict(Err(e), op, Duration::ZERO, window) {
+                    Verdict::DeadLetter {
+                        error,
+                        expired: false,
+                    } => assert!(
+                        error.starts_with(&format!("GitLab error: {status}")),
+                        "{error}"
+                    ),
+                    other => panic!("{status} {op:?}: expected a dead letter, got {other:?}"),
+                }
+            }
+        }
+    }
+
     // ── Dead-letter store ───────────────────────────────────────────────────
 
     fn fail_entry(id: i64) -> StoredFailure {

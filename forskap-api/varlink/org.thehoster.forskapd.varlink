@@ -98,7 +98,8 @@ type SyncJob (
   next_due: ?int,
   running_since: ?int,
   failures: int,
-  last_error: ?string
+  last_error: ?string,
+  unavailable: ?bool
 )
 
 type Epic (

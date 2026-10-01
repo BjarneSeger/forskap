@@ -403,7 +403,7 @@ impl<E: Env> Supervisor<E> {
         let wanted = new_expiry(info, now.date_naive());
         let rotated = match session.gitlab.rotate_token(wanted).await {
             // Most likely past the instance's maximum lifetime.
-            Err(Error::Gitlab(detail)) if wanted.is_some() => {
+            Err(Error::Rejected { detail, .. }) if wanted.is_some() => {
                 info!(error = %detail, "GitLab refused the token's lifetime; rotating with its default one");
                 session.gitlab.rotate_token(None).await
             }

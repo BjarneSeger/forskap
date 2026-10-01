@@ -78,7 +78,7 @@ type SyncJobStatus (
   running,      # its fetch is in flight
   demanded,     # requested ahead of the schedule; runs before anything merely due
   due,          # its time has come; runs once the worker gets to it
-  waiting,      # not due yet
+  waiting,      # not due yet; an unavailable job rests here until next_due
   backing_off   # failed; held back until next_due
 )
 
@@ -91,7 +91,10 @@ type SyncJob (
                                 # never due again (a fetched project avatar)
   running_since: ?int,          # unix seconds, only while running
   failures:      int,           # consecutive failed runs
-  last_error:    ?string        # why the last run failed, until a run succeeds
+  last_error:    ?string,       # why the last run failed, until a run succeeds
+  unavailable:   ?bool          # true: GitLab refuses the job for good and the daemon asks once a day
+                                # (see GetSyncJobs); false otherwise. Sent on every job since forskap-api
+                                # 0.28.0: absent means an older daemon, which doesn't tell
 )
 ```
 
@@ -358,7 +361,9 @@ or Ultimate: on other instances `epics` is always empty, and the daemon asks eac
 group only once a day.
 Issue `graph_status` comes from the synced board columns of the issue's project and
 is empty for projects whose boards were never synced (only those of assigned issues'
-projects and of tracked member projects are).
+projects and of tracked member projects are). A project's switched-off features are
+left out: no issues or boards where its issues are off, no MRs where its merge requests
+are (see *Unavailable jobs* under `GetSyncJobs`).
 When the member projects have never been synced: replies with empty arrays if a
 session exists (first sync pending), `NotAuthenticated` otherwise.
 
@@ -519,6 +524,30 @@ Status, not GitLab data: never errors and is served while dormant. A dormant
 daemon runs nothing, so its jobs stay `due` until a session exists. `last_error`
 is kept in memory only — after a daemon restart a job can be `backing_off` without
 one.
+
+**Unavailable jobs.** Some listings GitLab refuses for good, and failing them
+forever would only drown the failures that matter. Two mechanisms keep them out:
+
+- *Not planned.* A member project whose issues are switched off
+  (`issues_access_level` `disabled`, or `issues_enabled` false on an older instance)
+  gets no issues and no board job — boards belong to the issues — and one whose merge
+  requests or repository are switched off gets no merge request job. What the project
+  doesn't say plans as usual; the next member-projects sync after a change in the
+  project's settings adds or drops the jobs (and their rows).
+- *Refused three times in a row.* A per-project or per-group listing (`project/<id>/issues`,
+  `…/merge_requests`, `…/boards`, `…/avatar`, `group/<id>/epics`) that GitLab answers
+  `403` or `404` three times in a row is `unavailable: true`: it rests about a day
+  between attempts and reports `waiting` with that `next_due`, its `failures` and (until
+  a daemon restart) its `last_error` kept, and the daemon logs its refusals at debug
+  level only. An epics listing is unavailable at its first rejection of any status (an
+  instance without GitLab Premium has none). Network errors, `429`, `5xx` and `401`
+  neither count nor start the count over — they say nothing about the listing; any
+  other rejection (`400`, `422`, …) starts it over and backs off as a failure. A
+  success, `Login` (it clears every backoff) or a `ClearCache` resetting the job
+  (`assigned` for the boards, `search` for the rest, or everything) makes it available
+  again; the count is persisted, so a restart doesn't. The account-wide listings
+  (assigned lists, events, memberships, timelogs, …) never become unavailable: a
+  refusal there means something is wrong with the session.
 
 ## Usage statistics
 

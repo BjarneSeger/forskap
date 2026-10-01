@@ -626,13 +626,10 @@ impl GitlabApi for GitlabClient {
         let raw: serde_json::Value = RotateSelfTokenEndpoint { expires_at }
             .query_async(&self.inner)
             .await
-            .map_err(|e| {
-                let refused = status_of(&e).is_some();
-                match classify(e) {
-                    // No status to tell a refusal by: GitLab may have rotated.
-                    Error::Gitlab(detail) if !refused => Error::RotationLost(detail),
-                    other => other,
-                }
+            .map_err(|e| match classify(e) {
+                // No status to tell a refusal by: GitLab may have rotated.
+                Error::Gitlab(detail) => Error::RotationLost(detail),
+                other => other,
             })?;
         rotated_token_from(&raw)
     }
@@ -834,8 +831,9 @@ fn error_message(body: &[u8]) -> String {
 }
 
 /// Map a GitLab API error to [`Error::Transient`] for network failures,
-/// [`Error::Throttled`] for 429/5xx, and [`Error::Gitlab`] for permanent
-/// rejections (auth, other 4xx, bad JSON, …).
+/// [`Error::Throttled`] for 429/5xx, [`Error::Unauthorized`] for 401,
+/// [`Error::Rejected`] for any other status, and [`Error::Gitlab`] for a
+/// failure without one (bad JSON, …).
 fn classify<E>(e: gitlab::api::ApiError<E>) -> Error
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -871,7 +869,7 @@ where
 }
 
 /// [`Error::Throttled`] for 429/5xx, [`Error::Unauthorized`] for 401,
-/// [`Error::Gitlab`] for any other status.
+/// [`Error::Rejected`] with the status for any other one.
 fn throttled_or_rejected(status: u16, retry_after: Option<Duration>, detail: String) -> Error {
     if status == 401 {
         Error::Unauthorized(detail)
@@ -882,14 +880,14 @@ fn throttled_or_rejected(status: u16, retry_after: Option<Duration>, detail: Str
             detail,
         }
     } else {
-        Error::Gitlab(detail)
+        Error::Rejected { status, detail }
     }
 }
 
 /// Same split as [`classify`], but for the [`gitlab::GitlabError`] returned by
 /// `GitlabBuilder::build_async`. The builder runs an initial connection check,
 /// so an unreachable host must surface as [`Error::Transient`] (retryable) and
-/// not a permanent [`Error::Gitlab`] — otherwise `connect` reports a network
+/// not a permanent [`Error::Rejected`] — otherwise `connect` reports a network
 /// outage as a rejected token.
 fn classify_build(e: gitlab::GitlabError) -> Error {
     use gitlab::GitlabError;
@@ -1512,11 +1510,24 @@ mod tests {
             Err(Error::Unauthorized(_))
         ));
 
-        let fake = PagedFake::with(vec![Answer::Status(404, None)]);
-        assert!(matches!(
-            walk_pages(&fake, &EVENTS, None).await,
-            Err(Error::Gitlab(detail)) if detail.contains("404") && detail.contains("nope")
-        ));
+        for status in [403, 404, 400] {
+            let fake = PagedFake::with(vec![Answer::Status(status, None)]);
+            let walked = walk_pages(&fake, &EVENTS, None).await;
+            assert!(
+                matches!(
+                    &walked,
+                    Err(Error::Rejected { status: s, detail })
+                        if *s == status && detail.contains(&status.to_string()) && detail.contains("nope")
+                ),
+                "{walked:?}"
+            );
+            // What a job's last error reads, as before the status was kept.
+            let shown = walked.unwrap_err().to_string();
+            assert!(
+                shown.starts_with(&format!("GitLab error: {status} ")),
+                "{shown}"
+            );
+        }
     }
 
     /// One request as [`LocalGitlab`] saw it.
@@ -1752,11 +1763,22 @@ mod tests {
                 );
             }
         }
-        for s in [400, 403, 404] {
+        // The status survives: a refused listing (403/404) is told from a
+        // bad request by it.
+        for s in [400, 403, 404, 422] {
             for e in every_status_shape(s) {
-                assert!(matches!(classify(e), Error::Gitlab(_)), "{s} is permanent");
+                assert!(
+                    matches!(classify(e), Error::Rejected { status, .. } if status == s),
+                    "{s} is permanent, with its status"
+                );
             }
         }
+        // An answer that doesn't parse carries no status to keep.
+        let unreadable = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        assert!(matches!(
+            classify(A::<Boom>::Json { source: unreadable }),
+            Error::Gitlab(_)
+        ));
         for e in every_status_shape(401) {
             assert!(
                 matches!(classify(e), Error::Unauthorized(_)),

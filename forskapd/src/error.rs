@@ -7,8 +7,17 @@ use forskap_api::NotAuthReason;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// GitLab failed the request without an HTTP status to tell why (an
+    /// unreadable answer, a GraphQL error, …), or the daemon refused it
+    /// itself.
     #[error("GitLab error: {0}")]
     Gitlab(String),
+
+    /// GitLab answered with a status that is no 401, 429 or 5xx: it won't do
+    /// this as asked (403, 404, 400, 422, …). Permanent like [`Self::Gitlab`];
+    /// the status tells a refused listing (403/404) from a bad request.
+    #[error("GitLab error: {detail}")]
+    Rejected { status: u16, detail: String },
 
     /// GitLab answered 401: the token is dead, and only `forskap auth login` helps.
     #[error("GitLab rejected the token: {0}")]
@@ -184,6 +193,23 @@ mod tests {
         );
     }
 
+    /// A status GitLab answered the connection check with, other than a
+    /// 429/5xx, is the token's fault, as when it carried no status.
+    #[test]
+    fn from_connect_error_classifies_a_rejection_as_token_rejected() {
+        for status in [400, 403, 404] {
+            let r = DormancyReason::from_connect_error(
+                "gitlab.example.com",
+                &Error::Rejected {
+                    status,
+                    detail: format!("HTTP {status}"),
+                },
+            );
+            assert_eq!(r.reason(), NotAuthReason::token_rejected, "{status}");
+            assert!(!r.is_auto_retryable(), "{status}");
+        }
+    }
+
     #[test]
     fn from_connect_error_classifies_throttled_as_unreachable() {
         for status in [429, 502] {
@@ -210,6 +236,14 @@ mod tests {
             assert!(Error::Transient("x".into()).is_retryable(idempotent));
             assert!(throttled(429).is_retryable(idempotent));
             assert!(!Error::Gitlab("404".into()).is_retryable(idempotent));
+            for status in [400, 403, 404, 422] {
+                let rejected = Error::Rejected {
+                    status,
+                    detail: String::new(),
+                };
+                assert!(!rejected.is_retryable(idempotent), "{status}");
+                assert_eq!(rejected.retry_after(), None);
+            }
         }
         assert!(throttled(503).is_retryable(true));
         assert!(!throttled(503).is_retryable(false));

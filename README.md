@@ -112,7 +112,10 @@ to redraw their text view every SECS seconds (2 by default) until Ctrl-C; while 
 daemon is away the watch shows the error and keeps trying.
 
 `forskap sync jobs` puts the jobs that are done for good (a fetched avatar per
-project) on one line per kind; `-a`/`--all` lists each.
+project) on one line per kind, and does the same for the jobs GitLab refuses for good
+(`unavailable`: a project's merge requests or boards switched off, epics without GitLab
+Premium; the daemon asks again once a day); `-a`/`--all` lists each, with GitLab's
+answer.
 
 `forskap status` is the first thing to run when forskap seems off. It checks that the
 daemon answers (and runs the CLI's version), that it is logged in to GitLab, that no

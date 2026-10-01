@@ -76,10 +76,17 @@ waiting, and whether queued writes failed for good. Each check is `ok`,
 with a line on what to do. `-o json` gives the same as a document with the
 numbers behind it, and `-w` keeps redrawing it.
 
+A sync job GitLab refuses for good — a project with its merge requests or boards
+switched off, epics without GitLab Premium — is no failure: the daemon calls it
+unavailable once GitLab refused it three times in a row (epics: once), asks again
+once a day, and `forskap status` only notes it under an `ok` sync check (`-o json`
+lists it under `unavailable`). Against a daemon older than this, such jobs still
+count as failing, the epics excepted.
+
 The exit status is non-zero only when a check is an error: an unreachable or
 stuck daemon, a login that needs `forskap auth login`, a sync job that hangs.
-Warnings, like a project whose merge requests GitLab refuses, exit zero, so
-`forskap status >/dev/null || …` in a script or prompt fires only when
+Warnings, like a sync job GitLab keeps failing or a rate limit pause, exit zero,
+so `forskap status >/dev/null || …` in a script or prompt fires only when
 something is broken.
 
 ### Colour

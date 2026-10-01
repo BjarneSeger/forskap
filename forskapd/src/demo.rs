@@ -206,7 +206,12 @@ fn parse_duration(text: &str) -> Option<u64> {
 }
 
 fn not_found() -> Error {
-    Error::Gitlab("404 Not Found".into())
+    refused(404, "404 Not Found".into())
+}
+
+/// GitLab's answer with `status`, as the real client classifies it.
+fn refused(status: u16, detail: String) -> Error {
+    Error::Rejected { status, detail }
 }
 
 /// `updated_after` as unix seconds; everything without one.
@@ -349,7 +354,8 @@ impl State {
     fn writable(&self, project_id: i64) -> Result<()> {
         match self.projects.iter().find(|p| p.id == project_id) {
             None => Err(not_found()),
-            Some(p) if p.archived => Err(Error::Gitlab(
+            Some(p) if p.archived => Err(refused(
+                403,
                 "403 Forbidden: the project is archived and read-only".into(),
             )),
             Some(_) => Ok(()),
@@ -426,7 +432,7 @@ impl State {
         spent_at: u64,
     ) -> Result<()> {
         let time_spent = parse_duration(duration)
-            .ok_or_else(|| Error::Gitlab(format!("400 Bad Request: invalid time {duration:?}")))?;
+            .ok_or_else(|| refused(400, format!("400 Bad Request: invalid time {duration:?}")))?;
         let now = now_secs();
         let title = self.update(kind, project_id, iid, now, |_, _| {})?;
         let path = project_path(self, project_id);
@@ -734,6 +740,11 @@ fn fixture(now: u64) -> State {
         web_url: format!("{BASE}/{path}"),
         avatar_url: String::new(),
         archived: false,
+        issues_access_level: "enabled".into(),
+        merge_requests_access_level: "enabled".into(),
+        repository_access_level: "enabled".into(),
+        issues_enabled: Some(true),
+        merge_requests_enabled: Some(true),
     };
     let mut api = project(AVATAR_PROJECT, "API", "acme/backend/api");
     api.avatar_url = format!("{BASE}/uploads/-/system/project/avatar/{AVATAR_PROJECT}/api.png");
@@ -1199,14 +1210,19 @@ mod tests {
     async fn gitlab_refusals_are_kept() {
         let (demo, _) = demo();
         let archived = demo.close(Issuable::Issue, ARCHIVED_PROJECT, 2).await;
-        assert!(matches!(archived, Err(Error::Gitlab(m)) if m.starts_with("403")));
         assert!(
-            matches!(demo.close(Issuable::Issue, 101, 999).await, Err(Error::Gitlab(m)) if m.starts_with("404"))
+            matches!(archived, Err(Error::Rejected { status: 403, detail }) if detail.starts_with("403"))
         );
+        assert!(matches!(
+            demo.close(Issuable::Issue, 101, 999).await,
+            Err(Error::Rejected { status: 404, detail }) if detail.starts_with("404")
+        ));
         let bad = demo
             .add_spent_time(Issuable::Issue, 101, 12, "soon", None)
             .await;
-        assert!(matches!(bad, Err(Error::Gitlab(m)) if m.starts_with("400")));
+        assert!(
+            matches!(bad, Err(Error::Rejected { status: 400, detail }) if detail.starts_with("400"))
+        );
         assert!(demo.rotate_token(None).await.is_err());
         let token = demo.token_info().await.unwrap();
         assert_eq!(token.expires_at, None);

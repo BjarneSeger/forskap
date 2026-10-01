@@ -190,6 +190,11 @@ pub fn project(i: u64) -> Project {
         web_url: format!("https://gl/{}/proj{i}", namespace(i)),
         avatar_url: format!("https://gl/uploads/-/system/project/avatar/{i}/logo.png"),
         archived: false,
+        issues_access_level: "enabled".into(),
+        merge_requests_access_level: "enabled".into(),
+        repository_access_level: "enabled".into(),
+        issues_enabled: Some(true),
+        merge_requests_enabled: Some(true),
     }
 }
 

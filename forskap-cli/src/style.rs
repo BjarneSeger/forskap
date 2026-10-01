@@ -103,7 +103,7 @@ pub fn state(word: &str) -> Painted<'_> {
         "closed" | "backing off" | "error" => fg(AnsiColor::Red),
         "merged" | "demanded" => fg(AnsiColor::Magenta),
         "locked" | "due" | "queued" | "warning" => fg(AnsiColor::Yellow),
-        "waiting" | "skipped" => Style::new().dimmed(),
+        "waiting" | "skipped" | "unavailable" => Style::new().dimmed(),
         _ => Style::new(),
     };
     paint(style, word)
@@ -117,6 +117,11 @@ pub fn reference(sigil: impl fmt::Display, iid: i64) -> Painted<'static> {
 /// Why a sync job or a queued write failed.
 pub fn error(text: &str) -> Painted<'_> {
     paint(fg(AnsiColor::Red), text)
+}
+
+/// A remark that is no failure: why GitLab refuses a sync job for good.
+pub fn note(text: &str) -> Painted<'_> {
+    paint(Style::new().dimmed(), text)
 }
 
 #[cfg(test)]
@@ -159,6 +164,7 @@ mod tests {
         assert_eq!(state("opened").to_string(), "opened");
         assert_eq!(reference('#', 42).to_string(), "#42");
         assert_eq!(error("403").to_string(), "403");
+        assert_eq!(note("refused").to_string(), "refused");
     }
 
     #[test]
@@ -172,6 +178,12 @@ mod tests {
         assert_eq!(state("warning").to_string(), "\x1b[33mwarning\x1b[0m");
         assert_eq!(state("error").to_string(), "\x1b[31merror\x1b[0m");
         assert_eq!(state("skipped").to_string(), "\x1b[2mskipped\x1b[0m");
+        // A sync job GitLab refuses for good is no failure.
+        assert_eq!(
+            state("unavailable").to_string(),
+            "\x1b[2munavailable\x1b[0m"
+        );
+        assert_eq!(note("refused").to_string(), "\x1b[2mrefused\x1b[0m");
         assert_eq!(reference('!', 7).to_string(), "\x1b[36m!7\x1b[0m");
         assert_eq!(error("403").to_string(), "\x1b[31m403\x1b[0m");
         // A word outside the palette gets no escapes at all.
