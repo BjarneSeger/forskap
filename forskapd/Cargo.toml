@@ -7,6 +7,12 @@ default-run = "forskapd"
 
 [dependencies]
 gitlab.workspace = true
+# Not used in the code: the `gitlab` crate builds its own reqwest client, and
+# cargo's feature unification lets the `gzip` asked for here reach it. With it
+# compiled in, that client sends `Accept-Encoding: gzip` and decodes the answer
+# (a page of 100 projects is 121 kB plain, about 7 kB gzipped). A test in
+# `src/gitlab.rs` fails if a dependency bump splits the two reqwest versions.
+reqwest.workspace = true
 notify.workspace = true
 fjall.workspace = true
 xxhash-rust.workspace = true
@@ -37,6 +43,8 @@ proptest.workspace = true
 tempfile = "3"
 url = "2"
 bytes = "1"
+# Already in the tree through reqwest's `gzip`; a test encodes with it.
+flate2 = "1"
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 
 [[bench]]

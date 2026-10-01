@@ -27,6 +27,9 @@ varlink = { version = "13.0", features = ["tokio"] }
 varlink_generator = "13.0"
 dirs = "7"
 http = "1"
+# No code names this: it only switches `gzip` on for the client the `gitlab`
+# crate builds, so it has to stay on the reqwest line that crate uses.
+reqwest = { version = "0.13.1", default-features = false, features = ["gzip"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 # Local storage
