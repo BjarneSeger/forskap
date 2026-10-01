@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Notify, RwLock};
 
-use forskap_api::NotAuthReason;
+use forskap_api::{IssuableKind, NotAuthReason, WorkItemRef};
 
 use crate::config::SharedConfig;
 use crate::error::DormancyReason;
@@ -26,7 +26,7 @@ use crate::queue::RetryQueue;
 use crate::rotate::Rotation;
 use crate::secrets::{Keychain, Token};
 use crate::sync::{SyncHandle, now_secs};
-use crate::usage::UsageStats;
+use crate::usage::{UsageStats, epic_usage_key, usage_key};
 
 mod varlink;
 mod wire;
@@ -140,6 +140,46 @@ fn dormant_args(reason: &DormancyReason) -> (Option<NotAuthReason>, Option<Strin
 fn issue_ref_error(project_id: i64, iid: i64) -> Option<String> {
     (project_id <= 0 || iid <= 0)
         .then(|| format!("invalid issue/MR reference (project {project_id}, iid {iid})"))
+}
+
+/// The usage key `RecordOpen` counts an open under, or the message why the
+/// reference is malformed. A work item is addressed by its project or its
+/// group (an epic), never both; a merge request only by its project.
+fn open_key(
+    kind: &IssuableKind,
+    iid: i64,
+    project_id: Option<i64>,
+    group_id: Option<i64>,
+) -> Result<String, String> {
+    match (project_id, group_id) {
+        (Some(project_id), None) => match issue_ref_error(project_id, iid) {
+            Some(msg) => Err(msg),
+            None => Ok(usage_key(wire::internal_kind(kind), project_id, iid)),
+        },
+        (None, Some(_)) if *kind == IssuableKind::merge_request => {
+            Err("a merge request is addressed by its project_id, not a group_id".into())
+        }
+        (None, Some(group_id)) if group_id <= 0 || iid <= 0 => Err(format!(
+            "invalid work item reference (group {group_id}, iid {iid})"
+        )),
+        (None, Some(group_id)) => Ok(epic_usage_key(group_id, iid)),
+        _ => Err("give exactly one of project_id and group_id".into()),
+    }
+}
+
+/// The `(group_id, iid)` of the epic a new work item's `parent` names, or
+/// the message why it names none: only an epic can be a parent here.
+fn parent_epic(parent: &WorkItemRef) -> Result<(i64, i64), String> {
+    let epic = parent
+        .r#type
+        .as_deref()
+        .is_none_or(|t| t.eq_ignore_ascii_case("epic"));
+    match (parent.project_id, parent.group_id) {
+        (None, Some(group_id)) if epic && group_id > 0 && parent.iid > 0 => {
+            Ok((group_id, parent.iid))
+        }
+        _ => Err("invalid parent: name an epic by its group_id and iid".into()),
+    }
 }
 
 /// Reject a new issue GitLab would refuse or misread, before anything is

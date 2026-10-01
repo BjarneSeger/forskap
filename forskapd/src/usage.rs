@@ -1,6 +1,6 @@
 //! Persisted open statistics: how often, and how recently, each issue, MR or
-//! epic was opened through `RecordOpen` / `RecordEpicOpen`. The `Search` handler ranks frequently opened
-//! items first from this record; nothing else reads it.
+//! epic was opened through `RecordOpen`. The `Search` handler ranks frequently
+//! opened items first from this record; nothing else reads it.
 //!
 //! One JSON record in its own keyspace: a read-modify-write under an internal
 //! lock, lazy durability. Opens are human-rate events and the record is capped, so

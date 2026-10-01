@@ -22,42 +22,76 @@ operation is persisted to a retry queue and drained on reconnect (exponential ba
 dead-lettered after the retry window; see `GetFailures`). Only an actual GitLab
 *rejection* surfaces as `GitlabError`. The reads reflect a write at once — a queued
 or just-applied close/unassign hides the item from the assigned lists, and
-`ListIssues` shows the issue as closed or no longer assigned — and the
-jobs that display it rerun right after it lands. `CreateIssue` is the exception: it
-is sent to GitLab once and never queued, so it fails while GitLab is away (see
+`ListWorkItems` shows the issue as closed or no longer assigned — and the
+jobs that display it rerun right after it lands. `CreateWorkItem` is the exception:
+it is sent to GitLab once and never queued, so it fails while GitLab is away (see
 [Writing directly](#writing-directly-never-queued)).
 
 # Types
 
 ```varlink
-type Issue (
-  id:           int,    # global issue ID (unique across the GitLab instance)
-  iid:          int,    # per-project issue number (the "#42" shown in the UI)
-  project_id:   int,
-  title:        string,
-  web_url:      string,
-  state:        string, # "opened" | "closed"
-  parent:       string, # URL of the issue's epic; empty when it has none
-  total_time:   string, # GitLab's human-readable total spent time ("2h"); empty when none
-  graph_status: string, # board column the issue sits in, derived from its labels
-                        # matched against the project's issue board; empty when no
-                        # board/label matches
-  open_count:   int,    # opens recorded through RecordOpen (within usage.retention_hours)
-  project_avatar: string, # file of the project's avatar, see Project.avatar; empty when none
-  project_path: string,   # the project's full path ("team/api"): the stored project's, else
-                          # the one in web_url; empty when neither gives it
-  updated_at:   int       # unix seconds, GitLab's updated_at as of the last sync; 0 when unknown
+type WorkItem (
+  id:             int,          # global work item ID (unique across the GitLab instance)
+  iid:            int,          # number within its project or group ("#42" of an issue, "&5" of an epic)
+  type:           string,       # "issue", "task", "incident", "test_case", "epic", …
+  project_id:     ?int,         # the project of an issue, task, …; null for an epic
+  group_id:       ?int,         # the group of an epic; null for the rest
+  namespace_path: string,       # the full path of that project ("team/api") or group ("team"):
+                                # the stored project's or group's, else the one in web_url;
+                                # empty when neither gives it
+  title:          string,
+  web_url:        string,
+  state:          string,       # "opened" | "closed"
+  parent:         ?WorkItemRef, # the epic an issue belongs to; null when it has none, and for an epic
+  total_time:     string,       # GitLab's human-readable total spent time ("2h"); empty when none,
+                                # and for an epic
+  graph_status:   string,       # board column the issue sits in, derived from its labels matched
+                                # against the project's issue board; empty when no board/label
+                                # matches, and for an epic
+  open_count:     int,          # opens recorded through RecordOpen (within usage.retention_hours)
+  project_avatar: string,       # file of the project's avatar, see Project.avatar; empty when
+                                # none, and for an epic
+  updated_at:     int           # unix seconds, GitLab's updated_at as of the last sync; 0 when unknown
+)
+
+type WorkItemRef (
+  project_id: ?int,     # the project of the work item named, or
+  group_id:   ?int,     # its group: exactly one of the two is set
+  iid:        int,
+  type:       ?string,  # "epic", …; null when the naming side doesn't say
+  title:      ?string,
+  web_url:    ?string   # absolute; null when unknown
 )
 ```
 
+GitLab has made issues, tasks and epics one kind of thing, the *work item*. The wire
+follows: every issue the daemon stores is a work item of its project, with the type
+GitLab gives it (`issue_type`; a task is a work item of the type `task`, listed among
+a project's issues), and every epic a work item of its group, of the type `epic`.
+Exactly one of `project_id` and `group_id` is set. The daemon still reads them through
+GitLab's REST API (`/issues`, `/groups/:id/epics`); the shape doesn't depend on that.
+
+`id` is the work item's global ID — the ID GitLab's work items API knows, not the
+legacy epic ID the REST epics API addresses an epic by. An epic's comes from its
+`work_item_id`, which GitLab sends from 18.4 on: forskap needs GitLab 18.4 or newer.
+An epic synced by a daemon that didn't store it reads `0` until its group's epics are
+synced again, which the upgraded daemon does at its first start.
+
+An issue under an epic names it as `parent`: `group_id`, `iid`, `type` `epic`, its
+title and its link. GitLab links an issue's epic relative to the instance; the daemon
+answers with the stored epic's `web_url`, else the relative link behind the scheme and
+host of the issue's own. An epic's own `parent` is null. An issue synced by a daemon
+that didn't store its epic's group and number has no `parent` until its project is
+synced again, likewise at the first start.
+
 ```varlink
-type IssuableKind (issue, merge_request)
+type IssuableKind (work_item, merge_request)
 ```
 
-The two things time can be tracked on. Every method and type that addresses an
-issue or a merge request carries an `IssuableKind` next to the `(project_id, iid)`
-pair; the iid is the per-project number the UI shows (`#42` for issues, `!7` for
-MRs).
+The two things time can be tracked on. Every write that addresses an issue or a
+merge request carries an `IssuableKind` next to the `(project_id, iid)` pair, an issue
+being a `work_item`; the iid is the per-project number the UI shows (`#42` for
+issues, `!7` for MRs). `RecordOpen` takes a `work_item` by its group as well: an epic.
 
 ```varlink
 type HistoryEvent (
@@ -137,7 +171,7 @@ type FailedTask (
 ```
 
 Tasks dead-lettered by a daemon predating MR support render with the current `op`
-names (a close reads `"Close"`, never `"CloseIssue"`) and `kind` `issue`.
+names (a close reads `"Close"`, never `"CloseIssue"`) and `kind` `work_item`.
 
 ```varlink
 type MergeRequest (
@@ -196,35 +230,21 @@ type Group (
 )
 ```
 
-```varlink
-type Epic (
-  id:         int,     # global epic ID
-  iid:        int,     # per-group epic number (the "&5" shown in the UI)
-  group_id:   int,     # the group the epic belongs to
-  title:      string,
-  web_url:    string,
-  state:      string,  # "opened" or "closed"
-  open_count: int,     # opens recorded through RecordEpicOpen (within usage.retention_hours)
-  group_path: string,  # the group's full path ("team/backend"): the stored group's, else
-                       # the one in web_url; empty when neither gives it
-  updated_at: int      # unix seconds, GitLab's updated_at as of the last sync; 0 when unknown
-)
-```
-
 An epic belongs to a group and is numbered within it, so `(group_id, iid)` addresses
-one. Epics are read-only here: `IssuableKind` and the write methods don't cover them.
+one. Epics are read-only here: the write methods address a project's work items only.
 
 # Errors
 
 `org.varlink.service.InvalidParameter (parameter: string)` — the call's arguments
 don't fit the method: a required one is missing, or an enum argument (`IssuableKind`,
-`SearchKind`, `CacheScope`, `IssueRole`, `IssueState`) carries a value the interface
-doesn't have. `parameter` says what is wrong.
+`SearchKind`, `CacheScope`, `WorkItemRole`, `WorkItemState`) carries a value the
+interface doesn't have. `parameter` says what is wrong.
 
 `GitlabError (message: string)` — GitLab rejected the request (invalid input, API
 error, rate limit), or a local precondition failed (malformed issue reference, invalid
-duration, unknown failure id, a new issue without a title). For `CreateIssue` it also
-reports that GitLab could not be reached. `message` is human-readable.
+duration, unknown failure id, a new issue without a title, a parent that is no epic).
+For `CreateWorkItem` it also reports that GitLab could not be reached, or that the
+parent could not be looked up. `message` is human-readable.
 
 `NotAuthenticated (reason: ?NotAuthReason, detail: ?string)` — the daemon has no live
 GitLab session (it is *dormant*). `reason` says why; `detail` carries free text (host,
@@ -253,10 +273,10 @@ reported as `unreachable` for the moment it takes to reconnect with that one.
 
 ## Reading
 
-### `GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)`
+### `GetAssignedWorkItems(groups: ?[]string) -> (work_items: []WorkItem)`
 
-Open issues assigned to the authenticated user, served purely from the cache,
-grouped by namespace. `groups` filters to the given group namespaces (parsed from
+Open issues assigned to the authenticated user, work items of their project, served
+purely from the cache, grouped by namespace. `groups` filters to the given group namespaces (parsed from
 each issue's `web_url`, subgroups included); an issue matching several requested
 groups is listed once. Omitted or empty `groups` returns everything. When the list
 has never been synced: replies with an empty list if a session exists (first sync
@@ -266,20 +286,21 @@ pending), `NotAuthenticated` otherwise.
 
 Open merge requests assigned to the authenticated user, served purely from the
 cache and synced on the quick cadence like the assigned issues. `groups` filters by
-namespace exactly like `GetAssignedIssues`. Replies newest-updated first. When the
+namespace exactly like `GetAssignedWorkItems`. Replies newest-updated first. When the
 list has never been synced: empty list if a session exists, `NotAuthenticated`
 otherwise.
 
-### `ListIssues(role: ?IssueRole, updated_after: ?int, states: ?[]IssueState) -> (issues: []Issue)`
+### `ListWorkItems(role: ?WorkItemRole, updated_after: ?int, states: ?[]WorkItemState) -> (work_items: []WorkItem)`
 
 Your own issues across projects and states: the ones you authored or are assigned
-to that were updated recently, closed ones included, newest-updated first. Served
-purely from the cache. `Issue.parent` carries each one's epic, so a client can, for
-instance, tell which epic most of your recent work in a project belongs to.
+to that were updated recently, closed ones included, newest-updated first, as work
+items of their project. Served purely from the cache. `WorkItem.parent` carries each
+one's epic, so a client can, for instance, tell which epic most of your recent work
+in a project belongs to.
 
 ```varlink
-type IssueRole (author, assignee)
-type IssueState (opened, closed)
+type WorkItemRole (author, assignee)
+type WorkItemState (opened, closed)
 ```
 
 `role` picks one of the two lists; omitted, the reply is their union, with an issue
@@ -300,7 +321,7 @@ the daemon show at once: a queued or just-applied `Close` lists the issue as
 `author` one), and both lists are synced again right after an issue write lands. An
 issue you were just assigned appears with that sync.
 
-Unlike `GetAssignedIssues`, which keeps every open assigned issue however old and
+Unlike `GetAssignedWorkItems`, which keeps every open assigned issue however old and
 is synced every few minutes, this method is bounded by time and not by state; the two
 are synced separately and may briefly disagree. The projects listed here are not
 "tracked" by it: an issue closed two months ago pulls no project into the search
@@ -311,20 +332,23 @@ When a list the call needs has never been synced — both of them with `role`
 omitted: replies with an empty list if a session exists (first sync pending),
 `NotAuthenticated` otherwise.
 
-### `Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)`
+### `Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope, types: ?[]string) -> (work_items: []WorkItem, merge_requests: []MergeRequest, projects: []Project, groups: []Group)`
 
 Searches the locally cached corpus — a pure cache read, no GitLab round-trip.
-Matching is a case-insensitive substring test on issue/MR/epic titles and labels and
+Matching is a case-insensitive substring test on work item/MR titles and labels and
 on project/group names and paths; a query of the exact form `#123` additionally
-matches issues and MRs by their per-project number, one of the form `&5` epics by
-their per-group number. Descriptions are not cached and not searched.
+matches a project's work items and MRs by their per-project number, one of the form
+`&5` epics by their per-group number. Descriptions are not cached and not searched.
 
 ```varlink
-type SearchKind (issues, merge_requests, projects, groups, epics)
+type SearchKind (work_items, merge_requests, projects, groups)
 ```
 
-`kinds` restricts the reply to a subset of them (omitted or empty = all five).
-`limit` caps each returned array separately (default 50; must be positive).
+`kinds` restricts the reply to a subset of them (omitted or empty = all four).
+`limit` caps each returned array separately (default 50; must be positive); issues
+and epics share `work_items`, so they share its limit. `types` keeps only the work
+items of the listed types (`"issue"`, `"task"`, `"epic"`, …), compared
+case-insensitively; omitted or empty = every type. A type nothing has matches nothing.
 
 ```varlink
 type SearchScope (projects: ?[]int, groups: ?[]string)
@@ -332,22 +356,21 @@ type SearchScope (projects: ?[]int, groups: ?[]string)
 
 `scope` narrows every kind to the listed projects and groups, applied before
 `limit` so a scoped search fills its `limit` from the scope alone. An item passes
-if it matches *any* listed criterion: issues and merge requests by their
-`project_id` or by the namespace of their `web_url` lying in a group (subgroups
-included, as in `GetAssignedIssues`); projects by their `id` or their path lying in
-a group; groups by their path; epics by the path of their group. A kind no listed
-criterion can name comes back empty — `projects` alone yields no groups and no
+if it matches *any* listed criterion: a project's work items and merge requests by
+their `project_id` or by the namespace of their `web_url` lying in a group
+(subgroups included, as in `GetAssignedWorkItems`); projects by their `id` or their
+path lying in a group; groups by their path; epics by the path of their group. What
+no listed criterion can name is left out — `projects` alone yields no groups and no
 epics. A scope that is omitted, or whose lists are both omitted or empty, is no
 scope at all.
 
-**Ranking**: issues, MRs and epics are ordered by their `RecordOpen` /
-`RecordEpicOpen` statistics — most opens
-first, ties by most recent open, then newest-updated — so never-opened items keep
-the newest-first order among themselves below the frequently opened ones. Each row
-reports its count as `open_count`. Projects and groups are sorted by path. An empty or
-whitespace-only `query` selects the "frequently opened" view: only issues, MRs and
-epics with at least one recorded open, ranked the same way; projects and groups are empty in
-that mode. The statistics are read once per call and a read failure degrades to the
+**Ranking**: work items and MRs are ordered by their `RecordOpen` statistics — most
+opens first, ties by most recent open, then newest-updated — so never-opened items
+keep the newest-first order among themselves below the frequently opened ones; issues
+and epics are ranked together. Each row reports its count as `open_count`. Projects
+and groups are sorted by path. An empty or whitespace-only `query` selects the
+"frequently opened" view: only work items and MRs with at least one recorded open,
+ranked the same way; projects and groups are empty in that mode. The statistics are read once per call and a read failure degrades to the
 plain recency order.
 
 What the corpus contains depends on the `[search]` daemon config. The default
@@ -355,7 +378,7 @@ What the corpus contains depends on the `[search]` daemon config. The default
 active in: where you have assigned issues/MRs, pushed, opened or commented on an issue
 or MR, or logged time within `search.tracked_retention_hours` (default 90 days).
 Activity in a project you aren't a member of only keeps your assigned items there.
-The issues `ListIssues` serves are searchable too, wherever they are.
+The issues `ListWorkItems` serves are searchable too, wherever they are.
 Each project contributes at most its `search.max_items_per_project` most recently
 updated issues and MRs. `"member"`
 holds every member project's, `"all"` everything the token can see (`"auto"` is an
@@ -363,8 +386,8 @@ alias of `"tracked"`). Projects and groups are always membership-scoped.
 Epics come from the member groups above those projects, at any depth (`"all"`: from
 every member group), each group contributing at most its
 `search.max_items_per_project` most recently updated ones. Epics need GitLab Premium
-or Ultimate: on other instances `epics` is always empty, and the daemon asks each
-group only once a day.
+or Ultimate: on other instances there are none among the work items, and the daemon
+asks each group only once a day.
 Issue `graph_status` comes from the synced board columns of the issue's project and
 is empty for projects whose boards were never synced (only those of assigned issues'
 projects and of tracked member projects are). A project's switched-off features are
@@ -435,7 +458,7 @@ Records spent time on the issuable. `duration` uses GitLab's time-tracking synta
 ### `Close(project_id: int, iid: int, kind: IssuableKind) -> ()`
 
 Closes the issuable. Immediately reflected: the assigned lists stop showing it
-before the next sync, and `ListIssues` shows it as `closed`.
+before the next sync, and `ListWorkItems` shows it as `closed`.
 
 ### `AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()`
 
@@ -445,30 +468,35 @@ right after the write lands, so it appears within seconds.
 ### `UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()`
 
 Removes the authenticated user from the issuable's assignees. Immediately
-reflected: the assigned lists, and `ListIssues` for the `assignee` role, stop
+reflected: the assigned lists, and `ListWorkItems` for the `assignee` role, stop
 showing it before the next sync.
 
 ## Writing directly (never queued)
 
-### `CreateIssue(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, epic_id: ?int) -> (iid: int, web_url: string)`
+### `CreateWorkItem(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, parent: ?WorkItemRef) -> (iid: int, web_url: string)`
 
 Creates an issue in the project and replies with its number and its link.
 `description` is GitLab Markdown. `labels` are label names; GitLab creates the ones
 the project doesn't have yet. `assign_self` assigns the issue to the authenticated
-user (omitted: nobody is assigned). `epic_id` puts the issue under an epic, named by
-its global ID (`Epic.id`, not the per-group `iid`); that needs GitLab Premium or
-Ultimate.
+user (omitted: nobody is assigned). `parent` puts the issue under an epic, named by
+its `group_id` and `iid` (`type` may be omitted or `epic`; `title` and `web_url` are
+ignored); that needs GitLab Premium or Ultimate. GitLab's REST API takes the epic by
+its legacy ID, so the daemon reads that from the stored epic, else asks GitLab for
+the epic (`GET /groups/:id/epics/:iid`) before creating anything.
 
 Unlike every other write this one is **never queued**: the daemon sends it to GitLab
 once and replies with what came of it.
 
-- A blank `title`, a `project_id` that isn't positive or a label containing a comma
-  (GitLab takes the labels as one comma-separated list) replies `GitlabError`
-  without GitLab being asked.
+- A blank `title`, a `project_id` that isn't positive, a label containing a comma
+  (GitLab takes the labels as one comma-separated list) or a `parent` that names no
+  epic (no `group_id`, a `project_id`, a number that isn't positive, another type)
+  replies `GitlabError` without GitLab being asked.
 - Without a live session it replies `NotAuthenticated`, whatever the reason —
   `unreachable` too, where the other writes are queued.
 - Any failure of the request replies `GitlabError`: a network error, a 429 or 5xx, a
   rejection, a 401. None of them demotes the session, and nothing is retried.
+- A parent epic GitLab doesn't find (or that can't be looked up for any of these
+  reasons) replies `GitlabError`, and nothing is created.
 
 The reason is that a create has no idempotency key. The queued writes address an
 existing `(project_id, iid, kind)`; a create has no `iid` yet, and nothing tells a
@@ -478,8 +506,8 @@ same holds for a caller: after a `GitlabError` that isn't a plain rejection, loo
 before calling again.
 
 On success the issue is visible at once, before any sync: `Search` finds it,
-`ListIssues` lists it for the `author` role, and if GitLab assigned it to the user,
-`GetAssignedIssues` and `ListIssues` for the `assignee` role list it too. The daemon
+`ListWorkItems` lists it for the `author` role, and if GitLab assigned it to the user,
+`GetAssignedWorkItems` and `ListWorkItems` for the `assignee` role list it too. The daemon
 goes by GitLab's answer there, not by `assign_self`: a user who may not assign gets
 the issue unassigned. A list that was never synced still reads as never synced. The
 jobs displaying the issue rerun right after.
@@ -568,22 +596,22 @@ forever would only drown the failures that matter. Two mechanisms keep them out:
 
 ## Usage statistics
 
-### `RecordOpen(project_id: int, iid: int, kind: IssuableKind) -> ()`
+### `RecordOpen(kind: IssuableKind, iid: int, project_id: ?int, group_id: ?int) -> ()`
 
-Counts one open of an issue or merge request — the client's "the user just went
-there" signal (`forskap issue open`, a launcher activation). Purely local bookkeeping: no GitLab
-round-trip, no queueing, works while dormant. `Search` ranks by these counts and
-reports them as `open_count` (also on `GetAssignedIssues` /
-`GetAssignedMergeRequests` rows). An entry expires `usage.retention_hours` (default
-90 days) after its last open, and the record is capped at 1000 issuables (lowest
-counts dropped first); both are enforced on write. A non-positive `project_id` or
-`iid` is an eager `GitlabError`. Cleared only by `ClearCache` scope `usage`.
+Counts one open of a work item or merge request — the client's "the user just went
+there" signal (`forskap issue open`, `forskap epic open`, a launcher activation).
+Purely local bookkeeping: no GitLab round-trip, no queueing, works while dormant.
+`Search` ranks by these counts and reports them as `open_count` (also on
+`GetAssignedWorkItems` / `GetAssignedMergeRequests` rows). An entry expires
+`usage.retention_hours` (default 90 days) after its last open, and the record is
+capped at 1000 items (lowest counts dropped first); both are enforced on write.
+Cleared only by `ClearCache` scope `usage`.
 
-### `RecordEpicOpen(group_id: int, iid: int) -> ()`
-
-`RecordOpen` for an epic, addressed by its group (`forskap epic open`, a launcher
-activation): same bookkeeping, retention and cap, counted apart from issues and
-MRs. A non-positive `group_id` or `iid` is an eager `GitlabError`.
+Exactly one of `project_id` and `group_id` names where the item lives: a project for
+an issue or merge request, a group for an epic (`kind` `work_item`). A group's work
+items are counted apart from a project's, so a group and a project sharing an ID
+don't share counters. Both or neither given, a merge request by its group, or a
+number or ID that isn't positive is an eager `GitlabError`.
 
 ## Cache control
 
@@ -598,18 +626,18 @@ clears everything synced. Otherwise each scope selects a slice:
 
 | scope      | clears                                                       |
 |------------|--------------------------------------------------------------|
-| `assigned` | the assigned issue/MR lists, the `ListIssues` lists and the board columns |
+| `assigned` | the assigned issue/MR lists, the `ListWorkItems` lists and the board columns |
 | `search` | the corpus: issues, MRs, epics, projects, groups, project avatars |
 | `quick`  | history inside the quick window (last `refresh.quick.window_hours`) |
 | `slow`   | history between the retention horizon and the quick window     |
 | `stale`  | history older than `history.retention_hours` (normally already pruned) |
-| `usage`  | the `RecordOpen` / `RecordEpicOpen` statistics — **only when listed explicitly**; the empty "everything" scope leaves them alone (user data, not a cache) |
+| `usage`  | the `RecordOpen` statistics — **only when listed explicitly**; the empty "everything" scope leaves them alone (user data, not a cache) |
 
 When a session exists, the reply waits (up to 30 s) until what it cleared is
 re-synced: the assigned lists for `assigned`, `search` and the empty scope (plus the
 board columns of their projects that never synced), the recent and full history
 for a history band and the empty scope. Everything else refills in the
-background — the `ListIssues` lists among it, so that method can reply empty right
+background — the `ListWorkItems` lists among it, so that method can reply empty right
 after a clear; `usage` alone makes no GitLab call. Replies success even when
 dormant — the cleared state then stays empty until the next successful sync.
 
@@ -636,15 +664,23 @@ Drops the session (subsequent calls reply `NotAuthenticated` with reason
 SOCKET=unix:$XDG_RUNTIME_DIR/forskapd.socket
 
 # list assigned issues
-varlinkctl call $SOCKET org.thehoster.forskapd.GetAssignedIssues '{}'
+varlinkctl call $SOCKET org.thehoster.forskapd.GetAssignedWorkItems '{}'
 
 # the issues I authored that were closed, updated since 2026-09-01
-varlinkctl call $SOCKET org.thehoster.forskapd.ListIssues \
+varlinkctl call $SOCKET org.thehoster.forskapd.ListWorkItems \
   '{"role": "author", "states": ["closed"], "updated_after": 1788220800}'
+
+# the epics about billing
+varlinkctl call $SOCKET org.thehoster.forskapd.Search \
+  '{"query": "billing", "kinds": ["work_items"], "types": ["epic"]}'
+
+# count an open of epic &5 of group 9
+varlinkctl call $SOCKET org.thehoster.forskapd.RecordOpen \
+  '{"kind": "work_item", "iid": 5, "group_id": 9}'
 
 # post 1h30m to project 42, issue #7
 varlinkctl call $SOCKET org.thehoster.forskapd.PostTime \
-  '{"project_id": 42, "iid": 7, "kind": "issue", "duration": "1h30m", "summary": "code review"}'
+  '{"project_id": 42, "iid": 7, "kind": "work_item", "duration": "1h30m", "summary": "code review"}'
 
 # close merge request !3 in project 42
 varlinkctl call $SOCKET org.thehoster.forskapd.Close \

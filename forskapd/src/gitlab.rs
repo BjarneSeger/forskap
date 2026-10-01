@@ -1,9 +1,9 @@
 //! GitLab API access — the only module that knows about the `gitlab` crate.
 //!
 //! Wraps `gitlab::AsyncGitlab`: one paginated endpoint for every read
-//! ([`Listing`]), the GraphQL timelog query, the project avatar download, and
-//! the write endpoints the crate doesn't ship (`add_spent_time`, `close`,
-//! assignment, creating an issue, token rotation).
+//! ([`Listing`]), the GraphQL timelog query, the project avatar download, one
+//! epic by its number, and the write endpoints the crate doesn't ship
+//! (`add_spent_time`, `close`, assignment, creating an issue, token rotation).
 
 use std::borrow::Cow;
 use std::future::Future;
@@ -107,7 +107,8 @@ pub struct NewIssue {
     pub labels: Vec<String>,
     /// Assign it to the authenticated user.
     pub assign_self: bool,
-    /// The global id of the epic to put it under. GitLab Premium only.
+    /// The legacy id of the epic to put it under (not its work item id).
+    /// GitLab Premium only.
     pub epic_id: Option<i64>,
 }
 
@@ -333,6 +334,10 @@ pub trait GitlabApi: Send + Sync {
     /// whether GitLab created the issue before the answer was lost, and a
     /// second call would create a second one.
     async fn create_issue(&self, project_id: i64, issue: &NewIssue) -> Result<serde_json::Value>;
+
+    /// The epic `iid` of the group as GitLab answered (`GET
+    /// /groups/:id/epics/:iid`), for its legacy id.
+    async fn epic(&self, group_id: i64, iid: i64) -> Result<serde_json::Value>;
 
     /// The rows of a paginated REST listing, as raw JSON; paging stops once
     /// `limit` rows arrived. `progress` learns the total GitLab announces
@@ -605,6 +610,15 @@ impl GitlabApi for GitlabClient {
         .query_async(&self.inner)
         .await
         .map_err(classify)
+    }
+
+    #[instrument(skip(self))]
+    async fn epic(&self, group_id: i64, iid: i64) -> Result<serde_json::Value> {
+        let endpoint = EpicEndpoint { group_id, iid };
+        retry_transient("fetch epic", || async {
+            endpoint.query_async(&self.inner).await.map_err(classify)
+        })
+        .await
     }
 
     #[instrument(skip(self, progress))]
@@ -1044,6 +1058,22 @@ impl gitlab::api::Endpoint for CreateIssueEndpoint<'_> {
             body["epic_id"] = epic_id.into();
         }
         Ok(Some(("application/json", serde_json::to_vec(&body)?)))
+    }
+}
+
+/// `GET /groups/:id/epics/:epic_iid`
+struct EpicEndpoint {
+    group_id: i64,
+    iid: i64,
+}
+
+impl gitlab::api::Endpoint for EpicEndpoint {
+    fn method(&self) -> http::Method {
+        http::Method::GET
+    }
+
+    fn endpoint(&self) -> Cow<'static, str> {
+        format!("groups/{}/epics/{}", self.group_id, self.iid).into()
     }
 }
 
@@ -2215,6 +2245,18 @@ mod tests {
         let avatar = ProjectAvatarEndpoint { project_id: 7 };
         assert_eq!(avatar.endpoint(), "projects/7/avatar");
         assert_eq!(avatar.method(), http::Method::GET);
+    }
+
+    #[test]
+    fn the_epic_endpoint_renders_its_path() {
+        use gitlab::api::Endpoint;
+
+        let epic = EpicEndpoint {
+            group_id: 3,
+            iid: 5,
+        };
+        assert_eq!(epic.endpoint(), "groups/3/epics/5");
+        assert_eq!(epic.method(), http::Method::GET);
     }
 
     #[test]

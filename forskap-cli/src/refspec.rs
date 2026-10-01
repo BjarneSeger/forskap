@@ -16,8 +16,9 @@ use forskap_api::{IssuableKind, SearchKind};
 use serde::{Deserialize, Serialize};
 
 /// Which kind of issuable a ref denotes. The client-side counterpart of the
-/// wire `IssuableKind`, also persisted inside [`crate::state::LastIssue`]
-/// (default `Issue` keeps pre-MR state files readable).
+/// wire `IssuableKind`, where an issue is a work item; also persisted inside
+/// [`crate::state::LastIssue`] (default `Issue` keeps pre-MR state files
+/// readable).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefKind {
@@ -73,7 +74,7 @@ pub fn resolve_kind(r: IssuableRef, mr_flag: bool) -> Result<RefKind> {
 /// The wire enum value for a ref kind.
 pub fn wire(kind: RefKind) -> IssuableKind {
     match kind {
-        RefKind::Issue => IssuableKind::issue,
+        RefKind::Issue => IssuableKind::work_item,
         RefKind::Mr => IssuableKind::merge_request,
     }
 }
@@ -81,15 +82,16 @@ pub fn wire(kind: RefKind) -> IssuableKind {
 /// The ref kind of a wire enum value.
 pub fn from_wire(kind: &IssuableKind) -> RefKind {
     match kind {
-        IssuableKind::issue => RefKind::Issue,
+        IssuableKind::work_item => RefKind::Issue,
         IssuableKind::merge_request => RefKind::Mr,
     }
 }
 
-/// The `Search` kind holding this kind's rows.
+/// The `Search` kind holding this kind's rows; an issue's are the work
+/// items, epics included.
 pub fn search_kind(kind: RefKind) -> SearchKind {
     match kind {
-        RefKind::Issue => SearchKind::issues,
+        RefKind::Issue => SearchKind::work_items,
         RefKind::Mr => SearchKind::merge_requests,
     }
 }
@@ -172,8 +174,10 @@ mod tests {
         );
     }
 
+    /// State files hold these names, so they stay what they were before the
+    /// wire called an issue a work item.
     #[test]
-    fn ref_kind_serializes_like_the_wire_enum() {
+    fn ref_kind_keeps_its_persisted_names() {
         assert_eq!(serde_json::to_string(&RefKind::Issue).unwrap(), "\"issue\"");
         assert_eq!(
             serde_json::to_string(&RefKind::Mr).unwrap(),

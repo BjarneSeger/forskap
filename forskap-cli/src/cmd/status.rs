@@ -1712,7 +1712,7 @@ healthy
         let failed = |id| FailedTask {
             id,
             op: "post_time".to_string(),
-            kind: forskap_api::IssuableKind::issue,
+            kind: forskap_api::IssuableKind::work_item,
             project_id: 7,
             iid: 42,
             detail: "1h".to_string(),

@@ -12,13 +12,13 @@ use varlink::sansio::ServerEvent;
 
 use forskap_api::{
     AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
-    Call_CreateIssue, Call_DismissFailure, Call_GetActivity, Call_GetAssignedIssues,
-    Call_GetAssignedMergeRequests, Call_GetFailures, Call_GetHistory, Call_GetSyncJobs,
-    Call_ListIssues, Call_Login, Call_Logout, Call_PostTime, Call_RecordEpicOpen, Call_RecordOpen,
-    Call_RetryFailure, Call_Search, Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, Close_Args,
-    CreateIssue_Args, DismissFailure_Args, GetActivity_Args, GetAssignedIssues_Args,
-    GetAssignedMergeRequests_Args, GetHistory_Args, ListIssues_Args, Login_Args, PostTime_Args,
-    RecordEpicOpen_Args, RecordOpen_Args, RetryFailure_Args, Search_Args, UnassignSelf_Args,
+    Call_CreateWorkItem, Call_DismissFailure, Call_GetActivity, Call_GetAssignedMergeRequests,
+    Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetSyncJobs,
+    Call_ListWorkItems, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
+    Call_Search, Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, Close_Args, CreateWorkItem_Args,
+    DismissFailure_Args, GetActivity_Args, GetAssignedMergeRequests_Args,
+    GetAssignedWorkItems_Args, GetHistory_Args, ListWorkItems_Args, Login_Args, PostTime_Args,
+    RecordOpen_Args, RetryFailure_Args, Search_Args, UnassignSelf_Args,
     VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
 };
 
@@ -198,10 +198,13 @@ async fn handle_forskapd(
                 .clear_failures(&mut call as &mut dyn Call_ClearFailures)
                 .await?;
         }
-        "org.thehoster.forskapd.GetAssignedIssues" => {
-            let args: GetAssignedIssues_Args = args!();
+        "org.thehoster.forskapd.GetAssignedWorkItems" => {
+            let args: GetAssignedWorkItems_Args = args!();
             handlers
-                .get_assigned_issues(&mut call as &mut dyn Call_GetAssignedIssues, args.groups)
+                .get_assigned_work_items(
+                    &mut call as &mut dyn Call_GetAssignedWorkItems,
+                    args.groups,
+                )
                 .await?;
         }
         "org.thehoster.forskapd.GetAssignedMergeRequests" => {
@@ -213,11 +216,11 @@ async fn handle_forskapd(
                 )
                 .await?;
         }
-        "org.thehoster.forskapd.ListIssues" => {
-            let args: ListIssues_Args = args!();
+        "org.thehoster.forskapd.ListWorkItems" => {
+            let args: ListWorkItems_Args = args!();
             handlers
-                .list_issues(
-                    &mut call as &mut dyn Call_ListIssues,
+                .list_work_items(
+                    &mut call as &mut dyn Call_ListWorkItems,
                     args.role,
                     args.updated_after,
                     args.states,
@@ -233,6 +236,7 @@ async fn handle_forskapd(
                     args.kinds,
                     args.limit,
                     args.scope,
+                    args.types,
                 )
                 .await?;
         }
@@ -265,19 +269,10 @@ async fn handle_forskapd(
             handlers
                 .record_open(
                     &mut call as &mut dyn Call_RecordOpen,
-                    args.project_id,
-                    args.iid,
                     args.kind,
-                )
-                .await?;
-        }
-        "org.thehoster.forskapd.RecordEpicOpen" => {
-            let args: RecordEpicOpen_Args = args!();
-            handlers
-                .record_epic_open(
-                    &mut call as &mut dyn Call_RecordEpicOpen,
-                    args.group_id,
                     args.iid,
+                    args.project_id,
+                    args.group_id,
                 )
                 .await?;
         }
@@ -303,17 +298,17 @@ async fn handle_forskapd(
                 )
                 .await?;
         }
-        "org.thehoster.forskapd.CreateIssue" => {
-            let args: CreateIssue_Args = args!();
+        "org.thehoster.forskapd.CreateWorkItem" => {
+            let args: CreateWorkItem_Args = args!();
             handlers
-                .create_issue(
-                    &mut call as &mut dyn Call_CreateIssue,
+                .create_work_item(
+                    &mut call as &mut dyn Call_CreateWorkItem,
                     args.project_id,
                     args.title,
                     args.description,
                     args.labels,
                     args.assign_self,
-                    args.epic_id,
+                    args.parent,
                 )
                 .await?;
         }
@@ -351,19 +346,44 @@ mod tests {
     #[tokio::test]
     async fn dispatch_has_an_arm_for_search() {
         let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
-        let reply = handle_forskapd(
-            "org.thehoster.forskapd.Search",
-            Some(serde_json::json!({"query": "x"})),
-            &handlers,
-        )
-        .await
-        .unwrap()
-        .expect("a reply");
-        assert_ne!(
-            reply.error.as_deref(),
-            Some("org.varlink.service.MethodNotFound"),
-            "Search is missing its dispatch arm in handle_forskapd"
-        );
+        let typed = serde_json::json!({"query": "x", "kinds": ["work_items"], "types": ["epic"]});
+        for params in [serde_json::json!({"query": "x"}), typed] {
+            let reply = handle_forskapd("org.thehoster.forskapd.Search", Some(params), &handlers)
+                .await
+                .unwrap()
+                .expect("a reply");
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("org.thehoster.forskapd.NotAuthenticated"),
+                "Search is missing its dispatch arm in handle_forskapd"
+            );
+        }
+    }
+
+    /// The methods the work items replaced are gone, not answered.
+    #[tokio::test]
+    async fn removed_methods_are_not_found() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        for method in [
+            "GetAssignedIssues",
+            "ListIssues",
+            "CreateIssue",
+            "RecordEpicOpen",
+        ] {
+            let reply = handle_forskapd(
+                &format!("org.thehoster.forskapd.{method}"),
+                Some(serde_json::json!({"group_id": 1, "iid": 2})),
+                &handlers,
+            )
+            .await
+            .unwrap()
+            .expect("a reply");
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("org.varlink.service.MethodNotFound"),
+                "{method}"
+            );
+        }
     }
 
     /// Unparseable arguments are answered, not punished by a dropped
@@ -384,25 +404,35 @@ mod tests {
                 "everything",
             ),
             (
-                "RecordOpen",
-                Some(serde_json::json!({"project_id": 1, "iid": 2, "kind": "epic"})),
-                "epic",
+                "Search",
+                Some(serde_json::json!({"query": "x", "kinds": ["epics"]})),
+                "epics",
             ),
             (
-                "ListIssues",
+                "RecordOpen",
+                Some(serde_json::json!({"project_id": 1, "iid": 2, "kind": "issue"})),
+                "issue",
+            ),
+            (
+                "ListWorkItems",
                 Some(serde_json::json!({"role": "reviewer"})),
                 "reviewer",
             ),
             (
-                "ListIssues",
+                "ListWorkItems",
                 Some(serde_json::json!({"states": ["merged"]})),
                 "merged",
             ),
             ("Search", None, "query"),
             (
-                "CreateIssue",
+                "CreateWorkItem",
                 Some(serde_json::json!({"project_id": 1})),
                 "title",
+            ),
+            (
+                "CreateWorkItem",
+                Some(serde_json::json!({"project_id": 1, "title": "x", "parent": {"group_id": 3}})),
+                "iid",
             ),
             ("Search", Some(serde_json::json!({"kinds": []})), "query"),
         ] {
@@ -453,22 +483,51 @@ mod tests {
         );
     }
 
+    /// A project's work item, a group's and a merge request.
     #[tokio::test]
     async fn dispatch_has_an_arm_for_record_open() {
         let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
-        let reply = handle_forskapd(
-            "org.thehoster.forskapd.RecordOpen",
-            Some(serde_json::json!({"project_id": 1, "iid": 2, "kind": "issue"})),
-            &handlers,
-        )
-        .await
-        .unwrap()
-        .expect("a reply");
-        assert!(
-            reply.error.is_none(),
-            "RecordOpen is missing its dispatch arm or rejected valid args: {:?}",
-            reply.error
-        );
+        for params in [
+            serde_json::json!({"kind": "work_item", "iid": 2, "project_id": 1}),
+            serde_json::json!({"kind": "work_item", "iid": 2, "group_id": 1}),
+            serde_json::json!({"kind": "merge_request", "iid": 2, "project_id": 1}),
+        ] {
+            let reply = handle_forskapd(
+                "org.thehoster.forskapd.RecordOpen",
+                Some(params.clone()),
+                &handlers,
+            )
+            .await
+            .unwrap()
+            .expect("a reply");
+            assert!(
+                reply.error.is_none(),
+                "RecordOpen is missing its dispatch arm or rejected {params}: {:?}",
+                reply.error
+            );
+        }
+    }
+
+    /// Dormant and never synced: the arm answers `NotAuthenticated`, not
+    /// `MethodNotFound`, with and without parameters.
+    #[tokio::test]
+    async fn dispatch_has_an_arm_for_get_assigned_work_items() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        for params in [None, Some(serde_json::json!({"groups": ["team"]}))] {
+            let reply = handle_forskapd(
+                "org.thehoster.forskapd.GetAssignedWorkItems",
+                params,
+                &handlers,
+            )
+            .await
+            .unwrap()
+            .expect("a reply");
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("org.thehoster.forskapd.NotAuthenticated"),
+                "GetAssignedWorkItems is missing its dispatch arm in handle_forskapd"
+            );
+        }
     }
 
     /// Dormant and never synced: the arm answers `NotAuthenticated`, not
@@ -492,7 +551,7 @@ mod tests {
     /// Dormant and never synced: the arm answers `NotAuthenticated`, not
     /// `MethodNotFound`, with and without parameters.
     #[tokio::test]
-    async fn dispatch_has_an_arm_for_list_issues() {
+    async fn dispatch_has_an_arm_for_list_work_items() {
         let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
         let filtered = serde_json::json!({
             "role": "author",
@@ -500,14 +559,14 @@ mod tests {
             "states": ["opened", "closed"],
         });
         for params in [None, Some(filtered)] {
-            let reply = handle_forskapd("org.thehoster.forskapd.ListIssues", params, &handlers)
+            let reply = handle_forskapd("org.thehoster.forskapd.ListWorkItems", params, &handlers)
                 .await
                 .unwrap()
                 .expect("a reply");
             assert_eq!(
                 reply.error.as_deref(),
                 Some("org.thehoster.forskapd.NotAuthenticated"),
-                "ListIssues is missing its dispatch arm in handle_forskapd"
+                "ListWorkItems is missing its dispatch arm in handle_forskapd"
             );
         }
     }
@@ -515,7 +574,7 @@ mod tests {
     /// Dormant: the arm answers `NotAuthenticated`, not `MethodNotFound`,
     /// with the optional arguments and without.
     #[tokio::test]
-    async fn dispatch_has_an_arm_for_create_issue() {
+    async fn dispatch_has_an_arm_for_create_work_item() {
         let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
         let full = serde_json::json!({
             "project_id": 1,
@@ -523,11 +582,11 @@ mod tests {
             "description": "y",
             "labels": ["bug"],
             "assign_self": true,
-            "epic_id": 5,
+            "parent": {"group_id": 3, "iid": 5, "type": "epic"},
         });
         for params in [serde_json::json!({"project_id": 1, "title": "x"}), full] {
             let reply = handle_forskapd(
-                "org.thehoster.forskapd.CreateIssue",
+                "org.thehoster.forskapd.CreateWorkItem",
                 Some(params),
                 &handlers,
             )
@@ -537,26 +596,8 @@ mod tests {
             assert_eq!(
                 reply.error.as_deref(),
                 Some("org.thehoster.forskapd.NotAuthenticated"),
-                "CreateIssue is missing its dispatch arm in handle_forskapd"
+                "CreateWorkItem is missing its dispatch arm in handle_forskapd"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn dispatch_has_an_arm_for_record_epic_open() {
-        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
-        let reply = handle_forskapd(
-            "org.thehoster.forskapd.RecordEpicOpen",
-            Some(serde_json::json!({"group_id": 1, "iid": 2})),
-            &handlers,
-        )
-        .await
-        .unwrap()
-        .expect("a reply");
-        assert!(
-            reply.error.is_none(),
-            "RecordEpicOpen is missing its dispatch arm or rejected valid args: {:?}",
-            reply.error
-        );
     }
 }

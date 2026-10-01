@@ -16,7 +16,7 @@ use crate::cli::{ItemCommand, TargetArgs};
 use crate::client;
 use crate::cmd::project;
 use crate::friendly::friendly;
-use crate::item::Item;
+use crate::item::{self, Item};
 use crate::refspec::{self, RefKind};
 
 pub async fn run(kind: RefKind, command: ItemCommand) -> Result<()> {
@@ -58,16 +58,13 @@ pub async fn lookup(
             Some(vec![refspec::search_kind(kind)]),
             None,
             Some(scope),
+            None,
         )
         .call()
         .await
         .map_err(|e| friendly("Search", e))?;
     let from_corpus = match kind {
-        RefKind::Issue => reply
-            .issues
-            .into_iter()
-            .find(|i| i.iid == iid)
-            .map(Item::Issue),
+        RefKind::Issue => item::issues(reply.work_items).find(|i| i.iid() == iid),
         RefKind::Mr => reply
             .merge_requests
             .into_iter()
@@ -80,13 +77,13 @@ pub async fn lookup(
 
     let from_assigned = match kind {
         RefKind::Issue => client
-            .get_assigned_issues(None)
+            .get_assigned_work_items(None)
             .call()
             .await
-            .map_err(|e| friendly("GetAssignedIssues", e))?
-            .issues
+            .map_err(|e| friendly("GetAssignedWorkItems", e))?
+            .work_items
             .into_iter()
-            .find(|i| i.project_id == project_id && i.iid == iid)
+            .find(|i| i.project_id == Some(project_id) && i.iid == iid)
             .map(Item::Issue),
         RefKind::Mr => client
             .get_assigned_merge_requests(None)

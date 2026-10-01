@@ -1,8 +1,8 @@
 //! Projections of stored GitLab rows onto the varlink wire types.
 
 use forskap_api::{
-    ActivityEvent, Epic, Group, HistoryEvent, HistorySource, IssuableKind, Issue, IssueState,
-    MergeRequest, Project, SyncJob, SyncJobStatus,
+    ActivityEvent, Group, HistoryEvent, HistorySource, IssuableKind, MergeRequest, Project,
+    SyncJob, SyncJobStatus, WorkItem, WorkItemRef, WorkItemState,
 };
 
 use crate::gitlab::{Issuable, format_duration};
@@ -24,29 +24,75 @@ fn project_path(stored: Option<String>, web_url: &str) -> String {
         .unwrap_or_else(|| namespace_of(web_url))
 }
 
+/// The work item type of every epic.
+pub const EPIC: &str = "epic";
+
 /// `board_labels` are the issue's project board lists, `None` when never
-/// synced (then `graph_status` stays empty).
+/// synced (then `graph_status` stays empty). `epic_url` is the link of the
+/// stored epic the issue names as its parent, `None` without a row.
 pub fn issue(
     i: model::Issue,
     board_labels: Option<&[String]>,
     open_count: i64,
     project: ProjectInfo,
-) -> Issue {
-    Issue {
+    epic_url: Option<String>,
+) -> WorkItem {
+    WorkItem {
         graph_status: graph_status_from(board_labels, &i.labels, &i.state),
-        parent: i.parent_url().to_string(),
+        parent: i
+            .epic
+            .as_ref()
+            .and_then(|e| parent(e, epic_url, &i.web_url)),
         total_time: i.total_time().to_string(),
+        r#type: i.work_item_type().to_string(),
         id: i.id,
         iid: i.iid,
-        project_id: i.project_id,
+        project_id: Some(i.project_id),
+        group_id: None,
+        namespace_path: project_path(project.path, &i.web_url),
         title: i.title,
         state: i.state,
         open_count,
         project_avatar: project.avatar,
-        project_path: project_path(project.path, &i.web_url),
         web_url: i.web_url,
         updated_at: i.updated_at as i64,
     }
+}
+
+/// The epic an issue names as its parent. GitLab links it relative to the
+/// instance, so the link is the stored epic's, else made absolute by the
+/// issue's own. `None` for a reference without its group and number, as
+/// rows stored before them have.
+fn parent(
+    epic: &model::EpicRef,
+    stored_url: Option<String>,
+    issue_url: &str,
+) -> Option<WorkItemRef> {
+    if epic.group_id <= 0 || epic.iid <= 0 {
+        return None;
+    }
+    Some(WorkItemRef {
+        project_id: None,
+        group_id: Some(epic.group_id),
+        iid: epic.iid,
+        r#type: Some(EPIC.into()),
+        title: some(epic.title.clone()),
+        web_url: stored_url
+            .and_then(some)
+            .or_else(|| absolute(&epic.url, issue_url)),
+    })
+}
+
+/// `url` as an absolute link: as it is with a scheme, a path behind the
+/// scheme and host of `base`; `None` for anything else.
+fn absolute(url: &str, base: &str) -> Option<String> {
+    if url.contains("://") {
+        return Some(url.to_string());
+    }
+    let path = url.strip_prefix('/')?;
+    let (scheme, rest) = base.split_once("://")?;
+    let host = rest.split('/').next().filter(|h| !h.is_empty())?;
+    Some(format!("{scheme}://{host}/{path}"))
 }
 
 pub fn merge_request(
@@ -100,17 +146,24 @@ pub fn group_path(stored: Option<String>, web_url: &str) -> String {
     })
 }
 
-/// `group_path` is the stored group's `full_path`, `None` without a row.
-pub fn epic(e: model::Epic, open_count: i64, group_path: Option<String>) -> Epic {
-    Epic {
-        group_path: self::group_path(group_path, &e.web_url),
-        id: e.id,
+/// `group_path` is the stored group's `full_path`, `None` without a row. The
+/// id is the epic's work item id, never its legacy one.
+pub fn epic(e: model::Epic, open_count: i64, group_path: Option<String>) -> WorkItem {
+    WorkItem {
+        namespace_path: self::group_path(group_path, &e.web_url),
+        id: e.work_item_id,
         iid: e.iid,
-        group_id: e.group_id,
+        r#type: EPIC.into(),
+        project_id: None,
+        group_id: Some(e.group_id),
         title: e.title,
         web_url: e.web_url,
         state: e.state,
+        parent: None,
+        total_time: String::new(),
+        graph_status: String::new(),
         open_count,
+        project_avatar: String::new(),
         updated_at: e.updated_at as i64,
     }
 }
@@ -217,10 +270,10 @@ fn some(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// Internal → wire issuable kind.
+/// Internal → wire issuable kind: an issue is a work item.
 pub fn kind(kind: Issuable) -> IssuableKind {
     match kind {
-        Issuable::Issue => IssuableKind::issue,
+        Issuable::Issue => IssuableKind::work_item,
         Issuable::MergeRequest => IssuableKind::merge_request,
     }
 }
@@ -229,17 +282,17 @@ pub fn kind(kind: Issuable) -> IssuableKind {
 /// lowercase variants are matched.
 pub fn internal_kind(kind: &IssuableKind) -> Issuable {
     match kind {
-        IssuableKind::issue => Issuable::Issue,
+        IssuableKind::work_item => Issuable::Issue,
         IssuableKind::merge_request => Issuable::MergeRequest,
     }
 }
 
-/// Wire → GitLab's name of an issue state, which is what the stored rows
-/// (and `Issue.state`) carry.
-pub fn issue_state(state: &IssueState) -> &'static str {
+/// Wire → GitLab's name of a work item state, which is what the stored rows
+/// (and `WorkItem.state`) carry.
+pub fn issue_state(state: &WorkItemState) -> &'static str {
     match state {
-        IssueState::opened => "opened",
-        IssueState::closed => "closed",
+        WorkItemState::opened => "opened",
+        WorkItemState::closed => "closed",
     }
 }
 
@@ -364,8 +417,127 @@ mod tests {
         assert_eq!(stored.project_path, "team/api");
         let foreign = merge_request(item(), 0, info(None));
         assert_eq!(foreign.project_path, "other/big");
-        let unknown = issue(model::Issue::default(), None, 0, info(None));
-        assert_eq!(unknown.project_path, "");
+        let unknown = issue(model::Issue::default(), None, 0, info(None), None);
+        assert_eq!(unknown.namespace_path, "");
+    }
+
+    fn no_project() -> ProjectInfo {
+        ProjectInfo {
+            path: None,
+            avatar: String::new(),
+        }
+    }
+
+    /// An issue is a project's work item of its type, in the epic it names.
+    #[test]
+    fn an_issue_is_a_work_item_of_its_project() {
+        let row = || model::Issue {
+            id: 7042,
+            iid: 42,
+            project_id: 7,
+            web_url: "https://gl.test:8443/team/api/-/work_items/42".into(),
+            issue_type: "task".into(),
+            epic: Some(model::EpicRef {
+                id: 30,
+                iid: 5,
+                group_id: 3,
+                title: "Accounts".into(),
+                url: "/groups/team/-/epics/5".into(),
+            }),
+            ..Default::default()
+        };
+        let task = issue(row(), None, 0, no_project(), None);
+        assert_eq!((task.id, task.iid), (7042, 42));
+        assert_eq!(task.r#type, "task");
+        assert_eq!((task.project_id, task.group_id), (Some(7), None));
+        assert_eq!(task.namespace_path, "team/api");
+        assert_eq!(
+            task.parent,
+            Some(WorkItemRef {
+                project_id: None,
+                group_id: Some(3),
+                iid: 5,
+                r#type: Some("epic".into()),
+                title: Some("Accounts".into()),
+                web_url: Some("https://gl.test:8443/groups/team/-/epics/5".into()),
+            }),
+            "the link made absolute by the issue's own"
+        );
+
+        let stored = Some("https://gl.test/groups/team/-/epics/5".to_string());
+        let parent = issue(row(), None, 0, no_project(), stored.clone()).parent;
+        assert_eq!(
+            parent.unwrap().web_url,
+            stored,
+            "the stored epic's link wins"
+        );
+
+        let untyped = model::Issue {
+            issue_type: String::new(),
+            epic: None,
+            ..row()
+        };
+        let plain = issue(untyped, None, 0, no_project(), None);
+        assert_eq!(plain.r#type, "issue");
+        assert_eq!(plain.parent, None);
+    }
+
+    #[test]
+    fn a_parent_link_is_absolute_or_none() {
+        let base = "https://gl.test/team/api/-/issues/1";
+        assert_eq!(
+            absolute("https://other.test/groups/g/-/epics/1", base).as_deref(),
+            Some("https://other.test/groups/g/-/epics/1"),
+            "an absolute link stays"
+        );
+        assert_eq!(
+            absolute("/groups/g/-/epics/1", base).as_deref(),
+            Some("https://gl.test/groups/g/-/epics/1")
+        );
+        assert_eq!(absolute("/groups/g/-/epics/1", ""), None);
+        assert_eq!(absolute("/groups/g/-/epics/1", "gl.test/team"), None);
+        assert_eq!(absolute("groups/g/-/epics/1", base), None);
+        assert_eq!(absolute("", base), None);
+
+        // A reference stored before it had its group and number: no parent.
+        let old = model::EpicRef {
+            url: "/groups/g/-/epics/1".into(),
+            ..Default::default()
+        };
+        assert_eq!(parent(&old, None, base), None);
+        let unlinked = model::EpicRef {
+            iid: 1,
+            group_id: 3,
+            ..Default::default()
+        };
+        let unlinked = parent(&unlinked, None, base).unwrap();
+        assert_eq!((unlinked.web_url, unlinked.title), (None, None));
+    }
+
+    /// An epic is a group's work item, identified by its work item id.
+    #[test]
+    fn an_epic_is_a_work_item_of_its_group() {
+        let e = epic(
+            model::Epic {
+                id: 30,
+                iid: 5,
+                group_id: 3,
+                work_item_id: 9001,
+                web_url: "https://gl/groups/team/-/epics/5".into(),
+                ..Default::default()
+            },
+            2,
+            None,
+        );
+        assert_eq!((e.id, e.iid), (9001, 5), "never the legacy id");
+        assert_eq!(e.r#type, "epic");
+        assert_eq!((e.project_id, e.group_id), (None, Some(3)));
+        assert_eq!(e.namespace_path, "team");
+        assert_eq!(e.parent, None);
+        assert_eq!(e.open_count, 2);
+        assert!(
+            e.total_time.is_empty() && e.graph_status.is_empty() && e.project_avatar.is_empty()
+        );
     }
 
     #[test]
@@ -375,14 +547,14 @@ mod tests {
             ..Default::default()
         };
         let stored = epic(item(), 0, Some("team".into()));
-        assert_eq!(stored.group_path, "team");
+        assert_eq!(stored.namespace_path, "team");
         let foreign = epic(item(), 0, None);
         assert_eq!(
-            foreign.group_path, "other/big",
+            foreign.namespace_path, "other/big",
             "without the `groups/` prefix"
         );
         let unknown = epic(model::Epic::default(), 0, Some(String::new()));
-        assert_eq!(unknown.group_path, "");
+        assert_eq!(unknown.namespace_path, "");
     }
 
     #[test]

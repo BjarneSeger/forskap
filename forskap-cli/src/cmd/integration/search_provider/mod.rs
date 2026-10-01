@@ -8,8 +8,7 @@
 //! `install` writes, and it exits after [`IDLE`] without a
 //! call, so nothing runs while no launcher is open.
 //!
-//! Everything comes from the daemon (`Search`, `RecordOpen`, `RecordEpicOpen`,
-//! `WhoAmI`), the
+//! Everything comes from the daemon (`Search`, `RecordOpen`, `WhoAmI`), the
 //! same calls the noctalia plugin makes through `forskap search` / `forskap issue open`; the
 //! query grammar ([`query`]) and result ids ([`results`]) are shared with it.
 
@@ -25,12 +24,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use forskap_api::{ErrorKind, VarlinkClientInterface};
+use forskap_api::{ErrorKind, IssuableKind, VarlinkClientInterface};
 use tokio::signal::unix::{SignalKind, signal};
 use zbus::zvariant::{OwnedValue, Value};
 
 use crate::cli::SearchProviderCommand;
-use crate::cmd::search::wire_kind;
+use crate::cmd::search::wire_filter;
 use crate::cmd::{epic, item};
 use crate::friendly::friendly;
 use crate::{client, config, refspec};
@@ -159,9 +158,9 @@ impl Provider {
             });
         };
         let client = client::connect(&self.socket).await?;
-        let kinds = parsed.kind.map(|k| vec![wire_kind(k)]);
+        let (kinds, types) = wire_filter(parsed.kind.as_slice());
         let reply = match client
-            .search(parsed.query, kinds, Some(PER_KIND_LIMIT), None)
+            .search(parsed.query, kinds, Some(PER_KIND_LIMIT), None, types)
             .call()
             .await
         {
@@ -210,7 +209,7 @@ impl Provider {
                         .to_string(),
                 };
                 client
-                    .record_open(project_id, iid, refspec::wire(kind))
+                    .record_open(refspec::wire(kind), iid, Some(project_id), None)
                     .call()
                     .await
                     .map_err(|e| friendly("RecordOpen", e))?;
@@ -223,10 +222,10 @@ impl Provider {
                     None => epic::lookup(&client, group_id, iid).await?.web_url,
                 };
                 client
-                    .record_epic_open(group_id, iid)
+                    .record_open(IssuableKind::work_item, iid, None, Some(group_id))
                     .call()
                     .await
-                    .map_err(|e| friendly("RecordEpicOpen", e))?;
+                    .map_err(|e| friendly("RecordOpen", e))?;
                 self.open_url(&url)
             }
         }

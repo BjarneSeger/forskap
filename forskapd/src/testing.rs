@@ -6,9 +6,9 @@
 //! path can be gated to hold its next call until released. Every call is
 //! recorded for assertions. Writes succeed unless a failure is queued, and
 //! can all be held behind one gate to observe them in flight; creating an
-//! issue is one of them, answered with a served row. The token and
-//! avatar calls fail like reads, by their path ([`TOKEN_PATH`],
-//! [`ROTATE_PATH`], `projects/<id>/avatar`).
+//! issue is one of them, answered with a served row. The token, avatar and
+//! epic calls fail like reads, by their path ([`TOKEN_PATH`],
+//! [`ROTATE_PATH`], `projects/<id>/avatar`, [`epic_path`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -30,6 +30,11 @@ pub const ROTATE_PATH: &str = "personal_access_tokens/self/rotate";
 pub const RECENT_AUTHORED_PATH: &str = "issues?authored";
 /// What the fake routes the recent issues assigned to the user by.
 pub const RECENT_ASSIGNED_PATH: &str = "issues?assigned";
+
+/// The path [`FakeGitlab::fail_next`] fails the lookup of an epic by.
+pub fn epic_path(group_id: i64, iid: i64) -> String {
+    format!("groups/{group_id}/epics/{iid}")
+}
 
 /// The path a read is served, failed, gated and counted by: the listing's
 /// own, except for the recent issue lists. They share `issues` with the
@@ -106,6 +111,10 @@ pub struct FakeGitlab {
     avatars: Mutex<HashMap<i64, Vec<u8>>>,
     /// The project of every avatar download.
     avatar_calls: Mutex<Vec<i64>>,
+    /// The epics the lookup finds, by group and number.
+    epics: Mutex<HashMap<(i64, i64), Value>>,
+    /// The group and number of every epic lookup.
+    epic_calls: Mutex<Vec<(i64, i64)>>,
     write_failures: Mutex<VecDeque<FakeErr>>,
     writes: Mutex<Vec<WriteCall>>,
     /// Holds every write while set; see [`FakeGitlab::gate_writes`].
@@ -187,6 +196,19 @@ impl FakeGitlab {
         self.avatar_calls.lock().unwrap().clone()
     }
 
+    /// Let the epic lookup find `row`, an epic as GitLab returns it, by its
+    /// group and number; any other epic is a 404.
+    pub fn serve_epic(&self, row: Value) {
+        let id = |field: &str| row[field].as_i64().unwrap_or_default();
+        let key = (id("group_id"), id("iid"));
+        self.epics.lock().unwrap().insert(key, row);
+    }
+
+    /// The group and number of every epic lookup so far.
+    pub fn epic_calls(&self) -> Vec<(i64, i64)> {
+        self.epic_calls.lock().unwrap().clone()
+    }
+
     pub fn serve_token(&self, info: TokenInfo) {
         *self.token.lock().unwrap() = Some(info);
     }
@@ -265,11 +287,13 @@ impl FakeGitlab {
         self.timelog_calls.lock().unwrap().clone()
     }
 
-    /// Every read so far: listings, timelog queries and avatar downloads.
+    /// Every read so far: listings, timelog queries, avatar downloads and
+    /// epic lookups.
     pub fn read_calls(&self) -> usize {
         self.calls.lock().unwrap().len()
             + self.timelog_calls.lock().unwrap().len()
             + self.avatar_calls.lock().unwrap().len()
+            + self.epic_calls.lock().unwrap().len()
     }
 
     pub fn writes(&self) -> Vec<WriteCall> {
@@ -370,6 +394,15 @@ impl GitlabApi for FakeGitlab {
             return Err(err.error());
         }
         Ok(self.avatars.lock().unwrap().get(&project_id).cloned())
+    }
+
+    async fn epic(&self, group_id: i64, iid: i64) -> Result<Value> {
+        self.epic_calls.lock().unwrap().push((group_id, iid));
+        if let Some(err) = self.next_failure(&epic_path(group_id, iid)) {
+            return Err(err.error());
+        }
+        let served = self.epics.lock().unwrap().get(&(group_id, iid)).cloned();
+        served.ok_or_else(|| FakeErr::RejectedWith(404).error())
     }
 
     async fn add_spent_time(
@@ -473,12 +506,14 @@ pub fn issue_json(project_id: i64, iid: i64, title: &str) -> Value {
     })
 }
 
-/// An epic of the group `group_id` as GitLab's REST API returns it.
+/// An epic of the group `group_id` as GitLab's REST API returns it; its
+/// work item id is its legacy id plus 900 000.
 pub fn epic_json(group_id: i64, iid: i64, title: &str) -> Value {
     serde_json::json!({
         "id": group_id * 1000 + iid,
         "iid": iid,
         "group_id": group_id,
+        "work_item_id": 900_000 + group_id * 1000 + iid,
         "title": title,
         "web_url": format!("https://gitlab.test/groups/g{group_id}/-/epics/{iid}"),
         "state": "opened",

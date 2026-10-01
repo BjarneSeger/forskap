@@ -1,13 +1,26 @@
 //! A cached issue or merge request row, whichever kind it is.
 
-use forskap_api::{Issue, MergeRequest};
+use forskap_api::{MergeRequest, WorkItem};
 
 use crate::refspec::RefKind;
 
 /// Wraps the generated structs, which we don't own and which share no trait.
+/// An issue is a work item of a project.
 pub enum Item {
-    Issue(Issue),
+    Issue(WorkItem),
     Mr(MergeRequest),
+}
+
+/// The work items of a project among `rows`, as items: an epic belongs to a
+/// group and is no issue.
+pub fn issues(rows: Vec<WorkItem>) -> impl Iterator<Item = Item> {
+    rows.into_iter()
+        .filter(|w| w.project_id.is_some())
+        .map(Item::Issue)
+}
+
+pub fn is_epic(w: &WorkItem) -> bool {
+    w.r#type.eq_ignore_ascii_case("epic")
 }
 
 impl Item {
@@ -20,7 +33,7 @@ impl Item {
 
     pub fn project_id(&self) -> i64 {
         match self {
-            Item::Issue(i) => i.project_id,
+            Item::Issue(i) => i.project_id.unwrap_or_default(),
             Item::Mr(m) => m.project_id,
         }
     }
@@ -49,7 +62,7 @@ impl Item {
     /// The project's full path, if known.
     pub fn project_path(&self) -> Option<&str> {
         let path = match self {
-            Item::Issue(i) => &i.project_path,
+            Item::Issue(i) => &i.namespace_path,
             Item::Mr(m) => &m.project_path,
         };
         project_of(path, self.web_url())
@@ -92,19 +105,21 @@ pub mod testing {
             path => format!("https://gitlab.example.com/{path}/-/{resource}/{iid}"),
         };
         match kind {
-            RefKind::Issue => Item::Issue(Issue {
+            RefKind::Issue => Item::Issue(WorkItem {
                 id: project_id * 1000 + iid,
                 iid,
-                project_id,
+                r#type: "issue".to_string(),
+                project_id: Some(project_id),
+                group_id: None,
+                namespace_path: path.to_string(),
                 title: title.to_string(),
                 web_url: url("issues"),
                 state: "opened".to_string(),
-                parent: String::new(),
+                parent: None,
                 total_time: String::new(),
                 graph_status: String::new(),
                 open_count: 0,
                 project_avatar: String::new(),
-                project_path: path.to_string(),
                 updated_at: 0,
             }),
             RefKind::Mr => Item::Mr(MergeRequest {
@@ -120,6 +135,27 @@ pub mod testing {
                 project_path: path.to_string(),
                 updated_at: 0,
             }),
+        }
+    }
+
+    /// The epic `iid` of the group `group_id`, linked under `groups/g<id>`.
+    pub fn epic(group_id: i64, iid: i64) -> WorkItem {
+        WorkItem {
+            id: group_id * 100 + iid,
+            iid,
+            r#type: "epic".into(),
+            project_id: None,
+            group_id: Some(group_id),
+            namespace_path: String::new(),
+            title: String::new(),
+            web_url: format!("https://gl/groups/g{group_id}/-/epics/{iid}"),
+            state: "opened".into(),
+            parent: None,
+            total_time: String::new(),
+            graph_status: String::new(),
+            open_count: 0,
+            project_avatar: String::new(),
+            updated_at: 0,
         }
     }
 }
@@ -154,6 +190,20 @@ mod tests {
         assert_eq!(named.project(), "team/api");
         let bare = testing::item(RefKind::Issue, 7, "", 3, "t");
         assert_eq!(bare.project(), "project 7");
+    }
+
+    #[test]
+    fn an_epic_is_no_issue() {
+        let Item::Issue(issue) = testing::item(RefKind::Issue, 7, "team/api", 3, "t") else {
+            unreachable!()
+        };
+        let epic = WorkItem {
+            r#type: "Epic".into(),
+            ..testing::epic(4, 3)
+        };
+        assert!(is_epic(&epic) && !is_epic(&issue));
+        let kept: Vec<i64> = issues(vec![epic, issue]).map(|i| i.project_id()).collect();
+        assert_eq!(kept, [7]);
     }
 
     #[test]

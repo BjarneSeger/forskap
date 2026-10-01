@@ -11,20 +11,31 @@ import (
 
 // Generated type declarations
 
-type Issue struct {
-	Id             int64  `json:"id"`
-	Iid            int64  `json:"iid"`
-	Project_id     int64  `json:"project_id"`
-	Title          string `json:"title"`
-	Web_url        string `json:"web_url"`
-	State          string `json:"state"`
-	Parent         string `json:"parent"`
-	Total_time     string `json:"total_time"`
-	Graph_status   string `json:"graph_status"`
-	Open_count     int64  `json:"open_count"`
-	Project_avatar string `json:"project_avatar"`
-	Project_path   string `json:"project_path"`
-	Updated_at     int64  `json:"updated_at"`
+type WorkItemRef struct {
+	Project_id *int64  `json:"project_id,omitempty"`
+	Group_id   *int64  `json:"group_id,omitempty"`
+	Iid        int64   `json:"iid"`
+	Type       *string `json:"type,omitempty"`
+	Title      *string `json:"title,omitempty"`
+	Web_url    *string `json:"web_url,omitempty"`
+}
+
+type WorkItem struct {
+	Id             int64        `json:"id"`
+	Iid            int64        `json:"iid"`
+	Type           string       `json:"type"`
+	Project_id     *int64       `json:"project_id,omitempty"`
+	Group_id       *int64       `json:"group_id,omitempty"`
+	Namespace_path string       `json:"namespace_path"`
+	Title          string       `json:"title"`
+	Web_url        string       `json:"web_url"`
+	State          string       `json:"state"`
+	Parent         *WorkItemRef `json:"parent,omitempty"`
+	Total_time     string       `json:"total_time"`
+	Graph_status   string       `json:"graph_status"`
+	Open_count     int64        `json:"open_count"`
+	Project_avatar string       `json:"project_avatar"`
+	Updated_at     int64        `json:"updated_at"`
 }
 
 type IssuableKind string
@@ -116,23 +127,11 @@ type SyncJob struct {
 	Expected      *int64        `json:"expected,omitempty"`
 }
 
-type Epic struct {
-	Id         int64  `json:"id"`
-	Iid        int64  `json:"iid"`
-	Group_id   int64  `json:"group_id"`
-	Title      string `json:"title"`
-	Web_url    string `json:"web_url"`
-	State      string `json:"state"`
-	Open_count int64  `json:"open_count"`
-	Group_path string `json:"group_path"`
-	Updated_at int64  `json:"updated_at"`
-}
-
 type NotAuthReason string
 
-type IssueRole string
+type WorkItemRole string
 
-type IssueState string
+type WorkItemState string
 
 type SearchKind string
 
@@ -196,61 +195,61 @@ func Dispatch_Error(err error) error {
 
 // Generated client method calls
 
-type GetAssignedIssues_methods struct{}
+type GetAssignedWorkItems_methods struct{}
 
-func GetAssignedIssues() GetAssignedIssues_methods { return GetAssignedIssues_methods{} }
+func GetAssignedWorkItems() GetAssignedWorkItems_methods { return GetAssignedWorkItems_methods{} }
 
-func (m GetAssignedIssues_methods) Call(ctx context.Context, c *varlink.Connection, groups_in_ *[]string) (issues_out_ []Issue, err_ error) {
+func (m GetAssignedWorkItems_methods) Call(ctx context.Context, c *varlink.Connection, groups_in_ *[]string) (work_items_out_ []WorkItem, err_ error) {
 	receive, err_ := m.Send(ctx, c, 0, groups_in_)
 	if err_ != nil {
 		return
 	}
-	issues_out_, _, err_ = receive(ctx)
+	work_items_out_, _, err_ = receive(ctx)
 	return
 }
 
-func (m GetAssignedIssues_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, groups_in_ *[]string) (func(ctx context.Context) ([]Issue, uint64, error), error) {
+func (m GetAssignedWorkItems_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, groups_in_ *[]string) (func(ctx context.Context) ([]WorkItem, uint64, error), error) {
 	var in struct {
 		Groups *[]string `json:"groups,omitempty"`
 	}
 	in.Groups = groups_in_
-	receive, err := c.Send(ctx, "org.thehoster.forskapd.GetAssignedIssues", in, flags)
+	receive, err := c.Send(ctx, "org.thehoster.forskapd.GetAssignedWorkItems", in, flags)
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (issues_out_ []Issue, flags uint64, err error) {
+	return func(context.Context) (work_items_out_ []WorkItem, flags uint64, err error) {
 		var out struct {
-			Issues []Issue `json:"issues"`
+			Work_items []WorkItem `json:"work_items"`
 		}
 		flags, err = receive(ctx, &out)
 		if err != nil {
 			err = Dispatch_Error(err)
 			return
 		}
-		issues_out_ = []Issue(out.Issues)
+		work_items_out_ = []WorkItem(out.Work_items)
 		return
 	}, nil
 }
 
-func (m GetAssignedIssues_methods) Upgrade(ctx context.Context, c *varlink.Connection, groups_in_ *[]string) (func(ctx context.Context) (issues_out_ []Issue, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m GetAssignedWorkItems_methods) Upgrade(ctx context.Context, c *varlink.Connection, groups_in_ *[]string) (func(ctx context.Context) (work_items_out_ []WorkItem, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
 		Groups *[]string `json:"groups,omitempty"`
 	}
 	in.Groups = groups_in_
-	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.GetAssignedIssues", in)
+	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.GetAssignedWorkItems", in)
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (issues_out_ []Issue, flags uint64, conn varlink.ReadWriterContext, err error) {
+	return func(context.Context) (work_items_out_ []WorkItem, flags uint64, conn varlink.ReadWriterContext, err error) {
 		var out struct {
-			Issues []Issue `json:"issues"`
+			Work_items []WorkItem `json:"work_items"`
 		}
 		flags, conn, err = receive(ctx, &out)
 		if err != nil {
 			err = Dispatch_Error(err)
 			return
 		}
-		issues_out_ = []Issue(out.Issues)
+		work_items_out_ = []WorkItem(out.Work_items)
 		return
 	}, nil
 }
@@ -316,69 +315,69 @@ func (m GetAssignedMergeRequests_methods) Upgrade(ctx context.Context, c *varlin
 	}, nil
 }
 
-type ListIssues_methods struct{}
+type ListWorkItems_methods struct{}
 
-func ListIssues() ListIssues_methods { return ListIssues_methods{} }
+func ListWorkItems() ListWorkItems_methods { return ListWorkItems_methods{} }
 
-func (m ListIssues_methods) Call(ctx context.Context, c *varlink.Connection, role_in_ *IssueRole, updated_after_in_ *int64, states_in_ *[]IssueState) (issues_out_ []Issue, err_ error) {
+func (m ListWorkItems_methods) Call(ctx context.Context, c *varlink.Connection, role_in_ *WorkItemRole, updated_after_in_ *int64, states_in_ *[]WorkItemState) (work_items_out_ []WorkItem, err_ error) {
 	receive, err_ := m.Send(ctx, c, 0, role_in_, updated_after_in_, states_in_)
 	if err_ != nil {
 		return
 	}
-	issues_out_, _, err_ = receive(ctx)
+	work_items_out_, _, err_ = receive(ctx)
 	return
 }
 
-func (m ListIssues_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, role_in_ *IssueRole, updated_after_in_ *int64, states_in_ *[]IssueState) (func(ctx context.Context) ([]Issue, uint64, error), error) {
+func (m ListWorkItems_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, role_in_ *WorkItemRole, updated_after_in_ *int64, states_in_ *[]WorkItemState) (func(ctx context.Context) ([]WorkItem, uint64, error), error) {
 	var in struct {
-		Role          *IssueRole    `json:"role,omitempty"`
-		Updated_after *int64        `json:"updated_after,omitempty"`
-		States        *[]IssueState `json:"states,omitempty"`
+		Role          *WorkItemRole    `json:"role,omitempty"`
+		Updated_after *int64           `json:"updated_after,omitempty"`
+		States        *[]WorkItemState `json:"states,omitempty"`
 	}
 	in.Role = role_in_
 	in.Updated_after = updated_after_in_
 	in.States = states_in_
-	receive, err := c.Send(ctx, "org.thehoster.forskapd.ListIssues", in, flags)
+	receive, err := c.Send(ctx, "org.thehoster.forskapd.ListWorkItems", in, flags)
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (issues_out_ []Issue, flags uint64, err error) {
+	return func(context.Context) (work_items_out_ []WorkItem, flags uint64, err error) {
 		var out struct {
-			Issues []Issue `json:"issues"`
+			Work_items []WorkItem `json:"work_items"`
 		}
 		flags, err = receive(ctx, &out)
 		if err != nil {
 			err = Dispatch_Error(err)
 			return
 		}
-		issues_out_ = []Issue(out.Issues)
+		work_items_out_ = []WorkItem(out.Work_items)
 		return
 	}, nil
 }
 
-func (m ListIssues_methods) Upgrade(ctx context.Context, c *varlink.Connection, role_in_ *IssueRole, updated_after_in_ *int64, states_in_ *[]IssueState) (func(ctx context.Context) (issues_out_ []Issue, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m ListWorkItems_methods) Upgrade(ctx context.Context, c *varlink.Connection, role_in_ *WorkItemRole, updated_after_in_ *int64, states_in_ *[]WorkItemState) (func(ctx context.Context) (work_items_out_ []WorkItem, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
-		Role          *IssueRole    `json:"role,omitempty"`
-		Updated_after *int64        `json:"updated_after,omitempty"`
-		States        *[]IssueState `json:"states,omitempty"`
+		Role          *WorkItemRole    `json:"role,omitempty"`
+		Updated_after *int64           `json:"updated_after,omitempty"`
+		States        *[]WorkItemState `json:"states,omitempty"`
 	}
 	in.Role = role_in_
 	in.Updated_after = updated_after_in_
 	in.States = states_in_
-	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.ListIssues", in)
+	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.ListWorkItems", in)
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (issues_out_ []Issue, flags uint64, conn varlink.ReadWriterContext, err error) {
+	return func(context.Context) (work_items_out_ []WorkItem, flags uint64, conn varlink.ReadWriterContext, err error) {
 		var out struct {
-			Issues []Issue `json:"issues"`
+			Work_items []WorkItem `json:"work_items"`
 		}
 		flags, conn, err = receive(ctx, &out)
 		if err != nil {
 			err = Dispatch_Error(err)
 			return
 		}
-		issues_out_ = []Issue(out.Issues)
+		work_items_out_ = []WorkItem(out.Work_items)
 		return
 	}, nil
 }
@@ -387,85 +386,85 @@ type Search_methods struct{}
 
 func Search() Search_methods { return Search_methods{} }
 
-func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64, scope_in_ *SearchScope) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, err_ error) {
-	receive, err_ := m.Send(ctx, c, 0, query_in_, kinds_in_, limit_in_, scope_in_)
+func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64, scope_in_ *SearchScope, types_in_ *[]string) (work_items_out_ []WorkItem, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, query_in_, kinds_in_, limit_in_, scope_in_, types_in_)
 	if err_ != nil {
 		return
 	}
-	issues_out_, merge_requests_out_, projects_out_, groups_out_, epics_out_, _, err_ = receive(ctx)
+	work_items_out_, merge_requests_out_, projects_out_, groups_out_, _, err_ = receive(ctx)
 	return
 }
 
-func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64, scope_in_ *SearchScope) (func(ctx context.Context) ([]Issue, []MergeRequest, []Project, []Group, []Epic, uint64, error), error) {
+func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64, scope_in_ *SearchScope, types_in_ *[]string) (func(ctx context.Context) ([]WorkItem, []MergeRequest, []Project, []Group, uint64, error), error) {
 	var in struct {
 		Query string        `json:"query"`
 		Kinds *[]SearchKind `json:"kinds,omitempty"`
 		Limit *int64        `json:"limit,omitempty"`
 		Scope *SearchScope  `json:"scope,omitempty"`
+		Types *[]string     `json:"types,omitempty"`
 	}
 	in.Query = query_in_
 	in.Kinds = kinds_in_
 	in.Limit = limit_in_
 	in.Scope = scope_in_
+	in.Types = types_in_
 	receive, err := c.Send(ctx, "org.thehoster.forskapd.Search", in, flags)
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, flags uint64, err error) {
+	return func(context.Context) (work_items_out_ []WorkItem, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, flags uint64, err error) {
 		var out struct {
-			Issues         []Issue        `json:"issues"`
+			Work_items     []WorkItem     `json:"work_items"`
 			Merge_requests []MergeRequest `json:"merge_requests"`
 			Projects       []Project      `json:"projects"`
 			Groups         []Group        `json:"groups"`
-			Epics          []Epic         `json:"epics"`
 		}
 		flags, err = receive(ctx, &out)
 		if err != nil {
 			err = Dispatch_Error(err)
 			return
 		}
-		issues_out_ = []Issue(out.Issues)
+		work_items_out_ = []WorkItem(out.Work_items)
 		merge_requests_out_ = []MergeRequest(out.Merge_requests)
 		projects_out_ = []Project(out.Projects)
 		groups_out_ = []Group(out.Groups)
-		epics_out_ = []Epic(out.Epics)
 		return
 	}, nil
 }
 
-func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64, scope_in_ *SearchScope) (func(ctx context.Context) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64, scope_in_ *SearchScope, types_in_ *[]string) (func(ctx context.Context) (work_items_out_ []WorkItem, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
 		Query string        `json:"query"`
 		Kinds *[]SearchKind `json:"kinds,omitempty"`
 		Limit *int64        `json:"limit,omitempty"`
 		Scope *SearchScope  `json:"scope,omitempty"`
+		Types *[]string     `json:"types,omitempty"`
 	}
 	in.Query = query_in_
 	in.Kinds = kinds_in_
 	in.Limit = limit_in_
 	in.Scope = scope_in_
+	in.Types = types_in_
 	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.Search", in)
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (issues_out_ []Issue, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, epics_out_ []Epic, flags uint64, conn varlink.ReadWriterContext, err error) {
+	return func(context.Context) (work_items_out_ []WorkItem, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, flags uint64, conn varlink.ReadWriterContext, err error) {
 		var out struct {
-			Issues         []Issue        `json:"issues"`
+			Work_items     []WorkItem     `json:"work_items"`
 			Merge_requests []MergeRequest `json:"merge_requests"`
 			Projects       []Project      `json:"projects"`
 			Groups         []Group        `json:"groups"`
-			Epics          []Epic         `json:"epics"`
 		}
 		flags, conn, err = receive(ctx, &out)
 		if err != nil {
 			err = Dispatch_Error(err)
 			return
 		}
-		issues_out_ = []Issue(out.Issues)
+		work_items_out_ = []WorkItem(out.Work_items)
 		merge_requests_out_ = []MergeRequest(out.Merge_requests)
 		projects_out_ = []Project(out.Projects)
 		groups_out_ = []Group(out.Groups)
-		epics_out_ = []Epic(out.Epics)
 		return
 	}, nil
 }
@@ -714,12 +713,12 @@ func (m UnassignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection
 	}, nil
 }
 
-type CreateIssue_methods struct{}
+type CreateWorkItem_methods struct{}
 
-func CreateIssue() CreateIssue_methods { return CreateIssue_methods{} }
+func CreateWorkItem() CreateWorkItem_methods { return CreateWorkItem_methods{} }
 
-func (m CreateIssue_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, title_in_ string, description_in_ *string, labels_in_ *[]string, assign_self_in_ *bool, epic_id_in_ *int64) (iid_out_ int64, web_url_out_ string, err_ error) {
-	receive, err_ := m.Send(ctx, c, 0, project_id_in_, title_in_, description_in_, labels_in_, assign_self_in_, epic_id_in_)
+func (m CreateWorkItem_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, title_in_ string, description_in_ *string, labels_in_ *[]string, assign_self_in_ *bool, parent_in_ *WorkItemRef) (iid_out_ int64, web_url_out_ string, err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, project_id_in_, title_in_, description_in_, labels_in_, assign_self_in_, parent_in_)
 	if err_ != nil {
 		return
 	}
@@ -727,22 +726,22 @@ func (m CreateIssue_methods) Call(ctx context.Context, c *varlink.Connection, pr
 	return
 }
 
-func (m CreateIssue_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, title_in_ string, description_in_ *string, labels_in_ *[]string, assign_self_in_ *bool, epic_id_in_ *int64) (func(ctx context.Context) (int64, string, uint64, error), error) {
+func (m CreateWorkItem_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, title_in_ string, description_in_ *string, labels_in_ *[]string, assign_self_in_ *bool, parent_in_ *WorkItemRef) (func(ctx context.Context) (int64, string, uint64, error), error) {
 	var in struct {
-		Project_id  int64     `json:"project_id"`
-		Title       string    `json:"title"`
-		Description *string   `json:"description,omitempty"`
-		Labels      *[]string `json:"labels,omitempty"`
-		Assign_self *bool     `json:"assign_self,omitempty"`
-		Epic_id     *int64    `json:"epic_id,omitempty"`
+		Project_id  int64        `json:"project_id"`
+		Title       string       `json:"title"`
+		Description *string      `json:"description,omitempty"`
+		Labels      *[]string    `json:"labels,omitempty"`
+		Assign_self *bool        `json:"assign_self,omitempty"`
+		Parent      *WorkItemRef `json:"parent,omitempty"`
 	}
 	in.Project_id = project_id_in_
 	in.Title = title_in_
 	in.Description = description_in_
 	in.Labels = labels_in_
 	in.Assign_self = assign_self_in_
-	in.Epic_id = epic_id_in_
-	receive, err := c.Send(ctx, "org.thehoster.forskapd.CreateIssue", in, flags)
+	in.Parent = parent_in_
+	receive, err := c.Send(ctx, "org.thehoster.forskapd.CreateWorkItem", in, flags)
 	if err != nil {
 		return nil, err
 	}
@@ -762,22 +761,22 @@ func (m CreateIssue_methods) Send(ctx context.Context, c *varlink.Connection, fl
 	}, nil
 }
 
-func (m CreateIssue_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, title_in_ string, description_in_ *string, labels_in_ *[]string, assign_self_in_ *bool, epic_id_in_ *int64) (func(ctx context.Context) (iid_out_ int64, web_url_out_ string, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m CreateWorkItem_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, title_in_ string, description_in_ *string, labels_in_ *[]string, assign_self_in_ *bool, parent_in_ *WorkItemRef) (func(ctx context.Context) (iid_out_ int64, web_url_out_ string, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
-		Project_id  int64     `json:"project_id"`
-		Title       string    `json:"title"`
-		Description *string   `json:"description,omitempty"`
-		Labels      *[]string `json:"labels,omitempty"`
-		Assign_self *bool     `json:"assign_self,omitempty"`
-		Epic_id     *int64    `json:"epic_id,omitempty"`
+		Project_id  int64        `json:"project_id"`
+		Title       string       `json:"title"`
+		Description *string      `json:"description,omitempty"`
+		Labels      *[]string    `json:"labels,omitempty"`
+		Assign_self *bool        `json:"assign_self,omitempty"`
+		Parent      *WorkItemRef `json:"parent,omitempty"`
 	}
 	in.Project_id = project_id_in_
 	in.Title = title_in_
 	in.Description = description_in_
 	in.Labels = labels_in_
 	in.Assign_self = assign_self_in_
-	in.Epic_id = epic_id_in_
-	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.CreateIssue", in)
+	in.Parent = parent_in_
+	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.CreateWorkItem", in)
 	if err != nil {
 		return nil, err
 	}
@@ -801,8 +800,8 @@ type RecordOpen_methods struct{}
 
 func RecordOpen() RecordOpen_methods { return RecordOpen_methods{} }
 
-func (m RecordOpen_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (err_ error) {
-	receive, err_ := m.Send(ctx, c, 0, project_id_in_, iid_in_, kind_in_)
+func (m RecordOpen_methods) Call(ctx context.Context, c *varlink.Connection, kind_in_ IssuableKind, iid_in_ int64, project_id_in_ *int64, group_id_in_ *int64) (err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, kind_in_, iid_in_, project_id_in_, group_id_in_)
 	if err_ != nil {
 		return
 	}
@@ -810,15 +809,17 @@ func (m RecordOpen_methods) Call(ctx context.Context, c *varlink.Connection, pro
 	return
 }
 
-func (m RecordOpen_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (uint64, error), error) {
+func (m RecordOpen_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, kind_in_ IssuableKind, iid_in_ int64, project_id_in_ *int64, group_id_in_ *int64) (func(ctx context.Context) (uint64, error), error) {
 	var in struct {
-		Project_id int64        `json:"project_id"`
-		Iid        int64        `json:"iid"`
 		Kind       IssuableKind `json:"kind"`
+		Iid        int64        `json:"iid"`
+		Project_id *int64       `json:"project_id,omitempty"`
+		Group_id   *int64       `json:"group_id,omitempty"`
 	}
-	in.Project_id = project_id_in_
-	in.Iid = iid_in_
 	in.Kind = kind_in_
+	in.Iid = iid_in_
+	in.Project_id = project_id_in_
+	in.Group_id = group_id_in_
 	receive, err := c.Send(ctx, "org.thehoster.forskapd.RecordOpen", in, flags)
 	if err != nil {
 		return nil, err
@@ -833,71 +834,18 @@ func (m RecordOpen_methods) Send(ctx context.Context, c *varlink.Connection, fla
 	}, nil
 }
 
-func (m RecordOpen_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m RecordOpen_methods) Upgrade(ctx context.Context, c *varlink.Connection, kind_in_ IssuableKind, iid_in_ int64, project_id_in_ *int64, group_id_in_ *int64) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
-		Project_id int64        `json:"project_id"`
-		Iid        int64        `json:"iid"`
 		Kind       IssuableKind `json:"kind"`
+		Iid        int64        `json:"iid"`
+		Project_id *int64       `json:"project_id,omitempty"`
+		Group_id   *int64       `json:"group_id,omitempty"`
 	}
-	in.Project_id = project_id_in_
-	in.Iid = iid_in_
 	in.Kind = kind_in_
+	in.Iid = iid_in_
+	in.Project_id = project_id_in_
+	in.Group_id = group_id_in_
 	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.RecordOpen", in)
-	if err != nil {
-		return nil, err
-	}
-	return func(context.Context) (flags uint64, conn varlink.ReadWriterContext, err error) {
-		flags, conn, err = receive(ctx, nil)
-		if err != nil {
-			err = Dispatch_Error(err)
-			return
-		}
-		return
-	}, nil
-}
-
-type RecordEpicOpen_methods struct{}
-
-func RecordEpicOpen() RecordEpicOpen_methods { return RecordEpicOpen_methods{} }
-
-func (m RecordEpicOpen_methods) Call(ctx context.Context, c *varlink.Connection, group_id_in_ int64, iid_in_ int64) (err_ error) {
-	receive, err_ := m.Send(ctx, c, 0, group_id_in_, iid_in_)
-	if err_ != nil {
-		return
-	}
-	_, err_ = receive(ctx)
-	return
-}
-
-func (m RecordEpicOpen_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, group_id_in_ int64, iid_in_ int64) (func(ctx context.Context) (uint64, error), error) {
-	var in struct {
-		Group_id int64 `json:"group_id"`
-		Iid      int64 `json:"iid"`
-	}
-	in.Group_id = group_id_in_
-	in.Iid = iid_in_
-	receive, err := c.Send(ctx, "org.thehoster.forskapd.RecordEpicOpen", in, flags)
-	if err != nil {
-		return nil, err
-	}
-	return func(context.Context) (flags uint64, err error) {
-		flags, err = receive(ctx, nil)
-		if err != nil {
-			err = Dispatch_Error(err)
-			return
-		}
-		return
-	}, nil
-}
-
-func (m RecordEpicOpen_methods) Upgrade(ctx context.Context, c *varlink.Connection, group_id_in_ int64, iid_in_ int64) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
-	var in struct {
-		Group_id int64 `json:"group_id"`
-		Iid      int64 `json:"iid"`
-	}
-	in.Group_id = group_id_in_
-	in.Iid = iid_in_
-	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.RecordEpicOpen", in)
 	if err != nil {
 		return nil, err
 	}
@@ -1499,17 +1447,16 @@ func (m WhoAmI_methods) Upgrade(ctx context.Context, c *varlink.Connection) (fun
 // Generated service interface with all methods
 
 type orgthehosterforskapdInterface interface {
-	GetAssignedIssues(ctx context.Context, c VarlinkCall, groups_ *[]string) error
+	GetAssignedWorkItems(ctx context.Context, c VarlinkCall, groups_ *[]string) error
 	GetAssignedMergeRequests(ctx context.Context, c VarlinkCall, groups_ *[]string) error
-	ListIssues(ctx context.Context, c VarlinkCall, role_ *IssueRole, updated_after_ *int64, states_ *[]IssueState) error
-	Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64, scope_ *SearchScope) error
+	ListWorkItems(ctx context.Context, c VarlinkCall, role_ *WorkItemRole, updated_after_ *int64, states_ *[]WorkItemState) error
+	Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64, scope_ *SearchScope, types_ *[]string) error
 	PostTime(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind, duration_ string, summary_ *string) error
 	Close(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	AssignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	UnassignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
-	CreateIssue(ctx context.Context, c VarlinkCall, project_id_ int64, title_ string, description_ *string, labels_ *[]string, assign_self_ *bool, epic_id_ *int64) error
-	RecordOpen(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
-	RecordEpicOpen(ctx context.Context, c VarlinkCall, group_id_ int64, iid_ int64) error
+	CreateWorkItem(ctx context.Context, c VarlinkCall, project_id_ int64, title_ string, description_ *string, labels_ *[]string, assign_self_ *bool, parent_ *WorkItemRef) error
+	RecordOpen(ctx context.Context, c VarlinkCall, kind_ IssuableKind, iid_ int64, project_id_ *int64, group_id_ *int64) error
 	ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]CacheScope) error
 	GetHistory(ctx context.Context, c VarlinkCall, days_ *int64) error
 	GetActivity(ctx context.Context, c VarlinkCall, days_ *int64) error
@@ -1544,11 +1491,11 @@ func (c *VarlinkCall) ReplyNotAuthenticated(ctx context.Context, reason_ *NotAut
 
 // Generated reply methods for all varlink methods
 
-func (c *VarlinkCall) ReplyGetAssignedIssues(ctx context.Context, issues_ []Issue) error {
+func (c *VarlinkCall) ReplyGetAssignedWorkItems(ctx context.Context, work_items_ []WorkItem) error {
 	var out struct {
-		Issues []Issue `json:"issues"`
+		Work_items []WorkItem `json:"work_items"`
 	}
-	out.Issues = []Issue(issues_)
+	out.Work_items = []WorkItem(work_items_)
 	return c.Reply(ctx, &out)
 }
 
@@ -1560,27 +1507,25 @@ func (c *VarlinkCall) ReplyGetAssignedMergeRequests(ctx context.Context, merge_r
 	return c.Reply(ctx, &out)
 }
 
-func (c *VarlinkCall) ReplyListIssues(ctx context.Context, issues_ []Issue) error {
+func (c *VarlinkCall) ReplyListWorkItems(ctx context.Context, work_items_ []WorkItem) error {
 	var out struct {
-		Issues []Issue `json:"issues"`
+		Work_items []WorkItem `json:"work_items"`
 	}
-	out.Issues = []Issue(issues_)
+	out.Work_items = []WorkItem(work_items_)
 	return c.Reply(ctx, &out)
 }
 
-func (c *VarlinkCall) ReplySearch(ctx context.Context, issues_ []Issue, merge_requests_ []MergeRequest, projects_ []Project, groups_ []Group, epics_ []Epic) error {
+func (c *VarlinkCall) ReplySearch(ctx context.Context, work_items_ []WorkItem, merge_requests_ []MergeRequest, projects_ []Project, groups_ []Group) error {
 	var out struct {
-		Issues         []Issue        `json:"issues"`
+		Work_items     []WorkItem     `json:"work_items"`
 		Merge_requests []MergeRequest `json:"merge_requests"`
 		Projects       []Project      `json:"projects"`
 		Groups         []Group        `json:"groups"`
-		Epics          []Epic         `json:"epics"`
 	}
-	out.Issues = []Issue(issues_)
+	out.Work_items = []WorkItem(work_items_)
 	out.Merge_requests = []MergeRequest(merge_requests_)
 	out.Projects = []Project(projects_)
 	out.Groups = []Group(groups_)
-	out.Epics = []Epic(epics_)
 	return c.Reply(ctx, &out)
 }
 
@@ -1600,7 +1545,7 @@ func (c *VarlinkCall) ReplyUnassignSelf(ctx context.Context) error {
 	return c.Reply(ctx, nil)
 }
 
-func (c *VarlinkCall) ReplyCreateIssue(ctx context.Context, iid_ int64, web_url_ string) error {
+func (c *VarlinkCall) ReplyCreateWorkItem(ctx context.Context, iid_ int64, web_url_ string) error {
 	var out struct {
 		Iid     int64  `json:"iid"`
 		Web_url string `json:"web_url"`
@@ -1611,10 +1556,6 @@ func (c *VarlinkCall) ReplyCreateIssue(ctx context.Context, iid_ int64, web_url_
 }
 
 func (c *VarlinkCall) ReplyRecordOpen(ctx context.Context) error {
-	return c.Reply(ctx, nil)
-}
-
-func (c *VarlinkCall) ReplyRecordEpicOpen(ctx context.Context) error {
 	return c.Reply(ctx, nil)
 }
 
@@ -1694,19 +1635,19 @@ func (c *VarlinkCall) ReplyWhoAmI(ctx context.Context, host_ string, user_id_ in
 
 // Generated dummy implementations for all varlink methods
 
-func (s *VarlinkInterface) GetAssignedIssues(ctx context.Context, c VarlinkCall, groups_ *[]string) error {
-	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetAssignedIssues")
+func (s *VarlinkInterface) GetAssignedWorkItems(ctx context.Context, c VarlinkCall, groups_ *[]string) error {
+	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetAssignedWorkItems")
 }
 
 func (s *VarlinkInterface) GetAssignedMergeRequests(ctx context.Context, c VarlinkCall, groups_ *[]string) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetAssignedMergeRequests")
 }
 
-func (s *VarlinkInterface) ListIssues(ctx context.Context, c VarlinkCall, role_ *IssueRole, updated_after_ *int64, states_ *[]IssueState) error {
-	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.ListIssues")
+func (s *VarlinkInterface) ListWorkItems(ctx context.Context, c VarlinkCall, role_ *WorkItemRole, updated_after_ *int64, states_ *[]WorkItemState) error {
+	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.ListWorkItems")
 }
 
-func (s *VarlinkInterface) Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64, scope_ *SearchScope) error {
+func (s *VarlinkInterface) Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64, scope_ *SearchScope, types_ *[]string) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.Search")
 }
 
@@ -1726,16 +1667,12 @@ func (s *VarlinkInterface) UnassignSelf(ctx context.Context, c VarlinkCall, proj
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.UnassignSelf")
 }
 
-func (s *VarlinkInterface) CreateIssue(ctx context.Context, c VarlinkCall, project_id_ int64, title_ string, description_ *string, labels_ *[]string, assign_self_ *bool, epic_id_ *int64) error {
-	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.CreateIssue")
+func (s *VarlinkInterface) CreateWorkItem(ctx context.Context, c VarlinkCall, project_id_ int64, title_ string, description_ *string, labels_ *[]string, assign_self_ *bool, parent_ *WorkItemRef) error {
+	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.CreateWorkItem")
 }
 
-func (s *VarlinkInterface) RecordOpen(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error {
+func (s *VarlinkInterface) RecordOpen(ctx context.Context, c VarlinkCall, kind_ IssuableKind, iid_ int64, project_id_ *int64, group_id_ *int64) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.RecordOpen")
-}
-
-func (s *VarlinkInterface) RecordEpicOpen(ctx context.Context, c VarlinkCall, group_id_ int64, iid_ int64) error {
-	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.RecordEpicOpen")
 }
 
 func (s *VarlinkInterface) ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]CacheScope) error {
@@ -1786,7 +1723,7 @@ func (s *VarlinkInterface) WhoAmI(ctx context.Context, c VarlinkCall) error {
 
 func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Call, methodname string) error {
 	switch methodname {
-	case "GetAssignedIssues":
+	case "GetAssignedWorkItems":
 		var in struct {
 			Groups *[]string `json:"groups,omitempty"`
 		}
@@ -1794,7 +1731,7 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 		if err != nil {
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
-		return s.orgthehosterforskapdInterface.GetAssignedIssues(ctx, VarlinkCall{call}, in.Groups)
+		return s.orgthehosterforskapdInterface.GetAssignedWorkItems(ctx, VarlinkCall{call}, in.Groups)
 
 	case "GetAssignedMergeRequests":
 		var in struct {
@@ -1806,17 +1743,17 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 		}
 		return s.orgthehosterforskapdInterface.GetAssignedMergeRequests(ctx, VarlinkCall{call}, in.Groups)
 
-	case "ListIssues":
+	case "ListWorkItems":
 		var in struct {
-			Role          *IssueRole    `json:"role,omitempty"`
-			Updated_after *int64        `json:"updated_after,omitempty"`
-			States        *[]IssueState `json:"states,omitempty"`
+			Role          *WorkItemRole    `json:"role,omitempty"`
+			Updated_after *int64           `json:"updated_after,omitempty"`
+			States        *[]WorkItemState `json:"states,omitempty"`
 		}
 		err := call.GetParameters(&in)
 		if err != nil {
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
-		return s.orgthehosterforskapdInterface.ListIssues(ctx, VarlinkCall{call}, in.Role, in.Updated_after, in.States)
+		return s.orgthehosterforskapdInterface.ListWorkItems(ctx, VarlinkCall{call}, in.Role, in.Updated_after, in.States)
 
 	case "Search":
 		var in struct {
@@ -1824,12 +1761,13 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 			Kinds *[]SearchKind `json:"kinds,omitempty"`
 			Limit *int64        `json:"limit,omitempty"`
 			Scope *SearchScope  `json:"scope,omitempty"`
+			Types *[]string     `json:"types,omitempty"`
 		}
 		err := call.GetParameters(&in)
 		if err != nil {
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
-		return s.orgthehosterforskapdInterface.Search(ctx, VarlinkCall{call}, in.Query, in.Kinds, in.Limit, in.Scope)
+		return s.orgthehosterforskapdInterface.Search(ctx, VarlinkCall{call}, in.Query, in.Kinds, in.Limit, in.Scope, in.Types)
 
 	case "PostTime":
 		var in struct {
@@ -1881,43 +1819,33 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 		}
 		return s.orgthehosterforskapdInterface.UnassignSelf(ctx, VarlinkCall{call}, in.Project_id, in.Iid, in.Kind)
 
-	case "CreateIssue":
+	case "CreateWorkItem":
 		var in struct {
-			Project_id  int64     `json:"project_id"`
-			Title       string    `json:"title"`
-			Description *string   `json:"description,omitempty"`
-			Labels      *[]string `json:"labels,omitempty"`
-			Assign_self *bool     `json:"assign_self,omitempty"`
-			Epic_id     *int64    `json:"epic_id,omitempty"`
+			Project_id  int64        `json:"project_id"`
+			Title       string       `json:"title"`
+			Description *string      `json:"description,omitempty"`
+			Labels      *[]string    `json:"labels,omitempty"`
+			Assign_self *bool        `json:"assign_self,omitempty"`
+			Parent      *WorkItemRef `json:"parent,omitempty"`
 		}
 		err := call.GetParameters(&in)
 		if err != nil {
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
-		return s.orgthehosterforskapdInterface.CreateIssue(ctx, VarlinkCall{call}, in.Project_id, in.Title, in.Description, in.Labels, in.Assign_self, in.Epic_id)
+		return s.orgthehosterforskapdInterface.CreateWorkItem(ctx, VarlinkCall{call}, in.Project_id, in.Title, in.Description, in.Labels, in.Assign_self, in.Parent)
 
 	case "RecordOpen":
 		var in struct {
-			Project_id int64        `json:"project_id"`
-			Iid        int64        `json:"iid"`
 			Kind       IssuableKind `json:"kind"`
+			Iid        int64        `json:"iid"`
+			Project_id *int64       `json:"project_id,omitempty"`
+			Group_id   *int64       `json:"group_id,omitempty"`
 		}
 		err := call.GetParameters(&in)
 		if err != nil {
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
-		return s.orgthehosterforskapdInterface.RecordOpen(ctx, VarlinkCall{call}, in.Project_id, in.Iid, in.Kind)
-
-	case "RecordEpicOpen":
-		var in struct {
-			Group_id int64 `json:"group_id"`
-			Iid      int64 `json:"iid"`
-		}
-		err := call.GetParameters(&in)
-		if err != nil {
-			return call.ReplyInvalidParameter(ctx, "parameters")
-		}
-		return s.orgthehosterforskapdInterface.RecordEpicOpen(ctx, VarlinkCall{call}, in.Group_id, in.Iid)
+		return s.orgthehosterforskapdInterface.RecordOpen(ctx, VarlinkCall{call}, in.Kind, in.Iid, in.Project_id, in.Group_id)
 
 	case "ClearCache":
 		var in struct {
@@ -2011,23 +1939,34 @@ func (s *VarlinkInterface) VarlinkGetName() string {
 func (s *VarlinkInterface) VarlinkGetDescription() string {
 	return `interface org.thehoster.forskapd
 
-type Issue (
+type WorkItemRef (
+  project_id: ?int,
+  group_id: ?int,
+  iid: int,
+  type: ?string,
+  title: ?string,
+  web_url: ?string
+)
+
+type WorkItem (
   id: int,
   iid: int,
-  project_id: int,
+  type: string,
+  project_id: ?int,
+  group_id: ?int,
+  namespace_path: string,
   title: string,
   web_url: string,
   state: string,
-  parent: string,
+  parent: ?WorkItemRef,
   total_time: string,
   graph_status: string,
   open_count: int,
   project_avatar: string,
-  project_path: string,
   updated_at: int
 )
 
-type IssuableKind (issue, merge_request)
+type IssuableKind (work_item, merge_request)
 
 type HistorySource (gitlab, queued)
 
@@ -2116,39 +2055,27 @@ type SyncJob (
   expected: ?int
 )
 
-type Epic (
-  id: int,
-  iid: int,
-  group_id: int,
-  title: string,
-  web_url: string,
-  state: string,
-  open_count: int,
-  group_path: string,
-  updated_at: int
-)
-
 error GitlabError (message: string)
 
 type NotAuthReason (no_credentials, keychain_error, unreachable, token_rejected, logged_out)
 
 error NotAuthenticated (reason: ?NotAuthReason, detail: ?string)
 
-method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
+method GetAssignedWorkItems(groups: ?[]string) -> (work_items: []WorkItem)
 
 method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)
 
-type IssueRole (author, assignee)
+type WorkItemRole (author, assignee)
 
-type IssueState (opened, closed)
+type WorkItemState (opened, closed)
 
-method ListIssues(role: ?IssueRole, updated_after: ?int, states: ?[]IssueState) -> (issues: []Issue)
+method ListWorkItems(role: ?WorkItemRole, updated_after: ?int, states: ?[]WorkItemState) -> (work_items: []WorkItem)
 
-type SearchKind (issues, merge_requests, projects, groups, epics)
+type SearchKind (work_items, merge_requests, projects, groups)
 
 type SearchScope (projects: ?[]int, groups: ?[]string)
 
-method Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)
+method Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope, types: ?[]string) -> (work_items: []WorkItem, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
 
 method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
 
@@ -2158,11 +2085,9 @@ method AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
 method UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
-method CreateIssue(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, epic_id: ?int) -> (iid: int, web_url: string)
+method CreateWorkItem(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, parent: ?WorkItemRef) -> (iid: int, web_url: string)
 
-method RecordOpen(project_id: int, iid: int, kind: IssuableKind) -> ()
-
-method RecordEpicOpen(group_id: int, iid: int) -> ()
+method RecordOpen(kind: IssuableKind, iid: int, project_id: ?int, group_id: ?int) -> ()
 
 type CacheScope (assigned, search, quick, slow, stale, usage)
 

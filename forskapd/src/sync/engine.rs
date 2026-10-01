@@ -129,8 +129,8 @@ enum Command {
     Note(NotedWrite),
     /// Store an issue GitLab just created for the account (see
     /// [`SyncHandle::land_issue`]); the sender is answered once that is done
-    /// or given up.
-    Land(Issue, Identity, oneshot::Sender<()>),
+    /// or given up. Boxed: an issue row dwarfs every other command.
+    Land(Box<Issue>, Identity, oneshot::Sender<()>),
     /// Report the planned jobs (see [`SyncHandle::jobs`]).
     Snapshot(oneshot::Sender<Snapshot>),
 }
@@ -417,7 +417,7 @@ impl SyncHandle {
         by: Identity,
     ) -> impl Future<Output = ()> + Send + 'static {
         let (done, wait) = oneshot::channel();
-        let _ = self.tx.send(Command::Land(issue, by, done));
+        let _ = self.tx.send(Command::Land(Box::new(issue), by, done));
         async move {
             let _ = wait.await;
         }
@@ -624,7 +624,7 @@ impl Worker {
             Command::Wake => {}
             Command::LoggedIn => self.unpark(),
             Command::Note(note) => self.persist_note(note),
-            Command::Land(issue, by, done) => self.landings.push((issue, by, done)),
+            Command::Land(issue, by, done) => self.landings.push((*issue, by, done)),
             Command::Snapshot(reply) => {
                 let _ = reply.send(self.snapshot(now_secs()));
             }

@@ -1,7 +1,7 @@
 //! The [`VarlinkInterface`] method implementations plus the write cascade they
 //! share. Reads serve the sync store only; see the module docs of
-//! [`super`] for the conventions. `CreateIssue` is the one write outside the
-//! cascade: it has nothing to be replayed by.
+//! [`super`] for the conventions. `CreateWorkItem` is the one write outside
+//! the cascade: it has nothing to be replayed by.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -10,16 +10,16 @@ use tracing::{debug, info, instrument, warn};
 
 use forskap_api::{
     ActivityEvent, CacheScope, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
-    Call_CreateIssue, Call_DismissFailure, Call_GetActivity, Call_GetAssignedIssues,
-    Call_GetAssignedMergeRequests, Call_GetFailures, Call_GetHistory, Call_GetSyncJobs,
-    Call_ListIssues, Call_Login, Call_Logout, Call_PostTime, Call_RecordEpicOpen, Call_RecordOpen,
-    Call_RetryFailure, Call_Search, Call_UnassignSelf, Call_WhoAmI, Epic, FailedTask, Group,
-    HistoryEvent, HistorySource, IssuableKind, Issue, IssueRole, IssueState, MergeRequest, Project,
-    SearchKind, SearchScope, VarlinkInterface,
+    Call_CreateWorkItem, Call_DismissFailure, Call_GetActivity, Call_GetAssignedMergeRequests,
+    Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetSyncJobs,
+    Call_ListWorkItems, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
+    Call_Search, Call_UnassignSelf, Call_WhoAmI, FailedTask, Group, HistoryEvent, HistorySource,
+    IssuableKind, MergeRequest, Project, SearchKind, SearchScope, VarlinkInterface, WorkItem,
+    WorkItemRef, WorkItemRole, WorkItemState,
 };
 
 use crate::error::{DormancyReason, Error};
-use crate::gitlab::{GitlabClient, Issuable, NewIssue};
+use crate::gitlab::{GitlabApi, GitlabClient, Issuable, NewIssue};
 use crate::query::{in_group, namespace_of, parse_epic_query, parse_iid_query, text_matches};
 use crate::secrets::{Credentials, Token};
 use crate::sync::jobs::{
@@ -33,14 +33,14 @@ use crate::write::{Write, WriteOp};
 
 use super::{
     ConnState, Handlers, Session, dormant_args, issue_ref_error, looks_like_duration,
-    new_issue_error, now_secs, wire,
+    new_issue_error, now_secs, open_key, parent_epic, wire,
 };
 
 /// How long `GetSyncJobs` waits for the worker, which answers between two
 /// awaits even with a fetch in flight.
 const SYNC_JOBS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long `CreateIssue` waits for the worker to store the new issue before
+/// How long `CreateWorkItem` waits for the worker to store the new issue before
 /// replying anyway. The worker stores it between two awaits; past this the
 /// issue shows up with the next sync instead.
 const LAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -170,12 +170,12 @@ impl Handlers {
     /// it doesn't reflect yet (see [`Self::unreflected`]): a closed issue
     /// reads closed, and one the user unassigned from, or whose current row
     /// names other assignees, is no longer listed as assigned.
-    fn recent_issues(&self, role: &IssueRole) -> Vec<model::Issue> {
+    fn recent_issues(&self, role: &WorkItemRole) -> Vec<model::Issue> {
         let (_, name) = recent_source(role);
         let Some(view) = self.view(name) else {
             return Vec::new();
         };
-        let by_assignment = *role == IssueRole::assignee;
+        let by_assignment = *role == WorkItemRole::assignee;
         let writes = self.unreflected(&view, Issuable::Issue);
         let written = |op: WriteOp| -> HashSet<RowKey> {
             let writes = writes.iter().filter(|w| w.op == op);
@@ -190,7 +190,7 @@ impl Handlers {
             .filter(|(_, i)| !by_assignment || assigned_to(&i.assignees, me))
             .map(|(k, mut i)| {
                 if closed.contains(&k) {
-                    i.state = wire::issue_state(&IssueState::closed).into();
+                    i.state = wire::issue_state(&WorkItemState::closed).into();
                 }
                 i
             })
@@ -292,6 +292,24 @@ impl Handlers {
         }
         self.queue.enqueue(write).await;
     }
+
+    /// The legacy id of the epic `iid` of the group, which GitLab's REST
+    /// create takes: the stored row's, else GitLab's.
+    async fn legacy_epic_id(
+        &self,
+        gitlab: &dyn GitlabApi,
+        group_id: i64,
+        iid: i64,
+    ) -> Result<i64, Error> {
+        if let Some(epic) = self.row::<model::Epic>((group_id as u64, iid as u64)) {
+            return Ok(epic.id);
+        }
+        let epic: model::Epic = serde_json::from_value(gitlab.epic(group_id, iid).await?)?;
+        match epic.id {
+            id if id > 0 => Ok(id),
+            _ => Err(Error::Gitlab("GitLab's answer carries no epic id".into())),
+        }
+    }
 }
 
 /// Board list labels per project, read at most once per request. `None` for
@@ -335,10 +353,62 @@ impl<'a> BoardLabels<'a> {
             .as_deref()
     }
 
-    /// The wire issue for `i`, with its `graph_status` from the board labels.
-    fn wire(&mut self, i: model::Issue, open_count: i64, project: wire::ProjectInfo) -> Issue {
+    /// The work item for `i`, with its `graph_status` from the board labels
+    /// and its parent's link from `epics`.
+    fn wire(
+        &mut self,
+        i: model::Issue,
+        open_count: i64,
+        project: wire::ProjectInfo,
+        epics: &mut EpicLinks,
+    ) -> WorkItem {
         let labels = self.of(i.project_id).map(<[String]>::to_vec);
-        wire::issue(i, labels.as_deref(), open_count, project)
+        let epic_url = epics.of(&i);
+        wire::issue(i, labels.as_deref(), open_count, project, epic_url)
+    }
+}
+
+/// The links of the stored epics the issues name as their parent, each read
+/// at most once per request; `None` without a row.
+struct EpicLinks<'a> {
+    handlers: &'a Handlers,
+    urls: HashMap<RowKey, Option<String>>,
+}
+
+impl<'a> EpicLinks<'a> {
+    fn new(handlers: &'a Handlers) -> Self {
+        Self {
+            handlers,
+            urls: HashMap::new(),
+        }
+    }
+
+    fn of(&mut self, issue: &model::Issue) -> Option<String> {
+        let epic = issue
+            .epic
+            .as_ref()
+            .filter(|e| e.group_id > 0 && e.iid > 0)?;
+        let key = (epic.group_id as u64, epic.iid as u64);
+        let h = self.handlers;
+        self.urls
+            .entry(key)
+            .or_insert_with(|| h.row::<model::Epic>(key).map(|e| e.web_url))
+            .clone()
+    }
+}
+
+/// A stored row `Search` found as a work item.
+enum WorkItemRow {
+    Issue(model::Issue),
+    Epic(model::Epic),
+}
+
+impl WorkItemRow {
+    fn updated_at(&self) -> u64 {
+        match self {
+            Self::Issue(i) => i.updated_at,
+            Self::Epic(e) => e.updated_at,
+        }
     }
 }
 
@@ -536,7 +606,7 @@ fn open_count_of(usage: Option<UsageEntry>) -> i64 {
     usage.map_or(0, |u| u.count as i64)
 }
 
-/// Whether an issue, MR or epic matches the search: case-insensitive
+/// Whether a work item or MR matches the search: case-insensitive
 /// substring on the title or any label, or an exact reference query (`#iid`,
 /// for an epic `&iid`).
 fn search_item_matches(
@@ -570,10 +640,10 @@ fn written_key(write: &Write) -> RowKey {
 }
 
 /// The job syncing the recent issues of `role`, and the view it fills.
-fn recent_source(role: &IssueRole) -> (Job, &'static str) {
+fn recent_source(role: &WorkItemRole) -> (Job, &'static str) {
     match role {
-        IssueRole::author => (Job::RecentAuthoredIssues, RECENT_AUTHORED_ISSUES),
-        IssueRole::assignee => (Job::RecentAssignedIssues, RECENT_ASSIGNED_ISSUES),
+        WorkItemRole::author => (Job::RecentAuthoredIssues, RECENT_AUTHORED_ISSUES),
+        WorkItemRole::assignee => (Job::RecentAssignedIssues, RECENT_ASSIGNED_ISSUES),
     }
 }
 
@@ -592,9 +662,9 @@ fn in_groups(groups: &Option<Vec<String>>, web_url: &str) -> bool {
 #[async_trait::async_trait]
 impl VarlinkInterface for Handlers {
     #[instrument(skip(self, call))]
-    async fn get_assigned_issues(
+    async fn get_assigned_work_items(
         &self,
-        call: &mut dyn Call_GetAssignedIssues,
+        call: &mut dyn Call_GetAssignedWorkItems,
         groups: Option<Vec<String>>,
     ) -> varlink::Result<()> {
         reply_if_cold!(self, call, Job::AssignedIssues, (Vec::new()));
@@ -610,16 +680,17 @@ impl VarlinkInterface for Handlers {
         let usage = self.usage_or_empty();
         let mut boards = BoardLabels::new(self);
         let mut projects = Projects::new(self);
-        let issues: Vec<Issue> = rows
+        let mut epics = EpicLinks::new(self);
+        let work_items: Vec<WorkItem> = rows
             .into_iter()
             .map(|i| {
                 let open = open_count_of(usage.get(Issuable::Issue, i.project_id, i.iid));
                 let project = projects.of(i.project_id);
-                boards.wire(i, open, project)
+                boards.wire(i, open, project, &mut epics)
             })
             .collect();
-        debug!(count = issues.len(), "serving assigned issues");
-        call.reply(issues)
+        debug!(count = work_items.len(), "serving assigned work items");
+        call.reply(work_items)
     }
 
     #[instrument(skip(self, call))]
@@ -655,16 +726,16 @@ impl VarlinkInterface for Handlers {
     }
 
     #[instrument(skip(self, call))]
-    async fn list_issues(
+    async fn list_work_items(
         &self,
-        call: &mut dyn Call_ListIssues,
-        role: Option<IssueRole>,
+        call: &mut dyn Call_ListWorkItems,
+        role: Option<WorkItemRole>,
         updated_after: Option<i64>,
-        states: Option<Vec<IssueState>>,
+        states: Option<Vec<WorkItemState>>,
     ) -> varlink::Result<()> {
         let roles = match role {
             Some(role) => vec![role],
-            None => vec![IssueRole::author, IssueRole::assignee],
+            None => vec![WorkItemRole::author, WorkItemRole::assignee],
         };
         for role in &roles {
             reply_if_cold!(self, call, recent_source(role).0, (Vec::new()));
@@ -687,16 +758,17 @@ impl VarlinkInterface for Handlers {
         let usage = self.usage_or_empty();
         let mut boards = BoardLabels::new(self);
         let mut projects = Projects::new(self);
-        let issues: Vec<Issue> = rows
+        let mut epics = EpicLinks::new(self);
+        let work_items: Vec<WorkItem> = rows
             .into_iter()
             .map(|i| {
                 let open = open_count_of(usage.get(Issuable::Issue, i.project_id, i.iid));
                 let project = projects.of(i.project_id);
-                boards.wire(i, open, project)
+                boards.wire(i, open, project, &mut epics)
             })
             .collect();
-        debug!(count = issues.len(), "serving recent issues");
-        call.reply(issues)
+        debug!(count = work_items.len(), "serving recent work items");
+        call.reply(work_items)
     }
 
     #[instrument(skip(self, call))]
@@ -707,9 +779,10 @@ impl VarlinkInterface for Handlers {
         kinds: Option<Vec<SearchKind>>,
         limit: Option<i64>,
         scope: Option<SearchScope>,
+        types: Option<Vec<String>>,
     ) -> varlink::Result<()> {
-        // An empty query is the "frequently opened" view: only issues, MRs and
-        // epics with recorded opens, ranked. Projects and groups have no open
+        // An empty query is the "frequently opened" view: only work items and
+        // MRs with recorded opens, ranked. Projects and groups have no open
         // counts, so they come back empty in that mode.
         let needle = query.trim().to_lowercase();
         let scope = Scope::new(scope);
@@ -721,40 +794,82 @@ impl VarlinkInterface for Handlers {
         };
         let kinds = kinds.unwrap_or_default();
         let want = |k: SearchKind| kinds.is_empty() || kinds.contains(&k);
+        let types = types.unwrap_or_default();
+        let typed = |t: &str| types.is_empty() || types.iter().any(|w| w.eq_ignore_ascii_case(t));
 
         reply_if_cold!(
             self,
             call,
             Job::MemberProjects,
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         );
 
         let iid_query = parse_iid_query(&query);
         let usage = self.usage_or_empty();
         let mut project_info = Projects::new(self);
 
-        let mut issues: Vec<Issue> = Vec::new();
-        if want(SearchKind::issues) {
-            let mut hits: Vec<(Option<UsageEntry>, model::Issue)> = self
-                .all::<model::Issue>()
+        // Issues and epics share one ranking and one limit.
+        let mut work_items: Vec<WorkItem> = Vec::new();
+        if want(SearchKind::work_items) {
+            let epic_query = parse_epic_query(&query);
+            let mut group_info = Groups::new(self);
+            // Not read at all when only epics are asked for.
+            let only_epics =
+                !types.is_empty() && types.iter().all(|t| t.eq_ignore_ascii_case(wire::EPIC));
+            let issues = if only_epics {
+                Vec::new()
+            } else {
+                self.all::<model::Issue>()
+            };
+            let issues = issues
                 .into_iter()
+                .filter(|i| typed(i.work_item_type()))
                 .filter(|i| search_item_matches(&needle, iid_query, &i.title, &i.labels, i.iid))
                 .filter(|i| {
                     scope
                         .as_ref()
                         .is_none_or(|s| s.item(i.project_id, &i.web_url))
                 })
-                .map(|i| (usage.get(Issuable::Issue, i.project_id, i.iid), i))
+                .map(|i| {
+                    let u = usage.get(Issuable::Issue, i.project_id, i.iid);
+                    (u, WorkItemRow::Issue(i))
+                });
+            let epics = if typed(wire::EPIC) {
+                self.all::<model::Epic>()
+            } else {
+                Vec::new()
+            };
+            let epics = epics
+                .into_iter()
+                .filter(|e| search_item_matches(&needle, epic_query, &e.title, &e.labels, e.iid))
+                .filter(|e| {
+                    scope.as_ref().is_none_or(|s| {
+                        s.group(&wire::group_path(
+                            group_info.path_of(e.group_id),
+                            &e.web_url,
+                        ))
+                    })
+                })
+                .map(|e| (usage.get_epic(e.group_id, e.iid), WorkItemRow::Epic(e)));
+            let mut hits: Vec<(Option<UsageEntry>, WorkItemRow)> = issues
+                .chain(epics)
                 .filter(|(u, _)| !frequent_only || u.is_some())
                 .collect();
-            hits.sort_by_key(|(u, i)| rank_key(*u, i.updated_at));
+            hits.sort_by_key(|(u, row)| rank_key(*u, row.updated_at()));
             hits.truncate(limit);
             let mut boards = BoardLabels::new(self);
-            issues = hits
+            let mut epic_links = EpicLinks::new(self);
+            work_items = hits
                 .into_iter()
-                .map(|(u, i)| {
-                    let project = project_info.of(i.project_id);
-                    boards.wire(i, open_count_of(u), project)
+                .map(|(u, row)| match row {
+                    WorkItemRow::Issue(i) => {
+                        let project = project_info.of(i.project_id);
+                        boards.wire(i, open_count_of(u), project, &mut epic_links)
+                    }
+                    WorkItemRow::Epic(e) => {
+                        let group_path = group_info.path_of(e.group_id);
+                        wire::epic(e, open_count_of(u), group_path)
+                    }
                 })
                 .collect();
         }
@@ -816,45 +931,14 @@ impl VarlinkInterface for Handlers {
             groups = hits.into_iter().map(wire::group).collect();
         }
 
-        let mut epics: Vec<Epic> = Vec::new();
-        if want(SearchKind::epics) {
-            let epic_query = parse_epic_query(&query);
-            let mut group_info = Groups::new(self);
-            let mut hits: Vec<(Option<UsageEntry>, model::Epic)> = self
-                .all::<model::Epic>()
-                .into_iter()
-                .filter(|e| search_item_matches(&needle, epic_query, &e.title, &e.labels, e.iid))
-                .filter(|e| {
-                    scope.as_ref().is_none_or(|s| {
-                        s.group(&wire::group_path(
-                            group_info.path_of(e.group_id),
-                            &e.web_url,
-                        ))
-                    })
-                })
-                .map(|e| (usage.get_epic(e.group_id, e.iid), e))
-                .filter(|(u, _)| !frequent_only || u.is_some())
-                .collect();
-            hits.sort_by_key(|(u, e)| rank_key(*u, e.updated_at));
-            hits.truncate(limit);
-            epics = hits
-                .into_iter()
-                .map(|(u, e)| {
-                    let group_path = group_info.path_of(e.group_id);
-                    wire::epic(e, open_count_of(u), group_path)
-                })
-                .collect();
-        }
-
         debug!(
-            issues = issues.len(),
+            work_items = work_items.len(),
             merge_requests = merge_requests.len(),
             projects = projects.len(),
             groups = groups.len(),
-            epics = epics.len(),
             "serving search results"
         );
-        call.reply(issues, merge_requests, projects, groups, epics)
+        call.reply(work_items, merge_requests, projects, groups)
     }
 
     #[instrument(skip(self, call))]
@@ -1140,49 +1224,23 @@ impl VarlinkInterface for Handlers {
     async fn record_open(
         &self,
         call: &mut dyn Call_RecordOpen,
-        project_id: i64,
-        iid: i64,
         kind: IssuableKind,
+        iid: i64,
+        project_id: Option<i64>,
+        group_id: Option<i64>,
     ) -> varlink::Result<()> {
-        if let Some(msg) = issue_ref_error(project_id, iid) {
-            return call.reply_gitlab_error(msg);
-        }
+        let key = match open_key(&kind, iid, project_id, group_id) {
+            Ok(key) => key,
+            Err(msg) => return call.reply_gitlab_error(msg),
+        };
         // Local bookkeeping only — no GitLab, so it works while dormant.
         let retention_secs = self.config.read().unwrap().usage.retention().as_secs();
         let now = now_secs();
-        let key = crate::usage::usage_key(wire::internal_kind(&kind), project_id, iid);
         if let Err(e) = self
             .usage
             .record(&key, now, now.saturating_sub(retention_secs))
         {
             warn!(error = %e, key, "record_open failed");
-            return call.reply_gitlab_error(e.to_string());
-        }
-        debug!(key, "recorded open");
-        call.reply()
-    }
-
-    #[instrument(skip(self, call))]
-    async fn record_epic_open(
-        &self,
-        call: &mut dyn Call_RecordEpicOpen,
-        group_id: i64,
-        iid: i64,
-    ) -> varlink::Result<()> {
-        if group_id <= 0 || iid <= 0 {
-            return call.reply_gitlab_error(format!(
-                "invalid epic reference (group {group_id}, iid {iid})"
-            ));
-        }
-        // Local bookkeeping only, like `RecordOpen`.
-        let retention_secs = self.config.read().unwrap().usage.retention().as_secs();
-        let now = now_secs();
-        let key = crate::usage::epic_usage_key(group_id, iid);
-        if let Err(e) = self
-            .usage
-            .record(&key, now, now.saturating_sub(retention_secs))
-        {
-            warn!(error = %e, key, "record_epic_open failed");
             return call.reply_gitlab_error(e.to_string());
         }
         debug!(key, "recorded open");
@@ -1253,26 +1311,45 @@ impl VarlinkInterface for Handlers {
     /// and no idempotency key, so repeating one that may have landed would
     /// file the issue twice.
     #[instrument(skip(self, call, description))]
-    async fn create_issue(
+    async fn create_work_item(
         &self,
-        call: &mut dyn Call_CreateIssue,
+        call: &mut dyn Call_CreateWorkItem,
         project_id: i64,
         title: String,
         description: Option<String>,
         labels: Option<Vec<String>>,
         assign_self: Option<bool>,
-        epic_id: Option<i64>,
+        parent: Option<WorkItemRef>,
     ) -> varlink::Result<()> {
         let labels = labels.unwrap_or_default();
         if let Some(msg) = new_issue_error(project_id, &title, &labels) {
             return call.reply_gitlab_error(msg);
         }
+        let parent = match parent.as_ref().map(parent_epic).transpose() {
+            Ok(parent) => parent,
+            Err(msg) => return call.reply_gitlab_error(msg),
+        };
         // Whatever keeps the session away: nothing is deferred.
         let session = match self.current_session().await {
             Ok(s) => s,
             Err(r) => {
                 let (reason, detail) = dormant_args(&r);
                 return call.reply_not_authenticated(reason, detail);
+            }
+        };
+        // Resolved before the create, so a failed lookup creates nothing.
+        let epic_id = match parent {
+            None => None,
+            Some((group_id, iid)) => {
+                match self.legacy_epic_id(&*session.gitlab, group_id, iid).await {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        warn!(error = %e, group_id, iid, "looking up the parent epic failed");
+                        return call.reply_gitlab_error(format!(
+                            "looking up the parent epic &{iid} of group {group_id}: {e}"
+                        ));
+                    }
+                }
             }
         };
         let new = NewIssue {

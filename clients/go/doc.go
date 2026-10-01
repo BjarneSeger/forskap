@@ -19,7 +19,7 @@
 //	}
 //	defer c.Close()
 //
-//	issues, err := c.GetAssignedIssues(ctx, nil)
+//	issues, err := c.GetAssignedWorkItems(ctx, nil)
 //	if err != nil {
 //		var notAuth *forskap.NotAuthenticated
 //		if errors.As(err, &notAuth) {

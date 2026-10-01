@@ -529,7 +529,8 @@ pub enum Shell {
     Nu,
 }
 
-/// `mrs` maps to the wire value `merge_requests`.
+/// `mrs` maps to the wire value `merge_requests`; `issues` and `epics` are
+/// both work items, told apart by their type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SearchKind {
     Issues,

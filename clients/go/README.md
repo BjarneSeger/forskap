@@ -18,7 +18,7 @@ go get github.com/BjarneSeger/forskap/clients/go
 
 Releases are tagged `clients/go/vX.Y.Z` and carry the version of the
 [`forskap-api`](../../forskap-api/README.md) crate they were generated from, so a
-version names one state of the interface. Append `@v0.30.0` to pin one.
+version names one state of the interface. Append `@v0.31.0` to pin one.
 
 The generated package is named after the interface, so import it under an alias:
 
@@ -37,7 +37,7 @@ if err != nil {
 }
 defer c.Close()
 
-issues, err := c.GetAssignedIssues(ctx, nil)
+issues, err := c.GetAssignedWorkItems(ctx, nil)
 if err != nil {
 	var notAuth *forskap.NotAuthenticated
 	if errors.As(err, &notAuth) {
@@ -74,16 +74,41 @@ Daemon-side errors surface as typed values you match with `errors.As`:
 
 Optional varlink parameters are pointers; pass `nil` to omit them
 (e.g. `c.GetHistory(ctx, nil)` for the daemon's default window,
-`c.Search(ctx, "query", nil, nil, nil)` for all kinds, the default limit and no
-project/group scope,
-`c.ListIssues(ctx, nil, nil, nil)` for the issues you authored or are assigned to in
-any state, or
-`c.PostTime(ctx, pid, iid, forskap.KindIssue, "1h", &summary)`). The varlink
+`c.Search(ctx, "query", nil, nil, nil, nil)` for all kinds and types, the default
+limit and no project/group scope,
+`c.ListWorkItems(ctx, nil, nil, nil)` for the issues you authored or are assigned to
+in any state, or
+`c.PostTime(ctx, pid, iid, forskap.KindWorkItem, "1h", &summary)`). The varlink
 `Close` method maps to `c.CloseIssuable` — the Go name `Close` is taken by the
-connection releaser. Enum values come from constants: `KindIssue` /
+connection releaser. Enum values come from constants: `KindWorkItem` /
 `KindMergeRequest` for an `IssuableKind`, `Search*` for the kinds of `Search`,
 `Scope*` for the scopes of `ClearCache`, `RoleAuthor` / `RoleAssignee` and
-`StateOpened` / `StateClosed` for the role and the states of `ListIssues`.
+`StateOpened` / `StateClosed` for the role and the states of `ListWorkItems`.
+
+### Work items
+
+Issues, tasks and epics are all `WorkItem`s, told apart by `Type` (`"issue"`,
+`"task"`, `"incident"`, `"test_case"`, `"epic"`). An issue lives in a project and
+has `Project_id` set, an epic in a group and has `Group_id` set; exactly one of the
+two is. `Namespace_path` is the project's or the group's full path. `Id` is the
+work item's global ID, the one GitLab's work items API knows. An issue under an epic
+carries it as `Parent`, a `WorkItemRef` with the epic's group, number, title and
+absolute link.
+
+`c.Search` returns the issues and epics it finds as one list, ranked together under
+one limit; pass `types` to keep some of them:
+
+```go
+epics := []string{"epic"}
+res, err := c.Search(ctx, "billing", nil, nil, nil, &epics)
+```
+
+`c.RecordOpen` counts an open of an issue or merge request by its project, or of an
+epic by its group:
+
+```go
+err := c.RecordOpen(ctx, forskap.KindWorkItem, epic.Iid, nil, epic.Group_id)
+```
 
 Optional fields of a reply are pointers as well, `nil` when the daemon left them
 out. `c.GetSyncJobs` sets `SyncJob.Unavailable` on every job since `v0.28.0`: `true`
@@ -96,30 +121,33 @@ fetch has so far, `SyncJob.Expected` the total GitLab announced (`nil` where it
 announced none), and `SyncJob.Full` tells a full run from a delta for the jobs that
 have both. All three are `nil` on a job that isn't running.
 
-`c.ListIssues` lists your own issues across projects, closed ones included,
-newest-updated first; each carries its epic's URL as `Parent`. It reaches back
-the daemon's `search.tracked_retention_hours` (90 days by default):
+`c.ListWorkItems` lists your own issues across projects, closed ones included,
+newest-updated first; each carries its epic as `Parent`. It reaches back the
+daemon's `search.tracked_retention_hours` (90 days by default):
 
 ```go
 role := forskap.RoleAuthor
 since := time.Now().AddDate(0, 0, -30).Unix()
-closed := []forskap.IssueState{forskap.StateClosed}
-issues, err := c.ListIssues(ctx, &role, &since, &closed)
+closed := []forskap.WorkItemState{forskap.StateClosed}
+issues, err := c.ListWorkItems(ctx, &role, &since, &closed)
 ```
 
-`c.CreateIssue` files an issue and returns its number and link; the issue shows
-in `Search` and `ListIssues` at once:
+`c.CreateWorkItem` files an issue and returns its number and link; the issue
+shows in `Search` and `ListWorkItems` at once. A `parent` puts it under an epic,
+named by its group and number:
 
 ```go
 assign := true
 labels := []string{"bug"}
-iid, url, err := c.CreateIssue(ctx, projectID, "Fix the login", nil, &labels, &assign, nil)
+epic := forskap.WorkItemRef{Group_id: &groupID, Iid: 5}
+iid, url, err := c.CreateWorkItem(ctx, projectID, "Fix the login", nil, &labels, &assign, &epic)
 ```
 
 It is the one write the daemon never queues: while GitLab is unreachable it fails
 with `*forskap.NotAuthenticated`, and any failure of the request is a
-`*forskap.GitlabError`. Don't retry a failure blindly — GitLab may have created
-the issue before its answer was lost, and a second call files it again.
+`*forskap.GitlabError`, a parent it can't find included. Don't retry a failure
+blindly — GitLab may have created the issue before its answer was lost, and a
+second call files it again.
 
 ## Regenerating
 

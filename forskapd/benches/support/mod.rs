@@ -213,6 +213,7 @@ pub fn epic(i: u64) -> Epic {
         id: i as i64 + 1,
         iid: (i / 10) as i64 + 1,
         group_id,
+        work_item_id: i as i64 + 1_000_001,
         title: title(i, "Epic"),
         web_url: format!(
             "https://gl/groups/{}/group{group_id}/-/epics/{}",

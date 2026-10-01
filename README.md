@@ -53,7 +53,7 @@ brew services start forskap
 forskap auth login --host gitlab.com
 ```
 
-forskap needs GitLab 12 or newer; the project avatars need 16.9.
+forskap needs GitLab 18.4 or newer.
 
 This walks you through creating a personal access token with the appropriate scopes.
 Paste it back to the prompt and you are logged in — the token is stored in your

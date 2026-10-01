@@ -3,7 +3,7 @@
 //! it higher next time.
 
 use anyhow::Result;
-use forskap_api::VarlinkClientInterface;
+use forskap_api::{IssuableKind, VarlinkClientInterface, WorkItem};
 
 use super::locate;
 use crate::cli::EpicArgs;
@@ -15,10 +15,10 @@ pub async fn run(target: EpicArgs, no_browser: bool) -> Result<()> {
     let (client, epic) = locate(&target).await?;
 
     client
-        .record_epic_open(epic.group_id, epic.iid)
+        .record_open(IssuableKind::work_item, epic.iid, None, epic.group_id)
         .call()
         .await
-        .map_err(|e| friendly("RecordEpicOpen", e))?;
+        .map_err(|e| friendly("RecordOpen", e))?;
     remember(&epic);
 
     if !no_browser {
@@ -38,12 +38,12 @@ pub async fn run(target: EpicArgs, no_browser: bool) -> Result<()> {
 
 /// Best effort: a state file that can't be written only costs a `--group`
 /// next time.
-fn remember(epic: &forskap_api::Epic) {
-    let Ok(mut st) = state::load() else {
+fn remember(epic: &WorkItem) {
+    let (Ok(mut st), Some(group_id)) = (state::load(), epic.group_id) else {
         return;
     };
     st.last_epic = Some(LastEpic {
-        group_id: epic.group_id,
+        group_id,
         iid: epic.iid,
     });
     let _ = state::save(&st);
