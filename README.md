@@ -162,3 +162,10 @@ systemctl enable --now --user forskapd.socket
   `github.com/BjarneSeger/forskap/clients/go`.
 - `GITLAB_TRACKRD_SOCKET` and `GITLAB_TRACKRD_LOG` are still read; prefer
   `FORSKAPD_SOCKET` and `FORSKAPD_LOG`.
+
+# License
+
+The daemon, the CLI and the noctalia plugin are licensed under
+[GPL-3.0-only](LICENSE). The [`forskap-api`](forskap-api/README.md) crate and the
+[Go binding](clients/go/README.md) are licensed under either Apache-2.0 or MIT, at
+your option; both directories carry the two license texts.

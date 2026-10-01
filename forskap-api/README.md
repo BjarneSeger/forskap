@@ -6,3 +6,6 @@ example user or [forskapd](../forskapd/README.md) for more information.
 
 The [Go binding](../clients/go/README.md) is generated from the same `.varlink`
 definition, so Go consumers stay in lock-step with the wire contract.
+
+Licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) license, at
+your option.

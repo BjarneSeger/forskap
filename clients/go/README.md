@@ -16,6 +16,10 @@ those helpers with socket discovery and one method per varlink method.
 go get github.com/BjarneSeger/forskap/clients/go
 ```
 
+Releases are tagged `clients/go/vX.Y.Z` and carry the version of the
+[`forskap-api`](../../forskap-api/README.md) crate they were generated from, so a
+version names one state of the interface. Append `@v0.24.0` to pin one.
+
 The generated package is named after the interface, so import it under an alias:
 
 ```go
