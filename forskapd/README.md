@@ -8,8 +8,10 @@ forskapd provides precompiled releases for arm64 and amd64, with packages for
 debian, rpm and arch. See the `releases`-tab.
 
 On macOS, install with [Homebrew](https://brew.sh) from the tap in this repository.
-The formula builds `forskapd` and `forskap` from the source of the latest release;
-`brew services` runs the daemon under launchd and restarts it if it exits:
+Starting with the first release after 0.12.0, the formula installs the release's
+prebuilt `forskapd` and `forskap` (macOS on Apple silicon, Linux amd64 and arm64;
+Intel Macs are not supported by the formula). `brew services` runs the daemon under
+launchd and restarts it if it exits:
 
 ```sh
 brew tap bjarneseger/forskap https://github.com/BjarneSeger/forskap
@@ -18,8 +20,7 @@ brew services start forskap
 ```
 
 Its log is `$(brew --prefix)/var/log/forskapd.log`. On macOS the socket is
-`/tmp/forskapd.socket` unless `[server]` `socket` names another one. This needs a
-release newer than 0.12.0, which does not build on macOS.
+`/tmp/forskapd.socket` unless `[server]` `socket` names another one.
 
 ## Configuration
 
