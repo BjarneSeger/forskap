@@ -6,18 +6,18 @@ use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 
 use forskap_api::{
-    AsyncCall, CacheScope, Call_ClearCache, Call_Close, Call_GetActivity, Call_GetAssignedIssues,
-    Call_GetAssignedMergeRequests, Call_GetHistory, Call_GetSyncJobs, Call_ListIssues,
-    Call_PostTime, Call_RecordEpicOpen, Call_RecordOpen, Call_Search, Call_UnassignSelf,
-    Call_WhoAmI, GetActivity_Reply, GetAssignedIssues_Reply, GetAssignedMergeRequests_Reply,
-    GetHistory_Reply, GetSyncJobs_Reply, HistorySource, IssuableKind, Issue, IssueRole, IssueState,
-    ListIssues_Reply, MergeRequest, Search_Reply, SearchKind, SearchScope, SyncJobStatus,
-    VarlinkInterface, WhoAmI_Reply,
+    AsyncCall, CacheScope, Call_ClearCache, Call_Close, Call_CreateIssue, Call_GetActivity,
+    Call_GetAssignedIssues, Call_GetAssignedMergeRequests, Call_GetHistory, Call_GetSyncJobs,
+    Call_ListIssues, Call_PostTime, Call_RecordEpicOpen, Call_RecordOpen, Call_Search,
+    Call_UnassignSelf, Call_WhoAmI, CreateIssue_Reply, GetActivity_Reply, GetAssignedIssues_Reply,
+    GetAssignedMergeRequests_Reply, GetHistory_Reply, GetSyncJobs_Reply, HistorySource,
+    IssuableKind, Issue, IssueRole, IssueState, ListIssues_Reply, MergeRequest, Search_Reply,
+    SearchKind, SearchScope, SyncJobStatus, VarlinkInterface, WhoAmI_Reply,
 };
 
 use crate::config::SharedConfig;
 use crate::error::DormancyReason;
-use crate::gitlab::Issuable;
+use crate::gitlab::{Issuable, NewIssue};
 use crate::queue::RetryQueue;
 use crate::sync::avatars::Avatar;
 use crate::sync::jobs::{
@@ -459,6 +459,52 @@ async fn close(h: &Handlers, project_id: i64, iid: i64, kind: IssuableKind) -> O
     reply_error(&mut call)
 }
 
+/// `CreateIssue` with just a title, self-assigned or not; the call holds
+/// the reply.
+async fn create_issue(
+    h: &Handlers,
+    project_id: i64,
+    title: &str,
+    assign_self: Option<bool>,
+) -> AsyncCall {
+    create_issue_with(h, project_id, title, None, None, assign_self, None).await
+}
+
+async fn create_issue_with(
+    h: &Handlers,
+    project_id: i64,
+    title: &str,
+    description: Option<&str>,
+    labels: Option<&[&str]>,
+    assign_self: Option<bool>,
+    epic_id: Option<i64>,
+) -> AsyncCall {
+    let mut call = AsyncCall::default();
+    h.create_issue(
+        &mut call as &mut dyn Call_CreateIssue,
+        project_id,
+        title.to_string(),
+        description.map(str::to_string),
+        labels.map(|labels| labels.iter().map(|l| l.to_string()).collect()),
+        assign_self,
+        epic_id,
+    )
+    .await
+    .unwrap();
+    call
+}
+
+/// The issue GitLab answers a create in project 7 with, numbered `iid` and
+/// assigned to the users `assignees`.
+fn created_json(iid: i64, title: &str, assignees: &[i64]) -> serde_json::Value {
+    let mut row = issue_json(7, iid, title);
+    row["assignees"] = assignees
+        .iter()
+        .map(|id| serde_json::json!({"id": id, "username": format!("user{id}")}))
+        .collect();
+    row
+}
+
 async fn clear_cache(h: &Handlers, scope: Option<Vec<CacheScope>>) {
     let mut call = AsyncCall::default();
     h.clear_cache(&mut call as &mut dyn Call_ClearCache, scope)
@@ -605,6 +651,228 @@ async fn an_applied_write_reruns_the_jobs_that_show_it() {
         !fake.calls_to("issues").is_empty()
     })
     .await;
+}
+
+// ── Creating an issue ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn create_issue_rejects_a_blank_title_or_bad_project() {
+    let fake = Arc::new(FakeGitlab::default());
+    let (h, _dir) = connected_handlers(&fake);
+    for (project_id, title) in [(7, ""), (7, " \t\n"), (0, "Fix it"), (-3, "Fix it")] {
+        let mut call = create_issue(&h, project_id, title, None).await;
+        assert_eq!(
+            reply_error(&mut call).as_deref(),
+            Some(GITLAB_ERROR),
+            "{project_id} {title:?}"
+        );
+    }
+    // GitLab would read one label with a comma as two.
+    let labels = ["bug", "auth,flow"];
+    let mut call = create_issue_with(&h, 7, "Fix it", None, Some(&labels), None, None).await;
+    assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
+
+    assert!(fake.writes().is_empty(), "refused before GitLab is asked");
+    assert_eq!(fake.read_calls(), 0);
+
+    // Refused while dormant too, as what it is: an invalid call.
+    let (h, _dir) = dormant_handlers();
+    let mut call = create_issue(&h, 7, "", None).await;
+    assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
+}
+
+/// Where the other writes are queued, a create fails: a replay has nothing
+/// to tell it whether the first attempt landed.
+#[tokio::test]
+async fn create_issue_is_never_queued() {
+    for (h, _dir) in [unreachable_handlers(), dormant_handlers()] {
+        let mut call = create_issue(&h, 7, "Fix it", Some(true)).await;
+        assert_eq!(reply_error(&mut call).as_deref(), Some(NOT_AUTHENTICATED));
+        assert!(h.queue.pending().unwrap().is_empty());
+        assert!(h.queue.failures().unwrap().is_empty());
+    }
+
+    // The failures every other write is queued on.
+    for err in [
+        FakeErr::Transient,
+        FakeErr::Throttled(429),
+        FakeErr::Throttled(503),
+    ] {
+        let fake = Arc::new(FakeGitlab::default());
+        fake.fail_next_write(err);
+        let (h, _dir) = connected_handlers(&fake);
+        let mut call = create_issue(&h, 7, "Fix it", None).await;
+        assert_eq!(
+            reply_error(&mut call).as_deref(),
+            Some(GITLAB_ERROR),
+            "{err:?}"
+        );
+        assert!(h.queue.pending().unwrap().is_empty(), "{err:?}");
+        assert!(h.queue.failures().unwrap().is_empty(), "{err:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            fake.writes(),
+            [("create_issue", Issuable::Issue, 7, 0)],
+            "{err:?}: tried once"
+        );
+    }
+}
+
+/// A 401 included: the sync worker judges the session, not a write.
+#[tokio::test]
+async fn create_issue_reports_any_gitlab_failure_without_demoting() {
+    for err in [
+        FakeErr::Transient,
+        FakeErr::Throttled(429),
+        FakeErr::Throttled(502),
+        FakeErr::Rejected,
+        FakeErr::Unauthorized,
+    ] {
+        let fake = Arc::new(FakeGitlab::default());
+        fake.fail_next_write(err);
+        let (h, _dir) = connected_handlers(&fake);
+        seed_recent_issues(&h);
+
+        let mut call = create_issue(&h, 7, "Fix it", Some(true)).await;
+        assert_eq!(
+            reply_error(&mut call).as_deref(),
+            Some(GITLAB_ERROR),
+            "{err:?}"
+        );
+        assert!(
+            matches!(&*h.session.read().await, ConnState::Connected(_)),
+            "{err:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), h.reconnect_signal.notified())
+                .await
+                .is_err(),
+            "{err:?}"
+        );
+        // Nothing was created as far as the daemon knows: nothing to show.
+        assert_eq!(h.sync.store().issues.scan(RowScope::Prefix(7)).unwrap(), []);
+        assert_eq!(fake.read_calls(), 0, "{err:?}: no list reruns");
+    }
+}
+
+/// Before any list fetched it: the reruns the create sets off are held.
+#[tokio::test]
+async fn a_created_issue_is_searchable_at_once() {
+    let fake = Arc::new(FakeGitlab::default());
+    fake.serve_create(created_json(12, "Fix the login", &[]));
+    let _held = fake.gate("issues");
+    let (h, _dir) = connected_handlers(&fake);
+    seed_recent_issues(&h);
+    mark_synced(&h, &[Job::MemberProjects]);
+
+    let mut call = create_issue(&h, 7, "Fix the login", None).await;
+    let created: CreateIssue_Reply = reply(&mut call);
+    assert_eq!(created.iid, 12);
+    assert_eq!(created.web_url, "https://gitlab.test/g/p7/-/issues/12");
+
+    let found = run_search(&h, "login", None, None).await.issues;
+    assert_eq!(iids(&found), [12]);
+    assert_eq!(found[0].title, "Fix the login");
+    assert_eq!(found[0].project_id, 7);
+    // The newest of what the user authored; nobody is assigned.
+    let authored = list_issues(&h, Some(IssueRole::author), None, None).await;
+    assert_eq!(iids(&authored), [12, 1, 2]);
+    let assigned = list_issues(&h, Some(IssueRole::assignee), None, None).await;
+    assert_eq!(iids(&assigned), [2, 3]);
+    assert!(fake.calls_to("issues").len() <= 1, "nothing landed since");
+}
+
+#[tokio::test]
+async fn a_created_issue_assigned_to_me_is_listed_at_once() {
+    let fake = Arc::new(FakeGitlab::default());
+    fake.serve_create(created_json(12, "Fix the login", &[1]));
+    // A Guest may not assign: GitLab creates the issue without assignee.
+    fake.serve_create(created_json(13, "Fix the logout", &[]));
+    let (h, _dir) = connected_handlers(&fake);
+    seed_assigned_issues(&h);
+    seed_recent_issues(&h);
+
+    for (title, iid) in [("Fix the login", 12), ("Fix the logout", 13)] {
+        // Held anew: a create restarts the list the one before set off.
+        let _held = fake.gate("issues");
+        let mut call = create_issue(&h, 7, title, Some(true)).await;
+        assert_eq!(reply::<CreateIssue_Reply>(&mut call).iid, iid);
+    }
+
+    let assigned = assigned_issues(&h, None).await;
+    assert!(iids(&assigned).contains(&12), "{:?}", iids(&assigned));
+    assert!(!iids(&assigned).contains(&13), "by GitLab's answer");
+    let recent = list_issues(&h, Some(IssueRole::assignee), None, None).await;
+    assert_eq!(iids(&recent), [12, 2, 3]);
+    let authored = list_issues(&h, Some(IssueRole::author), None, None).await;
+    assert_eq!(iids(&authored)[..2], [12, 13]);
+}
+
+#[tokio::test]
+async fn create_issue_passes_its_arguments_on() {
+    let fake = Arc::new(FakeGitlab::default());
+    let (h, _dir) = connected_handlers(&fake);
+
+    let labels = ["bug", "auth flow"];
+    let mut call = create_issue_with(
+        &h,
+        7,
+        "Fix the login",
+        Some("It fails."),
+        Some(&labels),
+        Some(true),
+        Some(5005),
+    )
+    .await;
+    assert_eq!(reply_error(&mut call), None);
+    // Omitted on the wire: no labels, no epic, nobody assigned.
+    let mut call = create_issue(&h, 8, "Bare", None).await;
+    assert_eq!(reply_error(&mut call), None);
+
+    let full = NewIssue {
+        title: "Fix the login".into(),
+        description: Some("It fails.".into()),
+        labels: vec!["bug".into(), "auth flow".into()],
+        assign_self: true,
+        epic_id: Some(5005),
+    };
+    let bare = NewIssue {
+        title: "Bare".into(),
+        ..Default::default()
+    };
+    assert_eq!(fake.created(), [(7, full), (8, bare)]);
+    assert_eq!(
+        fake.writes(),
+        [
+            ("create_issue", Issuable::Issue, 7, 0),
+            ("create_issue", Issuable::Issue, 8, 0)
+        ]
+    );
+    // The lists that show it run again.
+    eventually("the list reruns", || !fake.calls_to("issues").is_empty()).await;
+}
+
+/// The issue exists: an answer the daemon can't read must not read as a
+/// failure, or the caller files it again.
+#[tokio::test]
+async fn create_issue_replies_success_whatever_gitlab_answered() {
+    let fake = Arc::new(FakeGitlab::default());
+    fake.serve_create(serde_json::json!("created"));
+    // No global id: nothing to store, but the number and link are there.
+    let mut partial = created_json(12, "Fix the login", &[]);
+    partial["id"] = serde_json::Value::Null;
+    fake.serve_create(partial);
+    let (h, _dir) = connected_handlers(&fake);
+
+    let mut call = create_issue(&h, 7, "Fix the login", None).await;
+    let unreadable: CreateIssue_Reply = reply(&mut call);
+    assert_eq!((unreadable.iid, unreadable.web_url.as_str()), (0, ""));
+
+    let mut call = create_issue(&h, 7, "Fix the login", None).await;
+    let created: CreateIssue_Reply = reply(&mut call);
+    assert_eq!(created.iid, 12);
+    assert!(created.web_url.ends_with("/issues/12"), "{created:?}");
+    assert_eq!(h.sync.store().issues.scan(RowScope::Prefix(7)).unwrap(), []);
 }
 
 // ── Read-time overlay of writes ────────────────────────────────────────

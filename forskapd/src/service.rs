@@ -12,14 +12,14 @@ use varlink::sansio::ServerEvent;
 
 use forskap_api::{
     AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
-    Call_DismissFailure, Call_GetActivity, Call_GetAssignedIssues, Call_GetAssignedMergeRequests,
-    Call_GetFailures, Call_GetHistory, Call_GetSyncJobs, Call_ListIssues, Call_Login, Call_Logout,
-    Call_PostTime, Call_RecordEpicOpen, Call_RecordOpen, Call_RetryFailure, Call_Search,
-    Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, Close_Args, DismissFailure_Args,
-    GetActivity_Args, GetAssignedIssues_Args, GetAssignedMergeRequests_Args, GetHistory_Args,
-    ListIssues_Args, Login_Args, PostTime_Args, RecordEpicOpen_Args, RecordOpen_Args,
-    RetryFailure_Args, Search_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION,
-    VarlinkInterface as _,
+    Call_CreateIssue, Call_DismissFailure, Call_GetActivity, Call_GetAssignedIssues,
+    Call_GetAssignedMergeRequests, Call_GetFailures, Call_GetHistory, Call_GetSyncJobs,
+    Call_ListIssues, Call_Login, Call_Logout, Call_PostTime, Call_RecordEpicOpen, Call_RecordOpen,
+    Call_RetryFailure, Call_Search, Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, Close_Args,
+    CreateIssue_Args, DismissFailure_Args, GetActivity_Args, GetAssignedIssues_Args,
+    GetAssignedMergeRequests_Args, GetHistory_Args, ListIssues_Args, Login_Args, PostTime_Args,
+    RecordEpicOpen_Args, RecordOpen_Args, RetryFailure_Args, Search_Args, UnassignSelf_Args,
+    VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
 };
 
 use crate::handlers::Handlers;
@@ -303,6 +303,20 @@ async fn handle_forskapd(
                 )
                 .await?;
         }
+        "org.thehoster.forskapd.CreateIssue" => {
+            let args: CreateIssue_Args = args!();
+            handlers
+                .create_issue(
+                    &mut call as &mut dyn Call_CreateIssue,
+                    args.project_id,
+                    args.title,
+                    args.description,
+                    args.labels,
+                    args.assign_self,
+                    args.epic_id,
+                )
+                .await?;
+        }
         "org.thehoster.forskapd.Login" => {
             let args: Login_Args = args!();
             handlers
@@ -385,6 +399,11 @@ mod tests {
                 "merged",
             ),
             ("Search", None, "query"),
+            (
+                "CreateIssue",
+                Some(serde_json::json!({"project_id": 1})),
+                "title",
+            ),
             ("Search", Some(serde_json::json!({"kinds": []})), "query"),
         ] {
             let reply = handle_forskapd(
@@ -489,6 +508,36 @@ mod tests {
                 reply.error.as_deref(),
                 Some("org.thehoster.forskapd.NotAuthenticated"),
                 "ListIssues is missing its dispatch arm in handle_forskapd"
+            );
+        }
+    }
+
+    /// Dormant: the arm answers `NotAuthenticated`, not `MethodNotFound`,
+    /// with the optional arguments and without.
+    #[tokio::test]
+    async fn dispatch_has_an_arm_for_create_issue() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        let full = serde_json::json!({
+            "project_id": 1,
+            "title": "x",
+            "description": "y",
+            "labels": ["bug"],
+            "assign_self": true,
+            "epic_id": 5,
+        });
+        for params in [serde_json::json!({"project_id": 1, "title": "x"}), full] {
+            let reply = handle_forskapd(
+                "org.thehoster.forskapd.CreateIssue",
+                Some(params),
+                &handlers,
+            )
+            .await
+            .unwrap()
+            .expect("a reply");
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("org.thehoster.forskapd.NotAuthenticated"),
+                "CreateIssue is missing its dispatch arm in handle_forskapd"
             );
         }
     }

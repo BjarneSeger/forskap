@@ -40,6 +40,14 @@ the daemon are the to-do list.
   once, queues on `Unreachable` or a retryable error, and only a real GitLab rejection
   returns `GitlabError`. A write never demotes the session — the sync worker is the
   demotion authority. Extend `Job::affected_by` so the right views re-sync after it.
+  **Exception: a write that creates something** (`CreateIssue`) is not a `WriteOp` and
+  never goes through `perform_write`/`defer`. `WriteOp`s are persisted and address an
+  existing `(kind, project_id, iid)`; a create has no `iid` and no idempotency key, so
+  a queued or replayed one could file its item twice. It calls GitLab once from the
+  handler, replies `NotAuthenticated` for every dormancy reason and `GitlabError` for
+  every failure, and after GitLab succeeded it must not fail any more: the created row
+  goes to the sync worker (`SyncHandle::land_issue`, the only store writer) and the
+  reply is sent whether or not that landed in time.
 - **Read methods** only read the sync store (`self.sync.store()`); never call GitLab.
   New data to serve? Add a mirror type (`sync/model.rs`, `Resource` + `Stored`), a
   `Listing` variant (`gitlab.rs`) and a `Job` (`sync/jobs.rs`, planned in

@@ -14,6 +14,10 @@
 //! still in flight then finish on their own: what they fetched lands, and a
 //! failure of the session already given up counts for nothing.
 //!
+//! One row comes from outside the fetches: an issue the handlers just
+//! created ([`SyncHandle::land_issue`]). The worker stores it like a fetched
+//! one and voids the issue lists still in flight, which never saw it.
+//!
 //! The avatar files are the worker's too: written with their row, removed
 //! by a sweep once a commit dropped rows.
 
@@ -118,6 +122,10 @@ enum Command {
     LoggedIn,
     /// Persist a write GitLab applied (see [`SyncHandle::note_write`]).
     Note(NotedWrite),
+    /// Store an issue GitLab just created for the account (see
+    /// [`SyncHandle::land_issue`]); the sender is answered once that is done
+    /// or given up.
+    Land(Issue, Identity, oneshot::Sender<()>),
     /// Report the planned jobs (see [`SyncHandle::jobs`]).
     Snapshot(oneshot::Sender<Snapshot>),
 }
@@ -258,6 +266,7 @@ impl SyncHandle {
             launched: None,
             lost: None,
             errors: HashMap::new(),
+            landings: Vec::new(),
             replan: true,
             incomplete: BTreeSet::new(),
             relisted: BTreeSet::new(),
@@ -378,6 +387,27 @@ impl SyncHandle {
         let _ = self.tx.send(Command::Note(note));
     }
 
+    /// Store `issue`, which GitLab just created for the account `by`, so the
+    /// reads show it before any list fetched it: its row, and its key at the
+    /// head of the views it belongs to, namely the issues the user authored
+    /// and, if GitLab assigned it to them, both assigned ones. A view that
+    /// never synced is left alone. The list fetches in flight are void and
+    /// run again: they started before the issue existed, and landing would
+    /// take it out of the views again. Nothing is stored once the store
+    /// holds another account's data. Resolves when the worker is done with
+    /// it; callers bound the wait.
+    pub fn land_issue(
+        &self,
+        issue: Issue,
+        by: Identity,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let (done, wait) = oneshot::channel();
+        let _ = self.tx.send(Command::Land(issue, by, done));
+        async move {
+            let _ = wait.await;
+        }
+    }
+
     /// Writes noted at or after `since` (a view's fetch start): the ones that
     /// view may not reflect yet.
     pub fn writes_since(&self, since: u64) -> Vec<Write> {
@@ -453,6 +483,9 @@ struct Worker {
     /// Why each job's last run failed, by state key. Not persisted: the
     /// persisted [`JobState`] stays `Copy`.
     errors: HashMap<String, String>,
+    /// Created issues waiting to be stored: [`Self::handle`] can run before
+    /// the session's account was checked against the store.
+    landings: Vec<(Issue, Identity, oneshot::Sender<()>)>,
     replan: bool,
     /// Plan-feeding jobs a clear reset that haven't synced since. Until they
     /// have, their evidence is missing, so a replan only adds jobs.
@@ -477,11 +510,18 @@ impl Worker {
                 ConnState::Connected(s) => Some(s.clone()),
                 ConnState::Dormant(_) => None,
             };
+            if let Some(session) = &session
+                && let Err(e) = self.check_identity(session)
+            {
+                warn!(error = %e, "sync identity check failed");
+            }
+            // Only now is it known whose data the store holds.
+            for (issue, by, done) in std::mem::take(&mut self.landings) {
+                self.land(issue, &by);
+                let _ = done.send(());
+            }
             let idle = match session {
                 Some(session) => {
-                    if let Err(e) = self.check_identity(&session) {
-                        warn!(error = %e, "sync identity check failed");
-                    }
                     if self.replan {
                         self.replan_now();
                     }
@@ -567,6 +607,7 @@ impl Worker {
             Command::Wake => {}
             Command::LoggedIn => self.unpark(),
             Command::Note(note) => self.persist_note(note),
+            Command::Land(issue, by, done) => self.landings.push((issue, by, done)),
             Command::Snapshot(reply) => {
                 let _ = reply.send(self.snapshot(now_secs()));
             }
@@ -657,6 +698,77 @@ impl Worker {
         })();
         if let Err(e) = stored {
             warn!(error = %e, "storing a noted write failed");
+        }
+    }
+
+    /// Store an issue the account `by` just created (see
+    /// [`SyncHandle::land_issue`]).
+    fn land(&mut self, issue: Issue, by: &Identity) {
+        if self.identity.as_ref() != Some(by) {
+            debug!("created issue not stored: the store holds another account's data");
+            return;
+        }
+        if !issue.is_valid() {
+            warn!("created issue not stored: GitLab's answer names no issue");
+            return;
+        }
+        let key = issue.key();
+        let (project_id, iid) = (issue.project_id, issue.iid);
+        // What GitLab made of it, not what was asked for: it ignores the
+        // assignee of a user who may not assign.
+        let mut views = vec![RECENT_AUTHORED_ISSUES];
+        if issue.assignees.iter().any(|a| a.id == by.user_id) {
+            views.extend([ASSIGNED_ISSUES, RECENT_ASSIGNED_ISSUES]);
+        }
+        let landed = (|| -> Result<Vec<&'static str>> {
+            let mut c = self.store.begin();
+            // A list fetched since may have stored a newer version already.
+            let stored = c.get::<Issue>(key)?;
+            if stored.is_none_or(|s| s.updated_at <= issue.updated_at) {
+                c.upsert(&[issue])?;
+            }
+            let mut listed = Vec::new();
+            for name in views {
+                // A view that never synced stays unsynced: one key is not
+                // the list.
+                let Some(mut view) = c.view(name)? else {
+                    continue;
+                };
+                if !view.keys.contains(&key) {
+                    // First: the lists come newest first. `fetched_at`
+                    // stays, the writes since that fetch still apply.
+                    view.keys.insert(0, key);
+                    c.set_view(name, &view)?;
+                    listed.push(name);
+                }
+            }
+            c.commit()?;
+            Ok(listed)
+        })();
+        let listed = match landed {
+            Ok(listed) => listed,
+            Err(e) => {
+                warn!(error = %e, project_id, iid, "storing a created issue failed");
+                return;
+            }
+        };
+        debug!(project_id, iid, views = ?listed, "created issue stored");
+        // The assigned view is evidence for the plan.
+        if listed.contains(&ASSIGNED_ISSUES) {
+            self.replan = true;
+        }
+        // An issue list fetched before the create lacks it: landing, it
+        // would replace the views without the key, and the row could go
+        // with it. No `updated_at` tells such a fetch from a newer one.
+        let lists = self
+            .flights
+            .iter()
+            .filter(|(_, f)| f.job.lane() == Lane::Issues);
+        let void = lists.map(|(&run, _)| run).collect();
+        for flight in self.cancel(void) {
+            debug!(job = %flight.key, "sync job restarted: an issue was created under it");
+            let waiters = flight.waiters.unwrap_or_default();
+            self.demand.entry(flight.job).or_default().extend(waiters);
         }
     }
 
@@ -1412,10 +1524,12 @@ mod tests {
     use super::*;
     use crate::error::DormancyReason;
     use crate::gitlab::{GitlabApi, Issuable, Listing};
-    use crate::sync::model::{Issue, Project};
+    use crate::sync::jobs::ISSUE_VIEWS;
+    use crate::sync::model::{Issue, Project, UserRef};
+    use crate::sync::store::View;
     use crate::testing::{
-        FakeErr, FakeGitlab, PNG, RECENT_ASSIGNED_PATH, epic_json, event_json, eventually,
-        group_json, issue_json, project_json, project_json_with_avatar,
+        FakeErr, FakeGitlab, PNG, RECENT_ASSIGNED_PATH, RECENT_AUTHORED_PATH, epic_json,
+        event_json, eventually, group_json, issue_json, project_json, project_json_with_avatar,
     };
     use crate::write::WriteOp;
 
@@ -3090,6 +3204,236 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), refreshed)
             .await
             .expect("all boards landed");
+    }
+
+    /// A worker that runs only demanded jobs, up to three at once: nothing
+    /// but the test fills the store.
+    fn start_on_demand(store: Arc<SyncStore>, state: ConnState) -> Env {
+        let tmp = tempfile::tempdir().unwrap();
+        let avatars = AvatarDir::new(tmp.path());
+        let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(state));
+        let config = flying(3);
+        let reconnect = Arc::new(Notify::new());
+        let sync = SyncHandle::spawn_on_demand(
+            Arc::clone(&store),
+            avatars.clone(),
+            Arc::clone(&session),
+            Arc::clone(&config),
+            Arc::clone(&reconnect),
+        );
+        Env {
+            sync,
+            config,
+            session,
+            reconnect,
+            store,
+            avatars,
+            _dir: None,
+            _avatar_tmp: Some(tmp),
+        }
+    }
+
+    /// The account [`connected`] logs in as `user_id`.
+    fn account(user_id: i64) -> Identity {
+        Identity {
+            host: "gitlab.test".into(),
+            user_id,
+        }
+    }
+
+    /// An issue as GitLab answers a create with, assigned to `assignees`.
+    fn created(project_id: i64, iid: i64, assignees: &[i64]) -> Issue {
+        let assignee = |&id| UserRef {
+            id,
+            ..Default::default()
+        };
+        Issue {
+            assignees: assignees.iter().map(assignee).collect(),
+            updated_at: now_secs(),
+            ..issue_row(project_id, iid)
+        }
+    }
+
+    /// Every one of `views` listing `keys`, fetched at `fetched_at`.
+    fn seed_views(store: &SyncStore, views: &[&str], keys: &[RowKey], fetched_at: u64) {
+        let mut c = store.begin();
+        for name in views {
+            let view = View {
+                keys: keys.to_vec(),
+                fetched_at,
+            };
+            c.set_view(name, &view).unwrap();
+        }
+        c.commit().unwrap();
+    }
+
+    fn view_of(env: &Env, name: &str) -> Option<View> {
+        env.store.view(name).unwrap()
+    }
+
+    /// The row and its key land together, the key in front: the lists come
+    /// newest first. What GitLab assigned decides on the assigned views.
+    #[tokio::test]
+    async fn a_landed_issue_leads_the_views_it_belongs_to() {
+        let (store, _dir) = open_store();
+        seed_views(&store, &ISSUE_VIEWS, &[(8, 1)], 500);
+        let fake = Arc::new(FakeGitlab::default());
+        let env = start_on_demand(store, connected(&fake, 1));
+        let keys = |name| view_of(&env, name).unwrap().keys;
+
+        env.sync
+            .land_issue(created(9, 5, &[2, 1]), account(1))
+            .await;
+        assert_eq!(env.store.issues.get((9, 5)).unwrap().unwrap().id, 9005);
+        for name in ISSUE_VIEWS {
+            let view = view_of(&env, name).unwrap();
+            assert_eq!(view.keys, [(9, 5), (8, 1)], "{name}");
+            assert_eq!(view.fetched_at, 500, "{name}: still that fetch's view");
+        }
+        // The assigned view is plan evidence: project 9 shows its boards.
+        let snapshot = env.sync.jobs().await;
+        let boards = Job::ProjectBoards(9).key();
+        assert!(snapshot.jobs.iter().any(|j| j.key == boards));
+
+        // Unassigned, or assigned to someone else only: authored, no more.
+        env.sync.land_issue(created(9, 6, &[]), account(1)).await;
+        env.sync.land_issue(created(9, 7, &[2]), account(1)).await;
+        let authored = [(9, 7), (9, 6), (9, 5), (8, 1)];
+        assert_eq!(keys(RECENT_AUTHORED_ISSUES), authored);
+        for name in [ASSIGNED_ISSUES, RECENT_ASSIGNED_ISSUES] {
+            assert_eq!(keys(name), [(9, 5), (8, 1)], "{name}");
+        }
+
+        // A key a list brought in meanwhile is not listed twice.
+        env.sync.land_issue(created(9, 6, &[]), account(1)).await;
+        assert_eq!(keys(RECENT_AUTHORED_ISSUES), authored);
+        assert_eq!(fake.read_calls(), 0, "{:?}", fake.calls());
+    }
+
+    /// A list fetched before the create lacks the new issue: landing, it
+    /// would replace the view without the key, and the row would go too.
+    #[tokio::test]
+    async fn a_landing_voids_the_list_fetch_in_flight() {
+        let (store, _dir) = open_store();
+        seed_views(&store, &ISSUE_VIEWS, &[(9, 1)], 500);
+        let fake = Arc::new(FakeGitlab::default());
+        // What GitLab lists once the issue exists.
+        let listed = vec![issue_json(9, 5, "new"), issue_json(9, 1, "old")];
+        fake.serve(RECENT_AUTHORED_PATH, listed);
+        let _authored = fake.gate(RECENT_AUTHORED_PATH);
+        let merge_requests = fake.gate("merge_requests");
+        let env = start_on_demand(store, connected(&fake, 1));
+
+        let relisted = env.sync.refresh_now(&[Job::RecentAuthoredIssues]);
+        let elsewhere = env.sync.refresh_now(&[Job::AssignedMergeRequests]);
+        called(&fake, RECENT_AUTHORED_PATH, 1).await;
+        called(&fake, "merge_requests", 1).await;
+
+        env.sync.land_issue(created(9, 5, &[]), account(1)).await;
+        // The first fetch is still held: only a rerun can end the wait.
+        tokio::time::timeout(Duration::from_secs(2), relisted)
+            .await
+            .expect("the rerun lands");
+        assert_eq!(fake.calls_to(RECENT_AUTHORED_PATH).len(), 2);
+        let view = view_of(&env, RECENT_AUTHORED_ISSUES).unwrap();
+        assert_eq!(view.keys, [(9, 5), (9, 1)]);
+        assert!(view.fetched_at > 500, "the rerun's view");
+        assert!(env.store.issues.get((9, 5)).unwrap().is_some());
+
+        // A fetch in another lane never listed issues: it goes on.
+        assert_eq!(fake.calls_to("merge_requests").len(), 1);
+        merge_requests.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), elsewhere)
+            .await
+            .expect("the fetch in another lane lands");
+        assert_eq!(fake.calls_to("merge_requests").len(), 1);
+    }
+
+    /// Its project has no corpus job, so only the view naming it keeps the
+    /// row once a changed plan prunes the store.
+    #[tokio::test]
+    async fn a_landed_issue_survives_a_plan_change_without_a_corpus() {
+        let (store, _dir) = open_store();
+        seed_views(&store, &ISSUE_VIEWS, &[], 500);
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve("events", vec![event_json(1, 7, "opened", now_secs())]);
+        fake.serve("projects", vec![project_json(7)]);
+        let env = start_on_demand(store, connected(&fake, 1));
+        // The boot's own pruning is over.
+        env.sync.jobs().await;
+        // What the landed row would be without its view: nobody's.
+        let mut c = env.store.begin();
+        c.upsert(&[issue_row(9, 6)]).unwrap();
+        c.commit().unwrap();
+
+        env.sync.land_issue(created(9, 5, &[]), account(1)).await;
+        // Activity in member project 7 adds its corpus to the plan.
+        env.sync
+            .refresh_now(&[Job::Events, Job::MemberProjects])
+            .await;
+        let snapshot = env.sync.jobs().await;
+        let corpus = Job::ProjectIssues(7).key();
+        assert!(snapshot.jobs.iter().any(|j| j.key == corpus));
+        assert!(env.store.issues.get((9, 6)).unwrap().is_none(), "pruned");
+        assert!(env.store.issues.get((9, 5)).unwrap().is_some());
+        assert_eq!(
+            view_of(&env, RECENT_AUTHORED_ISSUES).unwrap().keys,
+            [(9, 5)]
+        );
+    }
+
+    /// One key is not a list: a view that never synced is not made up, and
+    /// its reads stay "not synced yet".
+    #[tokio::test]
+    async fn a_landing_skips_views_that_never_synced() {
+        let (store, _dir) = open_store();
+        seed_views(&store, &[RECENT_AUTHORED_ISSUES], &[], 500);
+        let fake = Arc::new(FakeGitlab::default());
+        let env = start_on_demand(store, connected(&fake, 1));
+
+        env.sync.land_issue(created(9, 5, &[1]), account(1)).await;
+        assert!(env.store.issues.get((9, 5)).unwrap().is_some());
+        assert_eq!(
+            view_of(&env, RECENT_AUTHORED_ISSUES).unwrap().keys,
+            [(9, 5)]
+        );
+        for (name, job) in [
+            (ASSIGNED_ISSUES, Job::AssignedIssues),
+            (RECENT_ASSIGNED_ISSUES, Job::RecentAssignedIssues),
+        ] {
+            assert_eq!(view_of(&env, name), None, "{name}");
+            assert!(!env.sync.has_synced(job), "{name}");
+        }
+    }
+
+    /// The store may hold another account's data by the time the issue
+    /// arrives: it must not land there.
+    #[tokio::test]
+    async fn a_landing_for_another_account_is_dropped() {
+        let (store, _dir) = open_store();
+        seed_views(&store, &ISSUE_VIEWS, &[(9, 1)], 500);
+        let fake = Arc::new(FakeGitlab::default());
+        let env = start_on_demand(store, connected(&fake, 1));
+
+        let elsewhere = Identity {
+            host: "other.test".into(),
+            user_id: 1,
+        };
+        for by in [account(2), elsewhere] {
+            env.sync.land_issue(created(9, 5, &[1, 2]), by).await;
+        }
+        assert!(env.store.issues.scan(RowScope::All).unwrap().is_empty());
+        for name in ISSUE_VIEWS {
+            assert_eq!(view_of(&env, name).unwrap().keys, [(9, 1)], "{name}");
+        }
+
+        // Another account logged in while the create was on its way.
+        let fresh = Arc::new(FakeGitlab::default());
+        *env.session.write().await = connected(&fresh, 2);
+        env.sync.land_issue(created(9, 5, &[1]), account(1)).await;
+        assert_eq!(env.store.identity().unwrap(), Some(account(2)));
+        assert!(env.store.issues.scan(RowScope::All).unwrap().is_empty());
+        assert_eq!(view_of(&env, RECENT_AUTHORED_ISSUES), None, "wiped");
     }
 
     #[test]

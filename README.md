@@ -66,6 +66,7 @@ forskap mr list                 # your open merge requests
 forskap issue view 42           # what the cache knows about issue #42
 forskap issue open 42           # open it in the browser (and count the open)
 forskap mr close 7 -p team/api  # close merge request !7 of that project
+forskap issue create Fix the login -p team/api   # file an issue, assigned to you
 forskap search oauth token      # cached search; issues/MRs you open often rank first
 forskap epic open 5             # open epic &5 in the browser (GitLab Premium and up)
 forskap time log 42 1h30m       # log time on issue #42
@@ -80,7 +81,10 @@ forskap sync jobs               # what the background sync runs now, next, and w
 `forskap issue` and `forskap mr` share their verbs (`list`, `view`, `open`, `close`, `assign`,
 `unassign`) and take the number shown in GitLab. The project is looked up in the
 cache; when a number exists in several projects, name one with `-p`, as full path
-or numeric ID. `forskap epic` has `view` and `open`; epics belong to a group, so an
+or numeric ID. `forskap issue create <title> -p <project>` files a new issue
+(`--description`, `--label`, `--epic`, `--no-assign`); it always names its project,
+and unlike the other writes it is not queued while GitLab is unreachable: it fails,
+so nothing is created behind your back later. `forskap epic` has `view` and `open`; epics belong to a group, so an
 ambiguous number takes `-g`. Commands that print data take `-o json` or `-o yaml`.
 On a terminal the text output colours state words, headings and item numbers;
 `--color always|never` overrules that, and `NO_COLOR` is honoured.

@@ -5,7 +5,8 @@
 //! rows (empty by default), one-shot failures can be queued in front, and a
 //! path can be gated to hold its next call until released. Every call is
 //! recorded for assertions. Writes succeed unless a failure is queued, and
-//! can all be held behind one gate to observe them in flight. The token and
+//! can all be held behind one gate to observe them in flight; creating an
+//! issue is one of them, answered with a served row. The token and
 //! avatar calls fail like reads, by their path ([`TOKEN_PATH`],
 //! [`ROTATE_PATH`], `projects/<id>/avatar`).
 
@@ -16,7 +17,7 @@ use serde_json::Value;
 use tokio::sync::{Notify, Semaphore};
 
 use crate::error::{Error, Result};
-use crate::gitlab::{GitlabApi, Issuable, Listing, RotatedToken, TokenInfo};
+use crate::gitlab::{GitlabApi, Issuable, Listing, NewIssue, RotatedToken, TokenInfo};
 use crate::secrets::Token;
 use crate::sync::model::Timelog;
 
@@ -97,6 +98,10 @@ pub struct FakeGitlab {
     writes: Mutex<Vec<WriteCall>>,
     /// Holds every write while set; see [`FakeGitlab::gate_writes`].
     write_gate: Mutex<Option<Arc<Semaphore>>>,
+    /// The project and content of every create attempt.
+    created: Mutex<Vec<(i64, NewIssue)>>,
+    /// The rows the next creates answer with.
+    create_rows: Mutex<VecDeque<Value>>,
     /// The token's info; one that never expires by default.
     token: Mutex<Option<TokenInfo>>,
     token_info_calls: Mutex<usize>,
@@ -250,6 +255,17 @@ impl FakeGitlab {
         self.writes.lock().unwrap().clone()
     }
 
+    /// Answer the next create with `row`, the issue as GitLab would return
+    /// it. Without one a create answers `issue_json(project, 1, title)`.
+    pub fn serve_create(&self, row: Value) {
+        self.create_rows.lock().unwrap().push_back(row);
+    }
+
+    /// The project and content of every create so far, failed ones included.
+    pub fn created(&self) -> Vec<(i64, NewIssue)> {
+        self.created.lock().unwrap().clone()
+    }
+
     async fn write(
         &self,
         op: &'static str,
@@ -351,6 +367,16 @@ impl GitlabApi for FakeGitlab {
 
     async fn unassign_self(&self, kind: Issuable, project_id: i64, iid: i64) -> Result<()> {
         self.write("unassign_self", kind, project_id, iid).await
+    }
+
+    /// A write like the others, logged as `("create_issue", Issue, project, 0)`.
+    async fn create_issue(&self, project_id: i64, issue: &NewIssue) -> Result<Value> {
+        let sent = (project_id, issue.clone());
+        self.created.lock().unwrap().push(sent);
+        self.write("create_issue", Issuable::Issue, project_id, 0)
+            .await?;
+        let served = self.create_rows.lock().unwrap().pop_front();
+        Ok(served.unwrap_or_else(|| issue_json(project_id, 1, &issue.title)))
     }
 
     async fn token_info(&self) -> Result<TokenInfo> {

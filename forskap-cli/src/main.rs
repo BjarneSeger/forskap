@@ -45,7 +45,7 @@ mod state;
 mod style;
 mod watch;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, IssueCommand};
 use refspec::RefKind;
 
 /// Single-thread tokio flavour: each invocation does at most a few varlink
@@ -83,7 +83,10 @@ async fn run() -> Result<()> {
         note_old_name();
     }
     match command {
-        Command::Issue { command } => cmd::item::run(RefKind::Issue, command).await,
+        Command::Issue { command } => match command {
+            IssueCommand::Item(command) => cmd::item::run(RefKind::Issue, command).await,
+            IssueCommand::Create(args) => cmd::item::create::run(args).await,
+        },
         Command::Mr { command } => cmd::item::run(RefKind::Mr, command).await,
         Command::Epic { command } => cmd::epic::run(command).await,
         Command::Search {

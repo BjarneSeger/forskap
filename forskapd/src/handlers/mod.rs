@@ -4,7 +4,7 @@
 //! ([`crate::sync`]) last stored, corrected at read time for writes it hasn't
 //! picked up yet. A store read failure is logged and treated as empty so the
 //! daemon stays available. Writes try GitLab once and fall back to the retry
-//! queue.
+//! queue, except creating an issue: that is tried once and never queued.
 //!
 //! - [`varlink`] — the [`VarlinkInterface`](forskap_api::VarlinkInterface)
 //!   method impls plus the write cascade.
@@ -137,6 +137,20 @@ fn dormant_args(reason: &DormancyReason) -> (Option<NotAuthReason>, Option<Strin
 fn issue_ref_error(project_id: i64, iid: i64) -> Option<String> {
     (project_id <= 0 || iid <= 0)
         .then(|| format!("invalid issue/MR reference (project {project_id}, iid {iid})"))
+}
+
+/// Reject a new issue GitLab would refuse or misread, before anything is
+/// sent. Returns the error message when invalid. A comma can't be part of a
+/// label: GitLab takes the labels as one comma-separated list.
+fn new_issue_error(project_id: i64, title: &str, labels: &[String]) -> Option<String> {
+    if project_id <= 0 {
+        return Some(format!("invalid project: {project_id}"));
+    }
+    if title.trim().is_empty() {
+        return Some("an issue needs a title".to_string());
+    }
+    let split = labels.iter().find(|l| l.contains(','));
+    split.map(|label| format!("invalid label {label:?}: a label can't contain a comma"))
 }
 
 /// Permissive sanity check for a GitLab time-tracking duration (`30m`,

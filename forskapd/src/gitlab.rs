@@ -3,7 +3,7 @@
 //! Wraps `gitlab::AsyncGitlab`: one paginated endpoint for every read
 //! ([`Listing`]), the GraphQL timelog query, the project avatar download, and
 //! the write endpoints the crate doesn't ship (`add_spent_time`, `close`,
-//! assignment, token rotation).
+//! assignment, creating an issue, token rotation).
 
 use std::borrow::Cow;
 use std::future::Future;
@@ -96,6 +96,18 @@ impl GitlabClient {
     pub fn current_username(&self) -> &str {
         &self.current_username
     }
+}
+
+/// An issue to create.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewIssue {
+    pub title: String,
+    pub description: Option<String>,
+    pub labels: Vec<String>,
+    /// Assign it to the authenticated user.
+    pub assign_self: bool,
+    /// The global id of the epic to put it under. GitLab Premium only.
+    pub epic_id: Option<i64>,
 }
 
 /// A paginated REST listing the sync layer fetches. Path and query are
@@ -276,6 +288,12 @@ pub trait GitlabApi: Send + Sync {
     async fn assign_self(&self, kind: Issuable, project_id: i64, iid: i64) -> Result<()>;
 
     async fn unassign_self(&self, kind: Issuable, project_id: i64, iid: i64) -> Result<()>;
+
+    /// Create `issue` in the project and return it as GitLab answered. Never
+    /// retried in here, and never to be repeated on a failure: nothing tells
+    /// whether GitLab created the issue before the answer was lost, and a
+    /// second call would create a second one.
+    async fn create_issue(&self, project_id: i64, issue: &NewIssue) -> Result<serde_json::Value>;
 
     /// The rows of a paginated REST listing, as raw JSON; paging stops once
     /// `limit` rows arrived.
@@ -513,6 +531,19 @@ impl GitlabApi for GitlabClient {
     async fn unassign_self(&self, kind: Issuable, project_id: i64, iid: i64) -> Result<()> {
         self.mutate_self_assignment(kind, project_id, iid, false)
             .await
+    }
+
+    /// Create an issue (`POST /projects/:id/issues`).
+    #[instrument(skip(self, issue))]
+    async fn create_issue(&self, project_id: i64, issue: &NewIssue) -> Result<serde_json::Value> {
+        CreateIssueEndpoint {
+            project_id,
+            issue,
+            user_id: self.current_user_id,
+        }
+        .query_async(&self.inner)
+        .await
+        .map_err(classify)
     }
 
     #[instrument(skip(self))]
@@ -894,6 +925,43 @@ impl gitlab::api::Endpoint for AddSpentTime<'_> {
         let mut body = serde_json::json!({"duration": self.duration});
         if let Some(summary) = self.summary {
             body["summary"] = serde_json::Value::String(summary.to_owned());
+        }
+        Ok(Some(("application/json", serde_json::to_vec(&body)?)))
+    }
+}
+
+/// `POST /projects/:project_id/issues`
+struct CreateIssueEndpoint<'a> {
+    project_id: i64,
+    issue: &'a NewIssue,
+    /// Who `assign_self` assigns.
+    user_id: i64,
+}
+
+impl gitlab::api::Endpoint for CreateIssueEndpoint<'_> {
+    fn method(&self) -> http::Method {
+        http::Method::POST
+    }
+
+    fn endpoint(&self) -> Cow<'static, str> {
+        format!("projects/{}/issues", self.project_id).into()
+    }
+
+    fn body(&self) -> std::result::Result<Option<(&'static str, Vec<u8>)>, gitlab::api::BodyError> {
+        let issue = self.issue;
+        let mut body = serde_json::json!({"title": issue.title});
+        if let Some(description) = &issue.description {
+            body["description"] = description.as_str().into();
+        }
+        if !issue.labels.is_empty() {
+            // GitLab splits the list at the commas.
+            body["labels"] = issue.labels.join(",").into();
+        }
+        if issue.assign_self {
+            body["assignee_ids"] = serde_json::json!([self.user_id]);
+        }
+        if let Some(epic_id) = issue.epic_id {
+            body["epic_id"] = epic_id.into();
         }
         Ok(Some(("application/json", serde_json::to_vec(&body)?)))
     }
@@ -1658,6 +1726,50 @@ mod tests {
             };
             assert_eq!(update.endpoint(), format!("projects/7/{seg}/42"));
         }
+    }
+
+    /// Pins what a create sends: a wrong field here files issues nobody
+    /// asked for, and only what was given may be set.
+    #[test]
+    fn the_create_endpoint_renders_path_and_body() {
+        use gitlab::api::Endpoint;
+
+        let body = |issue: &NewIssue| -> serde_json::Value {
+            let endpoint = CreateIssueEndpoint {
+                project_id: 7,
+                issue,
+                user_id: 42,
+            };
+            assert_eq!(endpoint.endpoint(), "projects/7/issues");
+            assert_eq!(endpoint.method(), http::Method::POST);
+            let (mime, body) = endpoint.body().unwrap().unwrap();
+            assert_eq!(mime, "application/json");
+            serde_json::from_slice(&body).unwrap()
+        };
+
+        let bare = NewIssue {
+            title: "Fix the login".into(),
+            ..Default::default()
+        };
+        assert_eq!(body(&bare), serde_json::json!({"title": "Fix the login"}));
+
+        let full = NewIssue {
+            title: "Fix the login".into(),
+            description: Some("It fails.".into()),
+            labels: vec!["bug".into(), "auth flow".into()],
+            assign_self: true,
+            epic_id: Some(5005),
+        };
+        assert_eq!(
+            body(&full),
+            serde_json::json!({
+                "title": "Fix the login",
+                "description": "It fails.",
+                "labels": "bug,auth flow",
+                "assignee_ids": [42],
+                "epic_id": 5005,
+            })
+        );
     }
 
     proptest! {

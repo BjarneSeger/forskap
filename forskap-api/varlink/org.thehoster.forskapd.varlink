@@ -143,6 +143,8 @@ method AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
 method UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
+method CreateIssue(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, epic_id: ?int) -> (iid: int, web_url: string)
+
 method RecordOpen(project_id: int, iid: int, kind: IssuableKind) -> ()
 
 method RecordEpicOpen(group_id: int, iid: int) -> ()

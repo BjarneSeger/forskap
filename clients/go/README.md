@@ -18,7 +18,7 @@ go get github.com/BjarneSeger/forskap/clients/go
 
 Releases are tagged `clients/go/vX.Y.Z` and carry the version of the
 [`forskap-api`](../../forskap-api/README.md) crate they were generated from, so a
-version names one state of the interface. Append `@v0.26.0` to pin one.
+version names one state of the interface. Append `@v0.27.0` to pin one.
 
 The generated package is named after the interface, so import it under an alias:
 
@@ -94,6 +94,20 @@ since := time.Now().AddDate(0, 0, -30).Unix()
 closed := []forskap.IssueState{forskap.StateClosed}
 issues, err := c.ListIssues(ctx, &role, &since, &closed)
 ```
+
+`c.CreateIssue` files an issue and returns its number and link; the issue shows
+in `Search` and `ListIssues` at once:
+
+```go
+assign := true
+labels := []string{"bug"}
+iid, url, err := c.CreateIssue(ctx, projectID, "Fix the login", nil, &labels, &assign, nil)
+```
+
+It is the one write the daemon never queues: while GitLab is unreachable it fails
+with `*forskap.NotAuthenticated`, and any failure of the request is a
+`*forskap.GitlabError`. Don't retry a failure blindly — GitLab may have created
+the issue before its answer was lost, and a second call files it again.
 
 ## Regenerating
 

@@ -59,6 +59,18 @@ pub fn command() -> Command {
             group
         });
     }
+    // Only issues are created, and `create` takes no number: kept out of
+    // the loop above.
+    cmd = cmd.mut_subcommand("issue", |issue| {
+        issue.mut_subcommand("create", |create| {
+            // Not `mut_arg`, which would move the argument behind the title.
+            create.mut_args(|arg| match arg.get_id().as_str() {
+                "project" => completing(arg, projects),
+                "group" => completing(arg, groups),
+                _ => arg,
+            })
+        })
+    });
     cmd = cmd.mut_subcommand("epic", |mut epic| {
         for verb in EPIC_VERBS {
             epic = epic.mut_subcommand(verb, |verb| {

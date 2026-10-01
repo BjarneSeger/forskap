@@ -4,8 +4,8 @@ use clap::{CommandFactory, Parser};
 use clap_complete::ArgValueCompleter;
 
 use crate::cli::{
-    Cli, ColorChoice, Command, EpicCommand, ItemCommand, OutputFormat, QueueCommand, RefreshScope,
-    SyncCommand, TickMode, TimeCommand,
+    Cli, ColorChoice, Command, EpicCommand, IssueCommand, ItemCommand, OutputFormat, QueueCommand,
+    RefreshScope, SyncCommand, TickMode, TimeCommand,
 };
 
 fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -50,8 +50,9 @@ fn every_number_and_project_argument_completes() {
     let mut seen = 0;
     check(&cmd, "forskap", &mut seen);
     // Number and project of five verbs in two groups and of `time log`,
-    // number and group of the two epic verbs, project of `search`.
-    assert_eq!(seen, 2 * 5 * 2 + 2 + 2 * 2 + 1);
+    // number and group of the two epic verbs, project of `search`, project
+    // and epic group of `issue create`.
+    assert_eq!(seen, 2 * 5 * 2 + 2 + 2 * 2 + 1 + 2);
 
     // Attaching them must not reorder the positionals.
     let log = cmd.find_subcommand("time").unwrap();
@@ -59,6 +60,9 @@ fn every_number_and_project_argument_completes() {
     let positionals: Vec<&str> = log.get_positionals().map(|p| p.get_id().as_str()).collect();
     assert_eq!(positionals, ["reference", "duration"]);
     assert_eq!(log.get_positionals().next().unwrap().get_index(), Some(1));
+    let create = cmd.find_subcommand("issue").unwrap();
+    let create = create.find_subcommand("create").unwrap();
+    assert_eq!(create.get_positionals().count(), 1, "the title alone");
 }
 
 #[test]
@@ -79,6 +83,82 @@ fn issue_and_mr_share_their_verbs() {
     assert_eq!(target.iid, 7);
     assert_eq!(target.project.project.as_deref(), Some("12"));
     assert!(no_browser);
+}
+
+#[test]
+fn issue_create_takes_title_words_and_a_project() {
+    let Command::Issue {
+        command: IssueCommand::Create(args),
+    } = ok(&["issue", "create", "Fix", "the", "login", "-p", "team/api"])
+    else {
+        panic!("not `issue create`");
+    };
+    assert_eq!(args.title, ["Fix", "the", "login"]);
+    assert_eq!(args.project, "team/api");
+    assert_eq!(
+        (args.description, args.epic, args.group),
+        (None, None, None)
+    );
+    assert!(args.labels.is_empty());
+    assert!(!args.no_assign, "assigned unless asked not to");
+
+    let Command::Issue {
+        command: IssueCommand::Create(args),
+    } = ok(&[
+        "issue",
+        "create",
+        "--project",
+        "12",
+        "--description",
+        "It fails.",
+        "--label",
+        "bug",
+        "--label",
+        "auth flow",
+        "--no-assign",
+        "--epic",
+        "5",
+        "--group",
+        "team/backend",
+        "-o",
+        "json",
+        "Fix the login",
+    ])
+    else {
+        panic!("not `issue create`");
+    };
+    assert_eq!(args.title, ["Fix the login"]);
+    assert_eq!(args.project, "12");
+    assert_eq!(args.description.as_deref(), Some("It fails."));
+    assert_eq!(args.labels, ["bug", "auth flow"]);
+    assert!(args.no_assign);
+    assert_eq!(args.epic, Some(5));
+    assert_eq!(args.group.as_deref(), Some("team/backend"));
+    assert!(matches!(args.output.output, OutputFormat::Json));
+
+    // Never guessed: a create in the wrong project can't be taken back.
+    assert!(parse(&["issue", "create", "Fix the login"]).is_err());
+    assert!(parse(&["issue", "create", "-p", "team/api"]).is_err());
+    // A group alone names no epic.
+    assert!(parse(&["issue", "create", "x", "-p", "1", "--group", "team"]).is_err());
+    for bad in ["0", "&5", "abc"] {
+        let args = ["issue", "create", "x", "-p", "1", "--epic", bad];
+        assert!(parse(&args).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn only_issues_are_created() {
+    ok(&["issue", "create", "x", "-p", "1"]);
+    assert!(parse(&["mr", "create", "x", "-p", "1"]).is_err());
+    assert!(parse(&["epic", "create", "x", "-g", "1"]).is_err());
+    // The shared verbs are still the issue's too.
+    assert!(matches!(
+        ok(&["issue", "close", "42"]),
+        Command::Issue {
+            command: IssueCommand::Item(ItemCommand::Close { .. })
+        }
+    ));
 }
 
 #[test]
@@ -125,6 +205,7 @@ fn iid_is_a_positive_number() {
 fn output_only_where_data_is_printed() {
     for args in [
         &["issue", "list"][..],
+        &["issue", "create", "x", "-p", "1"],
         &["mr", "view", "1"],
         &["epic", "view", "1"],
         &["search"],
