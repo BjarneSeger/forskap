@@ -1696,7 +1696,8 @@ async fn search_serves_an_epic_as_its_groups_work_item() {
     assert_eq!(billing.r#type, "epic");
     assert_eq!((billing.project_id, billing.group_id), (None, Some(5)));
     assert_eq!(billing.parent, None);
-    assert!(billing.total_time.is_empty() && billing.project_avatar.is_empty());
+    assert_eq!(billing.time_spent, None);
+    assert!(billing.project_avatar.is_empty());
 }
 
 /// Issues and epics are ranked together and share one limit.
@@ -2322,9 +2323,21 @@ async fn get_history_merges_queued_and_synced_newest_first() {
     );
     assert_eq!(events[0].source, HistorySource::queued);
     assert_eq!(events[0].web_url, "https://gl/g/p/-/merge_requests/5");
-    assert_eq!(events[1].duration, "30m");
+    // As it was given: the daemon doesn't know GitLab's day or week.
+    assert_eq!(
+        (events[0].time_spent, events[0].duration.as_deref()),
+        (None, Some("30m"))
+    );
+    assert_eq!(
+        (events[1].time_spent, events[1].duration.as_deref()),
+        (Some(1800), None)
+    );
     assert_eq!(events[1].kind, IssuableKind::merge_request);
-    assert_eq!(events[2].duration, "1h 30m");
+    assert_eq!(events[2].time_spent, Some(5400));
+    let json = serde_json::to_value(&events[0]).unwrap();
+    assert!(json.get("time_spent").is_none(), "{json}");
+    let json = serde_json::to_value(&events[2]).unwrap();
+    assert!(json.get("duration").is_none(), "{json}");
 }
 
 // ── Activity ───────────────────────────────────────────────────────────

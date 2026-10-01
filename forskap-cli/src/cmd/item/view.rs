@@ -4,6 +4,7 @@ use anyhow::Result;
 
 use super::{locate, lookup};
 use crate::cli::{OutputFormat, TargetArgs};
+use crate::cmd::time;
 use crate::item::Item;
 use crate::refspec::{self, RefKind};
 use crate::{output, style};
@@ -17,7 +18,8 @@ pub async fn run(kind: RefKind, target: TargetArgs, format: OutputFormat) -> Res
             field("state", &style::state(&i.state).to_string())?;
             field("project", &i.project_id.unwrap_or_default().to_string())?;
             field("url", &i.web_url)?;
-            field("time spent", &i.total_time)?;
+            let spent = i.time_spent.filter(|&s| s > 0).map(time::spent);
+            field("time spent", spent.as_deref().unwrap_or_default())?;
             field("status", &i.graph_status)?;
             let parent = i.parent.as_ref().and_then(|p| p.web_url.as_deref());
             field("parent", parent.unwrap_or_default())?;

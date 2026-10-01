@@ -33,7 +33,7 @@ type WorkItem struct {
 	Web_url        string       `json:"web_url"`
 	State          string       `json:"state"`
 	Parent         *WorkItemRef `json:"parent,omitempty"`
-	Total_time     string       `json:"total_time"`
+	Time_spent     *int64       `json:"time_spent,omitempty"`
 	Graph_status   string       `json:"graph_status"`
 	Open_count     int64        `json:"open_count"`
 	Project_avatar string       `json:"project_avatar"`
@@ -55,7 +55,8 @@ type HistoryEvent struct {
 	Iid        int64         `json:"iid"`
 	Title      string        `json:"title"`
 	Web_url    string        `json:"web_url"`
-	Duration   string        `json:"duration"`
+	Time_spent *int64        `json:"time_spent,omitempty"`
+	Duration   *string       `json:"duration,omitempty"`
 	Summary    string        `json:"summary"`
 }
 
@@ -2307,9 +2308,9 @@ type WorkItem (
   state: string,
   # The epic an issue belongs to; absent when it has none, and for an epic.
   parent: ?WorkItemRef,
-  # GitLab's human-readable total spent time ("2h"); empty when none, and for
-  # an epic.
-  total_time: string,
+  # Seconds spent on it, GitLab's time_stats.total_time_spent: 0 when none is
+  # logged; absent for an epic.
+  time_spent: ?int,
   # Board column the issue sits in, from its labels and the project's issue
   # board; empty when no board or label matches, and for an epic.
   graph_status: string,
@@ -2345,7 +2346,12 @@ type HistoryEvent (
   # Empty on a queued event whose issuable is not in the caches.
   title: string,
   web_url: string,
-  duration: string,
+  # Seconds; set on a synced entry, absent on a queued one.
+  time_spent: ?int,
+  # A queued PostTime's duration as it was given ("1h30m"); absent on a synced
+  # entry. The daemon can't turn it into seconds: GitLab's "1d" and "1w" depend
+  # on the instance's settings.
+  duration: ?string,
   summary: string
 )
 

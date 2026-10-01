@@ -637,7 +637,7 @@ mod tests {
             .iter()
             .find(|i| (i.project_id, i.iid) == (Some(102), 7))
             .unwrap();
-        assert_eq!(invoice.total_time, "1h");
+        assert_eq!(invoice.time_spent, Some(3600));
 
         let mrs = client.get_assigned_merge_requests(None).call().await;
         let mrs = mrs.unwrap().merge_requests;
@@ -742,7 +742,7 @@ mod tests {
             let history = client.get_history(Some(1)).call().await.ok()?.events;
             history
                 .iter()
-                .any(|e| e.summary == "Dry run" && e.duration == "45m")
+                .any(|e| e.summary == "Dry run" && e.time_spent == Some(45 * 60))
                 .then_some(())
         })
         .await;

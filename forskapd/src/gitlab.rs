@@ -1363,75 +1363,12 @@ fn parse_gid(gid: &str) -> Option<u64> {
     gid.rsplit('/').next().and_then(|s| s.parse().ok())
 }
 
-/// Format a duration in seconds as `"1h 30m"` (or `"45s"` when sub-minute).
-/// Matches the style GitLab itself uses for `human_total_time_spent`.
-pub fn format_duration(secs: u64) -> String {
-    if secs == 0 {
-        return "0m".to_string();
-    }
-    let hours = secs / 3600;
-    let mins = (secs % 3600) / 60;
-    let rem = secs % 60;
-
-    let mut parts = Vec::new();
-    if hours > 0 {
-        parts.push(format!("{hours}h"));
-    }
-    if mins > 0 {
-        parts.push(format!("{mins}m"));
-    }
-    if hours == 0 && mins == 0 && rem > 0 {
-        parts.push(format!("{rem}s"));
-    }
-    parts.join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// Anchors the exact output grammar; the shape over all inputs is covered
-    /// by `format_duration_renders_whole_minutes_of_any_input`.
-    #[test]
-    fn format_duration_pins_the_gitlab_style_grammar() {
-        assert_eq!(format_duration(5400), "1h 30m");
-        assert_eq!(format_duration(45), "45s");
-        assert_eq!(format_duration(0), "0m");
-    }
-
-    /// Split a `"2h 5m"`-style rendering back into (hours, minutes).
-    fn parse_h_m(s: &str) -> (u64, u64) {
-        let (mut hours, mut mins) = (0, 0);
-        for part in s.split(' ') {
-            if let Some(h) = part.strip_suffix('h') {
-                hours = h.parse().unwrap();
-            } else if let Some(m) = part.strip_suffix('m') {
-                mins = m.parse().unwrap();
-            } else {
-                panic!("unexpected part {part:?} in {s:?}");
-            }
-        }
-        (hours, mins)
-    }
-
     proptest! {
-        #[test]
-        fn format_duration_renders_whole_minutes_of_any_input(secs in any::<u64>()) {
-            let out = format_duration(secs);
-            prop_assert!(!out.is_empty());
-            if secs == 0 {
-                prop_assert_eq!(out, "0m");
-            } else if secs < 60 {
-                prop_assert_eq!(out, format!("{secs}s"));
-            } else {
-                // Past a minute the seconds remainder is dropped, never shown.
-                let (hours, mins) = parse_h_m(&out);
-                prop_assert!(mins < 60);
-                prop_assert_eq!(hours * 3600 + mins * 60, secs - secs % 60);
-            }
-        }
-
         #[test]
         fn parse_gid_roundtrips_any_id(n in any::<u64>()) {
             prop_assert_eq!(parse_gid(&format!("gid://gitlab/Timelog/{n}")), Some(n));

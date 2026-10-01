@@ -8,7 +8,7 @@ use forskap_api::Search_Reply;
 
 use super::query;
 use crate::cli::SearchKind;
-use crate::cmd::epic;
+use crate::cmd::{epic, time};
 use crate::item::{self, is_epic};
 use crate::refspec::RefKind;
 
@@ -63,13 +63,14 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
     let mut out = Vec::new();
     let (epics, issues): (Vec<_>, Vec<_>) = reply.work_items.iter().partition(|w| is_epic(w));
     for i in issues {
+        let spent = i.time_spent.filter(|&s| s > 0).map(time::spent);
         out.push(Row {
             id: format!("issues:{}:{}", i.project_id.unwrap_or_default(), i.iid),
             title: format!("#{} {}", i.iid, i.title),
             subtitle: join(&[
                 project_of(&i.namespace_path, &i.web_url),
                 &i.state,
-                &i.total_time,
+                spent.as_deref().unwrap_or_default(),
             ]),
             kind: SearchKind::Issues,
             score: i.open_count,
@@ -195,7 +196,7 @@ mod tests {
                     web_url: "https://gl.example.com/team/api/-/issues/42".into(),
                     state: "opened".into(),
                     parent: None,
-                    total_time: "1h".into(),
+                    time_spent: Some(3600),
                     graph_status: String::new(),
                     open_count: 3,
                     project_avatar: "/cache/avatars/7-a.png".into(),

@@ -1096,7 +1096,8 @@ impl VarlinkInterface for Handlers {
                         iid,
                         title,
                         web_url,
-                        duration,
+                        time_spent: None,
+                        duration: Some(duration),
                         summary: summary.unwrap_or_default(),
                     });
                 }

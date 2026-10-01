@@ -5,7 +5,7 @@ use forskap_api::{
     SyncJob, SyncJobStatus, WorkItem, WorkItemRef, WorkItemState,
 };
 
-use crate::gitlab::{Issuable, format_duration};
+use crate::gitlab::Issuable;
 use crate::query::{graph_status_from, namespace_of};
 use crate::sync::{JobInfo, JobStatus, model};
 
@@ -43,7 +43,7 @@ pub fn issue(
             .epic
             .as_ref()
             .and_then(|e| parent(e, epic_url, &i.web_url)),
-        total_time: i.total_time().to_string(),
+        time_spent: Some(i.time_spent() as i64),
         r#type: i.work_item_type().to_string(),
         id: i.id,
         iid: i.iid,
@@ -160,7 +160,7 @@ pub fn epic(e: model::Epic, open_count: i64, group_path: Option<String>) -> Work
         web_url: e.web_url,
         state: e.state,
         parent: None,
-        total_time: String::new(),
+        time_spent: None,
         graph_status: String::new(),
         open_count,
         project_avatar: String::new(),
@@ -178,7 +178,8 @@ pub fn timelog(t: model::Timelog) -> HistoryEvent {
         iid: t.iid,
         title: t.title,
         web_url: t.web_url,
-        duration: format_duration(t.time_spent),
+        time_spent: Some(t.time_spent as i64),
+        duration: None,
         summary: t.summary,
     }
 }
@@ -482,6 +483,30 @@ mod tests {
         assert_eq!(plain.parent, None);
     }
 
+    /// In seconds, 0 when none is logged; a timelog's too, and only a queued
+    /// one carries a duration.
+    #[test]
+    fn time_spent_is_in_seconds() {
+        let spent = model::Issue {
+            time_stats: Some(model::TimeStats {
+                total_time_spent: 5400,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            issue(spent, None, 0, no_project(), None).time_spent,
+            Some(5400)
+        );
+        let none = issue(model::Issue::default(), None, 0, no_project(), None);
+        assert_eq!(none.time_spent, Some(0));
+
+        let logged = timelog(model::Timelog {
+            time_spent: 1800,
+            ..Default::default()
+        });
+        assert_eq!((logged.time_spent, logged.duration), (Some(1800), None));
+    }
+
     #[test]
     fn a_parent_link_is_absolute_or_none() {
         let base = "https://gl.test/team/api/-/issues/1";
@@ -535,9 +560,8 @@ mod tests {
         assert_eq!(e.namespace_path, "team");
         assert_eq!(e.parent, None);
         assert_eq!(e.open_count, 2);
-        assert!(
-            e.total_time.is_empty() && e.graph_status.is_empty() && e.project_avatar.is_empty()
-        );
+        assert_eq!(e.time_spent, None);
+        assert!(e.graph_status.is_empty() && e.project_avatar.is_empty());
     }
 
     #[test]

@@ -116,6 +116,31 @@ local function avatarIcon(path)
   return nil
 end
 
+-- The seconds spent on an issue as `forskap` shows them ("1h 30m", "45s"),
+-- nil when none is logged. An older `forskap` sends GitLab's own spelling as
+-- `total_time`.
+local function timeSpent(item)
+  local secs = item.time_spent
+  if secs == nil then
+    return item.total_time
+  end
+  if secs <= 0 then
+    return nil
+  end
+  local hours, mins = math.floor(secs / 3600), math.floor(secs % 3600 / 60)
+  if hours == 0 and mins == 0 then
+    return string.format("%ds", secs)
+  end
+  local parts = {}
+  if hours > 0 then
+    table.insert(parts, string.format("%dh", hours))
+  end
+  if mins > 0 then
+    table.insert(parts, string.format("%dm", mins))
+  end
+  return table.concat(parts, " ")
+end
+
 local function joinNonEmpty(parts)
   local kept = {}
   for _, p in ipairs(parts) do
@@ -130,7 +155,7 @@ local function issuableRow(kind, sigil, item)
   return {
     id = string.format("%s:%d:%d", kind, item.project_id, item.iid),
     title = string.format("%s%d %s", sigil, item.iid, item.title),
-    subtitle = joinNonEmpty({ issuableProject(item), item.state, item.total_time }),
+    subtitle = joinNonEmpty({ issuableProject(item), item.state, timeSpent(item) }),
     glyph = GLYPH[kind],
     icon = avatarIcon(item.project_avatar),
     category = CATEGORY[kind],
