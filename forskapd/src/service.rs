@@ -63,6 +63,9 @@ impl varlink::AsyncConnectionHandler for ServiceHandler {
             match event {
                 ServerEvent::Request { request } => {
                     debug!(method = request.method.as_ref(), "varlink request");
+                    // The varlink crate doesn't hold the reply back: a oneway
+                    // caller would read it as the answer to its next call.
+                    let oneway = request.oneway.unwrap_or(false);
                     let method = request.method.as_ref();
                     let reply = if let Some(reply) = handle_varlink_meta(method, &request) {
                         Some(reply)
@@ -75,7 +78,7 @@ impl varlink::AsyncConnectionHandler for ServiceHandler {
                             Some(serde_json::json!({"method": method})),
                         ))
                     };
-                    if let Some(reply) = reply {
+                    if let Some(reply) = reply.filter(|_| !oneway) {
                         server.send_reply(reply)?;
                     }
                 }
@@ -423,6 +426,46 @@ mod tests {
         assert_eq!(only, ["epic", "epic"]);
         let excluded = found(serde_json::json!({"exclude_types": ["epic"]})).await;
         assert_eq!(excluded, ["issue"]);
+    }
+
+    /// A oneway call runs and gets no reply, not even an error: the one
+    /// answer on the connection is the next call's.
+    #[tokio::test]
+    async fn a_oneway_call_gets_no_reply() {
+        use varlink::AsyncConnectionHandler as _;
+
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        let handlers = Arc::new(handlers);
+        let service = ServiceHandler::new(Arc::clone(&handlers));
+        let mut server = varlink::sansio::Server::new();
+        let open = serde_json::json!({"kind": "work_item", "iid": 2, "project_id": 1});
+        for call in [
+            serde_json::json!({"method": "org.thehoster.forskapd.RecordOpen", "parameters": open, "oneway": true}),
+            serde_json::json!({"method": "org.thehoster.forskapd.NoSuchMethod", "oneway": true}),
+            serde_json::json!({"method": "org.example.Other", "oneway": true}),
+            serde_json::json!({"method": "org.thehoster.forskapd.Close", "parameters": {"project_id": 1}, "oneway": true}),
+            serde_json::json!({"method": "org.thehoster.forskapd.WhoAmI", "oneway": true}),
+            serde_json::json!({"method": "org.varlink.service.GetInfo", "oneway": true}),
+            serde_json::json!({"method": "org.thehoster.forskapd.GetStatus", "oneway": false}),
+        ] {
+            let mut message = serde_json::to_vec(&call).unwrap();
+            message.push(0);
+            server.handle_input(&message).unwrap();
+        }
+        service.handle(&mut server, None).await.unwrap();
+
+        let sent: Vec<String> = std::iter::from_fn(|| server.poll_transmit())
+            .map(|t| String::from_utf8(t.payload).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let reply: serde_json::Value =
+            serde_json::from_str(sent[0].trim_end_matches('\0')).unwrap();
+        assert_eq!(
+            reply["parameters"]["api_version"],
+            forskap_api::API_VERSION,
+            "{reply}"
+        );
+        assert_eq!(handlers.usage.snapshot().unwrap().entries.len(), 1);
     }
 
     /// The methods the work items replaced are gone, not answered.

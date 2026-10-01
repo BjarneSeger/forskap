@@ -707,8 +707,9 @@ varlinkctl call $SOCKET org.thehoster.forskapd.Search \
 varlinkctl call $SOCKET org.thehoster.forskapd.Search \
   '{"query": "billing", "exclude_types": ["epic"]}'
 
-# count an open of epic &5 of group 9
-varlinkctl call $SOCKET org.thehoster.forskapd.RecordOpen \
+# count an open of epic &5 of group 9; oneway: the daemon runs it and answers
+# nothing, not even an error
+varlinkctl call --oneway $SOCKET org.thehoster.forskapd.RecordOpen \
   '{"kind": "work_item", "iid": 5, "group_id": 9}'
 
 # post 1h30m to project 42, issue #7
