@@ -1,11 +1,17 @@
 [package]
 name = "forskap-api"
-version = "0.31.0"
+version = "0.32.0"
 edition.workspace = true
 license = "MIT OR Apache-2.0"
 
 [build-dependencies]
+quote.workspace = true
+syn.workspace = true
 varlink_generator.workspace = true
+varlink_parser.workspace = true
+
+[dev-dependencies]
+syn.workspace = true
 
 [dependencies]
 async-trait.workspace = true

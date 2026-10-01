@@ -1,7 +1,15 @@
 # The `org.thehoster.forskapd` interface
 
-Machine-readable definition: [`forskap-api/varlink/org.thehoster.forskapd.varlink`](../../forskap-api/varlink/org.thehoster.forskapd.varlink)
-— that file is the source of truth; this document explains the behavior behind it.
+The shapes are in [`forskap-api/varlink/org.thehoster.forskapd.varlink`](../../forskap-api/varlink/org.thehoster.forskapd.varlink),
+the source of truth: every type, field, method and error, most with a line on what
+it means. A running daemon serves that file as it is, comments included:
+
+```sh
+varlinkctl introspect unix:$XDG_RUNTIME_DIR/forskapd.socket org.thehoster.forskapd
+```
+
+This document says what the definition can't: the caching and write models, what
+each method does beyond its line, orderings, edge cases, and how to call it.
 
 **Caching model**: the daemon has no TTL. A background sync worker owns freshness:
 it runs a few jobs at a time (`sync.max_in_flight`) from a persisted, jittered schedule — the assigned
@@ -27,42 +35,76 @@ jobs that display it rerun right after it lands. `CreateWorkItem` is the excepti
 it is sent to GitLab once and never queued, so it fails while GitLab is away (see
 [Writing directly](#writing-directly-never-queued)).
 
+# Finding the socket
+
+The daemon listens on a unix socket of the user it runs as. A client looks for it in
+this order:
+
+1. `$FORSKAPD_SOCKET`, used verbatim as a varlink address (`unix:/path/to.socket`),
+   else the same under its name from before the rename, `$GITLAB_TRACKRD_SOCKET`.
+2. `$XDG_RUNTIME_DIR/forskapd.socket`, where that variable holds an absolute path;
+   not on macOS, which has no runtime directory.
+3. `forskapd/forskapd.socket` in the user's data directory: `$XDG_DATA_HOME` if it is
+   an absolute path, else `~/.local/share`; on macOS `~/Library/Application Support`.
+
+The last two are the daemon's default socket: `forskap_api::default_socket()` to a
+Rust client, `DefaultAddress()` to a Go one. A daemon told to use another
+(`forskapd --socket`, `[server] socket` in its config) is only found through
+`$FORSKAPD_SOCKET`. The `forskap` CLI also takes a `socket` from its own config file,
+after the environment and before the default; that file is the CLI's business, and
+other clients don't read it.
+
+The socket is its user's alone: mode 0600, in a directory of theirs, never a shared
+one like `/tmp` where another user could put a socket first. On Linux the packages
+ship a systemd user socket unit, `forskapd.socket`, listening on the runtime directory's
+path; once it is enabled (`systemctl --user enable --now forskapd.socket`), the first
+connection starts the daemon, so a client needn't check whether it runs. Installed
+through Homebrew, the daemon runs as a `brew services` service and creates the socket
+when it starts.
+
+# Compatibility
+
+Until forskap-api 1.0 the interface still changes incompatibly between minor
+versions. A client tells which version a daemon speaks by `GetStatus.api_version`; a
+daemon that answers `GetStatus` with `MethodNotFound` is older than 0.32.0, and
+ignores an argument it doesn't know instead of refusing it. A client can use a daemon
+whose `api_version` has its own minor version before 1.0 (every interface change bumps
+the minor; a patch is a fix to a binding alone), and from 1.0 on the same major and a
+minor at least its own. Both bindings carry that rule: `forskap_api::compatible` in
+Rust, `Status.Compatible` in Go, against the version they were built from.
+
+The daemon leaves an optional field without a value out of what it sends, wherever
+the field is; the Rust and Go bindings leave such an argument out too. A daemon
+before 0.32.0 sent the optional fields of its types (`WorkItem.parent`,
+`SyncJob.expected`, …) as `null` instead.
+
+From forskap-api 1.0 on, a client can rely on these:
+
+- Nothing is removed or renamed: no method, type, field, enum variant or error.
+- A field new to a reply is optional (`?T`).
+- A new argument is optional, so a call that leaves it out means what it meant before.
+- An enum that appears in replies (`IssuableKind`, `HistorySource`, `SyncJobStatus`,
+  `NotAuthReason`) gets no new variants: a new state is a new optional field.
+  The enums only arguments take (`SearchKind`, `WorkItemRole`, `WorkItemState`,
+  `CacheScope`) may get new ones, which an older daemon refuses.
+- An incompatible change is a new interface, under a new name, served next to the old
+  one.
+
+And it must tolerate these:
+
+- Reply fields it doesn't know: it ignores them. The Rust and Go bindings do.
+- An optional field that is `null`: it means the same as the field being absent. The
+  Rust and Go bindings read both as `None` / `nil`.
+- `org.varlink.service.InvalidParameter` for an argument or an enum value the daemon
+  doesn't know: a newer client talking to an older daemon. `parameter` names an
+  unknown field, and says which value for an unknown enum value.
+- `org.varlink.service.MethodNotFound` for a method the daemon doesn't have.
+
 # Types
 
-```varlink
-type WorkItem (
-  id:             int,          # global work item ID (unique across the GitLab instance)
-  iid:            int,          # number within its project or group ("#42" of an issue, "&5" of an epic)
-  type:           string,       # "issue", "task", "incident", "test_case", "epic", …
-  project_id:     ?int,         # the project of an issue, task, …; null for an epic
-  group_id:       ?int,         # the group of an epic; null for the rest
-  namespace_path: string,       # the full path of that project ("team/api") or group ("team"):
-                                # the stored project's or group's, else the one in web_url;
-                                # empty when neither gives it
-  title:          string,
-  web_url:        string,
-  state:          string,       # "opened" | "closed"
-  parent:         ?WorkItemRef, # the epic an issue belongs to; null when it has none, and for an epic
-  total_time:     string,       # GitLab's human-readable total spent time ("2h"); empty when none,
-                                # and for an epic
-  graph_status:   string,       # board column the issue sits in, derived from its labels matched
-                                # against the project's issue board; empty when no board/label
-                                # matches, and for an epic
-  open_count:     int,          # opens recorded through RecordOpen (within usage.retention_hours)
-  project_avatar: string,       # file of the project's avatar, see Project.avatar; empty when
-                                # none, and for an epic
-  updated_at:     int           # unix seconds, GitLab's updated_at as of the last sync; 0 when unknown
-)
+The fields are described in the definition; this is what their lines leave out.
 
-type WorkItemRef (
-  project_id: ?int,     # the project of the work item named, or
-  group_id:   ?int,     # its group: exactly one of the two is set
-  iid:        int,
-  type:       ?string,  # "epic", …; null when the naming side doesn't say
-  title:      ?string,
-  web_url:    ?string   # absolute; null when unknown
-)
-```
+## `WorkItem` and `WorkItemRef`
 
 GitLab has made issues, tasks and epics one kind of thing, the *work item*. The wire
 follows: every issue the daemon stores is a work item of its project, with the type
@@ -80,127 +122,23 @@ synced again, which the upgraded daemon does at its first start.
 An issue under an epic names it as `parent`: `group_id`, `iid`, `type` `epic`, its
 title and its link. GitLab links an issue's epic relative to the instance; the daemon
 answers with the stored epic's `web_url`, else the relative link behind the scheme and
-host of the issue's own. An epic's own `parent` is null. An issue synced by a daemon
+host of the issue's own. An epic has no `parent`. An issue synced by a daemon
 that didn't store its epic's group and number has no `parent` until its project is
 synced again, likewise at the first start.
 
-```varlink
-type IssuableKind (work_item, merge_request)
-```
+## `IssuableKind`
 
 The two things time can be tracked on. Every write that addresses an issue or a
 merge request carries an `IssuableKind` next to the `(project_id, iid)` pair, an issue
 being a `work_item`; the iid is the per-project number the UI shows (`#42` for
 issues, `!7` for MRs). `RecordOpen` takes a `work_item` by its group as well: an epic.
 
-```varlink
-type HistoryEvent (
-  timestamp:  int,          # unix seconds — spent_at for synced entries, enqueue time for queued ones
-  source:     HistorySource, # gitlab (synced timelog) | queued (pending PostTime in the retry queue)
-  kind:       IssuableKind, # what the time was logged on
-  project_id: int,
-  iid:        int,
-  title:      string,       # empty on queued events whose issuable is not in the caches
-  web_url:    string,
-  duration:   string,
-  summary:    string
-)
-```
-
-```varlink
-type SyncJobStatus (
-  running,      # its fetch is in flight
-  demanded,     # requested ahead of the schedule; runs before anything merely due
-  due,          # its time has come; runs once the worker gets to it
-  waiting,      # not due yet; an unavailable job rests here until next_due
-  backing_off   # failed; held back until next_due
-)
-
-type SyncJob (
-  key:           string,        # stable job id: "assigned/issues", "recent/authored/issues", "timelogs/recent", "events", "project/<id>/issues", …
-  status:        SyncJobStatus,
-  last_ok:       ?int,          # unix seconds, start of the last successful run; absent if it never ran
-  next_due:      ?int,          # unix seconds, when the schedule runs it next (the retry time while backing off);
-                                # absent while running or demanded, before the first run, and for a job that is
-                                # never due again (a fetched project avatar)
-  running_since: ?int,          # unix seconds, only while running
-  failures:      int,           # consecutive failed runs
-  last_error:    ?string,       # why the last run failed, until a run succeeds
-  unavailable:   ?bool,         # true: GitLab refuses the job for good and the daemon asks once a day
-                                # (see GetSyncJobs); false otherwise. Sent on every job since forskap-api
-                                # 0.28.0: absent means an older daemon, which doesn't tell
-  full:          ?bool,         # only while running, and only for a job that also runs as a delta:
-                                # true for a full run, false for a delta
-  fetched:       ?int,          # rows the running fetch has so far (0 before its first page); only while
-                                # running. Sent since forskap-api 0.30.0
-  expected:      ?int           # rows GitLab announced for the running fetch; absent where it announced
-                                # none (see GetSyncJobs)
-)
-```
-
-```varlink
-type ActivityEvent (
-  timestamp:    int,      # unix seconds
-  action:       string,   # GitLab's action name: "pushed to", "opened", "commented on", "accepted", "joined", …
-  target_type:  string,   # "Issue", "MergeRequest", "Milestone", …; of a comment, what was commented on; empty on pushes and membership events
-  target_iid:   ?int,     # the target's number in its project, where it has one
-  target_title: ?string,
-  project_id:   int,      # 0 for events outside a project
-  project_path: ?string,  # null when neither the project nor the item is in the store
-  web_url:      ?string,  # the issue / MR, a pushed branch's commits, else the project; null when unknown
-  ref:          ?string,  # pushes only: the branch or tag
-  commit_count: ?int,     # pushes only
-  commit_title: ?string,  # pushes only: the newest commit's title; null when the ref was deleted
-  description:  ?string   # what the event did: a comment's first line (at most 200 characters, a cut one ends in …),
-                          # a push's commit_title; null for every other event
-)
-```
-
-```varlink
-type FailedTask (
-  id:         int,          # handle for RetryFailure / DismissFailure
-  op:         string,       # which write failed ("PostTime", "Close", "AssignSelf", "UnassignSelf")
-  kind:       IssuableKind,
-  project_id: int,
-  iid:        int,
-  detail:     string,       # operation-specific summary (e.g. the duration)
-  error:      string,       # the GitLab error that dead-lettered it
-  queued_at:  int,          # unix seconds
-  failed_at:  int           # unix seconds
-)
-```
+## `FailedTask`
 
 Tasks dead-lettered by a daemon predating MR support render with the current `op`
 names (a close reads `"Close"`, never `"CloseIssue"`) and `kind` `work_item`.
 
-```varlink
-type MergeRequest (
-  id:         int,      # global MR ID (unique across the GitLab instance)
-  iid:        int,      # per-project MR number (the "!7" shown in the UI)
-  project_id: int,
-  title:      string,
-  web_url:    string,
-  state:      string,   # "opened" | "closed" | "merged" | "locked"
-  assignees:  []string, # assignee usernames, captured at the last search sync
-  open_count: int,      # opens recorded through RecordOpen (within usage.retention_hours)
-  project_avatar: string, # file of the project's avatar, see Project.avatar; empty when none
-  project_path: string,   # the project's full path ("team/api"): the stored project's, else
-                          # the one in web_url; empty when neither gives it
-  updated_at: int         # unix seconds, GitLab's updated_at as of the last sync; 0 when unknown
-)
-```
-
-```varlink
-type Project (
-  id:       int,
-  name:     string,
-  path:     string,  # full namespace path ("team/backend/api")
-  web_url:  string,
-  avatar:   string,  # absolute path of the avatar image on the daemon's machine;
-                     # empty when the project has none
-  archived: bool     # whether the project is archived (read-only on GitLab)
-)
-```
+## `Project`
 
 `archived` is for the client to act on — grey the project out, sort it last, leave it
 out of a picker: the daemon itself treats an archived project like any other, so
@@ -221,14 +159,7 @@ ran, for projects you are not a member of, for images above 1 MiB, and on GitLab
 16.9. The file may be gone if the cache directory was emptied; the daemon fetches it
 again at its next start.
 
-```varlink
-type Group (
-  id:      int,
-  name:    string,
-  path:    string,  # full group path ("team/backend")
-  web_url: string
-)
-```
+## `Group`
 
 An epic belongs to a group and is numbered within it, so `(group_id, iid)` addresses
 one. Epics are read-only here: the write methods address a project's work items only.
@@ -236,9 +167,14 @@ one. Epics are read-only here: the write methods address a project's work items 
 # Errors
 
 `org.varlink.service.InvalidParameter (parameter: string)` — the call's arguments
-don't fit the method: a required one is missing, or an enum argument (`IssuableKind`,
+don't fit the method: a required one is missing, an enum argument (`IssuableKind`,
 `SearchKind`, `CacheScope`, `WorkItemRole`, `WorkItemState`) carries a value the
-interface doesn't have. `parameter` says what is wrong.
+interface doesn't have, or an argument object has a field the method doesn't know,
+nested ones included (`scope` of `Search`, `parent` of `CreateWorkItem`). `parameter`
+says what is wrong; for an unknown field it is that field's name, `.`-joined below the
+top level (`"labels"`, `"scope.users"`), for the methods without arguments too. An
+argument a newer interface added is thus refused by an older daemon rather than
+ignored.
 
 `GitlabError (message: string)` — GitLab rejected the request (invalid input, API
 error, rate limit), or a local precondition failed (malformed issue reference, invalid
@@ -250,11 +186,7 @@ parent could not be looked up. `message` is human-readable.
 GitLab session (it is *dormant*). `reason` says why; `detail` carries free text (host,
 underlying error) for the reasons that have one. Both fields are optional so older
 daemons that send neither stay compatible — clients fall back to a generic
-"run `forskap auth login`" message.
-
-```varlink
-type NotAuthReason (no_credentials, keychain_error, unreachable, token_rejected, logged_out)
-```
+"run `forskap auth login`" message. The `NotAuthReason`s:
 
 | reason           | meaning                                                            |
 |------------------|--------------------------------------------------------------------|
@@ -298,12 +230,7 @@ items of their project. Served purely from the cache. `WorkItem.parent` carries 
 one's epic, so a client can, for instance, tell which epic most of your recent work
 in a project belongs to.
 
-```varlink
-type WorkItemRole (author, assignee)
-type WorkItemState (opened, closed)
-```
-
-`role` picks one of the two lists; omitted, the reply is their union, with an issue
+`role` picks one of the two lists (`WorkItemRole`); omitted, the reply is their union, with an issue
 you both authored and are assigned to listed once. `states` keeps only issues in one
 of the given states (omitted or empty = both). `updated_after` (unix seconds) keeps
 only issues whose `updated_at` is at or after it — inclusive, like GitLab's parameter
@@ -340,11 +267,7 @@ on project/group names and paths; a query of the exact form `#123` additionally
 matches a project's work items and MRs by their per-project number, one of the form
 `&5` epics by their per-group number. Descriptions are not cached and not searched.
 
-```varlink
-type SearchKind (work_items, merge_requests, projects, groups)
-```
-
-`kinds` restricts the reply to a subset of them (omitted or empty = all four).
+`kinds` restricts the reply to some of its four arrays (omitted or empty = all four).
 `limit` caps each returned array separately (default 50; must be positive); issues
 and epics share `work_items`, so they share its limit. `types` keeps only the work
 items of the listed types (`"issue"`, `"task"`, `"epic"`, …), compared
@@ -354,10 +277,6 @@ omitted or empty = none. With both, a work item must be of one of `types` and of
 of `exclude_types`. Both apply before `limit`, so the limit fills from the work items
 that remain, and neither touches the other kinds. `"exclude_types": ["epic"]` asks
 for every type a project has, the ones GitLab adds later included.
-
-```varlink
-type SearchScope (projects: ?[]int, groups: ?[]string)
-```
 
 `scope` narrows every kind to the listed projects and groups, applied before
 `limit` so a scoped search fills its `limit` from the scope alone. An item passes
@@ -422,7 +341,7 @@ is not the last one; and it re-walks the whole window every
 `search.full_interval_secs`, so an event GitLab showed late or hid at the time is
 picked up. Events carry no link of their own; `web_url`
 and `project_path` come from the stored issue, merge request and project rows and
-are null for events in projects the store doesn't know (the project row exists for
+are absent for events in projects the store doesn't know (the project row exists for
 member projects only). A comment's text is not stored. Served from the store alone;
 degrades to an empty reply on cache trouble. When the events have never been synced:
 replies with an empty array if a session exists (first sync pending),
@@ -443,6 +362,21 @@ once GitLab refused to rotate it.
 
 A dry run (`forskapd --dry-run`) answers with the host `dry-run.invalid` and the user
 `demo`; its `Login` and `Logout` reply `GitlabError`.
+
+### `GetStatus() -> (api_version: string, daemon_version: string, connected: bool, reason: ?NotAuthReason, detail: ?string, host: ?string, username: ?string, user_id: ?int)`
+
+What a client asks first: which version of this interface the daemon speaks and
+whether it has a GitLab session. `api_version` is the version of the `forskap-api`
+crate the daemon was built with (`forskap_api::API_VERSION` to a Rust client,
+`APIVersion` to a Go one; see [Compatibility](#compatibility) for which ones fit);
+`daemon_version` is the daemon's own, the one `org.varlink.service.GetInfo` reports,
+which says nothing about the interface. A daemon from before forskap-api 0.32.0 has
+no `GetStatus` and answers `org.varlink.service.MethodNotFound`.
+
+While `connected`, `host`, `username` and `user_id` are set as `WhoAmI` answers them
+and `reason` and `detail` are absent; otherwise `reason` and `detail` are what
+`NotAuthenticated` would carry and the other three are absent. Never an error:
+served whatever the session is, without a GitLab round-trip.
 
 ## Writing (queued when GitLab is away)
 
@@ -622,10 +556,6 @@ number or ID that isn't positive is an eager `GitlabError`.
 
 ### `ClearCache(scope: ?[]CacheScope) -> ()`
 
-```varlink
-type CacheScope (assigned, search, quick, slow, stale, usage)
-```
-
 Clears cached state and makes its sync jobs due at once. Omitted or empty `scope`
 clears everything synced. Otherwise each scope selects a slice:
 
@@ -668,6 +598,9 @@ Drops the session (subsequent calls reply `NotAuthenticated` with reason
 ```sh
 SOCKET=unix:$XDG_RUNTIME_DIR/forskapd.socket
 
+# the interface version the daemon speaks, and its session
+varlinkctl call $SOCKET org.thehoster.forskapd.GetStatus '{}'
+
 # list assigned issues
 varlinkctl call $SOCKET org.thehoster.forskapd.GetAssignedWorkItems '{}'
 
@@ -683,8 +616,9 @@ varlinkctl call $SOCKET org.thehoster.forskapd.Search \
 varlinkctl call $SOCKET org.thehoster.forskapd.Search \
   '{"query": "billing", "exclude_types": ["epic"]}'
 
-# count an open of epic &5 of group 9
-varlinkctl call $SOCKET org.thehoster.forskapd.RecordOpen \
+# count an open of epic &5 of group 9; oneway: the daemon runs it and answers
+# nothing, not even an error
+varlinkctl call --oneway $SOCKET org.thehoster.forskapd.RecordOpen \
   '{"kind": "work_item", "iid": 5, "group_id": 9}'
 
 # post 1h30m to project 42, issue #7

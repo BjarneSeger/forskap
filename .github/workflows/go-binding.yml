@@ -1,18 +1,21 @@
 name: Go binding
 
 # Guards the checked-in Go binding (clients/go) against drift from the varlink
-# interface it is generated from. Fails if someone edits the .varlink without
-# regenerating, or hand-edits the generated file.
+# interface it is generated from. Fails if someone edits the .varlink, or bumps
+# the forskap-api version version.go carries, without regenerating, or
+# hand-edits a generated file.
 
 on:
   push:
     paths:
       - "forskap-api/varlink/**"
+      - "forskap-api/Cargo.toml"
       - "clients/go/**"
       - ".github/workflows/go-binding.yml"
   pull_request:
     paths:
       - "forskap-api/varlink/**"
+      - "forskap-api/Cargo.toml"
       - "clients/go/**"
       - ".github/workflows/go-binding.yml"
 

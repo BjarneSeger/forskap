@@ -399,7 +399,7 @@ mod tests {
         let waiting = sync_job(info("project/9/issues", JobStatus::Waiting));
         let json = serde_json::to_value(&waiting).unwrap();
         for key in ["full", "fetched", "expected"] {
-            assert!(json[key].is_null(), "{key} in {json}");
+            assert!(json.get(key).is_none(), "{key} in {json}");
         }
     }
 

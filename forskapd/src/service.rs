@@ -13,13 +13,14 @@ use varlink::sansio::ServerEvent;
 use forskap_api::{
     AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
     Call_CreateWorkItem, Call_DismissFailure, Call_GetActivity, Call_GetAssignedMergeRequests,
-    Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetSyncJobs,
+    Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetStatus, Call_GetSyncJobs,
     Call_ListWorkItems, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
-    Call_Search, Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, Close_Args, CreateWorkItem_Args,
-    DismissFailure_Args, GetActivity_Args, GetAssignedMergeRequests_Args,
-    GetAssignedWorkItems_Args, GetHistory_Args, ListWorkItems_Args, Login_Args, PostTime_Args,
-    RecordOpen_Args, RetryFailure_Args, Search_Args, UnassignSelf_Args,
-    VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
+    Call_Search, Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, ClearFailures_Args, Close_Args,
+    CreateWorkItem_Args, DismissFailure_Args, GetActivity_Args, GetAssignedMergeRequests_Args,
+    GetAssignedWorkItems_Args, GetFailures_Args, GetHistory_Args, GetStatus_Args, GetSyncJobs_Args,
+    ListWorkItems_Args, Login_Args, Logout_Args, PostTime_Args, RecordOpen_Args, RetryFailure_Args,
+    Search_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
+    WhoAmI_Args,
 };
 
 use crate::handlers::Handlers;
@@ -63,6 +64,9 @@ impl varlink::AsyncConnectionHandler for ServiceHandler {
             match event {
                 ServerEvent::Request { request } => {
                     debug!(method = request.method.as_ref(), "varlink request");
+                    // The varlink crate doesn't hold the reply back: a oneway
+                    // caller would read it as the answer to its next call.
+                    let oneway = request.oneway.unwrap_or(false);
                     let method = request.method.as_ref();
                     let reply = if let Some(reply) = handle_varlink_meta(method, &request) {
                         Some(reply)
@@ -75,7 +79,7 @@ impl varlink::AsyncConnectionHandler for ServiceHandler {
                             Some(serde_json::json!({"method": method})),
                         ))
                     };
-                    if let Some(reply) = reply {
+                    if let Some(reply) = reply.filter(|_| !oneway) {
                         server.send_reply(reply)?;
                     }
                 }
@@ -121,17 +125,45 @@ fn handle_varlink_meta(method: &str, request: &varlink::Request) -> Option<Reply
 }
 
 /// The call's arguments, or the `InvalidParameter` reply saying why they
-/// don't parse (a missing field, an unknown enum value). An omitted
-/// `parameters` block reads as an empty one: a valid call of a method whose
-/// arguments are all optional.
+/// don't parse (a missing field, an unknown enum value) or naming a field the
+/// method doesn't have: a newer client's argument this daemon would ignore
+/// unseen. An omitted `parameters` block reads as an empty one: a valid call
+/// of a method whose arguments are all optional.
 fn parse_args<T: DeserializeOwned>(params: Option<serde_json::Value>) -> Result<T, Reply> {
-    let params = params.unwrap_or_else(|| serde_json::json!({}));
-    serde_json::from_value(params).map_err(|e| {
+    let invalid = |parameter: String| {
         Reply::error(
             "org.varlink.service.InvalidParameter",
-            Some(serde_json::json!({"parameter": e.to_string()})),
+            Some(serde_json::json!({ "parameter": parameter })),
         )
+    };
+    let params = params.unwrap_or_else(|| serde_json::json!({}));
+    let mut unknown = None;
+    let args = serde_ignored::deserialize(params, |path| {
+        unknown.get_or_insert_with(|| field_name(&path));
     })
+    .map_err(|e| invalid(e.to_string()))?;
+    match unknown {
+        Some(field) => Err(invalid(field)),
+        None => Ok(args),
+    }
+}
+
+/// `scope.groups`, `parent.iid`: serde_ignored's path without the `?` it puts
+/// in for an optional's content.
+fn field_name(path: &serde_ignored::Path) -> String {
+    use serde_ignored::Path;
+    let (parent, name) = match path {
+        Path::Root => return String::new(),
+        Path::Seq { parent, index } => (parent, index.to_string()),
+        Path::Map { parent, key } => (parent, key.clone()),
+        Path::Some { parent }
+        | Path::NewtypeStruct { parent }
+        | Path::NewtypeVariant { parent } => return field_name(parent),
+    };
+    match field_name(parent) {
+        parent if parent.is_empty() => name,
+        parent => format!("{parent}.{name}"),
+    }
 }
 
 async fn handle_forskapd(
@@ -172,13 +204,21 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.GetFailures" => {
+            let GetFailures_Args {} = args!();
             handlers
                 .get_failures(&mut call as &mut dyn Call_GetFailures)
                 .await?;
         }
         "org.thehoster.forskapd.GetSyncJobs" => {
+            let GetSyncJobs_Args {} = args!();
             handlers
                 .get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
+                .await?;
+        }
+        "org.thehoster.forskapd.GetStatus" => {
+            let GetStatus_Args {} = args!();
+            handlers
+                .get_status(&mut call as &mut dyn Call_GetStatus)
                 .await?;
         }
         "org.thehoster.forskapd.RetryFailure" => {
@@ -194,6 +234,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.ClearFailures" => {
+            let ClearFailures_Args {} = args!();
             handlers
                 .clear_failures(&mut call as &mut dyn Call_ClearFailures)
                 .await?;
@@ -320,9 +361,11 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.Logout" => {
+            let Logout_Args {} = args!();
             handlers.logout(&mut call as &mut dyn Call_Logout).await?;
         }
         "org.thehoster.forskapd.WhoAmI" => {
+            let WhoAmI_Args {} = args!();
             handlers.who_am_i(&mut call as &mut dyn Call_WhoAmI).await?;
         }
         _ => {
@@ -392,6 +435,46 @@ mod tests {
         assert_eq!(excluded, ["issue"]);
     }
 
+    /// A oneway call runs and gets no reply, not even an error: the one
+    /// answer on the connection is the next call's.
+    #[tokio::test]
+    async fn a_oneway_call_gets_no_reply() {
+        use varlink::AsyncConnectionHandler as _;
+
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        let handlers = Arc::new(handlers);
+        let service = ServiceHandler::new(Arc::clone(&handlers));
+        let mut server = varlink::sansio::Server::new();
+        let open = serde_json::json!({"kind": "work_item", "iid": 2, "project_id": 1});
+        for call in [
+            serde_json::json!({"method": "org.thehoster.forskapd.RecordOpen", "parameters": open, "oneway": true}),
+            serde_json::json!({"method": "org.thehoster.forskapd.NoSuchMethod", "oneway": true}),
+            serde_json::json!({"method": "org.example.Other", "oneway": true}),
+            serde_json::json!({"method": "org.thehoster.forskapd.Close", "parameters": {"project_id": 1}, "oneway": true}),
+            serde_json::json!({"method": "org.thehoster.forskapd.WhoAmI", "oneway": true}),
+            serde_json::json!({"method": "org.varlink.service.GetInfo", "oneway": true}),
+            serde_json::json!({"method": "org.thehoster.forskapd.GetStatus", "oneway": false}),
+        ] {
+            let mut message = serde_json::to_vec(&call).unwrap();
+            message.push(0);
+            server.handle_input(&message).unwrap();
+        }
+        service.handle(&mut server, None).await.unwrap();
+
+        let sent: Vec<String> = std::iter::from_fn(|| server.poll_transmit())
+            .map(|t| String::from_utf8(t.payload).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let reply: serde_json::Value =
+            serde_json::from_str(sent[0].trim_end_matches('\0')).unwrap();
+        assert_eq!(
+            reply["parameters"]["api_version"],
+            forskap_api::API_VERSION,
+            "{reply}"
+        );
+        assert_eq!(handlers.usage.snapshot().unwrap().entries.len(), 1);
+    }
+
     /// The methods the work items replaced are gone, not answered.
     #[tokio::test]
     async fn removed_methods_are_not_found() {
@@ -420,7 +503,8 @@ mod tests {
 
     /// Unparseable arguments are answered, not punished by a dropped
     /// connection: an enum value the interface doesn't have, a missing
-    /// required field.
+    /// required field, a field the method doesn't have (named exactly, in
+    /// quotes), nested ones too.
     #[tokio::test]
     async fn invalid_arguments_get_an_invalid_parameter_reply() {
         let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
@@ -467,6 +551,66 @@ mod tests {
                 "iid",
             ),
             ("Search", Some(serde_json::json!({"kinds": []})), "query"),
+            (
+                "Search",
+                Some(serde_json::json!({"query": "x", "labels": ["bug"]})),
+                r#""labels""#,
+            ),
+            (
+                "Search",
+                Some(serde_json::json!({"query": "x", "scope": {"projects": [1], "users": [2]}})),
+                r#""scope.users""#,
+            ),
+            (
+                "CreateWorkItem",
+                Some(serde_json::json!({
+                    "project_id": 1,
+                    "title": "x",
+                    "parent": {"group_id": 3, "iid": 5, "state": "opened"},
+                })),
+                r#""parent.state""#,
+            ),
+            (
+                "RecordOpen",
+                Some(serde_json::json!({"kind": "work_item", "iid": 2, "project_id": 1, "at": 0})),
+                r#""at""#,
+            ),
+            (
+                "GetHistory",
+                Some(serde_json::json!({"since": 0})),
+                r#""since""#,
+            ),
+            // The methods without arguments as well.
+            (
+                "GetFailures",
+                Some(serde_json::json!({"op": "Close"})),
+                r#""op""#,
+            ),
+            (
+                "ClearFailures",
+                Some(serde_json::json!({"ids": [1]})),
+                r#""ids""#,
+            ),
+            (
+                "GetSyncJobs",
+                Some(serde_json::json!({"key": "events"})),
+                r#""key""#,
+            ),
+            (
+                "GetStatus",
+                Some(serde_json::json!({"verbose": true})),
+                r#""verbose""#,
+            ),
+            (
+                "WhoAmI",
+                Some(serde_json::json!({"host": "x"})),
+                r#""host""#,
+            ),
+            (
+                "Logout",
+                Some(serde_json::json!({"forget": true})),
+                r#""forget""#,
+            ),
         ] {
             let reply = handle_forskapd(
                 &format!("org.thehoster.forskapd.{method}"),
@@ -486,19 +630,53 @@ mod tests {
         }
     }
 
-    /// Every argument of these is optional, so a call without a
-    /// `parameters` block is valid.
+    /// Every argument of these is optional, or they have none, so a call
+    /// without a `parameters` block or with an empty one is valid: answered,
+    /// dormant, as the method answers it.
     #[tokio::test]
     async fn optional_arguments_may_be_omitted() {
         let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
-        for method in ["ClearCache", "GetHistory"] {
-            let reply =
-                handle_forskapd(&format!("org.thehoster.forskapd.{method}"), None, &handlers)
-                    .await
-                    .unwrap()
-                    .expect("a reply");
-            assert!(reply.error.is_none(), "{method}: {:?}", reply.error);
+        for (method, error) in [
+            ("ClearCache", None),
+            ("GetHistory", None),
+            ("GetFailures", None),
+            ("ClearFailures", None),
+            ("GetSyncJobs", None),
+            ("GetStatus", None),
+            ("WhoAmI", Some("org.thehoster.forskapd.NotAuthenticated")),
+            // The tests' disabled keychain turns it down.
+            ("Logout", Some("org.thehoster.forskapd.GitlabError")),
+        ] {
+            for params in [None, Some(serde_json::json!({}))] {
+                let reply = handle_forskapd(
+                    &format!("org.thehoster.forskapd.{method}"),
+                    params.clone(),
+                    &handlers,
+                )
+                .await
+                .unwrap()
+                .expect("a reply");
+                assert_eq!(reply.error.as_deref(), error, "{method} {params:?}");
+            }
         }
+    }
+
+    /// Answered whatever the session is, without arguments.
+    #[tokio::test]
+    async fn dispatch_has_an_arm_for_get_status() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        let reply = handle_forskapd("org.thehoster.forskapd.GetStatus", None, &handlers)
+            .await
+            .unwrap()
+            .expect("a reply");
+        assert!(
+            reply.error.is_none(),
+            "GetStatus is missing its dispatch arm: {:?}",
+            reply.error
+        );
+        let status = reply.parameters.expect("a result");
+        assert_eq!(status["api_version"], forskap_api::API_VERSION);
+        assert_eq!(status["connected"], false);
     }
 
     #[tokio::test]

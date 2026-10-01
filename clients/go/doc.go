@@ -3,9 +3,10 @@
 // daemon over a Unix socket.
 //
 // The wire types and low-level call helpers (orgthehosterforskapd.go) are
-// generated from the interface definition shared with the Rust crates; the
-// Client type (client.go) is a thin, hand-written convenience layer that resolves
-// the daemon socket and exposes one Go method per varlink method.
+// generated from the interface definition shared with the Rust crates, and
+// APIVersion (version.go) from that definition's version; the Client type
+// (client.go) is a thin, hand-written convenience layer that resolves the
+// daemon socket and exposes one Go method per varlink method.
 //
 // Because the generated package name is derived from the interface name, callers
 // usually import it under a shorter alias:

@@ -13,6 +13,12 @@ this list top to bottom.
 
 - Interface name is `org.thehoster.forskapd`. Keep the existing style: one blank
   line between declarations, optional params/fields as `?type`.
+- Document in the file itself: a short `#` comment on the lines before each new type,
+  method and error, and before each field or enum variant whose name doesn't say it
+  all (units, when it is absent or empty, since which version it is sent). Comments go
+  on their own lines: that is what both generators and systemd's `varlinkctl` parse,
+  and what introspection shows. Leave the `interface` line without one: the Go
+  generator would turn it into a second package comment of the binding.
 - Bump the version in `forskap-api/Cargo.toml` **in the same feature commit**.
   Convention (see git history): the api crate's version moves inside the commit that
   changes the interface; the workspace version moves only in separate
@@ -24,7 +30,10 @@ this list top to bottom.
 `forskap-api/build.rs` runs `varlink_generator` into `$OUT_DIR` on every build;
 `lib.rs` `include!`s it. No manual step — the next `cargo build` yields the new
 `VarlinkInterface` trait, `Call_*` traits, and request/reply structs. Compile errors in
-the daemon are the to-do list.
+the daemon are the to-do list. The build script also gives every `Option` field
+`skip_serializing_if`, so an absent field is left out rather than sent as `null`; it
+fails the build if the `Option` fields it finds don't match the `.varlink` file's
+optional ones (the generator's output changed: adapt `OmitAbsent`).
 
 ## 3. Daemon handlers
 
@@ -59,7 +68,9 @@ the daemon are the to-do list.
 - **New method? Add its arm to the hand-written dispatcher** `handle_forskapd` in
   `forskapd/src/service.rs` (clone the arm of an argument-identical method) plus a
   `dispatch_has_an_arm_for_<method>` test next to `dispatch_has_an_arm_for_search`. A
-  missing arm compiles fine and only fails at runtime as `MethodNotFound`.
+  missing arm compiles fine and only fails at runtime as `MethodNotFound`. Every arm
+  parses its `*_Args` through `args!()`, an empty one too (`let WhoAmI_Args {} =
+  args!();`): that is what refuses an argument the method doesn't have.
 - New field on a wire type? The store holds GitLab mirrors, not wire types: add the
   field to the mirror in `sync/model.rs` (lenient `serde(default)`) and bump that
   resource's `SCHEMA`, so every job syncing it runs full once and refills old rows.
@@ -76,20 +87,25 @@ build and are gitignored.
 
 ## 5. Docs
 
-Update `forskapd/docs/varlink_interface.md` — it documents every method, type,
-and error. Keep it complete; it is the human-facing contract.
+Update `forskapd/docs/varlink_interface.md` with what the `.varlink` comments can't
+say: what a method does beyond its line, ordering, caching, edge cases, tables,
+examples. Don't copy type bodies or field lists there — the doc points to the
+`.varlink` file for the shapes, and a copy drifts.
 
 ## 6. Go binding (CI trap)
 
 ```sh
 cd clients/go
-go generate ./...   # copies the .varlink in, runs varlink-go-interface-generator
+go generate ./...   # copies the .varlink in, runs varlink-go-interface-generator,
+                    # writes version.go from forskap-api/Cargo.toml
 go build ./... && go vet ./...
 ```
 
-Commit the regenerated `orgthehosterforskapd.go` — never hand-edit it. CI
-(`.github/workflows/go-binding.yml`) regenerates and fails on `git diff` if the
-committed binding is stale.
+Commit the regenerated `orgthehosterforskapd.go` and `version.go` — never hand-edit
+them. `version.go` holds `APIVersion`, the api crate's version, so a version bump alone
+makes the binding stale too. CI (`.github/workflows/go-binding.yml`, which also runs on
+`forskap-api/Cargo.toml`) regenerates and fails on `git diff` if the committed binding
+is stale.
 
 Once the change is on `main`, tag the binding with the api crate's version and push the
 tag — without one, `go get` only offers consumers a pseudo-version:

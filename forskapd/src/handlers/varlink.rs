@@ -11,7 +11,7 @@ use tracing::{debug, info, instrument, warn};
 use forskap_api::{
     ActivityEvent, CacheScope, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
     Call_CreateWorkItem, Call_DismissFailure, Call_GetActivity, Call_GetAssignedMergeRequests,
-    Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetSyncJobs,
+    Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetStatus, Call_GetSyncJobs,
     Call_ListWorkItems, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
     Call_Search, Call_UnassignSelf, Call_WhoAmI, FailedTask, Group, HistoryEvent, HistorySource,
     IssuableKind, MergeRequest, Project, SearchKind, SearchScope, VarlinkInterface, WorkItem,
@@ -1122,6 +1122,38 @@ impl VarlinkInterface for Handlers {
             snapshot.jobs.into_iter().map(wire::sync_job).collect(),
             snapshot.paused_until.map(|at| at as i64),
         )
+    }
+
+    /// Never an error: a client asks it first, whatever the session is.
+    #[instrument(skip(self, call))]
+    async fn get_status(&self, call: &mut dyn Call_GetStatus) -> varlink::Result<()> {
+        let api_version = forskap_api::API_VERSION.to_string();
+        let daemon_version = env!("CARGO_PKG_VERSION").to_string();
+        match self.current_session().await {
+            Ok(s) => call.reply(
+                api_version,
+                daemon_version,
+                true,
+                None,
+                None,
+                Some(s.host),
+                Some(s.username),
+                Some(s.user_id),
+            ),
+            Err(e) => {
+                let (reason, detail) = dormant_args(&e);
+                call.reply(
+                    api_version,
+                    daemon_version,
+                    false,
+                    reason,
+                    detail,
+                    None,
+                    None,
+                    None,
+                )
+            }
+        }
     }
 
     #[instrument(skip(self, call))]

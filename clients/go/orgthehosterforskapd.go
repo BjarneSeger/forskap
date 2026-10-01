@@ -11,6 +11,7 @@ import (
 
 // Generated type declarations
 
+// A work item named by where it lives and its number.
 type WorkItemRef struct {
 	Project_id *int64  `json:"project_id,omitempty"`
 	Group_id   *int64  `json:"group_id,omitempty"`
@@ -20,6 +21,7 @@ type WorkItemRef struct {
 	Web_url    *string `json:"web_url,omitempty"`
 }
 
+// An issue, task, epic, …: GitLab's work item, of a project or of a group.
 type WorkItem struct {
 	Id             int64        `json:"id"`
 	Iid            int64        `json:"iid"`
@@ -38,10 +40,13 @@ type WorkItem struct {
 	Updated_at     int64        `json:"updated_at"`
 }
 
+// What a write or RecordOpen targets; an issue is a work_item.
 type IssuableKind string
 
+// Where a HistoryEvent comes from.
 type HistorySource string
 
+// Time logged on an issue or merge request.
 type HistoryEvent struct {
 	Timestamp  int64         `json:"timestamp"`
 	Source     HistorySource `json:"source"`
@@ -54,6 +59,7 @@ type HistoryEvent struct {
 	Summary    string        `json:"summary"`
 }
 
+// One of the user's contribution events (GitLab's GET /events).
 type ActivityEvent struct {
 	Timestamp    int64   `json:"timestamp"`
 	Action       string  `json:"action"`
@@ -69,6 +75,7 @@ type ActivityEvent struct {
 	Description  *string `json:"description,omitempty"`
 }
 
+// A write that exhausted its retry window or was rejected while draining.
 type FailedTask struct {
 	Id         int64        `json:"id"`
 	Op         string       `json:"op"`
@@ -95,6 +102,7 @@ type MergeRequest struct {
 	Updated_at     int64    `json:"updated_at"`
 }
 
+// A project the user is a member of.
 type Project struct {
 	Id       int64  `json:"id"`
 	Name     string `json:"name"`
@@ -104,6 +112,7 @@ type Project struct {
 	Archived bool   `json:"archived"`
 }
 
+// A group the user is a member of.
 type Group struct {
 	Id      int64  `json:"id"`
 	Name    string `json:"name"`
@@ -111,8 +120,10 @@ type Group struct {
 	Web_url string `json:"web_url"`
 }
 
+// Where a SyncJob stands.
 type SyncJobStatus string
 
+// A job of the sync worker.
 type SyncJob struct {
 	Key           string        `json:"key"`
 	Status        SyncJobStatus `json:"status"`
@@ -127,21 +138,29 @@ type SyncJob struct {
 	Expected      *int64        `json:"expected,omitempty"`
 }
 
+// Why the daemon has no GitLab session.
 type NotAuthReason string
 
+// Which of ListWorkItems' lists: the issues the user authored, or is assigned to.
 type WorkItemRole string
 
+// The states ListWorkItems filters by; WorkItem.state carries them.
 type WorkItemState string
 
+// The result sets of a Search.
 type SearchKind string
 
+// Projects by ID and groups by path (subgroups included) a Search keeps to.
 type SearchScope struct {
 	Projects *[]int64  `json:"projects,omitempty"`
 	Groups   *[]string `json:"groups,omitempty"`
 }
 
+// What ClearCache clears.
 type CacheScope string
 
+// GitLab rejected the request, or a local precondition failed (a malformed
+// reference or duration, an unknown failure id, …).
 type GitlabError struct {
 	Message string `json:"message"`
 }
@@ -152,6 +171,8 @@ func (e GitlabError) Error() string {
 	return s
 }
 
+// The daemon has no live GitLab session; detail carries the host and the
+// underlying error for the reasons that have one.
 type NotAuthenticated struct {
 	Reason *NotAuthReason `json:"reason,omitempty"`
 	Detail *string        `json:"detail,omitempty"`
@@ -195,6 +216,7 @@ func Dispatch_Error(err error) error {
 
 // Generated client method calls
 
+// Open issues assigned to the user, optionally only those in the given groups.
 type GetAssignedWorkItems_methods struct{}
 
 func GetAssignedWorkItems() GetAssignedWorkItems_methods { return GetAssignedWorkItems_methods{} }
@@ -254,6 +276,8 @@ func (m GetAssignedWorkItems_methods) Upgrade(ctx context.Context, c *varlink.Co
 	}, nil
 }
 
+// Open merge requests assigned to the user, optionally only those in the given
+// groups.
 type GetAssignedMergeRequests_methods struct{}
 
 func GetAssignedMergeRequests() GetAssignedMergeRequests_methods {
@@ -315,6 +339,8 @@ func (m GetAssignedMergeRequests_methods) Upgrade(ctx context.Context, c *varlin
 	}, nil
 }
 
+// The user's own issues, closed ones included, updated recently; newest-updated
+// first.
 type ListWorkItems_methods struct{}
 
 func ListWorkItems() ListWorkItems_methods { return ListWorkItems_methods{} }
@@ -382,6 +408,8 @@ func (m ListWorkItems_methods) Upgrade(ctx context.Context, c *varlink.Connectio
 	}, nil
 }
 
+// Searches the cached corpus; work items and merge requests rank by their
+// RecordOpen counts.
 type Search_methods struct{}
 
 func Search() Search_methods { return Search_methods{} }
@@ -473,6 +501,7 @@ func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, quer
 	}, nil
 }
 
+// Logs spent time on an issue or merge request; queued while GitLab is away.
 type PostTime_methods struct{}
 
 func PostTime() PostTime_methods { return PostTime_methods{} }
@@ -540,6 +569,7 @@ func (m PostTime_methods) Upgrade(ctx context.Context, c *varlink.Connection, pr
 	}, nil
 }
 
+// Closes an issue or merge request; queued while GitLab is away.
 type Close_methods struct{}
 
 func Close() Close_methods { return Close_methods{} }
@@ -599,6 +629,7 @@ func (m Close_methods) Upgrade(ctx context.Context, c *varlink.Connection, proje
 	}, nil
 }
 
+// Assigns the user to an issue or merge request; queued while GitLab is away.
 type AssignSelf_methods struct{}
 
 func AssignSelf() AssignSelf_methods { return AssignSelf_methods{} }
@@ -658,6 +689,8 @@ func (m AssignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection, 
 	}, nil
 }
 
+// Removes the user from an issue's or merge request's assignees; queued while
+// GitLab is away.
 type UnassignSelf_methods struct{}
 
 func UnassignSelf() UnassignSelf_methods { return UnassignSelf_methods{} }
@@ -717,6 +750,8 @@ func (m UnassignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection
 	}, nil
 }
 
+// Creates an issue in a project, optionally under an epic. Sent to GitLab once,
+// never queued.
 type CreateWorkItem_methods struct{}
 
 func CreateWorkItem() CreateWorkItem_methods { return CreateWorkItem_methods{} }
@@ -800,6 +835,8 @@ func (m CreateWorkItem_methods) Upgrade(ctx context.Context, c *varlink.Connecti
 	}, nil
 }
 
+// Counts an open of a project's work item or merge request, or of a group's
+// epic. Local only: works while dormant.
 type RecordOpen_methods struct{}
 
 func RecordOpen() RecordOpen_methods { return RecordOpen_methods{} }
@@ -863,6 +900,7 @@ func (m RecordOpen_methods) Upgrade(ctx context.Context, c *varlink.Connection, 
 	}, nil
 }
 
+// Clears cached state, all of it or the given scopes, and syncs it again.
 type ClearCache_methods struct{}
 
 func ClearCache() ClearCache_methods { return ClearCache_methods{} }
@@ -914,6 +952,7 @@ func (m ClearCache_methods) Upgrade(ctx context.Context, c *varlink.Connection, 
 	}, nil
 }
 
+// Time logged in the last days (default 7): synced timelogs and queued PostTimes.
 type GetHistory_methods struct{}
 
 func GetHistory() GetHistory_methods { return GetHistory_methods{} }
@@ -973,6 +1012,7 @@ func (m GetHistory_methods) Upgrade(ctx context.Context, c *varlink.Connection, 
 	}, nil
 }
 
+// The user's contribution events of the last days (default 7), newest first.
 type GetActivity_methods struct{}
 
 func GetActivity() GetActivity_methods { return GetActivity_methods{} }
@@ -1032,6 +1072,7 @@ func (m GetActivity_methods) Upgrade(ctx context.Context, c *varlink.Connection,
 	}, nil
 }
 
+// The dead-lettered writes.
 type GetFailures_methods struct{}
 
 func GetFailures() GetFailures_methods { return GetFailures_methods{} }
@@ -1083,6 +1124,7 @@ func (m GetFailures_methods) Upgrade(ctx context.Context, c *varlink.Connection)
 	}, nil
 }
 
+// Queues a dead-lettered write again.
 type RetryFailure_methods struct{}
 
 func RetryFailure() RetryFailure_methods { return RetryFailure_methods{} }
@@ -1134,6 +1176,7 @@ func (m RetryFailure_methods) Upgrade(ctx context.Context, c *varlink.Connection
 	}, nil
 }
 
+// Drops a dead-lettered write.
 type DismissFailure_methods struct{}
 
 func DismissFailure() DismissFailure_methods { return DismissFailure_methods{} }
@@ -1185,6 +1228,7 @@ func (m DismissFailure_methods) Upgrade(ctx context.Context, c *varlink.Connecti
 	}, nil
 }
 
+// Drops every dead-lettered write.
 type ClearFailures_methods struct{}
 
 func ClearFailures() ClearFailures_methods { return ClearFailures_methods{} }
@@ -1228,6 +1272,8 @@ func (m ClearFailures_methods) Upgrade(ctx context.Context, c *varlink.Connectio
 	}, nil
 }
 
+// The sync worker's jobs in the order it runs them, and until when a GitLab rate
+// limit pauses them all. Never an error.
 type GetSyncJobs_methods struct{}
 
 func GetSyncJobs() GetSyncJobs_methods { return GetSyncJobs_methods{} }
@@ -1283,6 +1329,89 @@ func (m GetSyncJobs_methods) Upgrade(ctx context.Context, c *varlink.Connection)
 	}, nil
 }
 
+// The interface version the daemon speaks, its own version and its session:
+// the account while connected, else why not. Never an error.
+type GetStatus_methods struct{}
+
+func GetStatus() GetStatus_methods { return GetStatus_methods{} }
+
+func (m GetStatus_methods) Call(ctx context.Context, c *varlink.Connection) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, err_ error) {
+	receive, err_ := m.Send(ctx, c, 0)
+	if err_ != nil {
+		return
+	}
+	api_version_out_, daemon_version_out_, connected_out_, reason_out_, detail_out_, host_out_, username_out_, user_id_out_, _, err_ = receive(ctx)
+	return
+}
+
+func (m GetStatus_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64) (func(ctx context.Context) (string, string, bool, *NotAuthReason, *string, *string, *string, *int64, uint64, error), error) {
+	receive, err := c.Send(ctx, "org.thehoster.forskapd.GetStatus", nil, flags)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, flags uint64, err error) {
+		var out struct {
+			Api_version    string         `json:"api_version"`
+			Daemon_version string         `json:"daemon_version"`
+			Connected      bool           `json:"connected"`
+			Reason         *NotAuthReason `json:"reason,omitempty"`
+			Detail         *string        `json:"detail,omitempty"`
+			Host           *string        `json:"host,omitempty"`
+			Username       *string        `json:"username,omitempty"`
+			User_id        *int64         `json:"user_id,omitempty"`
+		}
+		flags, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		api_version_out_ = out.Api_version
+		daemon_version_out_ = out.Daemon_version
+		connected_out_ = out.Connected
+		reason_out_ = out.Reason
+		detail_out_ = out.Detail
+		host_out_ = out.Host
+		username_out_ = out.Username
+		user_id_out_ = out.User_id
+		return
+	}, nil
+}
+
+func (m GetStatus_methods) Upgrade(ctx context.Context, c *varlink.Connection) (func(ctx context.Context) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.GetStatus", nil)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, flags uint64, conn varlink.ReadWriterContext, err error) {
+		var out struct {
+			Api_version    string         `json:"api_version"`
+			Daemon_version string         `json:"daemon_version"`
+			Connected      bool           `json:"connected"`
+			Reason         *NotAuthReason `json:"reason,omitempty"`
+			Detail         *string        `json:"detail,omitempty"`
+			Host           *string        `json:"host,omitempty"`
+			Username       *string        `json:"username,omitempty"`
+			User_id        *int64         `json:"user_id,omitempty"`
+		}
+		flags, conn, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		api_version_out_ = out.Api_version
+		daemon_version_out_ = out.Daemon_version
+		connected_out_ = out.Connected
+		reason_out_ = out.Reason
+		detail_out_ = out.Detail
+		host_out_ = out.Host
+		username_out_ = out.Username
+		user_id_out_ = out.User_id
+		return
+	}, nil
+}
+
+// Connects to a GitLab host with a personal access token and stores it in the
+// keychain.
 type Login_methods struct{}
 
 func Login() Login_methods { return Login_methods{} }
@@ -1338,6 +1467,7 @@ func (m Login_methods) Upgrade(ctx context.Context, c *varlink.Connection, host_
 	}, nil
 }
 
+// Drops the session and the stored credentials.
 type Logout_methods struct{}
 
 func Logout() Logout_methods { return Logout_methods{} }
@@ -1381,6 +1511,7 @@ func (m Logout_methods) Upgrade(ctx context.Context, c *varlink.Connection) (fun
 	}, nil
 }
 
+// The connected host and user, and when the token expires.
 type WhoAmI_methods struct{}
 
 func WhoAmI() WhoAmI_methods { return WhoAmI_methods{} }
@@ -1469,6 +1600,7 @@ type orgthehosterforskapdInterface interface {
 	DismissFailure(ctx context.Context, c VarlinkCall, id_ int64) error
 	ClearFailures(ctx context.Context, c VarlinkCall) error
 	GetSyncJobs(ctx context.Context, c VarlinkCall) error
+	GetStatus(ctx context.Context, c VarlinkCall) error
 	Login(ctx context.Context, c VarlinkCall, host_ string, token_ string) error
 	Logout(ctx context.Context, c VarlinkCall) error
 	WhoAmI(ctx context.Context, c VarlinkCall) error
@@ -1480,12 +1612,16 @@ type VarlinkCall struct{ varlink.Call }
 
 // Generated reply methods for all varlink errors
 
+// GitLab rejected the request, or a local precondition failed (a malformed
+// reference or duration, an unknown failure id, …).
 func (c *VarlinkCall) ReplyGitlabError(ctx context.Context, message_ string) error {
 	var out GitlabError
 	out.Message = message_
 	return c.ReplyError(ctx, "org.thehoster.forskapd.GitlabError", &out)
 }
 
+// The daemon has no live GitLab session; detail carries the host and the
+// underlying error for the reasons that have one.
 func (c *VarlinkCall) ReplyNotAuthenticated(ctx context.Context, reason_ *NotAuthReason, detail_ *string) error {
 	var out NotAuthenticated
 	out.Reason = reason_
@@ -1613,6 +1749,28 @@ func (c *VarlinkCall) ReplyGetSyncJobs(ctx context.Context, jobs_ []SyncJob, pau
 	return c.Reply(ctx, &out)
 }
 
+func (c *VarlinkCall) ReplyGetStatus(ctx context.Context, api_version_ string, daemon_version_ string, connected_ bool, reason_ *NotAuthReason, detail_ *string, host_ *string, username_ *string, user_id_ *int64) error {
+	var out struct {
+		Api_version    string         `json:"api_version"`
+		Daemon_version string         `json:"daemon_version"`
+		Connected      bool           `json:"connected"`
+		Reason         *NotAuthReason `json:"reason,omitempty"`
+		Detail         *string        `json:"detail,omitempty"`
+		Host           *string        `json:"host,omitempty"`
+		Username       *string        `json:"username,omitempty"`
+		User_id        *int64         `json:"user_id,omitempty"`
+	}
+	out.Api_version = api_version_
+	out.Daemon_version = daemon_version_
+	out.Connected = connected_
+	out.Reason = reason_
+	out.Detail = detail_
+	out.Host = host_
+	out.Username = username_
+	out.User_id = user_id_
+	return c.Reply(ctx, &out)
+}
+
 func (c *VarlinkCall) ReplyLogin(ctx context.Context) error {
 	return c.Reply(ctx, nil)
 }
@@ -1639,86 +1797,121 @@ func (c *VarlinkCall) ReplyWhoAmI(ctx context.Context, host_ string, user_id_ in
 
 // Generated dummy implementations for all varlink methods
 
+// Open issues assigned to the user, optionally only those in the given groups.
 func (s *VarlinkInterface) GetAssignedWorkItems(ctx context.Context, c VarlinkCall, groups_ *[]string) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetAssignedWorkItems")
 }
 
+// Open merge requests assigned to the user, optionally only those in the given
+// groups.
 func (s *VarlinkInterface) GetAssignedMergeRequests(ctx context.Context, c VarlinkCall, groups_ *[]string) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetAssignedMergeRequests")
 }
 
+// The user's own issues, closed ones included, updated recently; newest-updated
+// first.
 func (s *VarlinkInterface) ListWorkItems(ctx context.Context, c VarlinkCall, role_ *WorkItemRole, updated_after_ *int64, states_ *[]WorkItemState) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.ListWorkItems")
 }
 
+// Searches the cached corpus; work items and merge requests rank by their
+// RecordOpen counts.
 func (s *VarlinkInterface) Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64, scope_ *SearchScope, types_ *[]string, exclude_types_ *[]string) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.Search")
 }
 
+// Logs spent time on an issue or merge request; queued while GitLab is away.
 func (s *VarlinkInterface) PostTime(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind, duration_ string, summary_ *string) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.PostTime")
 }
 
+// Closes an issue or merge request; queued while GitLab is away.
 func (s *VarlinkInterface) Close(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.Close")
 }
 
+// Assigns the user to an issue or merge request; queued while GitLab is away.
 func (s *VarlinkInterface) AssignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.AssignSelf")
 }
 
+// Removes the user from an issue's or merge request's assignees; queued while
+// GitLab is away.
 func (s *VarlinkInterface) UnassignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.UnassignSelf")
 }
 
+// Creates an issue in a project, optionally under an epic. Sent to GitLab once,
+// never queued.
 func (s *VarlinkInterface) CreateWorkItem(ctx context.Context, c VarlinkCall, project_id_ int64, title_ string, description_ *string, labels_ *[]string, assign_self_ *bool, parent_ *WorkItemRef) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.CreateWorkItem")
 }
 
+// Counts an open of a project's work item or merge request, or of a group's
+// epic. Local only: works while dormant.
 func (s *VarlinkInterface) RecordOpen(ctx context.Context, c VarlinkCall, kind_ IssuableKind, iid_ int64, project_id_ *int64, group_id_ *int64) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.RecordOpen")
 }
 
+// Clears cached state, all of it or the given scopes, and syncs it again.
 func (s *VarlinkInterface) ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]CacheScope) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.ClearCache")
 }
 
+// Time logged in the last days (default 7): synced timelogs and queued PostTimes.
 func (s *VarlinkInterface) GetHistory(ctx context.Context, c VarlinkCall, days_ *int64) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetHistory")
 }
 
+// The user's contribution events of the last days (default 7), newest first.
 func (s *VarlinkInterface) GetActivity(ctx context.Context, c VarlinkCall, days_ *int64) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetActivity")
 }
 
+// The dead-lettered writes.
 func (s *VarlinkInterface) GetFailures(ctx context.Context, c VarlinkCall) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetFailures")
 }
 
+// Queues a dead-lettered write again.
 func (s *VarlinkInterface) RetryFailure(ctx context.Context, c VarlinkCall, id_ int64) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.RetryFailure")
 }
 
+// Drops a dead-lettered write.
 func (s *VarlinkInterface) DismissFailure(ctx context.Context, c VarlinkCall, id_ int64) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.DismissFailure")
 }
 
+// Drops every dead-lettered write.
 func (s *VarlinkInterface) ClearFailures(ctx context.Context, c VarlinkCall) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.ClearFailures")
 }
 
+// The sync worker's jobs in the order it runs them, and until when a GitLab rate
+// limit pauses them all. Never an error.
 func (s *VarlinkInterface) GetSyncJobs(ctx context.Context, c VarlinkCall) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetSyncJobs")
 }
 
+// The interface version the daemon speaks, its own version and its session:
+// the account while connected, else why not. Never an error.
+func (s *VarlinkInterface) GetStatus(ctx context.Context, c VarlinkCall) error {
+	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetStatus")
+}
+
+// Connects to a GitLab host with a personal access token and stores it in the
+// keychain.
 func (s *VarlinkInterface) Login(ctx context.Context, c VarlinkCall, host_ string, token_ string) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.Login")
 }
 
+// Drops the session and the stored credentials.
 func (s *VarlinkInterface) Logout(ctx context.Context, c VarlinkCall) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.Logout")
 }
 
+// The connected host and user, and when the token expires.
 func (s *VarlinkInterface) WhoAmI(ctx context.Context, c VarlinkCall) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.WhoAmI")
 }
@@ -1911,6 +2104,9 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 	case "GetSyncJobs":
 		return s.orgthehosterforskapdInterface.GetSyncJobs(ctx, VarlinkCall{call})
 
+	case "GetStatus":
+		return s.orgthehosterforskapdInterface.GetStatus(ctx, VarlinkCall{call})
+
 	case "Login":
 		var in struct {
 			Host  string `json:"host"`
@@ -1944,178 +2140,348 @@ func (s *VarlinkInterface) VarlinkGetName() string {
 func (s *VarlinkInterface) VarlinkGetDescription() string {
 	return `interface org.thehoster.forskapd
 
+# A work item named by where it lives and its number.
 type WorkItemRef (
+  # The project of the work item named, or
   project_id: ?int,
+  # its group: exactly one of the two is set.
   group_id: ?int,
   iid: int,
+  # "epic", …; absent when the naming side doesn't say.
   type: ?string,
   title: ?string,
+  # Absolute; absent when unknown.
   web_url: ?string
 )
 
+# An issue, task, epic, …: GitLab's work item, of a project or of a group.
 type WorkItem (
+  # Global work item ID, unique across the GitLab instance.
   id: int,
+  # Number within its project or group ("#42" of an issue, "&5" of an epic).
   iid: int,
+  # "issue", "task", "incident", "test_case", "epic", …
   type: string,
+  # The project of an issue, task, …; absent for an epic.
   project_id: ?int,
+  # The group of an epic; absent for the rest.
   group_id: ?int,
+  # Full path of that project ("team/api") or group ("team"): the stored
+  # one's, else the one in web_url; empty when neither gives it.
   namespace_path: string,
   title: string,
   web_url: string,
+  # "opened" or "closed".
   state: string,
+  # The epic an issue belongs to; absent when it has none, and for an epic.
   parent: ?WorkItemRef,
+  # GitLab's human-readable total spent time ("2h"); empty when none, and for
+  # an epic.
   total_time: string,
+  # Board column the issue sits in, from its labels and the project's issue
+  # board; empty when no board or label matches, and for an epic.
   graph_status: string,
+  # Opens recorded through RecordOpen (within usage.retention_hours).
   open_count: int,
+  # File of the project's avatar, see Project.avatar; empty when none, and for
+  # an epic.
   project_avatar: string,
+  # Unix seconds, GitLab's updated_at as of the last sync; 0 when unknown.
   updated_at: int
 )
 
+# What a write or RecordOpen targets; an issue is a work_item.
 type IssuableKind (work_item, merge_request)
 
-type HistorySource (gitlab, queued)
+# Where a HistoryEvent comes from.
+type HistorySource (
+  # A timelog synced from GitLab.
+  gitlab,
+  # A PostTime still waiting in the retry queue.
+  queued
+)
 
+# Time logged on an issue or merge request.
 type HistoryEvent (
+  # Unix seconds: spent_at for a synced entry, the enqueue time for a queued one.
   timestamp: int,
   source: HistorySource,
+  # What the time was logged on.
   kind: IssuableKind,
   project_id: int,
   iid: int,
+  # Empty on a queued event whose issuable is not in the caches.
   title: string,
   web_url: string,
   duration: string,
   summary: string
 )
 
+# One of the user's contribution events (GitLab's GET /events).
 type ActivityEvent (
+  # Unix seconds.
   timestamp: int,
+  # GitLab's action name: "pushed to", "opened", "commented on", "accepted",
+  # "joined", …
   action: string,
+  # "Issue", "MergeRequest", "Milestone", …; of a comment, what was commented
+  # on; empty on pushes and membership events.
   target_type: string,
+  # The target's number in its project, where it has one.
   target_iid: ?int,
   target_title: ?string,
+  # 0 for events outside a project.
   project_id: int,
+  # Absent when neither the project nor the item is in the store.
   project_path: ?string,
+  # The issue or MR, a pushed branch's commits, else the project; absent when
+  # unknown.
   web_url: ?string,
+  # Pushes only: the branch or tag.
   ref: ?string,
+  # Pushes only.
   commit_count: ?int,
+  # Pushes only: the newest commit's title; absent when the ref was deleted.
   commit_title: ?string,
+  # What the event did: a comment's first line (at most 200 characters, a cut
+  # one ends in …), a push's commit_title; absent for every other event.
   description: ?string
 )
 
+# A write that exhausted its retry window or was rejected while draining.
 type FailedTask (
+  # Handle for RetryFailure and DismissFailure.
   id: int,
+  # Which write failed: "PostTime", "Close", "AssignSelf", "UnassignSelf".
   op: string,
   kind: IssuableKind,
   project_id: int,
   iid: int,
+  # Operation-specific summary, e.g. the duration.
   detail: string,
+  # The GitLab error that dead-lettered it.
   error: string,
+  # Unix seconds.
   queued_at: int,
+  # Unix seconds.
   failed_at: int
 )
 
 type MergeRequest (
+  # Global MR ID, unique across the GitLab instance.
   id: int,
+  # Per-project MR number (the "!7" shown in the UI).
   iid: int,
   project_id: int,
   title: string,
   web_url: string,
+  # "opened", "closed", "merged" or "locked".
   state: string,
+  # Assignee usernames, as of the last sync.
   assignees: []string,
+  # Opens recorded through RecordOpen (within usage.retention_hours).
   open_count: int,
+  # File of the project's avatar, see Project.avatar; empty when none.
   project_avatar: string,
+  # The project's full path ("team/api"): the stored project's, else the one
+  # in web_url; empty when neither gives it.
   project_path: string,
+  # Unix seconds, GitLab's updated_at as of the last sync; 0 when unknown.
   updated_at: int
 )
 
+# A project the user is a member of.
 type Project (
   id: int,
   name: string,
+  # Full namespace path ("team/backend/api").
   path: string,
   web_url: string,
+  # Absolute path of the avatar image on the daemon's machine; empty when the
+  # project has none.
   avatar: string,
+  # Whether the project is archived (read-only on GitLab).
   archived: bool
 )
 
+# A group the user is a member of.
 type Group (
   id: int,
   name: string,
+  # Full group path ("team/backend").
   path: string,
   web_url: string
 )
 
-type SyncJobStatus (running, demanded, due, waiting, backing_off)
+# Where a SyncJob stands.
+type SyncJobStatus (
+  # Its fetch is in flight.
+  running,
+  # Requested ahead of the schedule; runs before anything merely due.
+  demanded,
+  # Its time has come; runs once the worker gets to it.
+  due,
+  # Not due yet; an unavailable job rests here until next_due.
+  waiting,
+  # Failed; held back until next_due.
+  backing_off
+)
 
+# A job of the sync worker.
 type SyncJob (
+  # Stable job id: "assigned/issues", "recent/authored/issues",
+  # "timelogs/recent", "events", "project/<id>/issues", …
   key: string,
   status: SyncJobStatus,
+  # Unix seconds, start of the last successful run; absent if it never ran.
   last_ok: ?int,
+  # Unix seconds, when the schedule runs it next (the retry time while backing
+  # off); absent while running or demanded, before the first run, and for a job
+  # that is never due again (a fetched project avatar).
   next_due: ?int,
+  # Unix seconds, only while running.
   running_since: ?int,
+  # Consecutive failed runs.
   failures: int,
+  # Why the last run failed, until a run succeeds.
   last_error: ?string,
+  # True: GitLab refuses the job for good and the daemon asks once a day;
+  # false otherwise. Absent from a daemon before forskap-api 0.28.0.
   unavailable: ?bool,
+  # Only while running, and only for a job that also runs as a delta: true for
+  # a full run, false for a delta.
   full: ?bool,
+  # Rows the running fetch has so far (0 before its first page); only while
+  # running. Sent since forskap-api 0.30.0.
   fetched: ?int,
+  # Rows GitLab announced for the running fetch; absent where it announced none.
   expected: ?int
 )
 
+# GitLab rejected the request, or a local precondition failed (a malformed
+# reference or duration, an unknown failure id, …).
 error GitlabError (message: string)
 
-type NotAuthReason (no_credentials, keychain_error, unreachable, token_rejected, logged_out)
+# Why the daemon has no GitLab session.
+type NotAuthReason (
+  # No credentials stored (never logged in).
+  no_credentials,
+  # Reading the OS keychain failed (detail: the error).
+  keychain_error,
+  # Credentials exist but GitLab could not be reached (detail set); heals by
+  # itself.
+  unreachable,
+  # Credentials exist but GitLab rejected the token (detail set).
+  token_rejected,
+  # The user logged out.
+  logged_out
+)
 
+# The daemon has no live GitLab session; detail carries the host and the
+# underlying error for the reasons that have one.
 error NotAuthenticated (reason: ?NotAuthReason, detail: ?string)
 
+# Open issues assigned to the user, optionally only those in the given groups.
 method GetAssignedWorkItems(groups: ?[]string) -> (work_items: []WorkItem)
 
+# Open merge requests assigned to the user, optionally only those in the given
+# groups.
 method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)
 
+# Which of ListWorkItems' lists: the issues the user authored, or is assigned to.
 type WorkItemRole (author, assignee)
 
+# The states ListWorkItems filters by; WorkItem.state carries them.
 type WorkItemState (opened, closed)
 
+# The user's own issues, closed ones included, updated recently; newest-updated
+# first.
 method ListWorkItems(role: ?WorkItemRole, updated_after: ?int, states: ?[]WorkItemState) -> (work_items: []WorkItem)
 
+# The result sets of a Search.
 type SearchKind (work_items, merge_requests, projects, groups)
 
+# Projects by ID and groups by path (subgroups included) a Search keeps to.
 type SearchScope (projects: ?[]int, groups: ?[]string)
 
+# Searches the cached corpus; work items and merge requests rank by their
+# RecordOpen counts.
 method Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope, types: ?[]string, exclude_types: ?[]string) -> (work_items: []WorkItem, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
 
+# Logs spent time on an issue or merge request; queued while GitLab is away.
 method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
 
+# Closes an issue or merge request; queued while GitLab is away.
 method Close(project_id: int, iid: int, kind: IssuableKind) -> ()
 
+# Assigns the user to an issue or merge request; queued while GitLab is away.
 method AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
+# Removes the user from an issue's or merge request's assignees; queued while
+# GitLab is away.
 method UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
+# Creates an issue in a project, optionally under an epic. Sent to GitLab once,
+# never queued.
 method CreateWorkItem(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, parent: ?WorkItemRef) -> (iid: int, web_url: string)
 
+# Counts an open of a project's work item or merge request, or of a group's
+# epic. Local only: works while dormant.
 method RecordOpen(kind: IssuableKind, iid: int, project_id: ?int, group_id: ?int) -> ()
 
-type CacheScope (assigned, search, quick, slow, stale, usage)
+# What ClearCache clears.
+type CacheScope (
+  # The assigned lists, the ListWorkItems lists and the board columns.
+  assigned,
+  # The corpus: issues, MRs, epics, projects, groups, project avatars.
+  search,
+  # History inside the quick window.
+  quick,
+  # History between the retention horizon and the quick window.
+  slow,
+  # History older than history.retention_hours.
+  stale,
+  # The RecordOpen statistics, only when listed.
+  usage
+)
 
+# Clears cached state, all of it or the given scopes, and syncs it again.
 method ClearCache(scope: ?[]CacheScope) -> ()
 
+# Time logged in the last days (default 7): synced timelogs and queued PostTimes.
 method GetHistory(days: ?int) -> (events: []HistoryEvent)
 
+# The user's contribution events of the last days (default 7), newest first.
 method GetActivity(days: ?int) -> (events: []ActivityEvent)
 
+# The dead-lettered writes.
 method GetFailures() -> (failures: []FailedTask)
 
+# Queues a dead-lettered write again.
 method RetryFailure(id: int) -> ()
 
+# Drops a dead-lettered write.
 method DismissFailure(id: int) -> ()
 
+# Drops every dead-lettered write.
 method ClearFailures() -> ()
 
+# The sync worker's jobs in the order it runs them, and until when a GitLab rate
+# limit pauses them all. Never an error.
 method GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int)
 
+# The interface version the daemon speaks, its own version and its session:
+# the account while connected, else why not. Never an error.
+method GetStatus() -> (api_version: string, daemon_version: string, connected: bool, reason: ?NotAuthReason, detail: ?string, host: ?string, username: ?string, user_id: ?int)
+
+# Connects to a GitLab host with a personal access token and stores it in the
+# keychain.
 method Login(host: string, token: string) -> ()
 
+# Drops the session and the stored credentials.
 method Logout() -> ()
 
+# The connected host and user, and when the token expires.
 method WhoAmI() -> (host: string, user_id: int, username: string, token_expires_at: ?int, token_rotates: bool)
 `
 }
