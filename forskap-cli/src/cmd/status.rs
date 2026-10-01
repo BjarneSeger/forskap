@@ -1,0 +1,1795 @@
+//! `forskap status` — is anything not working?
+//!
+//! One look at what can break without the user noticing: the daemon away or
+//! stuck, its GitLab session down, sync jobs failing or hanging, writes that
+//! failed for good. Each check ends in a [`Level`]; an `error` anywhere makes
+//! the exit status non-zero, so a script or a shell prompt can ask too.
+//!
+//! Asking the daemon ([`gather`]) and judging its answers ([`evaluate`], pure
+//! over the answers and a `now`) are kept apart, so the judging is tested
+//! without a daemon.
+
+use std::future::Future;
+use std::time::Duration;
+
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use forskap_api::{
+    Error as ApiError, ErrorKind as ApiErrorKind, FailedTask, GetSyncJobs_Reply, NotAuthReason,
+    SyncJob, SyncJobStatus, VarlinkClient, VarlinkClientInterface, WhoAmI_Reply,
+};
+use serde::Serialize;
+
+use crate::cli::{OutputFormat, WatchArgs};
+use crate::cmd::auth::status::{expiry, token_line};
+use crate::cmd::sync::jobs::{failure, kind, pause, span};
+use crate::{client, config, friendly, output, style, watch};
+
+/// The CLI's own version, which the daemon's should match.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How long the daemon gets for each answer. It answers from memory and its
+/// local store within milliseconds; one that takes this long is stuck.
+const ANSWER_SECS: u64 = 10;
+
+/// A job running this long hangs. The slowest fetch seen, the whole
+/// member-projects walk over a bad link, took about four minutes; this is
+/// well beyond it, so a slow network alone does not get there.
+const HANG_SECS: i64 = 15 * 60;
+
+/// A job due this long is overdue. The assigned lists are due every five
+/// minutes, so a sync worker that works starts something well within this;
+/// it only warns when nothing at all started meanwhile (see [`sync`]).
+const OVERDUE_SECS: i64 = 30 * 60;
+
+/// A token this close to its expiry, and not rotated, needs replacing soon.
+/// A week: GitLab's own expiry mail gives as much notice.
+const EXPIRY_WARN_SECS: i64 = 7 * 86_400;
+
+/// How many failing jobs are named; `forskap sync jobs` has them all.
+const FAILING_NAMED: usize = 3;
+
+pub async fn run(format: OutputFormat, watch: WatchArgs) -> Result<()> {
+    let every = watch::interval(watch, format)?;
+    let socket = client::socket(&config::load()?);
+    let socket = socket.as_str();
+    match every {
+        Some(every) => {
+            watch::run(
+                every,
+                move || async move { Ok(render(&check(socket).await)) },
+            )
+            .await
+        }
+        None => {
+            let report = check(socket).await;
+            output::emit(format, &report, |report| out!("{}", render(report)))?;
+            outcome(&report)
+        }
+    }
+}
+
+async fn check(socket: &str) -> Report {
+    evaluate(&gather(socket).await, Utc::now())
+}
+
+/// `forskap status` found an error and printed it: `main` exits non-zero
+/// without another word.
+#[derive(Debug, thiserror::Error)]
+#[error("a status check found an error")]
+pub struct Unhealthy;
+
+/// What the exit status says: only an error is a failure, so a warning
+/// (a project with merge requests switched off) doesn't fail a prompt.
+fn outcome(report: &Report) -> Result<()> {
+    match report.level {
+        Level::Error => Err(Unhealthy.into()),
+        Level::Ok | Level::Skipped | Level::Warning => Ok(()),
+    }
+}
+
+/// What the daemon answered, call by call.
+struct Answers {
+    socket: String,
+    /// Whether the socket took the connection, else why not.
+    connected: Result<(), String>,
+    info: Answer<Info>,
+    who: Answer<Login>,
+    jobs: Answer<GetSyncJobs_Reply>,
+    failures: Answer<Vec<FailedTask>>,
+}
+
+enum Answer<T> {
+    Got(T),
+    /// The call failed: why.
+    Failed(String),
+    /// No answer within [`ANSWER_SECS`].
+    TimedOut,
+    /// Not asked: the daemon was out of reach, or stopped answering.
+    Unasked,
+}
+
+impl<T> Answer<T> {
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> Answer<U> {
+        match self {
+            Answer::Got(value) => Answer::Got(f(value)),
+            Answer::Failed(why) => Answer::Failed(why),
+            Answer::TimedOut => Answer::TimedOut,
+            Answer::Unasked => Answer::Unasked,
+        }
+    }
+}
+
+/// The daemon's `org.varlink.service.GetInfo`.
+struct Info {
+    product: String,
+    version: String,
+}
+
+enum Login {
+    Connected(WhoAmI_Reply),
+    Dormant {
+        reason: Option<NotAuthReason>,
+        detail: Option<String>,
+    },
+}
+
+/// Ask the daemon at `socket` everything the checks judge.
+///
+/// One call at a time on one connection. After a timeout the next answer on
+/// it could be the late one, so nothing more is asked.
+async fn gather(socket: &str) -> Answers {
+    let mut answers = Answers {
+        socket: socket.to_string(),
+        connected: Ok(()),
+        info: Answer::Unasked,
+        who: Answer::Unasked,
+        jobs: Answer::Unasked,
+        failures: Answer::Unasked,
+    };
+    let conn = match ask(client::open(socket)).await {
+        Some(Ok(conn)) => conn,
+        Some(Err(e)) => {
+            answers.connected = Err(unreachable_because(&e));
+            return answers;
+        }
+        None => {
+            answers.connected = Err(format!("No connection within {ANSWER_SECS}s."));
+            return answers;
+        }
+    };
+    answers.info = match ask(client::service_info(&conn)).await {
+        Some(Ok(info)) => Answer::Got(Info {
+            product: info.product.into_owned(),
+            version: info.version.into_owned(),
+        }),
+        Some(Err(e)) => Answer::Failed(varlink_words(e.kind())),
+        None => Answer::TimedOut,
+    };
+    if matches!(answers.info, Answer::TimedOut) {
+        return answers;
+    }
+    let api = VarlinkClient::new(conn);
+    answers.who = match ask(api.who_am_i().call()).await {
+        Some(Err(e)) => match e.kind() {
+            ApiErrorKind::NotAuthenticated(args) => Answer::Got(Login::Dormant {
+                reason: args.as_ref().and_then(|a| a.reason.clone()),
+                detail: args.as_ref().and_then(|a| a.detail.clone()),
+            }),
+            _ => Answer::Failed(describe(&e)),
+        },
+        other => answer(other).map(Login::Connected),
+    };
+    if matches!(answers.who, Answer::TimedOut) {
+        return answers;
+    }
+    answers.jobs = answer(ask(api.get_sync_jobs().call()).await);
+    if matches!(answers.jobs, Answer::TimedOut) {
+        return answers;
+    }
+    answers.failures = answer(ask(api.get_failures().call()).await).map(|r| r.failures);
+    answers
+}
+
+/// `call` under the timeout: `None` when it ran out.
+async fn ask<T, E>(call: impl Future<Output = Result<T, E>>) -> Option<Result<T, E>> {
+    tokio::time::timeout(Duration::from_secs(ANSWER_SECS), call)
+        .await
+        .ok()
+}
+
+fn answer<T>(asked: Option<Result<T, ApiError>>) -> Answer<T> {
+    match asked {
+        Some(Ok(reply)) => Answer::Got(reply),
+        Some(Err(e)) => Answer::Failed(describe(&e)),
+        None => Answer::TimedOut,
+    }
+}
+
+/// A failed call in a few words, rather than the generated client's dump.
+fn describe(e: &ApiError) -> String {
+    match (e.kind(), e.source_varlink_kind()) {
+        (ApiErrorKind::GitlabError(Some(args)), _) => args.message.clone(),
+        (_, Some(kind)) => varlink_words(kind),
+        _ => e.to_string(),
+    }
+}
+
+fn varlink_words(kind: &varlink::ErrorKind) -> String {
+    match kind {
+        varlink::ErrorKind::VarlinkErrorReply(reply) => {
+            let name = reply.error.as_deref().unwrap_or("an error");
+            match &reply.parameters {
+                Some(parameters) => format!("{name} {parameters}"),
+                None => name.to_string(),
+            }
+        }
+        varlink::ErrorKind::Io(io) => std::io::Error::from(*io).to_string(),
+        // A reply that doesn't decode: a field this CLI needs is missing.
+        varlink::ErrorKind::SerdeJsonSer(_) | varlink::ErrorKind::SerdeJsonDe(_) => {
+            "Its answer does not fit this forskap: the daemon and the CLI are from different \
+             builds."
+                .to_string()
+        }
+        kind => kind.to_string(),
+    }
+}
+
+/// Why connecting failed, in words that say what to look at.
+fn unreachable_because(e: &varlink::Error) -> String {
+    use std::io::ErrorKind as Io;
+    match e.kind() {
+        varlink::ErrorKind::Io(Io::NotFound) => "No socket exists there.".to_string(),
+        varlink::ErrorKind::Io(Io::ConnectionRefused) => {
+            "The socket exists, but nothing listens on it.".to_string()
+        }
+        // What a unix socket path longer than the ~100 bytes it may have gets.
+        varlink::ErrorKind::Io(Io::InvalidInput) => {
+            "That path can't be a unix socket: it is too long.".to_string()
+        }
+        varlink::ErrorKind::InvalidAddress => {
+            "That is no varlink address (`unix:PATH` or `tcp:HOST:PORT`).".to_string()
+        }
+        kind => format!("Connecting failed: {}.", varlink_words(kind)),
+    }
+}
+
+/// How a check came out, from best to worst.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Level {
+    Ok,
+    /// Not judged: an earlier check makes it moot.
+    Skipped,
+    Warning,
+    Error,
+}
+
+impl Level {
+    fn word(self) -> &'static str {
+        match self {
+            Level::Ok => "ok",
+            Level::Skipped => "skipped",
+            Level::Warning => "warning",
+            Level::Error => "error",
+        }
+    }
+}
+
+/// Everything `forskap status` found, as printed by `--output json`.
+#[derive(Serialize)]
+struct Report {
+    /// The worst level of any check.
+    level: Level,
+    checks: Checks,
+}
+
+#[derive(Serialize)]
+struct Checks {
+    daemon: Check<DaemonFacts>,
+    session: Check<SessionFacts>,
+    sync: Check<SyncFacts>,
+    queue: Check<QueueFacts>,
+}
+
+/// One check: its level, a line saying why, lines saying more. The facts
+/// behind it sit next to them, where the check got that far.
+#[derive(Serialize)]
+struct Check<F> {
+    name: &'static str,
+    level: Level,
+    summary: String,
+    details: Vec<String>,
+    #[serde(flatten)]
+    facts: Option<F>,
+}
+
+impl<F> Check<F> {
+    fn new(name: &'static str, level: Level, summary: impl Into<String>) -> Self {
+        Check {
+            name,
+            level,
+            summary: summary.into(),
+            details: Vec::new(),
+            facts: None,
+        }
+    }
+
+    fn details(self, details: Vec<String>) -> Self {
+        Check { details, ..self }
+    }
+
+    fn facts(self, facts: F) -> Self {
+        Check {
+            facts: Some(facts),
+            ..self
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct DaemonFacts {
+    socket: String,
+    /// What the daemon says it is; absent when it didn't say.
+    version: Option<String>,
+    cli_version: &'static str,
+}
+
+#[derive(Serialize)]
+struct SessionFacts {
+    connected: bool,
+    host: Option<String>,
+    username: Option<String>,
+    user_id: Option<i64>,
+    token_expires_at: Option<i64>,
+    token_rotates: Option<bool>,
+    /// Why there is no session.
+    reason: Option<NotAuthReason>,
+    detail: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SyncFacts {
+    jobs: JobCounts,
+    paused_until: Option<i64>,
+    /// Jobs whose last runs failed, or that back off after failing.
+    failing: Vec<String>,
+    /// Jobs running for longer than a fetch takes.
+    hanging: Vec<String>,
+    /// Due jobs left waiting for a while.
+    overdue: Vec<String>,
+    /// Instance-wide lists with no successful run yet.
+    never_synced: Vec<String>,
+    /// Failing jobs for something GitLab only has in its paid tiers (epics).
+    unavailable: Vec<String>,
+}
+
+#[derive(Default, Serialize)]
+struct JobCounts {
+    total: usize,
+    running: usize,
+    demanded: usize,
+    due: usize,
+    waiting: usize,
+    backing_off: usize,
+}
+
+#[derive(Serialize)]
+struct QueueFacts {
+    failed_writes: usize,
+}
+
+fn evaluate(a: &Answers, now: DateTime<Utc>) -> Report {
+    let checks = Checks {
+        daemon: daemon(a),
+        session: session(a, now),
+        sync: sync(a, link(&a.who), now.timestamp()),
+        queue: queue(a),
+    };
+    let level = checks.rows().iter().map(|row| row.level).max();
+    Report {
+        level: level.unwrap_or(Level::Ok),
+        checks,
+    }
+}
+
+/// The reply a check judges, or the check telling why there is none.
+fn reply<'a, T, F>(
+    name: &'static str,
+    method: &str,
+    answer: &'a Answer<T>,
+    a: &Answers,
+) -> Result<&'a T, Check<F>> {
+    match answer {
+        Answer::Got(reply) => Ok(reply),
+        Answer::Failed(why) => {
+            Err(Check::new(name, Level::Error, format!("{method} failed"))
+                .details(vec![why.clone()]))
+        }
+        Answer::TimedOut => Err(Check::new(
+            name,
+            Level::Error,
+            format!("no answer to {method} within {ANSWER_SECS}s"),
+        )
+        .details(vec![format!(
+            "The daemon stopped answering; restart it: {}.",
+            restart_command()
+        )])),
+        Answer::Unasked if a.connected.is_err() => Err(Check::new(
+            name,
+            Level::Skipped,
+            "the daemon is not reachable",
+        )),
+        Answer::Unasked => Err(Check::new(
+            name,
+            Level::Skipped,
+            "not asked: the daemon stopped answering",
+        )),
+    }
+}
+
+/// How to get the daemon running, the way it is installed here.
+fn start_hint() -> String {
+    let how = if cfg!(target_os = "macos") {
+        "`brew services start forskap`"
+    } else {
+        "`systemctl --user enable --now forskapd.service`"
+    };
+    format!("Start it with {how}.")
+}
+
+fn restart_command() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "`brew services restart forskap`"
+    } else {
+        "`systemctl --user restart forskapd.service`"
+    }
+}
+
+fn daemon(a: &Answers) -> Check<DaemonFacts> {
+    let socket = &a.socket;
+    let facts = |version: Option<&str>| DaemonFacts {
+        socket: socket.clone(),
+        version: version.map(str::to_string),
+        cli_version: VERSION,
+    };
+    if let Err(why) = &a.connected {
+        return Check::new("daemon", Level::Error, format!("not reachable on {socket}"))
+            .details(vec![why.clone(), start_hint()])
+            .facts(facts(None));
+    }
+    match &a.info {
+        Answer::Got(Info { product, version }) if version == VERSION => Check::new(
+            "daemon",
+            Level::Ok,
+            format!("{product} {version} on {socket}"),
+        )
+        .facts(facts(Some(version))),
+        Answer::Got(Info { product, version }) => Check::new(
+            "daemon",
+            Level::Warning,
+            format!("{product} {version} on {socket}, but forskap is {VERSION}"),
+        )
+        .details(vec![format!(
+            "After an upgrade the daemon runs the old version until it is restarted: {}.",
+            restart_command()
+        )])
+        .facts(facts(Some(version))),
+        Answer::Failed(why) => Check::new(
+            "daemon",
+            Level::Warning,
+            format!("answers on {socket}, but not with its version"),
+        )
+        .details(vec![format!("GetInfo failed: {why}")])
+        .facts(facts(None)),
+        Answer::TimedOut => Check::new(
+            "daemon",
+            Level::Error,
+            format!("no answer on {socket} within {ANSWER_SECS}s"),
+        )
+        .details(vec![
+            "It takes the connection but does not answer: it is stuck.".to_string(),
+            format!("Restart it: {}.", restart_command()),
+        ])
+        .facts(facts(None)),
+        Answer::Unasked => {
+            Check::new("daemon", Level::Skipped, format!("on {socket}")).facts(facts(None))
+        }
+    }
+}
+
+fn session(a: &Answers, now: DateTime<Utc>) -> Check<SessionFacts> {
+    match reply("session", "WhoAmI", &a.who, a) {
+        Ok(Login::Connected(me)) => connected(me, now),
+        Ok(Login::Dormant { reason, detail }) => dormant(reason.as_ref(), detail.as_deref()),
+        Err(check) => check,
+    }
+}
+
+fn connected(me: &WhoAmI_Reply, now: DateTime<Utc>) -> Check<SessionFacts> {
+    let who = format!("@{} on {}", me.username, me.host);
+    let expires = me
+        .token_expires_at
+        .and_then(|secs| DateTime::from_timestamp(secs, 0));
+    let check = match expires {
+        Some(at) if at <= now => Check::new(
+            "session",
+            Level::Error,
+            format!("{who}, but the token {}", expiry(at, now)),
+        )
+        .details(vec![
+            friendly::remedy(Some(&NotAuthReason::token_rejected)).to_string(),
+        ]),
+        Some(at) if !me.token_rotates && (at - now).num_seconds() < EXPIRY_WARN_SECS => Check::new(
+            "session",
+            Level::Warning,
+            format!("{who}; the token {}", expiry(at, now)),
+        )
+        .details(vec![
+            "Automatic rotation is off: create a new token and run `forskap auth login` \
+                 before then."
+                .to_string(),
+        ]),
+        _ => Check::new("session", Level::Ok, who).details(vec![token_line(
+            me.token_expires_at,
+            me.token_rotates,
+            now,
+        )]),
+    };
+    check.facts(SessionFacts {
+        connected: true,
+        host: Some(me.host.clone()),
+        username: Some(me.username.clone()),
+        user_id: Some(me.user_id),
+        token_expires_at: me.token_expires_at,
+        token_rotates: Some(me.token_rotates),
+        reason: None,
+        detail: None,
+    })
+}
+
+fn dormant(reason: Option<&NotAuthReason>, detail: Option<&str>) -> Check<SessionFacts> {
+    // Only `unreachable` heals by itself; the rest wait for the user.
+    let (level, summary) = match reason {
+        Some(NotAuthReason::unreachable) => (Level::Warning, "GitLab not reachable"),
+        Some(NotAuthReason::no_credentials) => (Level::Error, "not logged in"),
+        Some(NotAuthReason::logged_out) => (Level::Error, "logged out"),
+        Some(NotAuthReason::token_rejected) => (Level::Error, "GitLab rejected the token"),
+        Some(NotAuthReason::keychain_error) => {
+            (Level::Error, "can't read the credentials from the keychain")
+        }
+        None => (Level::Error, "not connected to GitLab"),
+    };
+    let detail = detail.filter(|d| !d.is_empty());
+    let next = match reason {
+        Some(NotAuthReason::unreachable) => {
+            "The daemon reconnects by itself unless `reconnect.enabled` is off; meanwhile \
+             cached reads keep working and writes are queued."
+        }
+        _ => friendly::remedy(reason),
+    };
+    let details = detail
+        .map(str::to_string)
+        .into_iter()
+        .chain([next.to_string()]);
+    Check::new("session", level, summary)
+        .details(details.collect())
+        .facts(SessionFacts {
+            connected: false,
+            host: None,
+            username: None,
+            user_id: None,
+            token_expires_at: None,
+            token_rotates: None,
+            reason: reason.cloned(),
+            detail: detail.map(str::to_string),
+        })
+}
+
+/// Whether the daemon has a GitLab session, as far as `WhoAmI` told.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Link {
+    Connected,
+    Dormant,
+    Unknown,
+}
+
+fn link(who: &Answer<Login>) -> Link {
+    match who {
+        Answer::Got(Login::Connected(_)) => Link::Connected,
+        Answer::Got(Login::Dormant { .. }) => Link::Dormant,
+        _ => Link::Unknown,
+    }
+}
+
+/// Something a check found; `ok` ones are notes.
+struct Finding {
+    level: Level,
+    line: String,
+    details: Vec<String>,
+}
+
+impl Finding {
+    fn new(level: Level, line: impl Into<String>) -> Self {
+        Finding {
+            level,
+            line: line.into(),
+            details: Vec::new(),
+        }
+    }
+
+    fn details(self, details: Vec<String>) -> Self {
+        Finding { details, ..self }
+    }
+}
+
+/// Whether GitLab may lack what the job reads, the daemon's
+/// `Job::optional`: epics need GitLab Premium, and the daemon expects their
+/// fetch to be rejected elsewhere.
+fn optional(key: &str) -> bool {
+    kind(key) == "group/*/epics"
+}
+
+fn sync(a: &Answers, link: Link, now: i64) -> Check<SyncFacts> {
+    let reply = match reply("sync", "GetSyncJobs", &a.jobs, a) {
+        Ok(reply) => reply,
+        Err(check) => return check,
+    };
+    let jobs = &reply.jobs;
+    let running = |j: &&SyncJob| j.status == SyncJobStatus::running;
+
+    let (unavailable, failing): (Vec<&SyncJob>, Vec<&SyncJob>) = jobs
+        .iter()
+        .filter(|j| {
+            j.status == SyncJobStatus::backing_off || (j.failures > 0 && j.last_error.is_some())
+        })
+        .partition(|j| optional(&j.key));
+    let hanging: Vec<(&SyncJob, i64)> = jobs
+        .iter()
+        .filter(running)
+        .filter_map(|j| Some((j, now - j.running_since?)))
+        .filter(|&(_, secs)| secs >= HANG_SECS)
+        .collect();
+    let overdue: Vec<(&SyncJob, i64)> = jobs
+        .iter()
+        .filter(|j| j.status == SyncJobStatus::due)
+        .filter_map(|j| Some((j, now - j.next_due?)))
+        .filter(|&(_, late)| late >= OVERDUE_SECS)
+        .collect();
+    // Something started lately: the worker gets through its backlog.
+    let busy = jobs
+        .iter()
+        .any(|j| running(&j) || j.last_ok.is_some_and(|at| now - at < OVERDUE_SECS));
+    let never_synced: Vec<&SyncJob> = jobs
+        .iter()
+        .filter(|j| j.last_ok.is_none() && kind(&j.key) == j.key)
+        .filter(|j| !failing.iter().any(|f| f.key == j.key))
+        .collect();
+    let paused = pause(reply.paused_until, now);
+
+    let mut findings = Vec::new();
+    // A hung fetch holds its slot whatever the session does.
+    let free = format!(
+        "A fetch this long hangs; restarting the daemon frees it: {}.",
+        restart_command()
+    );
+    match hanging[..] {
+        [] => {}
+        [(job, secs)] => findings.push(
+            Finding::new(
+                Level::Error,
+                format!("{} running for {}", job.key, span(secs)),
+            )
+            .details(vec![free]),
+        ),
+        _ => {
+            let line = format!(
+                "{} jobs running for over {}",
+                hanging.len(),
+                span(HANG_SECS)
+            );
+            let each = hanging
+                .iter()
+                .map(|(job, secs)| format!("{}: running for {}", job.key, span(*secs)));
+            let details = each.chain([free]).collect();
+            findings.push(Finding::new(Level::Error, line).details(details));
+        }
+    }
+    if link == Link::Dormant {
+        // Nothing runs without a session: the session check says why.
+        findings.push(Finding::new(
+            Level::Skipped,
+            "on hold while there is no GitLab session",
+        ));
+    } else {
+        let paused_now = paused.is_some();
+        if let Some(paused) = paused {
+            findings.push(Finding::new(Level::Warning, paused));
+        }
+        if !failing.is_empty() {
+            let line = format!("{} of {} jobs failing", failing.len(), jobs.len());
+            let mut named: Vec<String> = failing
+                .iter()
+                .take(FAILING_NAMED)
+                .map(|j| {
+                    format!(
+                        "{}: {}",
+                        j.key,
+                        failure(j.failures, j.last_error.as_deref())
+                    )
+                })
+                .collect();
+            if failing.len() > FAILING_NAMED {
+                named.push(format!(
+                    "… and {} more; `forskap sync jobs` lists them all",
+                    failing.len() - FAILING_NAMED
+                ));
+            }
+            findings.push(Finding::new(Level::Warning, line).details(named));
+        }
+        if let Some(&(oldest, late)) = overdue.iter().max_by_key(|&&(_, late)| late) {
+            let n = overdue.len();
+            // While the worker may run (connected, not paused) and runs
+            // nothing, it is not getting to them.
+            if link == Link::Connected && !paused_now && !busy {
+                let line = format!(
+                    "{n} jobs overdue, none started in the last {}",
+                    span(OVERDUE_SECS)
+                );
+                findings.push(Finding::new(Level::Warning, line).details(vec![
+                    format!("the oldest, {}, by {}", oldest.key, span(late)),
+                    format!(
+                        "The sync worker is not getting to them; restarting the daemon may \
+                         help: {}.",
+                        restart_command()
+                    ),
+                ]));
+            } else {
+                let catching_up = if busy { "catching up: " } else { "" };
+                findings.push(Finding::new(
+                    Level::Ok,
+                    format!(
+                        "{catching_up}{n} jobs overdue, the oldest by {}",
+                        span(late)
+                    ),
+                ));
+            }
+        }
+        if !unavailable.is_empty() {
+            let n = unavailable.len();
+            let groups = if n == 1 { "group" } else { "groups" };
+            findings.push(Finding::new(
+                Level::Ok,
+                format!("epics unavailable for {n} {groups}: they need GitLab Premium"),
+            ));
+        }
+        if !never_synced.is_empty() {
+            let keys: Vec<&str> = never_synced.iter().map(|j| j.key.as_str()).collect();
+            findings.push(Finding::new(
+                Level::Ok,
+                format!("not synced yet: {}", keys.join(", ")),
+            ));
+        }
+    }
+
+    let fine = match jobs.len() {
+        0 => "no sync jobs planned".to_string(),
+        n => format!("{n} jobs, none failing"),
+    };
+    let keys = |jobs: &[&SyncJob]| jobs.iter().map(|j| j.key.clone()).collect();
+    let facts = SyncFacts {
+        jobs: JobCounts::of(jobs),
+        paused_until: reply.paused_until,
+        failing: keys(&failing),
+        hanging: hanging.iter().map(|(j, _)| j.key.clone()).collect(),
+        overdue: overdue.iter().map(|(j, _)| j.key.clone()).collect(),
+        never_synced: keys(&never_synced),
+        unavailable: keys(&unavailable),
+    };
+    conclude("sync", fine, findings).facts(facts)
+}
+
+impl JobCounts {
+    fn of(jobs: &[SyncJob]) -> Self {
+        let mut counts = JobCounts {
+            total: jobs.len(),
+            ..JobCounts::default()
+        };
+        for job in jobs {
+            *match job.status {
+                SyncJobStatus::running => &mut counts.running,
+                SyncJobStatus::demanded => &mut counts.demanded,
+                SyncJobStatus::due => &mut counts.due,
+                SyncJobStatus::waiting => &mut counts.waiting,
+                SyncJobStatus::backing_off => &mut counts.backing_off,
+            } += 1;
+        }
+        counts
+    }
+}
+
+/// A check from its findings: the first of the worst sums it up and the
+/// others follow as details. With nothing worse than a note, `fine` does.
+fn conclude<F>(name: &'static str, fine: String, findings: Vec<Finding>) -> Check<F> {
+    let worst = findings.iter().map(|f| f.level).max().unwrap_or(Level::Ok);
+    let top = findings
+        .iter()
+        .position(|f| f.level == worst)
+        .filter(|_| worst > Level::Ok);
+    let mut check = Check::new(name, worst, fine);
+    let mut rest = Vec::new();
+    for (i, finding) in findings.into_iter().enumerate() {
+        if Some(i) == top {
+            check.summary = finding.line;
+            check.details = finding.details;
+        } else {
+            rest.push(finding.line);
+            rest.extend(finding.details);
+        }
+    }
+    check.details.extend(rest);
+    check
+}
+
+fn queue(a: &Answers) -> Check<QueueFacts> {
+    let failures = match reply("queue", "GetFailures", &a.failures, a) {
+        Ok(failures) => failures,
+        Err(check) => return check,
+    };
+    let facts = QueueFacts {
+        failed_writes: failures.len(),
+    };
+    let check = match failures.len() {
+        0 => Check::new("queue", Level::Ok, "no failed writes"),
+        n => Check::new(
+            "queue",
+            Level::Warning,
+            format!("{n} failed {}", if n == 1 { "write" } else { "writes" }),
+        )
+        .details(vec![
+            "GitLab rejected them, or they outlived the retry window: `forskap queue list` \
+             shows them, to retry or dismiss."
+                .to_string(),
+        ]),
+    };
+    check.facts(facts)
+}
+
+/// One line of the table.
+struct Row<'a> {
+    name: &'static str,
+    level: Level,
+    summary: &'a str,
+    details: &'a [String],
+}
+
+impl<F> Check<F> {
+    fn row(&self) -> Row<'_> {
+        Row {
+            name: self.name,
+            level: self.level,
+            summary: &self.summary,
+            details: &self.details,
+        }
+    }
+}
+
+impl Checks {
+    fn rows(&self) -> [Row<'_>; 4] {
+        [
+            self.daemon.row(),
+            self.session.row(),
+            self.sync.row(),
+            self.queue.row(),
+        ]
+    }
+}
+
+/// A line per check with its details beneath, then the verdict.
+fn render(report: &Report) -> String {
+    let rows = report.checks.rows();
+    let w0 = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
+    // As wide as any level, not just the ones there: a `--watch` keeps its
+    // columns when one changes.
+    let levels = [Level::Ok, Level::Skipped, Level::Warning, Level::Error];
+    let w1 = levels
+        .map(|l| l.word().len())
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let indent = " ".repeat(w0 + 2 + w1 + 2);
+    let mut out = String::new();
+    for row in &rows {
+        let level = style::state(row.level.word());
+        out.push_str(&format!(
+            "{:<w0$}  {level:<w1$}  {}\n",
+            row.name, row.summary
+        ));
+        for detail in row.details {
+            out.push_str(&format!("{indent}{detail}\n"));
+        }
+    }
+    out.push_str(&format!("\n{}\n", verdict(&rows)));
+    out
+}
+
+/// `healthy`, `healthy: 1 warning`, `unhealthy: 1 error, 3 skipped`.
+fn verdict(rows: &[Row]) -> String {
+    let count = |level| rows.iter().filter(|r| r.level == level).count();
+    let parts: Vec<String> = [
+        (Level::Error, "errors"),
+        (Level::Warning, "warnings"),
+        (Level::Skipped, "skipped"),
+    ]
+    .into_iter()
+    .filter_map(|(level, many)| match count(level) {
+        0 => None,
+        1 => Some(format!("1 {}", level.word())),
+        n => Some(format!("{n} {many}")),
+    })
+    .collect();
+    let state = if count(Level::Error) > 0 {
+        "unhealthy"
+    } else {
+        "healthy"
+    };
+    if parts.is_empty() {
+        state.to_string()
+    } else {
+        format!("{state}: {}", parts.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_800_000_000;
+    const DAY: i64 = 86_400;
+    const SOCKET: &str = "unix:/run/user/1000/forskapd.socket";
+
+    fn now() -> DateTime<Utc> {
+        DateTime::from_timestamp(NOW, 0).unwrap()
+    }
+
+    fn me() -> WhoAmI_Reply {
+        WhoAmI_Reply {
+            host: "gitlab.example.com".to_string(),
+            user_id: 7,
+            username: "ada".to_string(),
+            token_expires_at: Some(NOW + 90 * DAY),
+            token_rotates: true,
+        }
+    }
+
+    fn job(key: &str, status: SyncJobStatus) -> SyncJob {
+        SyncJob {
+            key: key.to_string(),
+            status,
+            last_ok: None,
+            next_due: None,
+            running_since: None,
+            failures: 0,
+            last_error: None,
+        }
+    }
+
+    /// Synced a minute ago, due again in four.
+    fn fresh(key: &str) -> SyncJob {
+        SyncJob {
+            last_ok: Some(NOW - 60),
+            next_due: Some(NOW + 240),
+            ..job(key, SyncJobStatus::waiting)
+        }
+    }
+
+    fn failing(key: &str, failures: i64, error: &str) -> SyncJob {
+        SyncJob {
+            next_due: Some(NOW + 3600),
+            failures,
+            last_error: Some(error.to_string()),
+            ..job(key, SyncJobStatus::backing_off)
+        }
+    }
+
+    fn jobs(jobs: Vec<SyncJob>) -> Answer<GetSyncJobs_Reply> {
+        Answer::Got(GetSyncJobs_Reply {
+            jobs,
+            paused_until: None,
+        })
+    }
+
+    fn healthy() -> Answers {
+        Answers {
+            socket: SOCKET.to_string(),
+            connected: Ok(()),
+            info: Answer::Got(Info {
+                product: "forskapd".to_string(),
+                version: VERSION.to_string(),
+            }),
+            who: Answer::Got(Login::Connected(me())),
+            jobs: jobs(vec![
+                fresh("assigned/issues"),
+                fresh("events"),
+                fresh("project/7/issues"),
+            ]),
+            failures: Answer::Got(Vec::new()),
+        }
+    }
+
+    fn unreachable(socket: &str) -> Answers {
+        Answers {
+            socket: socket.to_string(),
+            connected: Err("No socket exists there.".to_string()),
+            info: Answer::Unasked,
+            who: Answer::Unasked,
+            jobs: Answer::Unasked,
+            failures: Answer::Unasked,
+        }
+    }
+
+    fn dormant_with(reason: Option<NotAuthReason>, detail: Option<&str>) -> Answers {
+        Answers {
+            who: Answer::Got(Login::Dormant {
+                reason,
+                detail: detail.map(str::to_string),
+            }),
+            ..healthy()
+        }
+    }
+
+    fn report(answers: &Answers) -> Report {
+        evaluate(answers, now())
+    }
+
+    fn levels(report: &Report) -> [Level; 4] {
+        report.checks.rows().map(|row| row.level)
+    }
+
+    #[test]
+    fn everything_healthy_is_ok_and_exits_zero() {
+        let report = report(&healthy());
+        assert_eq!(levels(&report), [Level::Ok; 4]);
+        assert_eq!(report.level, Level::Ok);
+        assert!(outcome(&report).is_ok());
+        let c = &report.checks;
+        assert_eq!(c.daemon.summary, format!("forskapd {VERSION} on {SOCKET}"));
+        assert_eq!(c.session.summary, "@ada on gitlab.example.com");
+        assert_eq!(
+            c.session.details,
+            ["The token expires on 2027-04-15 (in 90 days); the daemon rotates it before that."]
+        );
+        assert_eq!(c.sync.summary, "3 jobs, none failing");
+        assert!(c.sync.details.is_empty(), "{:?}", c.sync.details);
+        assert_eq!(c.queue.summary, "no failed writes");
+    }
+
+    #[test]
+    fn an_unreachable_daemon_is_an_error_and_the_rest_is_skipped() {
+        let report = report(&unreachable("unix:/tmp/does-not-exist.socket"));
+        assert_eq!(
+            levels(&report),
+            [Level::Error, Level::Skipped, Level::Skipped, Level::Skipped]
+        );
+        let daemon = &report.checks.daemon;
+        assert_eq!(
+            daemon.summary,
+            "not reachable on unix:/tmp/does-not-exist.socket"
+        );
+        assert_eq!(daemon.details[0], "No socket exists there.");
+        assert!(
+            daemon.details[1].starts_with("Start it with `"),
+            "{:?}",
+            daemon.details
+        );
+        for row in &report.checks.rows()[1..] {
+            assert_eq!(row.summary, "the daemon is not reachable");
+        }
+        assert!(outcome(&report).unwrap_err().is::<Unhealthy>());
+    }
+
+    #[test]
+    fn a_daemon_that_stops_answering_is_an_error() {
+        // It took the connection, then went silent on the first call.
+        let answers = Answers {
+            info: Answer::TimedOut,
+            who: Answer::Unasked,
+            jobs: Answer::Unasked,
+            failures: Answer::Unasked,
+            ..healthy()
+        };
+        let report = report(&answers);
+        assert_eq!(
+            levels(&report),
+            [Level::Error, Level::Skipped, Level::Skipped, Level::Skipped]
+        );
+        assert_eq!(
+            report.checks.daemon.summary,
+            format!("no answer on {SOCKET} within 10s")
+        );
+        assert_eq!(
+            report.checks.queue.summary,
+            "not asked: the daemon stopped answering"
+        );
+
+        // Later: the check that asked is the error.
+        let answers = Answers {
+            jobs: Answer::TimedOut,
+            failures: Answer::Unasked,
+            ..healthy()
+        };
+        let report = evaluate(&answers, now());
+        assert_eq!(
+            levels(&report),
+            [Level::Ok, Level::Ok, Level::Error, Level::Skipped]
+        );
+        assert_eq!(
+            report.checks.sync.summary,
+            "no answer to GetSyncJobs within 10s"
+        );
+    }
+
+    #[test]
+    fn each_dormancy_reason_has_its_level_and_next_step() {
+        for (reason, level, summary) in [
+            (
+                Some(NotAuthReason::unreachable),
+                Level::Warning,
+                "GitLab not reachable",
+            ),
+            (
+                Some(NotAuthReason::no_credentials),
+                Level::Error,
+                "not logged in",
+            ),
+            (Some(NotAuthReason::logged_out), Level::Error, "logged out"),
+            (
+                Some(NotAuthReason::token_rejected),
+                Level::Error,
+                "GitLab rejected the token",
+            ),
+            (
+                Some(NotAuthReason::keychain_error),
+                Level::Error,
+                "can't read the credentials from the keychain",
+            ),
+            // A daemon too old to say why.
+            (None, Level::Error, "not connected to GitLab"),
+        ] {
+            let healing = reason == Some(NotAuthReason::unreachable);
+            let report = report(&dormant_with(
+                reason.clone(),
+                Some("gitlab.example.com: 401"),
+            ));
+            let session = &report.checks.session;
+            assert_eq!((session.level, session.summary.as_str()), (level, summary));
+            assert_eq!(session.details[0], "gitlab.example.com: 401");
+            let next = &session.details[1];
+            if healing {
+                assert!(next.contains("reconnects by itself"), "{next}");
+            } else {
+                assert!(next.contains("forskap auth login"), "{next}");
+            }
+            assert_eq!(report.level, level, "{reason:?}");
+            assert_eq!(outcome(&report).is_ok(), healing, "{reason:?}");
+        }
+        // No detail, no empty line for it.
+        let report = report(&dormant_with(Some(NotAuthReason::logged_out), Some("")));
+        assert_eq!(
+            report.checks.session.details,
+            ["Run `forskap auth login` to authenticate."]
+        );
+    }
+
+    #[test]
+    fn a_token_expiring_soon_warns_only_when_it_is_not_rotated() {
+        let session = |expires_in: i64, rotates: bool| {
+            let me = WhoAmI_Reply {
+                token_expires_at: Some(NOW + expires_in),
+                token_rotates: rotates,
+                ..me()
+            };
+            let answers = Answers {
+                who: Answer::Got(Login::Connected(me)),
+                ..healthy()
+            };
+            report(&answers).checks.session
+        };
+        let soon = session(2 * DAY + 3600, false);
+        assert_eq!(soon.level, Level::Warning);
+        assert_eq!(
+            soon.summary,
+            "@ada on gitlab.example.com; the token expires on 2027-01-17 (in 2 days)"
+        );
+        assert!(
+            soon.details[0].contains("forskap auth login"),
+            "{:?}",
+            soon.details
+        );
+
+        // The daemon replaces it before then.
+        let rotated = session(2 * DAY, true);
+        assert_eq!(rotated.level, Level::Ok);
+        assert_eq!(rotated.summary, "@ada on gitlab.example.com");
+        // Far enough out.
+        assert_eq!(session(30 * DAY, false).level, Level::Ok);
+        // No known expiry.
+        let me = WhoAmI_Reply {
+            token_expires_at: None,
+            token_rotates: false,
+            ..me()
+        };
+        let answers = Answers {
+            who: Answer::Got(Login::Connected(me)),
+            ..healthy()
+        };
+        let session = report(&answers).checks.session;
+        assert_eq!(session.level, Level::Ok);
+        assert_eq!(session.details, ["The token has no known expiry date."]);
+    }
+
+    #[test]
+    fn an_expired_token_is_an_error() {
+        for rotates in [false, true] {
+            let me = WhoAmI_Reply {
+                token_expires_at: Some(NOW - DAY),
+                token_rotates: rotates,
+                ..me()
+            };
+            let answers = Answers {
+                who: Answer::Got(Login::Connected(me)),
+                ..healthy()
+            };
+            let report = report(&answers);
+            let session = &report.checks.session;
+            assert_eq!(session.level, Level::Error);
+            assert_eq!(
+                session.summary,
+                "@ada on gitlab.example.com, but the token expired on 2027-01-14"
+            );
+            assert!(outcome(&report).is_err());
+        }
+    }
+
+    #[test]
+    fn a_rate_limit_pause_warns_for_how_long() {
+        let answers = Answers {
+            jobs: Answer::Got(GetSyncJobs_Reply {
+                jobs: vec![fresh("assigned/issues")],
+                paused_until: Some(NOW + 240),
+            }),
+            ..healthy()
+        };
+        let sync = report(&answers).checks.sync;
+        assert_eq!(sync.level, Level::Warning);
+        assert_eq!(sync.summary, "paused by a GitLab rate limit for another 4m");
+
+        // One that is over says nothing.
+        let answers = Answers {
+            jobs: Answer::Got(GetSyncJobs_Reply {
+                jobs: vec![fresh("assigned/issues")],
+                paused_until: Some(NOW - 1),
+            }),
+            ..healthy()
+        };
+        assert_eq!(report(&answers).checks.sync.level, Level::Ok);
+    }
+
+    #[test]
+    fn failing_jobs_warn_with_their_count_and_the_first_few_named() {
+        let forbidden = "GitLab error: 403 Forbidden";
+        let answers = Answers {
+            jobs: jobs(vec![
+                fresh("assigned/issues"),
+                failing("project/7/merge_requests", 8, forbidden),
+                failing("project/9/boards", 1, forbidden),
+                // Failed and due again, not backing off: still failing.
+                SyncJob {
+                    last_ok: Some(NOW - DAY),
+                    next_due: Some(NOW - 10),
+                    failures: 2,
+                    last_error: Some("GitLab unavailable (502)".to_string()),
+                    ..job("events", SyncJobStatus::due)
+                },
+                // Backing off since before a restart: no error kept.
+                SyncJob {
+                    last_error: None,
+                    ..failing("member/groups", 3, "")
+                },
+                failing("project/11/issues", 1, forbidden),
+            ]),
+            ..healthy()
+        };
+        let report = report(&answers);
+        let sync = &report.checks.sync;
+        assert_eq!(sync.level, Level::Warning);
+        assert_eq!(sync.summary, "5 of 6 jobs failing");
+        assert_eq!(
+            sync.details,
+            [
+                "project/7/merge_requests: failed 8 times: GitLab error: 403 Forbidden",
+                "project/9/boards: failed once: GitLab error: 403 Forbidden",
+                "events: failed 2 times: GitLab unavailable (502)",
+                "… and 2 more; `forskap sync jobs` lists them all",
+            ]
+        );
+        let facts = sync.facts.as_ref().unwrap();
+        assert_eq!(facts.failing.len(), 5);
+        assert_eq!(facts.failing[3], "member/groups");
+        // Something to look at, nothing broken.
+        assert_eq!(report.level, Level::Warning);
+        assert!(outcome(&report).is_ok());
+    }
+
+    /// The owner's account: two projects with a feature switched off.
+    #[test]
+    fn features_switched_off_in_a_project_stay_a_warning() {
+        let forbidden = "GitLab error: gitlab server error (403 Forbidden): 403 Forbidden";
+        let mut all = vec![fresh("assigned/issues"), fresh("assigned/merge_requests")];
+        all.extend((1..=55).map(|p| fresh(&format!("project/{p}/avatar"))));
+        all.push(failing("project/60/merge_requests", 8, forbidden));
+        all.push(failing("project/61/boards", 8, forbidden));
+        let answers = Answers {
+            jobs: jobs(all),
+            ..healthy()
+        };
+        let report = report(&answers);
+        assert_eq!(
+            levels(&report),
+            [Level::Ok, Level::Ok, Level::Warning, Level::Ok]
+        );
+        assert_eq!(report.checks.sync.summary, "2 of 59 jobs failing");
+        assert!(outcome(&report).is_ok());
+    }
+
+    #[test]
+    fn epics_gitlab_does_not_serve_are_only_noted() {
+        let answers = Answers {
+            jobs: jobs(vec![
+                fresh("assigned/issues"),
+                failing("group/3/epics", 1, "GitLab error: 404 Not Found"),
+                failing("group/4/epics", 1, "GitLab error: 403 Forbidden"),
+            ]),
+            ..healthy()
+        };
+        let sync = report(&answers).checks.sync;
+        assert_eq!(sync.level, Level::Ok);
+        assert_eq!(sync.summary, "3 jobs, none failing");
+        assert_eq!(
+            sync.details,
+            ["epics unavailable for 2 groups: they need GitLab Premium"]
+        );
+        let facts = sync.facts.unwrap();
+        assert!(facts.failing.is_empty());
+        assert_eq!(facts.unavailable, ["group/3/epics", "group/4/epics"]);
+    }
+
+    #[test]
+    fn a_job_running_for_a_quarter_hour_hangs() {
+        let running = |key: &str, secs: i64| SyncJob {
+            last_ok: Some(NOW - DAY),
+            running_since: Some(NOW - secs),
+            ..job(key, SyncJobStatus::running)
+        };
+        // The slowest real fetch: about four minutes.
+        let answers = Answers {
+            jobs: jobs(vec![running("member/projects", 4 * 60), fresh("events")]),
+            ..healthy()
+        };
+        assert_eq!(report(&answers).checks.sync.level, Level::Ok);
+
+        let answers = Answers {
+            jobs: jobs(vec![running("member/projects", 47 * 60), fresh("events")]),
+            ..healthy()
+        };
+        let report = report(&answers);
+        let sync = &report.checks.sync;
+        assert_eq!(sync.level, Level::Error);
+        assert_eq!(sync.summary, "member/projects running for 47m");
+        assert!(sync.details[0].starts_with("A fetch this long hangs"));
+        assert_eq!(sync.facts.as_ref().unwrap().hanging, ["member/projects"]);
+        assert!(outcome(&report).is_err());
+
+        let answers = Answers {
+            jobs: jobs(vec![
+                running("member/projects", 47 * 60),
+                running("project/7/issues", 16 * 60),
+            ]),
+            ..healthy()
+        };
+        let sync = evaluate(&answers, now()).checks.sync;
+        assert_eq!(sync.summary, "2 jobs running for over 15m");
+        assert_eq!(
+            sync.details[..2],
+            [
+                "member/projects: running for 47m",
+                "project/7/issues: running for 16m"
+            ]
+        );
+    }
+
+    #[test]
+    fn overdue_jobs_warn_only_while_the_worker_starts_nothing() {
+        let overdue = |key: &str, late: i64| SyncJob {
+            last_ok: Some(NOW - late - 1800),
+            next_due: Some(NOW - late),
+            ..job(key, SyncJobStatus::due)
+        };
+        let stale = |key: &str| SyncJob {
+            last_ok: Some(NOW - 2 * 3600),
+            next_due: Some(NOW + 600),
+            ..job(key, SyncJobStatus::waiting)
+        };
+        let idle = vec![
+            stale("assigned/issues"),
+            overdue("project/7/issues", 2 * 3600),
+            overdue("project/8/issues", 45 * 60),
+        ];
+        let answers = Answers {
+            jobs: jobs(idle.clone()),
+            ..healthy()
+        };
+        let sync = report(&answers).checks.sync;
+        assert_eq!(sync.level, Level::Warning);
+        assert_eq!(sync.summary, "2 jobs overdue, none started in the last 30m");
+        assert_eq!(sync.details[0], "the oldest, project/7/issues, by 2h");
+
+        // Something runs: it is catching up, as after a suspend.
+        let mut busy = idle.clone();
+        busy[0] = SyncJob {
+            last_ok: Some(NOW - 2 * 3600),
+            running_since: Some(NOW - 5),
+            ..job("assigned/issues", SyncJobStatus::running)
+        };
+        let answers = Answers {
+            jobs: jobs(busy),
+            ..healthy()
+        };
+        let sync = report(&answers).checks.sync;
+        assert_eq!(sync.level, Level::Ok);
+        assert_eq!(
+            sync.details,
+            ["catching up: 2 jobs overdue, the oldest by 2h"]
+        );
+
+        // Paused: the rate limit holds them, and says so.
+        let answers = Answers {
+            jobs: Answer::Got(GetSyncJobs_Reply {
+                jobs: idle.clone(),
+                paused_until: Some(NOW + 60),
+            }),
+            ..healthy()
+        };
+        let sync = report(&answers).checks.sync;
+        assert_eq!(sync.summary, "paused by a GitLab rate limit for another 1m");
+        assert_eq!(sync.details, ["2 jobs overdue, the oldest by 2h"]);
+
+        // Late, but not by much.
+        let answers = Answers {
+            jobs: jobs(vec![stale("events"), overdue("project/7/issues", 20 * 60)]),
+            ..healthy()
+        };
+        assert_eq!(report(&answers).checks.sync.level, Level::Ok);
+    }
+
+    #[test]
+    fn a_dormant_session_puts_the_sync_on_hold_without_more_warnings() {
+        let paused_failing_overdue = Answer::Got(GetSyncJobs_Reply {
+            jobs: vec![
+                failing("project/7/boards", 3, "GitLab error: 403 Forbidden"),
+                SyncJob {
+                    last_ok: Some(NOW - DAY),
+                    next_due: Some(NOW - DAY / 2),
+                    ..job("assigned/issues", SyncJobStatus::due)
+                },
+            ],
+            paused_until: Some(NOW + 600),
+        });
+        let answers = Answers {
+            jobs: paused_failing_overdue,
+            ..dormant_with(Some(NotAuthReason::unreachable), None)
+        };
+        let report = report(&answers);
+        let sync = &report.checks.sync;
+        assert_eq!(sync.level, Level::Skipped);
+        assert_eq!(sync.summary, "on hold while there is no GitLab session");
+        assert!(sync.details.is_empty(), "{:?}", sync.details);
+        // Only the session finding counts.
+        assert_eq!(
+            levels(&report),
+            [Level::Ok, Level::Warning, Level::Skipped, Level::Ok]
+        );
+
+        // A hung fetch still is one.
+        let answers = Answers {
+            jobs: jobs(vec![SyncJob {
+                running_since: Some(NOW - 3600),
+                ..job("member/projects", SyncJobStatus::running)
+            }]),
+            ..dormant_with(Some(NotAuthReason::unreachable), None)
+        };
+        let sync = evaluate(&answers, now()).checks.sync;
+        assert_eq!(sync.level, Level::Error);
+        assert_eq!(sync.details[1], "on hold while there is no GitLab session");
+    }
+
+    #[test]
+    fn lists_that_never_synced_are_noted() {
+        let answers = Answers {
+            jobs: jobs(vec![
+                fresh("assigned/issues"),
+                job("events", SyncJobStatus::due),
+                job("timelogs/all", SyncJobStatus::waiting),
+                // Per-project jobs are too many to name.
+                job("project/7/avatar", SyncJobStatus::due),
+                // Named as failing already.
+                failing("member/groups", 1, "GitLab error: 500"),
+            ]),
+            ..healthy()
+        };
+        let sync = report(&answers).checks.sync;
+        assert_eq!(sync.level, Level::Warning);
+        assert_eq!(
+            sync.details.last().unwrap(),
+            "not synced yet: events, timelogs/all"
+        );
+        assert_eq!(sync.facts.unwrap().never_synced, ["events", "timelogs/all"]);
+    }
+
+    #[test]
+    fn failed_writes_warn_with_the_count_and_where_to_look() {
+        let failed = |id| FailedTask {
+            id,
+            op: "post_time".to_string(),
+            kind: forskap_api::IssuableKind::issue,
+            project_id: 7,
+            iid: 42,
+            detail: "1h".to_string(),
+            error: "403 Forbidden".to_string(),
+            queued_at: NOW - DAY,
+            failed_at: NOW - 60,
+        };
+        let answers = Answers {
+            failures: Answer::Got(vec![failed(1), failed(2)]),
+            ..healthy()
+        };
+        let report = report(&answers);
+        let queue = &report.checks.queue;
+        assert_eq!(queue.level, Level::Warning);
+        assert_eq!(queue.summary, "2 failed writes");
+        assert!(queue.details[0].contains("`forskap queue list`"));
+        assert_eq!(queue.facts.as_ref().unwrap().failed_writes, 2);
+        assert!(outcome(&report).is_ok());
+        let answers = Answers {
+            failures: Answer::Got(vec![failed(1)]),
+            ..healthy()
+        };
+        assert_eq!(
+            evaluate(&answers, now()).checks.queue.summary,
+            "1 failed write"
+        );
+    }
+
+    #[test]
+    fn a_daemon_of_another_version_warns_to_restart_it() {
+        let answers = Answers {
+            info: Answer::Got(Info {
+                product: "forskapd".to_string(),
+                version: "0.0.1".to_string(),
+            }),
+            ..healthy()
+        };
+        let report = report(&answers);
+        let daemon = &report.checks.daemon;
+        assert_eq!(daemon.level, Level::Warning);
+        assert_eq!(
+            daemon.summary,
+            format!("forskapd 0.0.1 on {SOCKET}, but forskap is {VERSION}")
+        );
+        assert!(
+            daemon.details[0].contains("restart"),
+            "{:?}",
+            daemon.details
+        );
+        assert_eq!(
+            daemon.facts.as_ref().unwrap().version.as_deref(),
+            Some("0.0.1")
+        );
+        assert!(outcome(&report).is_ok());
+
+        // It didn't say: reachable all the same.
+        let answers = Answers {
+            info: Answer::Failed("org.varlink.service.MethodNotFound".to_string()),
+            ..healthy()
+        };
+        let daemon = evaluate(&answers, now()).checks.daemon;
+        assert_eq!(daemon.level, Level::Warning);
+        assert_eq!(daemon.facts.unwrap().version, None);
+    }
+
+    #[test]
+    fn a_reply_this_cli_cannot_read_is_an_error_of_its_check() {
+        let answers = Answers {
+            who: Answer::Failed(varlink_words(&varlink::ErrorKind::SerdeJsonSer(
+                serde_json::error::Category::Data,
+            ))),
+            ..healthy()
+        };
+        let report = report(&answers);
+        let session = &report.checks.session;
+        assert_eq!(
+            (session.level, session.summary.as_str()),
+            (Level::Error, "WhoAmI failed")
+        );
+        assert!(
+            session.details[0].contains("different builds"),
+            "{:?}",
+            session.details
+        );
+        // The sync runs on regardless: nothing tells it is down.
+        assert_eq!(report.checks.sync.level, Level::Ok);
+    }
+
+    #[test]
+    fn only_an_error_exits_non_zero() {
+        for (level, fails) in [
+            (Level::Ok, false),
+            (Level::Skipped, false),
+            (Level::Warning, false),
+            (Level::Error, true),
+        ] {
+            let report = Report {
+                level,
+                ..evaluate(&healthy(), now())
+            };
+            let outcome = outcome(&report);
+            assert_eq!(outcome.is_err(), fails, "{level:?}");
+            if let Err(e) = outcome {
+                assert!(e.is::<Unhealthy>());
+            }
+        }
+    }
+
+    #[test]
+    fn render_aligns_the_checks_and_closes_with_the_verdict() {
+        let answers = Answers {
+            jobs: jobs(vec![
+                fresh("assigned/issues"),
+                failing("project/9/boards", 8, "403 Forbidden"),
+            ]),
+            ..healthy()
+        };
+        assert_eq!(
+            render(&report(&answers)),
+            format!(
+                "\
+daemon   ok       forskapd {VERSION} on {SOCKET}
+session  ok       @ada on gitlab.example.com
+                  The token expires on 2027-04-15 (in 90 days); the daemon rotates it before that.
+sync     warning  1 of 2 jobs failing
+                  project/9/boards: failed 8 times: 403 Forbidden
+queue    ok       no failed writes
+
+healthy: 1 warning
+"
+            )
+        );
+
+        let text = render(&report(&unreachable(SOCKET)));
+        assert!(
+            text.starts_with(&format!(
+                "\
+daemon   error    not reachable on {SOCKET}
+                  No socket exists there.
+                  Start it with `"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "\
+session  skipped  the daemon is not reachable
+sync     skipped  the daemon is not reachable
+queue    skipped  the daemon is not reachable
+
+unhealthy: 1 error, 3 skipped
+"
+            ),
+            "{text}"
+        );
+        assert_eq!(verdict(&report(&healthy()).checks.rows()), "healthy");
+        // All `ok`: the columns stay where a warning would put them.
+        let text = render(&report(&healthy()));
+        assert!(text.starts_with("daemon   ok       forskapd"), "{text}");
+        assert!(
+            text.ends_with("queue    ok       no failed writes\n\nhealthy\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_colours_the_levels_and_keeps_the_columns() {
+        style::force(true);
+        let answers = Answers {
+            failures: Answer::Got(vec![]),
+            jobs: Answer::TimedOut,
+            ..healthy()
+        };
+        let text = render(&report(&answers));
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[0].starts_with("daemon   \x1b[32mok     \x1b[0m  forskapd"),
+            "{text}"
+        );
+        assert!(
+            lines[3].starts_with("sync     \x1b[31merror  \x1b[0m  no answer"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn json_carries_the_levels_and_the_numbers_behind_them() {
+        let answers = Answers {
+            jobs: jobs(vec![
+                fresh("assigned/issues"),
+                failing("project/9/boards", 8, "403 Forbidden"),
+            ]),
+            ..healthy()
+        };
+        let json = serde_json::to_value(report(&answers)).unwrap();
+        assert_eq!(json["level"], "warning");
+        let checks = &json["checks"];
+        assert_eq!(checks["daemon"]["name"], "daemon");
+        assert_eq!(checks["daemon"]["version"], VERSION);
+        assert_eq!(checks["daemon"]["cli_version"], VERSION);
+        assert_eq!(checks["session"]["level"], "ok");
+        assert_eq!(checks["session"]["username"], "ada");
+        assert_eq!(checks["session"]["host"], "gitlab.example.com");
+        assert_eq!(checks["session"]["reason"], serde_json::Value::Null);
+        assert_eq!(checks["sync"]["level"], "warning");
+        assert_eq!(checks["sync"]["jobs"]["backing_off"], 1);
+        assert_eq!(checks["sync"]["jobs"]["total"], 2);
+        assert_eq!(checks["sync"]["failing"][0], "project/9/boards");
+        assert_eq!(checks["queue"]["failed_writes"], 0);
+        assert_eq!(checks["queue"]["details"], serde_json::json!([]));
+
+        let dormant = dormant_with(Some(NotAuthReason::token_rejected), Some("401"));
+        let json = serde_json::to_value(report(&dormant)).unwrap();
+        assert_eq!(json["checks"]["session"]["connected"], false);
+        assert_eq!(json["checks"]["session"]["reason"], "token_rejected");
+        // Skipped for want of an answer: no numbers to give.
+        let json = serde_json::to_value(report(&unreachable(SOCKET))).unwrap();
+        assert_eq!(json["checks"]["sync"]["level"], "skipped");
+        assert!(json["checks"]["sync"].get("jobs").is_none());
+        assert_eq!(json["checks"]["daemon"]["version"], serde_json::Value::Null);
+
+        // YAML takes the same document, the facts flattened in as well.
+        let yaml = serde_saphyr::to_string(&report(&healthy())).unwrap();
+        assert!(yaml.contains("\n    failed_writes: 0\n"), "{yaml}");
+        assert!(yaml.contains("\n    username: ada\n"), "{yaml}");
+    }
+
+    #[test]
+    fn connect_failures_say_what_to_look_at() {
+        let because = |kind| unreachable_because(&varlink::Error::from(kind));
+        assert_eq!(
+            because(varlink::ErrorKind::Io(std::io::ErrorKind::NotFound)),
+            "No socket exists there."
+        );
+        assert_eq!(
+            because(varlink::ErrorKind::Io(
+                std::io::ErrorKind::ConnectionRefused
+            )),
+            "The socket exists, but nothing listens on it."
+        );
+        assert_eq!(
+            because(varlink::ErrorKind::Io(std::io::ErrorKind::PermissionDenied)),
+            "Connecting failed: permission denied."
+        );
+        assert_eq!(
+            because(varlink::ErrorKind::Io(std::io::ErrorKind::InvalidInput)),
+            "That path can't be a unix socket: it is too long."
+        );
+        assert!(because(varlink::ErrorKind::InvalidAddress).contains("`unix:PATH`"));
+    }
+}

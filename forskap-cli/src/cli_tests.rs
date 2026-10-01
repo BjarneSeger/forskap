@@ -214,6 +214,7 @@ fn output_only_where_data_is_printed() {
         &["auth", "status"],
         &["queue", "list"],
         &["sync", "jobs"],
+        &["status"],
     ] {
         for format in ["text", "json", "yaml"] {
             ok(&[args, &["-o", format]].concat());
@@ -233,6 +234,24 @@ fn output_only_where_data_is_printed() {
     }
     // Not global: it belongs behind the command.
     assert!(parse(&["-o", "json", "issue", "list"]).is_err());
+}
+
+/// A top-level command of the CLI: it checks the whole setup, so it names
+/// no item, project or group.
+#[test]
+fn status_takes_no_target() {
+    assert!(matches!(
+        ok(&["status", "-o", "json"]),
+        Command::Status { output, .. } if matches!(output.output, OutputFormat::Json)
+    ));
+    for args in [
+        &["status", "42"][..],
+        &["status", "-p", "team/api"],
+        &["status", "--group", "team"],
+        &["status", "daemon"],
+    ] {
+        assert!(parse(args).is_err(), "{args:?}");
+    }
 }
 
 #[test]
@@ -311,7 +330,8 @@ fn watch_takes_an_optional_interval() {
         }
         | Command::Queue {
             command: QueueCommand::List { watch, .. },
-        } => watch.watch,
+        }
+        | Command::Status { watch, .. } => watch.watch,
         _ => panic!("{args:?} has no --watch"),
     };
     assert_eq!(secs(&["sync", "jobs"]), None);
@@ -319,6 +339,8 @@ fn watch_takes_an_optional_interval() {
     assert_eq!(secs(&["sync", "jobs", "--watch", "10"]), Some(10));
     assert_eq!(secs(&["queue", "list", "-w5"]), Some(5));
     assert_eq!(secs(&["queue", "list", "--watch", "-o", "text"]), Some(2));
+    assert_eq!(secs(&["status"]), None);
+    assert_eq!(secs(&["status", "--watch", "30"]), Some(30));
 
     assert!(parse(&["sync", "jobs", "--watch", "0"]).is_err());
     assert!(parse(&["sync", "jobs", "--watch", "soon"]).is_err());

@@ -41,26 +41,31 @@ pub async fn run(format: OutputFormat) -> Result<()> {
 }
 
 /// The token's expiry and rotation in one sentence.
-fn token_line(expires_at: Option<i64>, rotates: bool, now: DateTime<Utc>) -> String {
+pub fn token_line(expires_at: Option<i64>, rotates: bool, now: DateTime<Utc>) -> String {
     let Some(expires) = expires_at.and_then(|secs| DateTime::from_timestamp(secs, 0)) else {
         return "The token has no known expiry date.".to_string();
-    };
-    let date = expires.format("%Y-%m-%d");
-    let left = expires - now;
-    let when = match (left.num_days(), left.num_hours()) {
-        _ if left <= chrono::TimeDelta::zero() => format!("expired on {date}"),
-        (0, 0) => format!("expires on {date} (in less than an hour)"),
-        (0, 1) => format!("expires on {date} (in 1 hour)"),
-        (0, hours) => format!("expires on {date} (in {hours} hours)"),
-        (1, _) => format!("expires on {date} (in 1 day)"),
-        (days, _) => format!("expires on {date} (in {days} days)"),
     };
     let rotation = if rotates {
         "the daemon rotates it before that"
     } else {
         "automatic rotation is off"
     };
-    format!("The token {when}; {rotation}.")
+    format!("The token {}; {rotation}.", expiry(expires, now))
+}
+
+/// When the token expires, or that it did: `expires on 2026-12-31 (in 6
+/// days)`, `expired on 2026-12-24`.
+pub fn expiry(expires: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let date = expires.format("%Y-%m-%d");
+    let left = expires - now;
+    match (left.num_days(), left.num_hours()) {
+        _ if left <= chrono::TimeDelta::zero() => format!("expired on {date}"),
+        (0, 0) => format!("expires on {date} (in less than an hour)"),
+        (0, 1) => format!("expires on {date} (in 1 hour)"),
+        (0, hours) => format!("expires on {date} (in {hours} hours)"),
+        (1, _) => format!("expires on {date} (in 1 day)"),
+        (days, _) => format!("expires on {date} (in {days} days)"),
+    }
 }
 
 #[cfg(test)]

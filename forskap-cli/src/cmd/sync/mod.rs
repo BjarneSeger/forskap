@@ -1,6 +1,6 @@
 //! `forskap sync` — the daemon's background sync.
 
-mod jobs;
+pub mod jobs;
 mod refresh;
 
 use anyhow::Result;

@@ -94,15 +94,16 @@ pub fn heading(text: &str) -> Painted<'_> {
     paint(Style::new().bold(), text)
 }
 
-/// A state word: of an issue, merge request or epic, of a sync job, or the
-/// origin of a time entry. Words outside the palette stay plain.
+/// A state word: of an issue, merge request or epic, of a sync job, the
+/// origin of a time entry, or the level of a `forskap status` check. Words
+/// outside the palette stay plain.
 pub fn state(word: &str) -> Painted<'_> {
     let style = match word {
-        "opened" | "running" => fg(AnsiColor::Green),
-        "closed" | "backing off" => fg(AnsiColor::Red),
+        "opened" | "running" | "ok" => fg(AnsiColor::Green),
+        "closed" | "backing off" | "error" => fg(AnsiColor::Red),
         "merged" | "demanded" => fg(AnsiColor::Magenta),
-        "locked" | "due" | "queued" => fg(AnsiColor::Yellow),
-        "waiting" => Style::new().dimmed(),
+        "locked" | "due" | "queued" | "warning" => fg(AnsiColor::Yellow),
+        "waiting" | "skipped" => Style::new().dimmed(),
         _ => Style::new(),
     };
     paint(style, word)
@@ -166,6 +167,11 @@ mod tests {
         assert_eq!(heading("Issues:").to_string(), "\x1b[1mIssues:\x1b[0m");
         assert_eq!(state("opened").to_string(), "\x1b[32mopened\x1b[0m");
         assert_eq!(state("waiting").to_string(), "\x1b[2mwaiting\x1b[0m");
+        // The levels of `forskap status`.
+        assert_eq!(state("ok").to_string(), "\x1b[32mok\x1b[0m");
+        assert_eq!(state("warning").to_string(), "\x1b[33mwarning\x1b[0m");
+        assert_eq!(state("error").to_string(), "\x1b[31merror\x1b[0m");
+        assert_eq!(state("skipped").to_string(), "\x1b[2mskipped\x1b[0m");
         assert_eq!(reference('!', 7).to_string(), "\x1b[36m!7\x1b[0m");
         assert_eq!(error("403").to_string(), "\x1b[31m403\x1b[0m");
         // A word outside the palette gets no escapes at all.
