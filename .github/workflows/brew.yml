@@ -1,0 +1,108 @@
+name: Homebrew
+
+# Installs the formula of this repository's tap the way a user does: built
+# from the source tarball of the release it names, then `brew test`. On macOS
+# it also runs the daemon as a launchd service, which nothing else covers.
+# The release workflow calls this after it bumped the formula.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "Formula/**"
+      - ".github/workflows/brew.yml"
+  pull_request:
+    paths:
+      - "Formula/**"
+      - ".github/workflows/brew.yml"
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit or branch holding the formula to test.
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brew-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HOMEBREW_NO_ANALYTICS: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  HOMEBREW_NO_ENV_HINTS: "1"
+
+jobs:
+  formula:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest # arm64
+          - macos-15-intel
+          - ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Put brew on the PATH
+        if: runner.os == 'Linux'
+        run: echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+
+      # The checkout itself is the tap, as `brew tap bjarneseger/forskap <url>`
+      # makes it for a user.
+      - name: Tap the checkout
+        run: |
+          taps="$(brew --repository)/Library/Taps/bjarneseger"
+          mkdir -p "$taps"
+          ln -s "$GITHUB_WORKSPACE" "$taps/homebrew-forskap"
+          brew info bjarneseger/forskap/forskap
+
+      # The formula alone: `brew style <tap>` would also lint every workflow
+      # of this repository.
+      - name: Style and audit
+        run: |
+          brew style bjarneseger/forskap/forskap
+          brew audit --strict bjarneseger/forskap/forskap
+
+      - name: Install from source
+        run: brew install --build-from-source bjarneseger/forskap/forskap
+
+      - name: Test
+        run: brew test bjarneseger/forskap/forskap
+
+      - name: Check what was installed
+        run: |
+          prefix="$(brew --prefix forskap)"
+          test -x "$prefix/bin/forskapd"
+          test -x "$prefix/bin/forskap"
+          test ! -e "$prefix/bin/gen-config-template"
+          test -s "$prefix/etc/bash_completion.d/forskap"
+          test -s "$prefix/share/zsh/site-functions/_forskap"
+          test -s "$prefix/share/fish/vendor_completions.d/forskap.fish"
+          forskap --version
+
+      - name: Run the daemon as a service
+        if: runner.os == 'macOS'
+        run: |
+          brew services start bjarneseger/forskap/forskap
+          for _ in $(seq 1 60); do
+            [ -S /tmp/forskapd.socket ] && break
+            sleep 1
+          done
+          brew services info forskap
+          test -S /tmp/forskapd.socket
+          forskap queue list --output json
+          forskap auth status || true
+          brew services stop forskap
+
+      - name: Service log
+        if: always() && runner.os == 'macOS'
+        run: cat "$(brew --prefix)/var/log/forskapd.log" || true

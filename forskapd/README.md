@@ -7,12 +7,27 @@ time tracking with caching. Provides the basis for other tools in this workspace
 forskapd provides precompiled releases for arm64 and amd64, with packages for
 debian, rpm and arch. See the `releases`-tab.
 
+On macOS, install with [Homebrew](https://brew.sh) from the tap in this repository.
+The formula builds `forskapd` and `forskap` from the source of the latest release;
+`brew services` runs the daemon under launchd and restarts it if it exits:
+
+```sh
+brew tap bjarneseger/forskap https://github.com/BjarneSeger/forskap
+brew install forskap
+brew services start forskap
+```
+
+Its log is `$(brew --prefix)/var/log/forskapd.log`. On macOS the socket is
+`/tmp/forskapd.socket` unless `[server]` `socket` names another one.
+
 ## Configuration
 
 The daemon reads a TOML config file. Values are layered, highest priority first:
 
-1. `$XDG_CONFIG_HOME/forskapd/config.toml` — your overrides
-2. `/usr/share/forskapd/config.toml` — the package-provided default
+1. `$XDG_CONFIG_HOME/forskapd/config.toml` — your overrides (on macOS:
+   `~/Library/Application Support/forskapd/config.toml`)
+2. `/usr/share/forskapd/config.toml` — the package-provided default (deb, rpm and
+   arch packages only; Homebrew installs none)
 3. the values baked into the daemon
 
 Every key is optional; a missing key falls back to the next layer. Print an
