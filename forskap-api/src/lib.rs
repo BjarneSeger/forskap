@@ -10,6 +10,10 @@ include!(concat!(env!("OUT_DIR"), "/org.thehoster.forskapd.rs"));
 pub const VARLINK_INTERFACE_DESCRIPTION: &str =
     include_str!("../varlink/org.thehoster.forskapd.varlink");
 
+/// The version of the interface above: the daemon reports it in `GetStatus`,
+/// a client compares it with the one it was built against.
+pub const API_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const SOCKET_NAME: &str = "forskapd.socket";
 
 /// The socket the daemon listens on unless it is told another one, and where

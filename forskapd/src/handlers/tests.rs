@@ -7,12 +7,13 @@ use tokio::sync::{Notify, RwLock};
 
 use forskap_api::{
     AsyncCall, CacheScope, Call_ClearCache, Call_Close, Call_CreateWorkItem, Call_GetActivity,
-    Call_GetAssignedMergeRequests, Call_GetAssignedWorkItems, Call_GetHistory, Call_GetSyncJobs,
-    Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_Search, Call_UnassignSelf,
-    Call_WhoAmI, CreateWorkItem_Reply, GetActivity_Reply, GetAssignedMergeRequests_Reply,
-    GetAssignedWorkItems_Reply, GetHistory_Reply, GetSyncJobs_Reply, HistorySource, IssuableKind,
-    ListWorkItems_Reply, MergeRequest, Search_Reply, SearchKind, SearchScope, SyncJobStatus,
-    VarlinkInterface, WhoAmI_Reply, WorkItem, WorkItemRef, WorkItemRole, WorkItemState,
+    Call_GetAssignedMergeRequests, Call_GetAssignedWorkItems, Call_GetHistory, Call_GetStatus,
+    Call_GetSyncJobs, Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_Search,
+    Call_UnassignSelf, Call_WhoAmI, CreateWorkItem_Reply, GetActivity_Reply,
+    GetAssignedMergeRequests_Reply, GetAssignedWorkItems_Reply, GetHistory_Reply, GetStatus_Reply,
+    GetSyncJobs_Reply, HistorySource, IssuableKind, ListWorkItems_Reply, MergeRequest,
+    Search_Reply, SearchKind, SearchScope, SyncJobStatus, VarlinkInterface, WhoAmI_Reply, WorkItem,
+    WorkItemRef, WorkItemRole, WorkItemState,
 };
 
 use crate::config::SharedConfig;
@@ -2604,6 +2605,57 @@ async fn who_am_i_reports_the_token_once_it_is_known() {
     h.config.write().unwrap().auth.rotate = crate::config::RotatePolicy::Never;
     assert!(!who_am_i(&h).await.token_rotates);
     assert_eq!(fake.read_calls() + fake.token_info_calls(), 0);
+}
+
+// ── GetStatus ──────────────────────────────────────────────────────────
+
+async fn get_status(h: &Handlers) -> GetStatus_Reply {
+    let mut call = AsyncCall::default();
+    h.get_status(&mut call as &mut dyn Call_GetStatus)
+        .await
+        .unwrap();
+    reply(&mut call)
+}
+
+#[tokio::test]
+async fn get_status_names_the_account_while_connected() {
+    let fake = Arc::new(FakeGitlab::default());
+    let (h, _dir) = connected_handlers(&fake);
+    let status = get_status(&h).await;
+    assert_eq!(status.api_version, forskap_api::API_VERSION);
+    assert_eq!(status.daemon_version, env!("CARGO_PKG_VERSION"));
+    assert!(status.connected);
+    assert_eq!(
+        (status.host, status.username, status.user_id),
+        (Some("gitlab.test".into()), Some("tester".into()), Some(1))
+    );
+    assert_eq!((status.reason, status.detail), (None, None));
+    assert_eq!(fake.read_calls() + fake.token_info_calls(), 0);
+}
+
+/// Dormant it says why, as `NotAuthenticated` would, and no account.
+#[tokio::test]
+async fn get_status_says_why_while_dormant() {
+    let (h, _dir) = unreachable_handlers();
+    let status = get_status(&h).await;
+    assert_eq!(status.api_version, forskap_api::API_VERSION);
+    assert!(!status.connected);
+    assert_eq!(status.reason, Some(forskap_api::NotAuthReason::unreachable));
+    assert_eq!(
+        status.detail.as_deref(),
+        Some("gitlab.test: connection refused")
+    );
+    assert_eq!(
+        (status.host, status.username, status.user_id),
+        (None, None, None)
+    );
+
+    let (h, _dir) = dormant_handlers();
+    let status = get_status(&h).await;
+    assert_eq!(
+        (status.reason, status.detail),
+        (Some(forskap_api::NotAuthReason::no_credentials), None)
+    );
 }
 
 // ── Properties ─────────────────────────────────────────────────────────

@@ -1283,6 +1283,85 @@ func (m GetSyncJobs_methods) Upgrade(ctx context.Context, c *varlink.Connection)
 	}, nil
 }
 
+type GetStatus_methods struct{}
+
+func GetStatus() GetStatus_methods { return GetStatus_methods{} }
+
+func (m GetStatus_methods) Call(ctx context.Context, c *varlink.Connection) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, err_ error) {
+	receive, err_ := m.Send(ctx, c, 0)
+	if err_ != nil {
+		return
+	}
+	api_version_out_, daemon_version_out_, connected_out_, reason_out_, detail_out_, host_out_, username_out_, user_id_out_, _, err_ = receive(ctx)
+	return
+}
+
+func (m GetStatus_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64) (func(ctx context.Context) (string, string, bool, *NotAuthReason, *string, *string, *string, *int64, uint64, error), error) {
+	receive, err := c.Send(ctx, "org.thehoster.forskapd.GetStatus", nil, flags)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, flags uint64, err error) {
+		var out struct {
+			Api_version    string         `json:"api_version"`
+			Daemon_version string         `json:"daemon_version"`
+			Connected      bool           `json:"connected"`
+			Reason         *NotAuthReason `json:"reason,omitempty"`
+			Detail         *string        `json:"detail,omitempty"`
+			Host           *string        `json:"host,omitempty"`
+			Username       *string        `json:"username,omitempty"`
+			User_id        *int64         `json:"user_id,omitempty"`
+		}
+		flags, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		api_version_out_ = out.Api_version
+		daemon_version_out_ = out.Daemon_version
+		connected_out_ = out.Connected
+		reason_out_ = out.Reason
+		detail_out_ = out.Detail
+		host_out_ = out.Host
+		username_out_ = out.Username
+		user_id_out_ = out.User_id
+		return
+	}, nil
+}
+
+func (m GetStatus_methods) Upgrade(ctx context.Context, c *varlink.Connection) (func(ctx context.Context) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.GetStatus", nil)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, flags uint64, conn varlink.ReadWriterContext, err error) {
+		var out struct {
+			Api_version    string         `json:"api_version"`
+			Daemon_version string         `json:"daemon_version"`
+			Connected      bool           `json:"connected"`
+			Reason         *NotAuthReason `json:"reason,omitempty"`
+			Detail         *string        `json:"detail,omitempty"`
+			Host           *string        `json:"host,omitempty"`
+			Username       *string        `json:"username,omitempty"`
+			User_id        *int64         `json:"user_id,omitempty"`
+		}
+		flags, conn, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		api_version_out_ = out.Api_version
+		daemon_version_out_ = out.Daemon_version
+		connected_out_ = out.Connected
+		reason_out_ = out.Reason
+		detail_out_ = out.Detail
+		host_out_ = out.Host
+		username_out_ = out.Username
+		user_id_out_ = out.User_id
+		return
+	}, nil
+}
+
 type Login_methods struct{}
 
 func Login() Login_methods { return Login_methods{} }
@@ -1469,6 +1548,7 @@ type orgthehosterforskapdInterface interface {
 	DismissFailure(ctx context.Context, c VarlinkCall, id_ int64) error
 	ClearFailures(ctx context.Context, c VarlinkCall) error
 	GetSyncJobs(ctx context.Context, c VarlinkCall) error
+	GetStatus(ctx context.Context, c VarlinkCall) error
 	Login(ctx context.Context, c VarlinkCall, host_ string, token_ string) error
 	Logout(ctx context.Context, c VarlinkCall) error
 	WhoAmI(ctx context.Context, c VarlinkCall) error
@@ -1613,6 +1693,28 @@ func (c *VarlinkCall) ReplyGetSyncJobs(ctx context.Context, jobs_ []SyncJob, pau
 	return c.Reply(ctx, &out)
 }
 
+func (c *VarlinkCall) ReplyGetStatus(ctx context.Context, api_version_ string, daemon_version_ string, connected_ bool, reason_ *NotAuthReason, detail_ *string, host_ *string, username_ *string, user_id_ *int64) error {
+	var out struct {
+		Api_version    string         `json:"api_version"`
+		Daemon_version string         `json:"daemon_version"`
+		Connected      bool           `json:"connected"`
+		Reason         *NotAuthReason `json:"reason,omitempty"`
+		Detail         *string        `json:"detail,omitempty"`
+		Host           *string        `json:"host,omitempty"`
+		Username       *string        `json:"username,omitempty"`
+		User_id        *int64         `json:"user_id,omitempty"`
+	}
+	out.Api_version = api_version_
+	out.Daemon_version = daemon_version_
+	out.Connected = connected_
+	out.Reason = reason_
+	out.Detail = detail_
+	out.Host = host_
+	out.Username = username_
+	out.User_id = user_id_
+	return c.Reply(ctx, &out)
+}
+
 func (c *VarlinkCall) ReplyLogin(ctx context.Context) error {
 	return c.Reply(ctx, nil)
 }
@@ -1709,6 +1811,10 @@ func (s *VarlinkInterface) ClearFailures(ctx context.Context, c VarlinkCall) err
 
 func (s *VarlinkInterface) GetSyncJobs(ctx context.Context, c VarlinkCall) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetSyncJobs")
+}
+
+func (s *VarlinkInterface) GetStatus(ctx context.Context, c VarlinkCall) error {
+	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetStatus")
 }
 
 func (s *VarlinkInterface) Login(ctx context.Context, c VarlinkCall, host_ string, token_ string) error {
@@ -1911,6 +2017,9 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 	case "GetSyncJobs":
 		return s.orgthehosterforskapdInterface.GetSyncJobs(ctx, VarlinkCall{call})
 
+	case "GetStatus":
+		return s.orgthehosterforskapdInterface.GetStatus(ctx, VarlinkCall{call})
+
 	case "Login":
 		var in struct {
 			Host  string `json:"host"`
@@ -2111,6 +2220,8 @@ method DismissFailure(id: int) -> ()
 method ClearFailures() -> ()
 
 method GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int)
+
+method GetStatus() -> (api_version: string, daemon_version: string, connected: bool, reason: ?NotAuthReason, detail: ?string, host: ?string, username: ?string, user_id: ?int)
 
 method Login(host: string, token: string) -> ()
 

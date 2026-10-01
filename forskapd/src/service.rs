@@ -13,7 +13,7 @@ use varlink::sansio::ServerEvent;
 use forskap_api::{
     AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
     Call_CreateWorkItem, Call_DismissFailure, Call_GetActivity, Call_GetAssignedMergeRequests,
-    Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetSyncJobs,
+    Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetStatus, Call_GetSyncJobs,
     Call_ListWorkItems, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
     Call_Search, Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, Close_Args, CreateWorkItem_Args,
     DismissFailure_Args, GetActivity_Args, GetAssignedMergeRequests_Args,
@@ -179,6 +179,11 @@ async fn handle_forskapd(
         "org.thehoster.forskapd.GetSyncJobs" => {
             handlers
                 .get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
+                .await?;
+        }
+        "org.thehoster.forskapd.GetStatus" => {
+            handlers
+                .get_status(&mut call as &mut dyn Call_GetStatus)
                 .await?;
         }
         "org.thehoster.forskapd.RetryFailure" => {
@@ -499,6 +504,24 @@ mod tests {
                     .expect("a reply");
             assert!(reply.error.is_none(), "{method}: {:?}", reply.error);
         }
+    }
+
+    /// Answered whatever the session is, without arguments.
+    #[tokio::test]
+    async fn dispatch_has_an_arm_for_get_status() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        let reply = handle_forskapd("org.thehoster.forskapd.GetStatus", None, &handlers)
+            .await
+            .unwrap()
+            .expect("a reply");
+        assert!(
+            reply.error.is_none(),
+            "GetStatus is missing its dispatch arm: {:?}",
+            reply.error
+        );
+        let status = reply.parameters.expect("a result");
+        assert_eq!(status["api_version"], forskap_api::API_VERSION);
+        assert_eq!(status["connected"], false);
     }
 
     #[tokio::test]

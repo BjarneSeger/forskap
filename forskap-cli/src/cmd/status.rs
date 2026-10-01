@@ -15,8 +15,8 @@ use std::time::Duration;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use forskap_api::{
-    Error as ApiError, ErrorKind as ApiErrorKind, FailedTask, GetSyncJobs_Reply, NotAuthReason,
-    SyncJob, SyncJobStatus, VarlinkClient, VarlinkClientInterface, WhoAmI_Reply,
+    API_VERSION, Error as ApiError, ErrorKind as ApiErrorKind, FailedTask, GetSyncJobs_Reply,
+    NotAuthReason, SyncJob, SyncJobStatus, VarlinkClient, VarlinkClientInterface, WhoAmI_Reply,
 };
 use serde::Serialize;
 
@@ -25,7 +25,8 @@ use crate::cmd::auth::status::{expiry, token_line};
 use crate::cmd::sync::jobs::{self, failure, kind, pause, span};
 use crate::{client, config, friendly, output, style, watch};
 
-/// The CLI's own version, which the daemon's should match.
+/// The CLI's own version. The daemon's may differ: what has to match is the
+/// interface ([`API_VERSION`]).
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How long the daemon gets for each answer. It answers from memory and its
@@ -94,6 +95,9 @@ struct Answers {
     /// Whether the socket took the connection, else why not.
     connected: Result<(), String>,
     info: Answer<Info>,
+    /// The interface version it speaks; `None` from a daemon older than
+    /// `GetStatus`.
+    interface: Answer<Option<String>>,
     who: Answer<Login>,
     jobs: Answer<GetSyncJobs_Reply>,
     failures: Answer<Vec<FailedTask>>,
@@ -143,6 +147,7 @@ async fn gather(socket: &str) -> Answers {
         socket: socket.to_string(),
         connected: Ok(()),
         info: Answer::Unasked,
+        interface: Answer::Unasked,
         who: Answer::Unasked,
         jobs: Answer::Unasked,
         failures: Answer::Unasked,
@@ -170,6 +175,13 @@ async fn gather(socket: &str) -> Answers {
         return answers;
     }
     let api = VarlinkClient::new(conn);
+    answers.interface = match ask(api.get_status().call()).await {
+        Some(Err(e)) if is_method_not_found(&e) => Answer::Got(None),
+        other => answer(other).map(|status| Some(status.api_version)),
+    };
+    if matches!(answers.interface, Answer::TimedOut) {
+        return answers;
+    }
     answers.who = match ask(api.who_am_i().call()).await {
         Some(Err(e)) => match e.kind() {
             ApiErrorKind::NotAuthenticated(args) => Answer::Got(Login::Dormant {
@@ -204,6 +216,13 @@ fn answer<T>(asked: Option<Result<T, ApiError>>) -> Answer<T> {
         Some(Err(e)) => Answer::Failed(describe(&e)),
         None => Answer::TimedOut,
     }
+}
+
+fn is_method_not_found(e: &ApiError) -> bool {
+    matches!(
+        e.source_varlink_kind(),
+        Some(varlink::ErrorKind::MethodNotFound(_))
+    )
 }
 
 /// A failed call in a few words, rather than the generated client's dump.
@@ -333,6 +352,9 @@ struct DaemonFacts {
     /// What the daemon says it is; absent when it didn't say.
     version: Option<String>,
     cli_version: &'static str,
+    /// The interface version it speaks; absent when it didn't say.
+    api_version: Option<String>,
+    cli_api_version: &'static str,
 }
 
 #[derive(Serialize)]
@@ -447,43 +469,36 @@ fn restart_command() -> &'static str {
     }
 }
 
+/// Judged by the interface it speaks: a daemon of another package version
+/// that speaks this forskap's interface is fine.
 fn daemon(a: &Answers) -> Check<DaemonFacts> {
     let socket = &a.socket;
-    let facts = |version: Option<&str>| DaemonFacts {
+    let facts = DaemonFacts {
         socket: socket.clone(),
-        version: version.map(str::to_string),
+        version: match &a.info {
+            Answer::Got(info) => Some(info.version.clone()),
+            _ => None,
+        },
         cli_version: VERSION,
+        api_version: match &a.interface {
+            Answer::Got(api) => api.clone(),
+            _ => None,
+        },
+        cli_api_version: API_VERSION,
     };
     if let Err(why) = &a.connected {
         return Check::new("daemon", Level::Error, format!("not reachable on {socket}"))
             .details(vec![why.clone(), start_hint()])
-            .facts(facts(None));
+            .facts(facts);
     }
-    match &a.info {
-        Answer::Got(Info { product, version }) if version == VERSION => Check::new(
-            "daemon",
-            Level::Ok,
-            format!("{product} {version} on {socket}"),
-        )
-        .facts(facts(Some(version))),
-        Answer::Got(Info { product, version }) => Check::new(
-            "daemon",
-            Level::Warning,
-            format!("{product} {version} on {socket}, but forskap is {VERSION}"),
-        )
-        .details(vec![format!(
+    let restart = || {
+        vec![format!(
             "After an upgrade the daemon runs the old version until it is restarted: {}.",
             restart_command()
-        )])
-        .facts(facts(Some(version))),
-        Answer::Failed(why) => Check::new(
-            "daemon",
-            Level::Warning,
-            format!("answers on {socket}, but not with its version"),
-        )
-        .details(vec![format!("GetInfo failed: {why}")])
-        .facts(facts(None)),
-        Answer::TimedOut => Check::new(
+        )]
+    };
+    let check = match (&a.info, &a.interface) {
+        (Answer::TimedOut, _) | (_, Answer::TimedOut) => Check::new(
             "daemon",
             Level::Error,
             format!("no answer on {socket} within {ANSWER_SECS}s"),
@@ -491,12 +506,42 @@ fn daemon(a: &Answers) -> Check<DaemonFacts> {
         .details(vec![
             "It takes the connection but does not answer: it is stuck.".to_string(),
             format!("Restart it: {}.", restart_command()),
-        ])
-        .facts(facts(None)),
-        Answer::Unasked => {
-            Check::new("daemon", Level::Skipped, format!("on {socket}")).facts(facts(None))
+        ]),
+        (Answer::Failed(why), _) => Check::new(
+            "daemon",
+            Level::Warning,
+            format!("answers on {socket}, but not with its version"),
+        )
+        .details(vec![format!("GetInfo failed: {why}")]),
+        (Answer::Unasked, _) | (_, Answer::Unasked) => {
+            Check::new("daemon", Level::Skipped, format!("on {socket}"))
         }
-    }
+        (Answer::Got(Info { product, version }), Answer::Got(api)) => {
+            let daemon = format!("{product} {version} on {socket}");
+            match api {
+                Some(api) if api == API_VERSION => Check::new("daemon", Level::Ok, daemon),
+                Some(api) => Check::new(
+                    "daemon",
+                    Level::Warning,
+                    format!("{daemon} speaks interface {api}, forskap {API_VERSION}"),
+                )
+                .details(restart()),
+                None => Check::new(
+                    "daemon",
+                    Level::Warning,
+                    format!("{daemon} speaks an interface older than forskap's {API_VERSION}"),
+                )
+                .details(restart()),
+            }
+        }
+        (Answer::Got(Info { product, version }), Answer::Failed(why)) => Check::new(
+            "daemon",
+            Level::Warning,
+            format!("{product} {version} on {socket}, but not saying its interface"),
+        )
+        .details(vec![format!("GetStatus failed: {why}")]),
+    };
+    check.facts(facts)
 }
 
 fn session(a: &Answers, now: DateTime<Utc>) -> Check<SessionFacts> {
@@ -1058,6 +1103,7 @@ mod tests {
                 product: "forskapd".to_string(),
                 version: VERSION.to_string(),
             }),
+            interface: Answer::Got(Some(API_VERSION.to_string())),
             who: Answer::Got(Login::Connected(me())),
             jobs: jobs(vec![
                 fresh("assigned/issues"),
@@ -1073,6 +1119,7 @@ mod tests {
             socket: socket.to_string(),
             connected: Err("No socket exists there.".to_string()),
             info: Answer::Unasked,
+            interface: Answer::Unasked,
             who: Answer::Unasked,
             jobs: Answer::Unasked,
             failures: Answer::Unasked,
@@ -1144,6 +1191,7 @@ mod tests {
         // It took the connection, then went silent on the first call.
         let answers = Answers {
             info: Answer::TimedOut,
+            interface: Answer::Unasked,
             who: Answer::Unasked,
             jobs: Answer::Unasked,
             failures: Answer::Unasked,
@@ -1741,21 +1789,38 @@ healthy
         );
     }
 
-    #[test]
-    fn a_daemon_of_another_version_warns_to_restart_it() {
-        let answers = Answers {
+    fn of_version(version: &str, interface: Answer<Option<String>>) -> Answers {
+        Answers {
             info: Answer::Got(Info {
                 product: "forskapd".to_string(),
-                version: "0.0.1".to_string(),
+                version: version.to_string(),
             }),
+            interface,
             ..healthy()
-        };
+        }
+    }
+
+    /// Another package version speaking this interface is fine.
+    #[test]
+    fn a_daemon_is_judged_by_its_interface() {
+        let answers = of_version("0.0.1", Answer::Got(Some(API_VERSION.to_string())));
+        let daemon = report(&answers).checks.daemon;
+        assert_eq!(daemon.level, Level::Ok);
+        assert_eq!(daemon.summary, format!("forskapd 0.0.1 on {SOCKET}"));
+        let facts = daemon.facts.unwrap();
+        assert_eq!(facts.version.as_deref(), Some("0.0.1"));
+        assert_eq!(facts.api_version.as_deref(), Some(API_VERSION));
+    }
+
+    #[test]
+    fn a_daemon_of_another_interface_warns_to_restart_it() {
+        let answers = of_version(VERSION, Answer::Got(Some("0.0.1".to_string())));
         let report = report(&answers);
         let daemon = &report.checks.daemon;
         assert_eq!(daemon.level, Level::Warning);
         assert_eq!(
             daemon.summary,
-            format!("forskapd 0.0.1 on {SOCKET}, but forskap is {VERSION}")
+            format!("forskapd {VERSION} on {SOCKET} speaks interface 0.0.1, forskap {API_VERSION}")
         );
         assert!(
             daemon.details[0].contains("restart"),
@@ -1763,12 +1828,41 @@ healthy
             daemon.details
         );
         assert_eq!(
-            daemon.facts.as_ref().unwrap().version.as_deref(),
+            daemon.facts.as_ref().unwrap().api_version.as_deref(),
             Some("0.0.1")
         );
         assert!(outcome(&report).is_ok());
 
-        // It didn't say: reachable all the same.
+        // One from before `GetStatus`: the same.
+        let answers = of_version("0.0.1", Answer::Got(None));
+        let daemon = evaluate(&answers, now()).checks.daemon;
+        assert_eq!(daemon.level, Level::Warning);
+        assert_eq!(
+            daemon.summary,
+            format!(
+                "forskapd 0.0.1 on {SOCKET} speaks an interface older than forskap's \
+                 {API_VERSION}"
+            )
+        );
+        assert!(daemon.details[0].contains("restart"));
+        let facts = daemon.facts.unwrap();
+        assert_eq!(facts.version.as_deref(), Some("0.0.1"));
+        assert_eq!(facts.api_version, None);
+    }
+
+    /// How a daemon from before `GetStatus` answers it.
+    #[test]
+    fn a_method_the_daemon_lacks_is_told_from_other_failures() {
+        let error = |kind| ApiError::from(varlink::Error::from(kind));
+        let missing = varlink::ErrorKind::MethodNotFound("org.thehoster.forskapd.GetStatus".into());
+        assert!(is_method_not_found(&error(missing)));
+        assert!(!is_method_not_found(&error(
+            varlink::ErrorKind::ConnectionClosed
+        )));
+    }
+
+    #[test]
+    fn a_daemon_that_does_not_say_is_reachable_all_the_same() {
         let answers = Answers {
             info: Answer::Failed("org.varlink.service.MethodNotFound".to_string()),
             ..healthy()
@@ -1776,6 +1870,29 @@ healthy
         let daemon = evaluate(&answers, now()).checks.daemon;
         assert_eq!(daemon.level, Level::Warning);
         assert_eq!(daemon.facts.unwrap().version, None);
+
+        let answers = of_version(VERSION, Answer::Failed("Connection closed".to_string()));
+        let daemon = evaluate(&answers, now()).checks.daemon;
+        assert_eq!(daemon.level, Level::Warning);
+        assert_eq!(daemon.details, ["GetStatus failed: Connection closed"]);
+
+        // Silent on the second call: stuck as on the first.
+        let answers = Answers {
+            interface: Answer::TimedOut,
+            who: Answer::Unasked,
+            jobs: Answer::Unasked,
+            failures: Answer::Unasked,
+            ..healthy()
+        };
+        let report = report(&answers);
+        assert_eq!(
+            levels(&report),
+            [Level::Error, Level::Skipped, Level::Skipped, Level::Skipped]
+        );
+        assert_eq!(
+            report.checks.daemon.summary,
+            format!("no answer on {SOCKET} within 10s")
+        );
     }
 
     #[test]
@@ -1913,6 +2030,8 @@ unhealthy: 1 error, 3 skipped
         assert_eq!(checks["daemon"]["name"], "daemon");
         assert_eq!(checks["daemon"]["version"], VERSION);
         assert_eq!(checks["daemon"]["cli_version"], VERSION);
+        assert_eq!(checks["daemon"]["api_version"], API_VERSION);
+        assert_eq!(checks["daemon"]["cli_api_version"], API_VERSION);
         assert_eq!(checks["session"]["level"], "ok");
         assert_eq!(checks["session"]["username"], "ada");
         assert_eq!(checks["session"]["host"], "gitlab.example.com");

@@ -168,6 +168,8 @@ method ClearFailures() -> ()
 
 method GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int)
 
+method GetStatus() -> (api_version: string, daemon_version: string, connected: bool, reason: ?NotAuthReason, detail: ?string, host: ?string, username: ?string, user_id: ?int)
+
 method Login(host: string, token: string) -> ()
 
 method Logout() -> ()

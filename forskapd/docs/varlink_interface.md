@@ -444,6 +444,21 @@ once GitLab refused to rotate it.
 A dry run (`forskapd --dry-run`) answers with the host `dry-run.invalid` and the user
 `demo`; its `Login` and `Logout` reply `GitlabError`.
 
+### `GetStatus() -> (api_version: string, daemon_version: string, connected: bool, reason: ?NotAuthReason, detail: ?string, host: ?string, username: ?string, user_id: ?int)`
+
+What a client asks first: which version of this interface the daemon speaks and
+whether it has a GitLab session. `api_version` is the version of the `forskap-api`
+crate the daemon was built with (`forskap_api::API_VERSION` to a Rust client, the
+`clients/go/v…` tag to a Go one); `daemon_version` is the daemon's own, the one
+`org.varlink.service.GetInfo` reports, which says nothing about the interface. A
+daemon from before forskap-api 0.32.0 has no `GetStatus` and answers
+`org.varlink.service.MethodNotFound`.
+
+While `connected`, `host`, `username` and `user_id` are set as `WhoAmI` answers them
+and `reason` and `detail` are absent; otherwise `reason` and `detail` are what
+`NotAuthenticated` would carry and the other three are absent. Never an error:
+served whatever the session is, without a GitLab round-trip.
+
 ## Writing (queued when GitLab is away)
 
 The four methods of this section take the target as `(project_id, iid, kind)` —
@@ -667,6 +682,9 @@ Drops the session (subsequent calls reply `NotAuthenticated` with reason
 
 ```sh
 SOCKET=unix:$XDG_RUNTIME_DIR/forskapd.socket
+
+# the interface version the daemon speaks, and its session
+varlinkctl call $SOCKET org.thehoster.forskapd.GetStatus '{}'
 
 # list assigned issues
 varlinkctl call $SOCKET org.thehoster.forskapd.GetAssignedWorkItems '{}'

@@ -62,6 +62,11 @@ for _, is := range issues {
 Use `forskap.DialAddress(ctx, "unix:/path/to.socket")` to point elsewhere, or
 `forskap.DefaultAddress()` to inspect what `Dial` would pick.
 
+`c.GetStatus` tells which interface version the daemon speaks (`Status.APIVersion`,
+the version of the binding tag that matches it) and whether it has a GitLab session,
+whatever that session is. A daemon older than `v0.32.0` doesn't have it and answers
+`*varlink.MethodNotFound`.
+
 ### Errors
 
 Daemon-side errors surface as typed values you match with `errors.As`:

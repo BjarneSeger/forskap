@@ -289,6 +289,37 @@ func (c *Client) GetSyncJobs(ctx context.Context) (jobs []SyncJob, pausedUntil *
 	return GetSyncJobs().Call(ctx, c.conn)
 }
 
+// Status is what GetStatus reports.
+type Status struct {
+	// APIVersion is the version of the interface the daemon speaks: the
+	// forskap-api version this binding is tagged with, clients/go/v<APIVersion>.
+	APIVersion string
+	// DaemonVersion is the daemon's own version, the one
+	// org.varlink.service.GetInfo reports.
+	DaemonVersion string
+	// Connected tells whether the daemon has a GitLab session.
+	Connected bool
+	// Reason and Detail say why it has none, as a *NotAuthenticated would;
+	// nil while Connected.
+	Reason *NotAuthReason
+	Detail *string
+	// Host, Username and UserID name the account; nil unless Connected.
+	Host     *string
+	Username *string
+	UserID   *int64
+}
+
+// GetStatus returns the interface version the daemon speaks, its own version
+// and whether it has a GitLab session. It succeeds whatever the session is; a
+// daemon older than v0.32.0 doesn't have it and fails with
+// *varlink.MethodNotFound.
+func (c *Client) GetStatus(ctx context.Context) (Status, error) {
+	var s Status
+	var err error
+	s.APIVersion, s.DaemonVersion, s.Connected, s.Reason, s.Detail, s.Host, s.Username, s.UserID, err = GetStatus().Call(ctx, c.conn)
+	return s, err
+}
+
 // RetryFailure re-enqueues a previously failed task by id.
 func (c *Client) RetryFailure(ctx context.Context, id int64) error {
 	return RetryFailure().Call(ctx, c.conn, id)
