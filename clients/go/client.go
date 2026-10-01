@@ -281,6 +281,9 @@ func (c *Client) GetFailures(ctx context.Context) ([]FailedTask, error) {
 // (nil = not paused). Status only: it succeeds while the daemon is dormant.
 // A job whose Unavailable is true is one GitLab refuses for good, asked again
 // once a day; Unavailable is nil from a daemon older than v0.28.0.
+// A running job carries Fetched, its rows so far, Expected, the total GitLab
+// announced (nil without one), and Full where it also runs as a delta; all
+// three are nil for any other job and from a daemon older than v0.30.0.
 func (c *Client) GetSyncJobs(ctx context.Context) (jobs []SyncJob, pausedUntil *int64, err error) {
 	return GetSyncJobs().Call(ctx, c.conn)
 }

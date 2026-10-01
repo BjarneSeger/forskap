@@ -26,7 +26,7 @@ pub async fn run(all: bool, format: OutputFormat, watch: WatchArgs) -> Result<()
 }
 
 // Connects per call: a watch has to find a restarted daemon again.
-async fn fetch() -> Result<GetSyncJobs_Reply> {
+pub(super) async fn fetch() -> Result<GetSyncJobs_Reply> {
     let client = client::connect_default().await?;
     client
         .get_sync_jobs()
@@ -221,6 +221,29 @@ fn refused(error: Option<&str>) -> String {
     }
 }
 
+/// What the sync is at, on one line, for a command waiting on it:
+/// `syncing assigned/issues 12/40, timelogs/all 300/?; 2 waiting`. Empty
+/// while nothing runs or waits.
+pub(super) fn summary(jobs: &[SyncJob], paused_until: Option<i64>, now: i64) -> String {
+    let of = |status| jobs.iter().filter(move |j| j.status == status);
+    let running: Vec<String> = of(SyncJobStatus::running)
+        .map(|job| match counts(job) {
+            Some(counts) => format!("{} {counts}", job.key),
+            None => job.key.clone(),
+        })
+        .collect();
+    let waiting = of(SyncJobStatus::demanded).count();
+    match (running.is_empty(), waiting) {
+        (false, 0) => format!("syncing {}", running.join(", ")),
+        (false, n) => format!("syncing {}; {n} waiting", running.join(", ")),
+        (true, n) => match pause(paused_until, now) {
+            Some(pause) => pause,
+            None if n > 0 => format!("{n} waiting to sync"),
+            None => String::new(),
+        },
+    }
+}
+
 /// The rate-limit pause, while it lasts.
 pub fn pause(paused_until: Option<i64>, now: i64) -> Option<String> {
     let until = paused_until.filter(|&until| until > now)?;
@@ -265,13 +288,36 @@ fn status(job: &SyncJob) -> &'static str {
     }
 }
 
-/// When the job runs next, or for how long it has been running.
+/// How far a running job is: `400/1000`, or `400/?` where GitLab announced
+/// no total. Nothing before its first row, or from a daemon too old to say.
+fn counts(job: &SyncJob) -> Option<String> {
+    let fetched = job.fetched.unwrap_or(0);
+    match job.expected.filter(|&expected| expected > 0) {
+        // A total can fall short of the rows (GitLab counted before they
+        // changed): never more than all of them.
+        Some(expected) => Some(format!("{}/{expected}", fetched.min(expected))),
+        None if fetched > 0 => Some(format!("{fetched}/?")),
+        None => None,
+    }
+}
+
+/// When the job runs next, or for how long it has been running and how far
+/// it is.
 fn next(job: &SyncJob, now: i64) -> String {
     match (&job.status, job.next_due) {
-        (SyncJobStatus::running, _) => match job.running_since {
-            Some(since) => format!("for {}", span(now - since)),
-            None => "now".to_string(),
-        },
+        (SyncJobStatus::running, _) => {
+            let mut cell = match job.running_since {
+                Some(since) => format!("for {}", span(now - since)),
+                None => "now".to_string(),
+            };
+            if let Some(counts) = counts(job) {
+                cell.push_str(&format!(" · {counts}"));
+            }
+            if job.full == Some(true) {
+                cell.push_str(" (full)");
+            }
+            cell
+        }
         (SyncJobStatus::demanded, _) => "next".to_string(),
         (SyncJobStatus::due, _) => "now".to_string(),
         (_, Some(at)) => when(at, now),
@@ -320,6 +366,9 @@ mod tests {
             last_error: None,
             // What a daemon too old to say sends.
             unavailable: None,
+            full: None,
+            fetched: None,
+            expected: None,
         }
     }
 
@@ -355,6 +404,87 @@ mod tests {
                 ..job("project/9/issues", SyncJobStatus::backing_off)
             },
         ]
+    }
+
+    fn running(key: &str, secs: i64, fetched: i64, expected: Option<i64>) -> SyncJob {
+        SyncJob {
+            running_since: Some(NOW - secs),
+            fetched: Some(fetched),
+            expected,
+            ..job(key, SyncJobStatus::running)
+        }
+    }
+
+    /// A running job says how far it is: of GitLab's total, of `?` without
+    /// one, and nothing before its first row.
+    #[test]
+    fn a_running_job_shows_its_rows_and_whether_it_runs_full() {
+        let jobs = [
+            SyncJob {
+                full: Some(true),
+                ..running("project/42/issues", 8, 400, Some(1000))
+            },
+            SyncJob {
+                last_ok: Some(NOW - 7200),
+                full: Some(false),
+                ..running("all/issues", 3, 120, None)
+            },
+            // A total that fell short of the rows.
+            running("events", 2, 1003, Some(1000)),
+            SyncJob {
+                full: Some(true),
+                ..running("project/42/merge_requests", 1, 0, None)
+            },
+            running("project/42/avatar", 1, 0, None),
+            // A daemon too old to say.
+            SyncJob {
+                running_since: Some(NOW - 3),
+                ..job("assigned/issues", SyncJobStatus::running)
+            },
+            SyncJob {
+                last_ok: Some(NOW - 300),
+                ..job("timelogs/recent", SyncJobStatus::demanded)
+            },
+        ];
+        assert_eq!(
+            render(&jobs, None, NOW, false),
+            "JOB                        STATUS    LAST SYNC  NEXT
+project/42/issues          running   never      for 8s · 400/1000 (full)
+all/issues                 running   2h ago     for 3s · 120/?
+events                     running   never      for 2s · 1000/1000
+project/42/merge_requests  running   never      for 1s (full)
+project/42/avatar          running   never      for 1s
+assigned/issues            running   never      for 3s
+timelogs/recent            demanded  5m ago     next
+"
+        );
+    }
+
+    #[test]
+    fn the_summary_names_what_runs_and_counts_what_waits() {
+        let waiting = || job("timelogs/all", SyncJobStatus::demanded);
+        let jobs = [
+            running("assigned/issues", 2, 12, Some(40)),
+            running("timelogs/recent", 2, 300, None),
+            running("events", 1, 0, None),
+            waiting(),
+            waiting(),
+            job("all/issues", SyncJobStatus::due),
+        ];
+        assert_eq!(
+            summary(&jobs, None, NOW),
+            "syncing assigned/issues 12/40, timelogs/recent 300/?, events; 2 waiting"
+        );
+        assert_eq!(
+            summary(&jobs[..1], None, NOW),
+            "syncing assigned/issues 12/40"
+        );
+        assert_eq!(summary(&jobs[3..], None, NOW), "2 waiting to sync");
+        assert_eq!(
+            summary(&jobs[3..], Some(NOW + 90), NOW),
+            "paused by a GitLab rate limit for another 1m"
+        );
+        assert_eq!(summary(&jobs[5..], None, NOW), "");
     }
 
     /// Refused jobs are no failures: they say `unavailable` and why, without

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::error::Result;
-use crate::gitlab::{GitlabApi, Issuable, Listing};
+use crate::gitlab::{GitlabApi, Issuable, Listing, Progress};
 
 /// What a write does. Persisted inside queued and dead-lettered tasks, so the
 /// variant names and field aliases are an on-disk format.
@@ -121,7 +121,7 @@ impl Write {
             project_id: self.project_id,
             iid: self.iid,
         };
-        match gitlab.list(&listing, None).await {
+        match gitlab.list(&listing, None, &Progress::default()).await {
             Ok(rows) => rows
                 .iter()
                 .find(|r| r["iid"].as_i64() == Some(self.iid))

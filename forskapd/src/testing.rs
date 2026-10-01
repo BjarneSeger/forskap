@@ -17,7 +17,7 @@ use serde_json::Value;
 use tokio::sync::{Notify, Semaphore};
 
 use crate::error::{Error, Result};
-use crate::gitlab::{GitlabApi, Issuable, Listing, NewIssue, RotatedToken, TokenInfo};
+use crate::gitlab::{GitlabApi, Issuable, Listing, NewIssue, Progress, RotatedToken, TokenInfo};
 use crate::secrets::Token;
 use crate::sync::model::Timelog;
 
@@ -208,6 +208,15 @@ impl FakeGitlab {
         })
     }
 
+    /// How many rows the next call to `path` answers with.
+    fn pending(&self, path: &str) -> usize {
+        let next = self.next_rows.lock().unwrap();
+        match next.get(path).and_then(VecDeque::front) {
+            Some(rows) => rows.len(),
+            None => self.rows.lock().unwrap().get(path).map_or(0, Vec::len),
+        }
+    }
+
     fn next_failure(&self, path: &str) -> Option<FakeErr> {
         self.failures
             .lock()
@@ -304,10 +313,19 @@ impl FakeGitlab {
 
 #[async_trait::async_trait]
 impl GitlabApi for FakeGitlab {
-    async fn list(&self, listing: &Listing, limit: Option<usize>) -> Result<Vec<Value>> {
+    async fn list(
+        &self,
+        listing: &Listing,
+        limit: Option<usize>,
+        progress: &Progress,
+    ) -> Result<Vec<Value>> {
         let path = route(listing);
         self.calls.lock().unwrap().push(listing.clone());
         self.limits.lock().unwrap().push(limit);
+        // Like GitLab's first page: the total is known while the rows are
+        // still to come, so a gated call shows as 0 of them.
+        let cap = limit.unwrap_or(usize::MAX);
+        progress.expect(Some(self.pending(&path).min(cap) as u64));
         let gate = self.gates.lock().unwrap().remove(&path);
         if let Some(gate) = gate {
             self.gated.notify_one();
@@ -330,13 +348,20 @@ impl GitlabApi for FakeGitlab {
                 .cloned()
                 .unwrap_or_default()
         });
-        rows.truncate(limit.unwrap_or(usize::MAX));
+        rows.truncate(cap);
+        progress.add(rows.len());
         Ok(rows)
     }
 
-    async fn list_timelogs(&self, since: chrono::DateTime<chrono::Utc>) -> Result<Vec<Timelog>> {
+    async fn list_timelogs(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        progress: &Progress,
+    ) -> Result<Vec<Timelog>> {
         self.timelog_calls.lock().unwrap().push(since);
-        Ok(self.timelogs.lock().unwrap().clone())
+        let logs = self.timelogs.lock().unwrap().clone();
+        progress.add(logs.len());
+        Ok(logs)
     }
 
     async fn project_avatar(&self, project_id: i64) -> Result<Option<Vec<u8>>> {

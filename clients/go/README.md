@@ -18,7 +18,7 @@ go get github.com/BjarneSeger/forskap/clients/go
 
 Releases are tagged `clients/go/vX.Y.Z` and carry the version of the
 [`forskap-api`](../../forskap-api/README.md) crate they were generated from, so a
-version names one state of the interface. Append `@v0.28.0` to pin one.
+version names one state of the interface. Append `@v0.30.0` to pin one.
 
 The generated package is named after the interface, so import it under an alias:
 
@@ -90,6 +90,11 @@ out. `c.GetSyncJobs` sets `SyncJob.Unavailable` on every job since `v0.28.0`: `t
 for a job GitLab refuses for good (a project's merge requests or boards switched off,
 epics without GitLab Premium), which the daemon only asks once a day — no failure to
 report. It is `nil` from an older daemon, which doesn't tell.
+
+Since `v0.30.0` a running job says how far it is: `SyncJob.Fetched` is the rows its
+fetch has so far, `SyncJob.Expected` the total GitLab announced (`nil` where it
+announced none), and `SyncJob.Full` tells a full run from a delta for the jobs that
+have both. All three are `nil` on a job that isn't running.
 
 `c.ListIssues` lists your own issues across projects, closed ones included,
 newest-updated first; each carries its epic's URL as `Parent`. It reaches back
