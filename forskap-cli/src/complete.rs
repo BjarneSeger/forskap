@@ -17,12 +17,12 @@ use std::time::Duration;
 use clap::{Arg, Command, CommandFactory};
 use clap_complete::env::{Bash, Elvish, Fish, Powershell, Shells, Zsh};
 use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
-use forskap_api::{Epic, SearchKind, VarlinkClientInterface};
+use forskap_api::{SearchKind, VarlinkClientInterface, WorkItem};
 
 use self::nushell::Nushell;
 use crate::cli::Cli;
 use crate::cmd::epic::group_of;
-use crate::item::{Item, project_of};
+use crate::item::{self, Item, project_of};
 use crate::refspec::{self, RefKind};
 use crate::state::{LastEpic, LastIssue};
 use crate::{client, state};
@@ -240,12 +240,12 @@ fn ranked(kind: RefKind, last: Option<&LastIssue>, rows: &[Item]) -> Vec<Known> 
 }
 
 /// The epics opened before, most used first, behind the one opened last.
-fn ranked_epics(last: Option<LastEpic>, rows: &[Epic]) -> Vec<Known> {
+fn ranked_epics(last: Option<LastEpic>, rows: &[WorkItem]) -> Vec<Known> {
     let mut known: Vec<Known> = rows
         .iter()
         .map(|e| Known {
             iid: e.iid,
-            project_id: e.group_id,
+            project_id: e.group_id.unwrap_or_default(),
             help: match group_of(e) {
                 Some(path) => format!("{} ({path})", e.title),
                 None => e.title.clone(),
@@ -366,8 +366,8 @@ async fn fetch_items(kind: RefKind, rows: &mut Vec<Item>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
     match kind {
         RefKind::Issue => {
-            let reply = client.get_assigned_issues(None).call().await.ok()?;
-            rows.extend(reply.issues.into_iter().map(Item::Issue));
+            let reply = client.get_assigned_work_items(None).call().await.ok()?;
+            rows.extend(reply.work_items.into_iter().map(Item::Issue));
         }
         RefKind::Mr => {
             let reply = client.get_assigned_merge_requests(None).call().await.ok()?;
@@ -375,13 +375,14 @@ async fn fetch_items(kind: RefKind, rows: &mut Vec<Item>) -> Option<()> {
         }
     }
     let kinds = vec![refspec::search_kind(kind)];
+    let excluded = refspec::excluded_types(kind);
     let reply = client
-        .search(String::new(), Some(kinds), None, None)
+        .search(String::new(), Some(kinds), None, None, None, excluded)
         .call()
         .await
         .ok()?;
     match kind {
-        RefKind::Issue => rows.extend(reply.issues.into_iter().map(Item::Issue)),
+        RefKind::Issue => rows.extend(item::issues(reply.work_items)),
         RefKind::Mr => rows.extend(reply.merge_requests.into_iter().map(Item::Mr)),
     }
     Some(())
@@ -391,8 +392,9 @@ async fn fetch_items(kind: RefKind, rows: &mut Vec<Item>) -> Option<()> {
 /// what is typed.
 async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
-    let issues = client.get_assigned_issues(None).call().await.ok()?.issues;
-    let paths = issues.iter().map(|i| (&i.project_path, &i.web_url));
+    let issues = client.get_assigned_work_items(None).call().await;
+    let issues = issues.ok()?.work_items;
+    let paths = issues.iter().map(|i| (&i.namespace_path, &i.web_url));
     let mrs = client.get_assigned_merge_requests(None).call().await.ok()?;
     let paths = paths.chain(
         mrs.merge_requests
@@ -408,7 +410,7 @@ async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     let query = current.trim_matches('/').to_string();
     let kinds = vec![SearchKind::projects];
     let reply = client
-        .search(query, Some(kinds), None, None)
+        .search(query, Some(kinds), None, None, None, None)
         .call()
         .await
         .ok()?;
@@ -417,15 +419,16 @@ async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
 }
 
 /// The epics opened before, most used first (an empty `Search`).
-async fn fetch_epics(rows: &mut Vec<Epic>) -> Option<()> {
+async fn fetch_epics(rows: &mut Vec<WorkItem>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
-    let kinds = vec![SearchKind::epics];
+    let kinds = vec![SearchKind::work_items];
+    let types = vec!["epic".to_string()];
     let reply = client
-        .search(String::new(), Some(kinds), None, None)
+        .search(String::new(), Some(kinds), None, None, Some(types), None)
         .call()
         .await
         .ok()?;
-    rows.extend(reply.epics);
+    rows.extend(reply.work_items.into_iter().filter(item::is_epic));
     Some(())
 }
 
@@ -435,7 +438,7 @@ async fn fetch_groups(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     let query = current.trim_matches('/').to_string();
     let kinds = vec![SearchKind::groups];
     let reply = client
-        .search(query, Some(kinds), None, None)
+        .search(query, Some(kinds), None, None, None, None)
         .call()
         .await
         .ok()?;
@@ -544,16 +547,11 @@ mod tests {
 
     #[test]
     fn epics_rank_behind_the_one_opened_last() {
-        let epic = |group_id, path: &str, iid, title: &str| Epic {
-            id: group_id * 100 + iid,
-            iid,
-            group_id,
+        let epic = |group_id, path: &str, iid, title: &str| WorkItem {
             title: title.to_string(),
             web_url: format!("https://gitlab.example.com/groups/{path}/-/epics/{iid}"),
-            state: "opened".to_string(),
             open_count: 1,
-            group_path: String::new(),
-            updated_at: 0,
+            ..crate::item::testing::epic(group_id, iid)
         };
         let rows = [
             epic(3, "team", 5, "Accounts"),

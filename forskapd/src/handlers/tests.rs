@@ -6,13 +6,13 @@ use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 
 use forskap_api::{
-    AsyncCall, CacheScope, Call_ClearCache, Call_Close, Call_CreateIssue, Call_GetActivity,
-    Call_GetAssignedIssues, Call_GetAssignedMergeRequests, Call_GetHistory, Call_GetSyncJobs,
-    Call_ListIssues, Call_PostTime, Call_RecordEpicOpen, Call_RecordOpen, Call_Search,
-    Call_UnassignSelf, Call_WhoAmI, CreateIssue_Reply, GetActivity_Reply, GetAssignedIssues_Reply,
-    GetAssignedMergeRequests_Reply, GetHistory_Reply, GetSyncJobs_Reply, HistorySource,
-    IssuableKind, Issue, IssueRole, IssueState, ListIssues_Reply, MergeRequest, Search_Reply,
-    SearchKind, SearchScope, SyncJobStatus, VarlinkInterface, WhoAmI_Reply,
+    AsyncCall, CacheScope, Call_ClearCache, Call_Close, Call_CreateWorkItem, Call_GetActivity,
+    Call_GetAssignedMergeRequests, Call_GetAssignedWorkItems, Call_GetHistory, Call_GetSyncJobs,
+    Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_Search, Call_UnassignSelf,
+    Call_WhoAmI, CreateWorkItem_Reply, GetActivity_Reply, GetAssignedMergeRequests_Reply,
+    GetAssignedWorkItems_Reply, GetHistory_Reply, GetSyncJobs_Reply, HistorySource, IssuableKind,
+    ListWorkItems_Reply, MergeRequest, Search_Reply, SearchKind, SearchScope, SyncJobStatus,
+    VarlinkInterface, WhoAmI_Reply, WorkItem, WorkItemRef, WorkItemRole, WorkItemState,
 };
 
 use crate::config::SharedConfig;
@@ -27,7 +27,10 @@ use crate::sync::model::{self, Board, BoardList, LabelRef, RowKey, UserRef};
 use crate::sync::schedule::JobState;
 use crate::sync::store::{RowScope, Stored, SyncStore, View};
 use crate::sync::{Job, SyncHandle};
-use crate::testing::{FakeErr, FakeGitlab, event_json, eventually, issue_json};
+use crate::testing::{
+    FakeErr, FakeGitlab, epic_json, epic_path, event_json, eventually, issue_json,
+};
+use crate::usage::{epic_usage_key, usage_key};
 use crate::write::{Write, WriteOp};
 
 const NOT_AUTHENTICATED: &str = "org.thehoster.forskapd.NotAuthenticated";
@@ -164,13 +167,14 @@ fn mr(
     }
 }
 
-/// Three assigned issues: two under `team` (one in a subgroup), one under
-/// `other`, listed in that GitLab order.
+/// An epic of `team`, its legacy id `group_id * 1000 + iid`, its work item
+/// id that plus 900 000.
 fn epic(group_id: i64, iid: i64, title: &str, updated_at: u64) -> model::Epic {
     model::Epic {
         id: group_id * 1000 + iid,
         iid,
         group_id,
+        work_item_id: 900_000 + group_id * 1000 + iid,
         title: title.into(),
         web_url: format!("https://gl/groups/team/-/epics/{iid}"),
         state: "opened".into(),
@@ -179,6 +183,8 @@ fn epic(group_id: i64, iid: i64, title: &str, updated_at: u64) -> model::Epic {
     }
 }
 
+/// Three assigned issues: two under `team` (one in a subgroup), one under
+/// `other`, listed in that GitLab order.
 fn seed_assigned_issues(h: &Handlers) {
     seed(
         h,
@@ -265,7 +271,7 @@ fn seed_recent_issues(h: &Handlers) {
 /// Issues "OAuth token refresh" (1/10) and a labeled one (1/20), MR "Fix
 /// oauth flow" (1/30), project `team/auth-service`, group `team` with the
 /// epics "Identity roadmap" (5/7) and "Billing" (5/8).
-fn seed_corpus(h: &Handlers) {
+pub(crate) fn seed_corpus(h: &Handlers) {
     let mut labeled = issue(1, 20, "unrelated title", "https://gl/team/p/-/issues/20");
     labeled.labels = vec!["Backend".into()];
     labeled.updated_at = 200;
@@ -333,43 +339,69 @@ fn reply_error(call: &mut AsyncCall) -> Option<String> {
         .map(|e| e.to_string())
 }
 
-async fn assigned_issues(h: &Handlers, groups: Option<Vec<String>>) -> Vec<Issue> {
+async fn assigned_work_items(h: &Handlers, groups: Option<Vec<String>>) -> Vec<WorkItem> {
     let mut call = AsyncCall::default();
-    h.get_assigned_issues(&mut call as &mut dyn Call_GetAssignedIssues, groups)
+    h.get_assigned_work_items(&mut call as &mut dyn Call_GetAssignedWorkItems, groups)
         .await
         .unwrap();
-    reply::<GetAssignedIssues_Reply>(&mut call).issues
+    reply::<GetAssignedWorkItems_Reply>(&mut call).work_items
 }
 
-async fn list_issues(
+async fn list_work_items(
     h: &Handlers,
-    role: Option<IssueRole>,
+    role: Option<WorkItemRole>,
     updated_after: Option<i64>,
-    states: Option<Vec<IssueState>>,
-) -> Vec<Issue> {
+    states: Option<Vec<WorkItemState>>,
+) -> Vec<WorkItem> {
     let mut call = AsyncCall::default();
-    h.list_issues(
-        &mut call as &mut dyn Call_ListIssues,
+    h.list_work_items(
+        &mut call as &mut dyn Call_ListWorkItems,
         role,
         updated_after,
         states,
     )
     .await
     .unwrap();
-    reply::<ListIssues_Reply>(&mut call).issues
+    reply::<ListWorkItems_Reply>(&mut call).work_items
 }
 
-/// The error `ListIssues` replies for `role`, `None` for a success.
-async fn list_issues_error(h: &Handlers, role: Option<IssueRole>) -> Option<String> {
+/// The error `ListWorkItems` replies for `role`, `None` for a success.
+async fn list_work_items_error(h: &Handlers, role: Option<WorkItemRole>) -> Option<String> {
     let mut call = AsyncCall::default();
-    h.list_issues(&mut call as &mut dyn Call_ListIssues, role, None, None)
+    h.list_work_items(&mut call as &mut dyn Call_ListWorkItems, role, None, None)
         .await
         .unwrap();
     reply_error(&mut call)
 }
 
-fn iids(issues: &[Issue]) -> Vec<i64> {
-    issues.iter().map(|i| i.iid).collect()
+fn iids(items: &[WorkItem]) -> Vec<i64> {
+    items.iter().map(|i| i.iid).collect()
+}
+
+fn is_epic(item: &WorkItem) -> bool {
+    item.r#type == "epic"
+}
+
+/// The numbers of the project work items `Search` found, in its order.
+fn issue_iids(r: &Search_Reply) -> Vec<i64> {
+    r.work_items
+        .iter()
+        .filter(|w| !is_epic(w))
+        .map(|w| w.iid)
+        .collect()
+}
+
+/// The epics `Search` found, in its order.
+fn epics(r: &Search_Reply) -> Vec<&WorkItem> {
+    r.work_items.iter().filter(|w| is_epic(w)).collect()
+}
+
+/// The `(group_id, iid)` of the epics `Search` found, in its order.
+fn epic_keys(r: &Search_Reply) -> Vec<(i64, i64)> {
+    epics(r)
+        .iter()
+        .map(|e| (e.group_id.unwrap(), e.iid))
+        .collect()
 }
 
 async fn unassign(h: &Handlers, project_id: i64, iid: i64, kind: IssuableKind) -> Option<String> {
@@ -409,6 +441,41 @@ async fn run_scoped_search(
     limit: Option<i64>,
     scope: Option<SearchScope>,
 ) -> Search_Reply {
+    search_with(h, query, kinds, limit, scope, None, None).await
+}
+
+/// `Search` for the work items of `types` only.
+async fn run_typed_search(
+    h: &Handlers,
+    query: &str,
+    types: &[&str],
+    limit: Option<i64>,
+) -> Search_Reply {
+    run_filtered_search(h, query, types, &[], limit).await
+}
+
+/// `Search` for the work items of `types` (empty: any) but not of `excluded`.
+async fn run_filtered_search(
+    h: &Handlers,
+    query: &str,
+    types: &[&str],
+    excluded: &[&str],
+    limit: Option<i64>,
+) -> Search_Reply {
+    let names = |list: &[&str]| Some(list.iter().map(|t| t.to_string()).collect());
+    let kinds = Some(vec![SearchKind::work_items]);
+    search_with(h, query, kinds, limit, None, names(types), names(excluded)).await
+}
+
+async fn search_with(
+    h: &Handlers,
+    query: &str,
+    kinds: Option<Vec<SearchKind>>,
+    limit: Option<i64>,
+    scope: Option<SearchScope>,
+    types: Option<Vec<String>>,
+    exclude_types: Option<Vec<String>>,
+) -> Search_Reply {
     let mut call = AsyncCall::default();
     h.search(
         &mut call as &mut dyn Call_Search,
@@ -416,25 +483,38 @@ async fn run_scoped_search(
         kinds,
         limit,
         scope,
+        types,
+        exclude_types,
     )
     .await
     .unwrap();
     reply(&mut call)
 }
 
+/// `RecordOpen` of a project's work item or merge request.
 async fn run_record_open(h: &Handlers, project_id: i64, iid: i64, kind: IssuableKind) {
-    let mut call = AsyncCall::default();
-    h.record_open(&mut call as &mut dyn Call_RecordOpen, project_id, iid, kind)
-        .await
-        .unwrap();
-    assert_eq!(reply_error(&mut call), None);
+    let error = record_open(h, kind, iid, Some(project_id), None).await;
+    assert_eq!(error, None);
 }
 
-async fn run_record_epic_open(h: &Handlers, group_id: i64, iid: i64) -> Option<String> {
+/// The error `RecordOpen` replies, `None` for a success.
+async fn record_open(
+    h: &Handlers,
+    kind: IssuableKind,
+    iid: i64,
+    project_id: Option<i64>,
+    group_id: Option<i64>,
+) -> Option<String> {
     let mut call = AsyncCall::default();
-    h.record_epic_open(&mut call as &mut dyn Call_RecordEpicOpen, group_id, iid)
-        .await
-        .unwrap();
+    h.record_open(
+        &mut call as &mut dyn Call_RecordOpen,
+        kind,
+        iid,
+        project_id,
+        group_id,
+    )
+    .await
+    .unwrap();
     reply_error(&mut call)
 }
 
@@ -461,39 +541,56 @@ async fn close(h: &Handlers, project_id: i64, iid: i64, kind: IssuableKind) -> O
     reply_error(&mut call)
 }
 
-/// `CreateIssue` with just a title, self-assigned or not; the call holds
+/// `CreateWorkItem` with just a title, self-assigned or not; the call holds
 /// the reply.
-async fn create_issue(
+async fn create_work_item(
     h: &Handlers,
     project_id: i64,
     title: &str,
     assign_self: Option<bool>,
 ) -> AsyncCall {
-    create_issue_with(h, project_id, title, None, None, assign_self, None).await
+    create_work_item_with(h, project_id, title, None, None, assign_self, None).await
 }
 
-async fn create_issue_with(
+async fn create_work_item_with(
     h: &Handlers,
     project_id: i64,
     title: &str,
     description: Option<&str>,
     labels: Option<&[&str]>,
     assign_self: Option<bool>,
-    epic_id: Option<i64>,
+    parent: Option<WorkItemRef>,
 ) -> AsyncCall {
     let mut call = AsyncCall::default();
-    h.create_issue(
-        &mut call as &mut dyn Call_CreateIssue,
+    h.create_work_item(
+        &mut call as &mut dyn Call_CreateWorkItem,
         project_id,
         title.to_string(),
         description.map(str::to_string),
         labels.map(|labels| labels.iter().map(|l| l.to_string()).collect()),
         assign_self,
-        epic_id,
+        parent,
     )
     .await
     .unwrap();
     call
+}
+
+/// The epic `iid` of the group as a parent, named by its group and number.
+fn parent(group_id: i64, iid: i64) -> WorkItemRef {
+    WorkItemRef {
+        project_id: None,
+        group_id: Some(group_id),
+        iid,
+        r#type: Some("epic".into()),
+        title: None,
+        web_url: None,
+    }
+}
+
+/// `CreateWorkItem` of "Fix it" in project 7 under `parent`.
+async fn create_under(h: &Handlers, parent: WorkItemRef) -> AsyncCall {
+    create_work_item_with(h, 7, "Fix it", None, None, None, Some(parent)).await
 }
 
 /// The issue GitLab answers a create in project 7 with, numbered `iid` and
@@ -547,7 +644,7 @@ fn looks_like_duration_accepts_valid_and_rejects_typos() {
 async fn close_rejects_bad_issuable_ref() {
     let (h, _dir) = dormant_handlers();
     assert_eq!(
-        close(&h, 0, 42, IssuableKind::issue).await.as_deref(),
+        close(&h, 0, 42, IssuableKind::work_item).await.as_deref(),
         Some(GITLAB_ERROR)
     );
 }
@@ -557,7 +654,7 @@ async fn close_rejects_bad_issuable_ref() {
 #[tokio::test]
 async fn post_time_queues_through_an_unreachable_outage() {
     let (h, _dir) = unreachable_handlers();
-    assert_eq!(post_time(&h, 7, 42, IssuableKind::issue).await, None);
+    assert_eq!(post_time(&h, 7, 42, IssuableKind::work_item).await, None);
     assert_eq!(h.queue.pending().unwrap().len(), 1, "drains on reconnect");
 }
 
@@ -565,7 +662,9 @@ async fn post_time_queues_through_an_unreachable_outage() {
 async fn post_time_rejects_when_dormant_but_not_unreachable() {
     let (h, _dir) = dormant_handlers();
     assert_eq!(
-        post_time(&h, 7, 42, IssuableKind::issue).await.as_deref(),
+        post_time(&h, 7, 42, IssuableKind::work_item)
+            .await
+            .as_deref(),
         Some(NOT_AUTHENTICATED),
         "no credentials: queuing wouldn't help"
     );
@@ -580,7 +679,7 @@ async fn post_time_queues_rate_limits_but_reports_server_errors() {
         let fake = Arc::new(FakeGitlab::default());
         fake.fail_next_write(FakeErr::Throttled(status));
         let (h, _dir) = connected_handlers(&fake);
-        let error = post_time(&h, 7, 42, IssuableKind::issue).await;
+        let error = post_time(&h, 7, 42, IssuableKind::work_item).await;
         assert_eq!(error.is_none(), queued, "{status}");
         assert_eq!(
             h.queue.pending().unwrap().len(),
@@ -595,7 +694,7 @@ async fn close_queues_through_a_server_error() {
     let fake = Arc::new(FakeGitlab::default());
     fake.fail_next_write(FakeErr::Throttled(503));
     let (h, _dir) = connected_handlers(&fake);
-    assert_eq!(close(&h, 7, 42, IssuableKind::issue).await, None);
+    assert_eq!(close(&h, 7, 42, IssuableKind::work_item).await, None);
     let pending = h.queue.pending().unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].write.op, WriteOp::Close);
@@ -609,7 +708,7 @@ async fn post_time_transient_queues_without_demoting() {
     fake.fail_next_write(FakeErr::Transient);
     let (h, _dir) = connected_handlers(&fake);
 
-    assert_eq!(post_time(&h, 7, 42, IssuableKind::issue).await, None);
+    assert_eq!(post_time(&h, 7, 42, IssuableKind::work_item).await, None);
     assert_eq!(h.queue.pending().unwrap().len(), 1);
     assert!(matches!(&*h.session.read().await, ConnState::Connected(_)));
     assert!(
@@ -647,7 +746,7 @@ async fn an_applied_write_reruns_the_jobs_that_show_it() {
     let fake = Arc::new(FakeGitlab::default());
     let (h, _dir) = connected_handlers(&fake);
 
-    assert_eq!(close(&h, 7, 1, IssuableKind::issue).await, None);
+    assert_eq!(close(&h, 7, 1, IssuableKind::work_item).await, None);
     assert_eq!(fake.writes(), [("close", Issuable::Issue, 7, 1)]);
     eventually("the assigned-issue refresh", || {
         !fake.calls_to("issues").is_empty()
@@ -658,11 +757,11 @@ async fn an_applied_write_reruns_the_jobs_that_show_it() {
 // ── Creating an issue ──────────────────────────────────────────────────
 
 #[tokio::test]
-async fn create_issue_rejects_a_blank_title_or_bad_project() {
+async fn create_work_item_rejects_a_blank_title_or_bad_project() {
     let fake = Arc::new(FakeGitlab::default());
     let (h, _dir) = connected_handlers(&fake);
     for (project_id, title) in [(7, ""), (7, " \t\n"), (0, "Fix it"), (-3, "Fix it")] {
-        let mut call = create_issue(&h, project_id, title, None).await;
+        let mut call = create_work_item(&h, project_id, title, None).await;
         assert_eq!(
             reply_error(&mut call).as_deref(),
             Some(GITLAB_ERROR),
@@ -671,7 +770,7 @@ async fn create_issue_rejects_a_blank_title_or_bad_project() {
     }
     // GitLab would read one label with a comma as two.
     let labels = ["bug", "auth,flow"];
-    let mut call = create_issue_with(&h, 7, "Fix it", None, Some(&labels), None, None).await;
+    let mut call = create_work_item_with(&h, 7, "Fix it", None, Some(&labels), None, None).await;
     assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
 
     assert!(fake.writes().is_empty(), "refused before GitLab is asked");
@@ -679,16 +778,16 @@ async fn create_issue_rejects_a_blank_title_or_bad_project() {
 
     // Refused while dormant too, as what it is: an invalid call.
     let (h, _dir) = dormant_handlers();
-    let mut call = create_issue(&h, 7, "", None).await;
+    let mut call = create_work_item(&h, 7, "", None).await;
     assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
 }
 
 /// Where the other writes are queued, a create fails: a replay has nothing
 /// to tell it whether the first attempt landed.
 #[tokio::test]
-async fn create_issue_is_never_queued() {
+async fn create_work_item_is_never_queued() {
     for (h, _dir) in [unreachable_handlers(), dormant_handlers()] {
-        let mut call = create_issue(&h, 7, "Fix it", Some(true)).await;
+        let mut call = create_work_item(&h, 7, "Fix it", Some(true)).await;
         assert_eq!(reply_error(&mut call).as_deref(), Some(NOT_AUTHENTICATED));
         assert!(h.queue.pending().unwrap().is_empty());
         assert!(h.queue.failures().unwrap().is_empty());
@@ -703,7 +802,7 @@ async fn create_issue_is_never_queued() {
         let fake = Arc::new(FakeGitlab::default());
         fake.fail_next_write(err);
         let (h, _dir) = connected_handlers(&fake);
-        let mut call = create_issue(&h, 7, "Fix it", None).await;
+        let mut call = create_work_item(&h, 7, "Fix it", None).await;
         assert_eq!(
             reply_error(&mut call).as_deref(),
             Some(GITLAB_ERROR),
@@ -722,7 +821,7 @@ async fn create_issue_is_never_queued() {
 
 /// A 401 included: the sync worker judges the session, not a write.
 #[tokio::test]
-async fn create_issue_reports_any_gitlab_failure_without_demoting() {
+async fn create_work_item_reports_any_gitlab_failure_without_demoting() {
     for err in [
         FakeErr::Transient,
         FakeErr::Throttled(429),
@@ -735,7 +834,7 @@ async fn create_issue_reports_any_gitlab_failure_without_demoting() {
         let (h, _dir) = connected_handlers(&fake);
         seed_recent_issues(&h);
 
-        let mut call = create_issue(&h, 7, "Fix it", Some(true)).await;
+        let mut call = create_work_item(&h, 7, "Fix it", Some(true)).await;
         assert_eq!(
             reply_error(&mut call).as_deref(),
             Some(GITLAB_ERROR),
@@ -767,19 +866,19 @@ async fn a_created_issue_is_searchable_at_once() {
     seed_recent_issues(&h);
     mark_synced(&h, &[Job::MemberProjects]);
 
-    let mut call = create_issue(&h, 7, "Fix the login", None).await;
-    let created: CreateIssue_Reply = reply(&mut call);
+    let mut call = create_work_item(&h, 7, "Fix the login", None).await;
+    let created: CreateWorkItem_Reply = reply(&mut call);
     assert_eq!(created.iid, 12);
     assert_eq!(created.web_url, "https://gitlab.test/g/p7/-/issues/12");
 
-    let found = run_search(&h, "login", None, None).await.issues;
+    let found = run_search(&h, "login", None, None).await.work_items;
     assert_eq!(iids(&found), [12]);
     assert_eq!(found[0].title, "Fix the login");
-    assert_eq!(found[0].project_id, 7);
+    assert_eq!(found[0].project_id, Some(7));
     // The newest of what the user authored; nobody is assigned.
-    let authored = list_issues(&h, Some(IssueRole::author), None, None).await;
+    let authored = list_work_items(&h, Some(WorkItemRole::author), None, None).await;
     assert_eq!(iids(&authored), [12, 1, 2]);
-    let assigned = list_issues(&h, Some(IssueRole::assignee), None, None).await;
+    let assigned = list_work_items(&h, Some(WorkItemRole::assignee), None, None).await;
     assert_eq!(iids(&assigned), [2, 3]);
     assert!(fake.calls_to("issues").len() <= 1, "nothing landed since");
 }
@@ -797,38 +896,40 @@ async fn a_created_issue_assigned_to_me_is_listed_at_once() {
     for (title, iid) in [("Fix the login", 12), ("Fix the logout", 13)] {
         // Held anew: a create restarts the list the one before set off.
         let _held = fake.gate("issues");
-        let mut call = create_issue(&h, 7, title, Some(true)).await;
-        assert_eq!(reply::<CreateIssue_Reply>(&mut call).iid, iid);
+        let mut call = create_work_item(&h, 7, title, Some(true)).await;
+        assert_eq!(reply::<CreateWorkItem_Reply>(&mut call).iid, iid);
     }
 
-    let assigned = assigned_issues(&h, None).await;
+    let assigned = assigned_work_items(&h, None).await;
     assert!(iids(&assigned).contains(&12), "{:?}", iids(&assigned));
     assert!(!iids(&assigned).contains(&13), "by GitLab's answer");
-    let recent = list_issues(&h, Some(IssueRole::assignee), None, None).await;
+    let recent = list_work_items(&h, Some(WorkItemRole::assignee), None, None).await;
     assert_eq!(iids(&recent), [12, 2, 3]);
-    let authored = list_issues(&h, Some(IssueRole::author), None, None).await;
+    let authored = list_work_items(&h, Some(WorkItemRole::author), None, None).await;
     assert_eq!(iids(&authored)[..2], [12, 13]);
 }
 
+/// The parent is the stored epic, which GitLab takes by its legacy id.
 #[tokio::test]
-async fn create_issue_passes_its_arguments_on() {
+async fn create_work_item_passes_its_arguments_on() {
     let fake = Arc::new(FakeGitlab::default());
     let (h, _dir) = connected_handlers(&fake);
+    seed(&h, &[epic(5, 5, "Accounts", 100)]);
 
     let labels = ["bug", "auth flow"];
-    let mut call = create_issue_with(
+    let mut call = create_work_item_with(
         &h,
         7,
         "Fix the login",
         Some("It fails."),
         Some(&labels),
         Some(true),
-        Some(5005),
+        Some(parent(5, 5)),
     )
     .await;
     assert_eq!(reply_error(&mut call), None);
     // Omitted on the wire: no labels, no epic, nobody assigned.
-    let mut call = create_issue(&h, 8, "Bare", None).await;
+    let mut call = create_work_item(&h, 8, "Bare", None).await;
     assert_eq!(reply_error(&mut call), None);
 
     let full = NewIssue {
@@ -850,14 +951,107 @@ async fn create_issue_passes_its_arguments_on() {
             ("create_issue", Issuable::Issue, 8, 0)
         ]
     );
+    assert_eq!(fake.epic_calls(), [], "the epic is stored");
     // The lists that show it run again.
     eventually("the list reruns", || !fake.calls_to("issues").is_empty()).await;
+}
+
+/// An epic the store doesn't hold is asked of GitLab, once, before the
+/// create; the type may be left out or spelled in any case.
+#[tokio::test]
+async fn create_work_item_looks_an_unknown_parent_up() {
+    let fake = Arc::new(FakeGitlab::default());
+    fake.serve_epic(epic_json(9, 4, "Roadmap"));
+    let (h, _dir) = connected_handlers(&fake);
+
+    for spelled in [Some("Epic"), None] {
+        let parent = WorkItemRef {
+            r#type: spelled.map(str::to_string),
+            ..parent(9, 4)
+        };
+        let mut call = create_under(&h, parent).await;
+        assert_eq!(reply_error(&mut call), None, "{spelled:?}");
+    }
+    let epic_ids: Vec<_> = fake.created().iter().map(|(_, new)| new.epic_id).collect();
+    assert_eq!(epic_ids, [Some(9004), Some(9004)], "the legacy id");
+    assert_eq!(fake.epic_calls(), [(9, 4), (9, 4)]);
+}
+
+/// Nothing is created under a parent that can't be found, whatever kept it.
+#[tokio::test]
+async fn a_failed_parent_lookup_creates_nothing() {
+    let fake = Arc::new(FakeGitlab::default());
+    fake.fail_next(&epic_path(9, 4), FakeErr::Transient);
+    fake.fail_next(&epic_path(9, 4), FakeErr::Throttled(503));
+    // Not served at all: a 404.
+    let (h, _dir) = connected_handlers(&fake);
+
+    for _ in 0..3 {
+        let mut call = create_under(&h, parent(9, 4)).await;
+        assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
+    }
+    assert_eq!(fake.epic_calls().len(), 3, "each looked up once");
+    assert!(fake.created().is_empty() && fake.writes().is_empty());
+    assert!(h.queue.pending().unwrap().is_empty());
+    assert!(matches!(&*h.session.read().await, ConnState::Connected(_)));
+
+    // GitLab's answer has to name the epic.
+    let fake = Arc::new(FakeGitlab::default());
+    let mut unnamed = epic_json(9, 4, "Roadmap");
+    unnamed["id"] = serde_json::Value::Null;
+    fake.serve_epic(unnamed);
+    let (h, _dir) = connected_handlers(&fake);
+    let mut call = create_under(&h, parent(9, 4)).await;
+    assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
+    assert!(fake.created().is_empty());
+}
+
+/// Only an epic, named by its group and number, can be a parent; anything
+/// else is refused before GitLab is asked, while dormant too.
+#[tokio::test]
+async fn create_work_item_refuses_a_parent_that_is_no_epic() {
+    let fake = Arc::new(FakeGitlab::default());
+    let (h, _dir) = connected_handlers(&fake);
+    let in_project = WorkItemRef {
+        project_id: Some(7),
+        group_id: None,
+        ..parent(9, 4)
+    };
+    let both = WorkItemRef {
+        project_id: Some(7),
+        ..parent(9, 4)
+    };
+    let a_task = WorkItemRef {
+        r#type: Some("task".into()),
+        ..parent(9, 4)
+    };
+    for refused in [
+        in_project,
+        both,
+        a_task,
+        parent(0, 4),
+        parent(9, 0),
+        parent(-1, 4),
+    ] {
+        let mut call = create_under(&h, refused.clone()).await;
+        assert_eq!(
+            reply_error(&mut call).as_deref(),
+            Some(GITLAB_ERROR),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(fake.read_calls(), 0);
+    assert!(fake.writes().is_empty());
+
+    let (h, _dir) = dormant_handlers();
+    let mut call = create_under(&h, parent(9, 0)).await;
+    assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
 }
 
 /// The issue exists: an answer the daemon can't read must not read as a
 /// failure, or the caller files it again.
 #[tokio::test]
-async fn create_issue_replies_success_whatever_gitlab_answered() {
+async fn create_work_item_replies_success_whatever_gitlab_answered() {
     let fake = Arc::new(FakeGitlab::default());
     fake.serve_create(serde_json::json!("created"));
     // No global id: nothing to store, but the number and link are there.
@@ -866,12 +1060,12 @@ async fn create_issue_replies_success_whatever_gitlab_answered() {
     fake.serve_create(partial);
     let (h, _dir) = connected_handlers(&fake);
 
-    let mut call = create_issue(&h, 7, "Fix the login", None).await;
-    let unreadable: CreateIssue_Reply = reply(&mut call);
+    let mut call = create_work_item(&h, 7, "Fix the login", None).await;
+    let unreadable: CreateWorkItem_Reply = reply(&mut call);
     assert_eq!((unreadable.iid, unreadable.web_url.as_str()), (0, ""));
 
-    let mut call = create_issue(&h, 7, "Fix the login", None).await;
-    let created: CreateIssue_Reply = reply(&mut call);
+    let mut call = create_work_item(&h, 7, "Fix the login", None).await;
+    let created: CreateWorkItem_Reply = reply(&mut call);
     assert_eq!(created.iid, 12);
     assert!(created.web_url.ends_with("/issues/12"), "{created:?}");
     assert_eq!(h.sync.store().issues.scan(RowScope::Prefix(7)).unwrap(), []);
@@ -884,8 +1078,8 @@ async fn a_queued_close_hides_the_issue_until_it_settles() {
     let (h, _dir) = unreachable_handlers();
     seed_assigned_issues(&h);
 
-    assert_eq!(close(&h, 1, 1, IssuableKind::issue).await, None);
-    let iids: Vec<i64> = assigned_issues(&h, None)
+    assert_eq!(close(&h, 1, 1, IssuableKind::work_item).await, None);
+    let iids: Vec<i64> = assigned_work_items(&h, None)
         .await
         .iter()
         .map(|i| i.iid)
@@ -903,8 +1097,8 @@ async fn an_applied_write_hides_only_views_fetched_before_it() {
         iid: 1,
         op: WriteOp::UnassignSelf,
     });
-    let iids = |v: Vec<Issue>| v.iter().map(|i| i.iid).collect::<Vec<_>>();
-    assert_eq!(iids(assigned_issues(&h, None).await), [3, 2]);
+    let iids = |v: Vec<WorkItem>| v.iter().map(|i| i.iid).collect::<Vec<_>>();
+    assert_eq!(iids(assigned_work_items(&h, None).await), [3, 2]);
 
     // A view fetched after the write reflects GitLab, including the write.
     seed_view(
@@ -913,7 +1107,7 @@ async fn an_applied_write_hides_only_views_fetched_before_it() {
         &[(2, 3), (1, 1), (1, 2)],
         now_secs() + 5,
     );
-    assert_eq!(iids(assigned_issues(&h, None).await), [3, 1, 2]);
+    assert_eq!(iids(assigned_work_items(&h, None).await), [3, 1, 2]);
 }
 
 #[tokio::test]
@@ -950,7 +1144,7 @@ async fn assigned_views_follow_the_rows_current_state() {
     }];
     seed(&h, &[closed, reassigned]);
 
-    let iids: Vec<i64> = assigned_issues(&h, None)
+    let iids: Vec<i64> = assigned_work_items(&h, None)
         .await
         .iter()
         .map(|i| i.iid)
@@ -963,10 +1157,10 @@ async fn assigned_views_follow_the_rows_current_state() {
 /// Served under a dormant session: proves the read never fetches — a fetch
 /// would have replied NotAuthenticated instead.
 #[tokio::test]
-async fn get_assigned_issues_serves_the_view_while_dormant_grouped_by_namespace() {
+async fn get_assigned_work_items_serves_the_view_while_dormant_grouped_by_namespace() {
     let (h, _dir) = dormant_handlers();
     seed_assigned_issues(&h);
-    let iids: Vec<i64> = assigned_issues(&h, None)
+    let iids: Vec<i64> = assigned_work_items(&h, None)
         .await
         .iter()
         .map(|i| i.iid)
@@ -975,31 +1169,31 @@ async fn get_assigned_issues_serves_the_view_while_dormant_grouped_by_namespace(
 }
 
 #[tokio::test]
-async fn get_assigned_issues_filters_by_group_and_subgroups() {
+async fn get_assigned_work_items_filters_by_group_and_subgroups() {
     let (h, _dir) = dormant_handlers();
     seed_assigned_issues(&h);
-    let iids = |v: Vec<Issue>| v.iter().map(|i| i.iid).collect::<Vec<_>>();
+    let iids = |v: Vec<WorkItem>| v.iter().map(|i| i.iid).collect::<Vec<_>>();
     assert_eq!(
-        iids(assigned_issues(&h, Some(vec!["team".into()])).await),
+        iids(assigned_work_items(&h, Some(vec!["team".into()])).await),
         [1, 2]
     );
     assert_eq!(
-        iids(assigned_issues(&h, Some(vec!["team/sub".into(), "team".into()])).await),
+        iids(assigned_work_items(&h, Some(vec!["team/sub".into(), "team".into()])).await),
         [1, 2],
         "overlapping groups list each issue once"
     );
     assert_eq!(
-        iids(assigned_issues(&h, Some(vec!["tea".into()])).await),
+        iids(assigned_work_items(&h, Some(vec!["tea".into()])).await),
         Vec::<i64>::new(),
         "a shared prefix is not a group"
     );
 }
 
 #[tokio::test]
-async fn get_assigned_issues_never_synced_is_honest_about_the_session() {
+async fn get_assigned_work_items_never_synced_is_honest_about_the_session() {
     let (h, _dir) = dormant_handlers();
     let mut call = AsyncCall::default();
-    h.get_assigned_issues(&mut call as &mut dyn Call_GetAssignedIssues, None)
+    h.get_assigned_work_items(&mut call as &mut dyn Call_GetAssignedWorkItems, None)
         .await
         .unwrap();
     assert_eq!(reply_error(&mut call).as_deref(), Some(NOT_AUTHENTICATED));
@@ -1007,14 +1201,14 @@ async fn get_assigned_issues_never_synced_is_honest_about_the_session() {
     let fake = Arc::new(FakeGitlab::default());
     let (h, _dir) = connected_handlers(&fake);
     assert!(
-        assigned_issues(&h, None).await.is_empty(),
+        assigned_work_items(&h, None).await.is_empty(),
         "connected: the first sync is pending"
     );
     assert_eq!(fake.read_calls(), 0, "reads never fetch");
 }
 
 #[tokio::test]
-async fn get_assigned_issues_overlays_open_counts_and_board_status() {
+async fn get_assigned_work_items_overlays_open_counts_and_board_status() {
     let (h, _dir) = dormant_handlers();
     let mut labeled = issue(1, 1, "api", "https://gl/team/api/-/issues/1");
     labeled.labels = vec!["bug".into(), "Doing".into()];
@@ -1039,9 +1233,9 @@ async fn get_assigned_issues_overlays_open_counts_and_board_status() {
         }],
     );
     mark_synced(&h, &[Job::AssignedIssues, Job::ProjectBoards(1)]);
-    run_record_open(&h, 1, 1, IssuableKind::issue).await;
+    run_record_open(&h, 1, 1, IssuableKind::work_item).await;
 
-    let issues = assigned_issues(&h, None).await;
+    let issues = assigned_work_items(&h, None).await;
     let api = issues.iter().find(|i| i.iid == 1).unwrap();
     assert_eq!(api.open_count, 1);
     assert_eq!(api.graph_status, "Doing");
@@ -1049,84 +1243,142 @@ async fn get_assigned_issues_overlays_open_counts_and_board_status() {
     assert_eq!(other.graph_status, "", "project 2's boards never synced");
 }
 
+/// Assigned issues are work items of their project, of their type, under
+/// the epic they name. GitLab links that epic relative to the instance.
+#[tokio::test]
+async fn assigned_work_items_name_their_epic_as_parent() {
+    let (h, _dir) = dormant_handlers();
+    seed_assigned_issues(&h);
+    let in_epic = |iid, group_id| model::EpicRef {
+        id: group_id * 1000 + iid,
+        iid,
+        group_id,
+        title: "Roadmap".into(),
+        url: format!("/groups/team/-/epics/{iid}"),
+    };
+    let mut task = issue(1, 1, "api", "https://gl/team/api/-/issues/1");
+    task.issue_type = "task".into();
+    task.epic = Some(in_epic(7, 5));
+    let mut stored = issue(1, 2, "web", "https://gl/team/sub/web/-/issues/2");
+    stored.epic = Some(in_epic(8, 5));
+    seed(&h, &[task, stored]);
+    let mut epic_row = epic(5, 8, "Roadmap", 100);
+    epic_row.web_url = "https://gl.example/groups/team/-/epics/8".into();
+    seed(&h, &[epic_row]);
+
+    let items = assigned_work_items(&h, None).await;
+    let of = |iid| items.iter().find(|i| i.iid == iid).unwrap();
+    assert_eq!(
+        (of(1).r#type.as_str(), of(3).r#type.as_str()),
+        ("task", "issue")
+    );
+    assert_eq!((of(1).project_id, of(1).group_id), (Some(1), None));
+    assert_eq!(of(1).id, 1001);
+    assert_eq!(
+        of(1).parent,
+        Some(WorkItemRef {
+            project_id: None,
+            group_id: Some(5),
+            iid: 7,
+            r#type: Some("epic".into()),
+            title: Some("Roadmap".into()),
+            web_url: Some("https://gl/groups/team/-/epics/7".into()),
+        }),
+        "no epic row: the issue's own host"
+    );
+    let parent = of(2).parent.clone().unwrap();
+    assert_eq!(
+        parent.web_url.as_deref(),
+        Some("https://gl.example/groups/team/-/epics/8"),
+        "the stored epic's link"
+    );
+    assert_eq!(of(3).parent, None);
+}
+
 // ── Recent issues ──────────────────────────────────────────────────────
 
 /// Served under a dormant session: the read never fetches. 1/2 is in both
 /// views and listed once.
 #[tokio::test]
-async fn list_issues_serves_both_roles_once_newest_first() {
+async fn list_work_items_serves_both_roles_once_newest_first() {
     let (h, _dir) = dormant_handlers();
     seed_recent_issues(&h);
-    run_record_open(&h, 2, 3, IssuableKind::issue).await;
+    run_record_open(&h, 2, 3, IssuableKind::work_item).await;
 
-    let issues = list_issues(&h, None, None, None).await;
+    let issues = list_work_items(&h, None, None, None).await;
     assert_eq!(iids(&issues), [1, 2, 3]);
     let updated: Vec<i64> = issues.iter().map(|i| i.updated_at).collect();
     assert_eq!(updated, [300, 200, 100]);
     assert_eq!(issues[1].state, "closed", "closed ones are listed too");
-    assert_eq!(issues[2].project_path, "other/x");
+    assert_eq!(issues[2].namespace_path, "other/x");
     assert_eq!(issues[2].open_count, 1);
     assert_eq!(issues[2].graph_status, "", "its boards never synced");
 }
 
 #[tokio::test]
-async fn list_issues_filters_by_role_state_and_time() {
+async fn list_work_items_filters_by_role_state_and_time() {
     let (h, _dir) = dormant_handlers();
     seed_recent_issues(&h);
-    let (author, assignee) = (Some(IssueRole::author), Some(IssueRole::assignee));
+    let (author, assignee) = (Some(WorkItemRole::author), Some(WorkItemRole::assignee));
     let (opened, closed) = (
-        || Some(vec![IssueState::opened]),
-        || Some(vec![IssueState::closed]),
+        || Some(vec![WorkItemState::opened]),
+        || Some(vec![WorkItemState::closed]),
     );
 
-    assert_eq!(iids(&list_issues(&h, author, None, None).await), [1, 2]);
-    let assigned = list_issues(&h, assignee.clone(), None, None).await;
+    assert_eq!(iids(&list_work_items(&h, author, None, None).await), [1, 2]);
+    let assigned = list_work_items(&h, assignee.clone(), None, None).await;
     assert_eq!(iids(&assigned), [2, 3]);
 
-    assert_eq!(iids(&list_issues(&h, None, None, closed()).await), [2]);
-    assert_eq!(iids(&list_issues(&h, None, None, opened()).await), [1, 3]);
-    let both = Some(vec![IssueState::closed, IssueState::opened]);
-    assert_eq!(iids(&list_issues(&h, None, None, both).await), [1, 2, 3]);
+    assert_eq!(iids(&list_work_items(&h, None, None, closed()).await), [2]);
+    assert_eq!(
+        iids(&list_work_items(&h, None, None, opened()).await),
+        [1, 3]
+    );
+    let both = Some(vec![WorkItemState::closed, WorkItemState::opened]);
+    assert_eq!(
+        iids(&list_work_items(&h, None, None, both).await),
+        [1, 2, 3]
+    );
     let none = Some(Vec::new());
     assert_eq!(
-        iids(&list_issues(&h, None, None, none).await),
+        iids(&list_work_items(&h, None, None, none).await),
         [1, 2, 3],
         "no state is every state"
     );
 
     assert_eq!(
-        iids(&list_issues(&h, None, Some(200), None).await),
+        iids(&list_work_items(&h, None, Some(200), None).await),
         [1, 2],
         "inclusive, as GitLab's updated_after"
     );
-    assert_eq!(iids(&list_issues(&h, None, Some(201), None).await), [1]);
+    assert_eq!(iids(&list_work_items(&h, None, Some(201), None).await), [1]);
     assert_eq!(
-        iids(&list_issues(&h, None, Some(-5), None).await),
+        iids(&list_work_items(&h, None, Some(-5), None).await),
         [1, 2, 3]
     );
-    let narrow = list_issues(&h, assignee, Some(100), opened()).await;
+    let narrow = list_work_items(&h, assignee, Some(100), opened()).await;
     assert_eq!(iids(&narrow), [3], "the filters combine");
 }
 
 #[tokio::test]
-async fn list_issues_never_synced_is_honest_about_the_session() {
+async fn list_work_items_never_synced_is_honest_about_the_session() {
     let (h, _dir) = dormant_handlers();
-    let cold = |role| list_issues_error(&h, role);
+    let cold = |role| list_work_items_error(&h, role);
     assert_eq!(cold(None).await.as_deref(), Some(NOT_AUTHENTICATED));
 
     // One list alone answers for its role, not for both.
     seed(&h, &[issue(1, 1, "api", "https://gl/team/api/-/issues/1")]);
     seed_view(&h, RECENT_AUTHORED_ISSUES, &[(1, 1)], now_secs() - 60);
     mark_synced(&h, &[Job::RecentAuthoredIssues]);
-    assert_eq!(cold(Some(IssueRole::author)).await, None);
-    let assigned = cold(Some(IssueRole::assignee)).await;
+    assert_eq!(cold(Some(WorkItemRole::author)).await, None);
+    let assigned = cold(Some(WorkItemRole::assignee)).await;
     assert_eq!(assigned.as_deref(), Some(NOT_AUTHENTICATED));
     assert_eq!(cold(None).await.as_deref(), Some(NOT_AUTHENTICATED));
 
     let fake = Arc::new(FakeGitlab::default());
     let (h, _dir) = connected_handlers(&fake);
     assert!(
-        list_issues(&h, None, None, None).await.is_empty(),
+        list_work_items(&h, None, None, None).await.is_empty(),
         "connected: the first sync is pending"
     );
     assert_eq!(fake.read_calls(), 0, "reads never fetch");
@@ -1136,7 +1388,7 @@ async fn list_issues_never_synced_is_honest_about_the_session() {
 /// assigned ones, not out of the authored ones; so does a row a project sync
 /// stored with other assignees.
 #[tokio::test]
-async fn list_issues_drops_what_was_unassigned_since() {
+async fn list_work_items_drops_what_was_unassigned_since() {
     let (h, _dir) = unreachable_handlers();
     seed_recent_issues(&h);
     let mut c = h.sync.store().begin();
@@ -1146,12 +1398,15 @@ async fn list_issues_drops_what_was_unassigned_since() {
     })
     .unwrap();
     c.commit().unwrap();
-    let assignee = || Some(IssueRole::assignee);
+    let assignee = || Some(WorkItemRole::assignee);
 
-    assert_eq!(unassign(&h, 1, 2, IssuableKind::issue).await, None);
-    assert_eq!(iids(&list_issues(&h, assignee(), None, None).await), [3]);
+    assert_eq!(unassign(&h, 1, 2, IssuableKind::work_item).await, None);
     assert_eq!(
-        iids(&list_issues(&h, None, None, None).await),
+        iids(&list_work_items(&h, assignee(), None, None).await),
+        [3]
+    );
+    assert_eq!(
+        iids(&list_work_items(&h, None, None, None).await),
         [1, 2, 3],
         "still authored"
     );
@@ -1162,8 +1417,8 @@ async fn list_issues_drops_what_was_unassigned_since() {
         username: "someone".into(),
     }];
     seed(&h, &[reassigned]);
-    assert!(list_issues(&h, assignee(), None, None).await.is_empty());
-    assert_eq!(iids(&list_issues(&h, None, None, None).await), [1, 2]);
+    assert!(list_work_items(&h, assignee(), None, None).await.is_empty());
+    assert_eq!(iids(&list_work_items(&h, None, None, None).await), [1, 2]);
 }
 
 /// A close the lists don't reflect yet reads as closed, before the state
@@ -1172,18 +1427,21 @@ async fn list_issues_drops_what_was_unassigned_since() {
 async fn a_just_closed_issue_lists_as_closed() {
     let (h, _dir) = unreachable_handlers();
     seed_recent_issues(&h);
-    let closed = || Some(vec![IssueState::closed]);
-    let opened = || Some(vec![IssueState::opened]);
+    let closed = || Some(vec![WorkItemState::closed]);
+    let opened = || Some(vec![WorkItemState::opened]);
 
-    assert_eq!(close(&h, 1, 1, IssuableKind::issue).await, None);
-    let issues = list_issues(&h, None, None, None).await;
+    assert_eq!(close(&h, 1, 1, IssuableKind::work_item).await, None);
+    let issues = list_work_items(&h, None, None, None).await;
     assert_eq!(iids(&issues), [1, 2, 3]);
     assert_eq!(
         issues[0].state, "closed",
         "the pending close already applies"
     );
-    assert_eq!(iids(&list_issues(&h, None, None, closed()).await), [1, 2]);
-    assert_eq!(iids(&list_issues(&h, None, None, opened()).await), [3]);
+    assert_eq!(
+        iids(&list_work_items(&h, None, None, closed()).await),
+        [1, 2]
+    );
+    assert_eq!(iids(&list_work_items(&h, None, None, opened()).await), [3]);
 
     h.sync.note_write(&Write {
         kind: Issuable::Issue,
@@ -1191,7 +1449,7 @@ async fn a_just_closed_issue_lists_as_closed() {
         iid: 3,
         op: WriteOp::Close,
     });
-    assert!(list_issues(&h, None, None, opened()).await.is_empty());
+    assert!(list_work_items(&h, None, None, opened()).await.is_empty());
     // A list fetched after the write reflects GitLab, including the write.
     seed_view(
         &h,
@@ -1199,7 +1457,7 @@ async fn a_just_closed_issue_lists_as_closed() {
         &[(2, 3), (1, 2)],
         now_secs() + 5,
     );
-    assert_eq!(iids(&list_issues(&h, None, None, opened()).await), [3]);
+    assert_eq!(iids(&list_work_items(&h, None, None, opened()).await), [3]);
 }
 
 // ── Assigned merge requests ────────────────────────────────────────────
@@ -1237,13 +1495,13 @@ async fn search_matches_title_labels_and_paths_case_insensitively() {
     let (h, _dir) = dormant_handlers();
     seed_corpus(&h);
     let r = run_search(&h, "OAUTH", None, None).await;
-    assert_eq!(r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(), [10]);
+    assert_eq!(r.work_items.iter().map(|i| i.iid).collect::<Vec<_>>(), [10]);
     assert_eq!(r.merge_requests.len(), 1);
     assert!(r.projects.is_empty() && r.groups.is_empty());
 
     let r = run_search(&h, "backend", None, None).await;
     assert_eq!(
-        r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(),
+        r.work_items.iter().map(|i| i.iid).collect::<Vec<_>>(),
         [20],
         "by label"
     );
@@ -1259,7 +1517,7 @@ async fn search_iid_reference_matches_issues_and_mrs() {
     let (h, _dir) = dormant_handlers();
     seed_corpus(&h);
     let r = run_search(&h, "#30", None, None).await;
-    assert!(r.issues.is_empty());
+    assert!(r.work_items.is_empty());
     assert_eq!(r.merge_requests[0].iid, 30);
 }
 
@@ -1273,69 +1531,245 @@ async fn search_finds_epics_by_title_label_and_reference() {
     seed(&h, &[labeled]);
 
     let r = run_search(&h, "ROADMAP", None, None).await;
-    let hits: Vec<_> = r.epics.iter().map(|e| (e.group_id, e.iid)).collect();
-    assert_eq!(hits, [(5, 7), (6, 7)], "title and label, newest first");
-    assert_eq!(r.epics[0].web_url, "https://gl/groups/team/-/epics/7");
-    assert_eq!(r.epics[0].group_path, "team", "from the group row");
     assert_eq!(
-        r.epics[1].group_path, "other",
+        epic_keys(&r),
+        [(5, 7), (6, 7)],
+        "title and label, newest first"
+    );
+    let found = epics(&r);
+    assert_eq!(found[0].web_url, "https://gl/groups/team/-/epics/7");
+    assert_eq!(found[0].namespace_path, "team", "from the group row");
+    assert_eq!(
+        found[1].namespace_path, "other",
         "no row for group 6: from the link"
     );
-    assert!(r.issues.is_empty() && r.groups.is_empty());
+    assert!(issue_iids(&r).is_empty() && r.groups.is_empty());
 
     // `&7` is the epic reference; `#7` stays with issues and MRs.
     let r = run_search(&h, "&7", None, None).await;
-    assert_eq!(r.epics.len(), 2, "one per group");
-    assert!(r.issues.is_empty() && r.merge_requests.is_empty());
-    assert!(run_search(&h, "#7", None, None).await.epics.is_empty());
+    assert_eq!(epic_keys(&r), [(5, 7), (6, 7)], "one per group");
+    assert!(issue_iids(&r).is_empty() && r.merge_requests.is_empty());
+    assert!(epics(&run_search(&h, "#7", None, None).await).is_empty());
 
-    let r = run_search(&h, "i", Some(vec![SearchKind::epics]), Some(1)).await;
-    assert_eq!(r.epics.iter().map(|e| e.iid).collect::<Vec<_>>(), [8]);
-    assert!(r.issues.is_empty() && r.projects.is_empty());
-    let r = run_search(&h, "i", Some(vec![SearchKind::issues]), None).await;
-    assert!(r.epics.is_empty(), "not asked for");
+    let r = run_typed_search(&h, "i", &["epic"], Some(1)).await;
+    assert_eq!(iids(&r.work_items), [8]);
+    assert!(r.projects.is_empty());
+    let r = run_typed_search(&h, "i", &["issue"], None).await;
+    assert!(epics(&r).is_empty(), "not asked for");
 }
 
-/// An epic's opens are counted by its group, apart from the issue of a
-/// project sharing id and number.
+/// An epic is a work item of its group, identified by its work item id.
 #[tokio::test]
-async fn record_epic_open_ranks_the_epic_and_nothing_else() {
+async fn search_serves_an_epic_as_its_groups_work_item() {
+    let (h, _dir) = dormant_handlers();
+    seed_corpus(&h);
+
+    let r = run_search(&h, "billing", None, None).await;
+    let [billing] = r.work_items.as_slice() else {
+        panic!("{r:?}");
+    };
+    assert_eq!(
+        (billing.id, billing.iid),
+        (905_008, 8),
+        "never the legacy id"
+    );
+    assert_eq!(billing.r#type, "epic");
+    assert_eq!((billing.project_id, billing.group_id), (None, Some(5)));
+    assert_eq!(billing.parent, None);
+    assert!(billing.total_time.is_empty() && billing.project_avatar.is_empty());
+}
+
+/// Issues and epics are ranked together and share one limit.
+#[tokio::test]
+async fn search_ranks_issues_and_epics_under_one_limit() {
+    let (h, _dir) = dormant_handlers();
+    seed_corpus(&h);
+
+    // Issue 20 and epic 8 both updated at 200, epic 7 at 100.
+    let r = run_search(&h, "i", Some(vec![SearchKind::work_items]), Some(2)).await;
+    let hits: Vec<_> = r
+        .work_items
+        .iter()
+        .map(|w| (w.r#type.as_str(), w.iid))
+        .collect();
+    assert_eq!(hits, [("issue", 20), ("epic", 8)]);
+
+    record_open(&h, IssuableKind::work_item, 7, None, Some(5)).await;
+    let r = run_search(&h, "i", None, Some(2)).await;
+    let hits: Vec<_> = r
+        .work_items
+        .iter()
+        .map(|w| (w.r#type.as_str(), w.iid))
+        .collect();
+    assert_eq!(hits, [("epic", 7), ("issue", 20)], "the opened epic first");
+}
+
+/// `types` keeps the work items of the listed types, in any case.
+#[tokio::test]
+async fn search_narrows_work_items_to_types() {
+    let (h, _dir) = dormant_handlers();
+    seed_corpus(&h);
+    let mut task = issue(1, 40, "Write the tests", "https://gl/team/p/-/issues/40");
+    task.issue_type = "task".into();
+    seed(&h, &[task]);
+    let found = async |types: &[&str]| -> Vec<(String, i64)> {
+        let r = run_typed_search(&h, "t", types, None).await;
+        r.work_items
+            .into_iter()
+            .map(|w| (w.r#type, w.iid))
+            .collect()
+    };
+
+    let tasks = [("task".to_string(), 40)];
+    assert_eq!(found(&["task"]).await, tasks);
+    assert_eq!(found(&["TASK"]).await, tasks);
+    let both = found(&["Task", "epic"]).await;
+    assert_eq!(both, [("epic".into(), 7), ("task".into(), 40)]);
+    let issues = found(&["issue"]).await;
+    assert_eq!(
+        issues,
+        [("issue".into(), 20), ("issue".into(), 10)],
+        "untyped rows are issues"
+    );
+    assert!(found(&["incident"]).await.is_empty());
+    assert_eq!(found(&[]).await.len(), 4, "no types is every type");
+}
+
+/// `exclude_types` drops the work items of the listed types, in any case;
+/// with `types`, an item must be in the one and not in the other.
+#[tokio::test]
+async fn search_leaves_out_work_items_of_excluded_types() {
+    let (h, _dir) = dormant_handlers();
+    seed_corpus(&h);
+    let mut task = issue(1, 40, "Write the tests", "https://gl/team/p/-/issues/40");
+    task.issue_type = "task".into();
+    seed(&h, &[task]);
+    let found = async |types: &[&str], excluded: &[&str]| -> Vec<i64> {
+        iids(
+            &run_filtered_search(&h, "t", types, excluded, None)
+                .await
+                .work_items,
+        )
+    };
+
+    assert_eq!(found(&[], &[]).await, [20, 10, 7, 40]);
+    assert_eq!(found(&[], &["epic"]).await, [20, 10, 40], "the task stays");
+    assert_eq!(found(&[], &["EPIC", "Task"]).await, [20, 10]);
+    assert_eq!(found(&[], &["incident"]).await, [20, 10, 7, 40]);
+    assert_eq!(found(&["task", "epic"], &["Epic"]).await, [40]);
+    assert!(found(&["epic"], &["epic"]).await.is_empty());
+
+    // The other kinds don't have a type to leave out.
+    let mrs = search_with(
+        &h,
+        "oauth",
+        None,
+        None,
+        None,
+        None,
+        Some(vec!["epic".into()]),
+    )
+    .await;
+    assert_eq!(iids(&mrs.work_items), [10]);
+    assert_eq!(mrs.merge_requests.len(), 1);
+}
+
+/// Left out before the limit: it fills from the work items that remain.
+#[tokio::test]
+async fn search_fills_its_limit_from_what_is_not_excluded() {
+    let (h, _dir) = dormant_handlers();
+    seed_corpus(&h);
+    let mut task = issue(1, 40, "Write the tests", "https://gl/team/p/-/issues/40");
+    task.issue_type = "task".into();
+    seed(&h, &[task]);
+
+    // Issue 20 and epic 8 updated at 200, epic 7 at 100, the task never.
+    let r = run_filtered_search(&h, "i", &[], &[], Some(2)).await;
+    assert_eq!(epic_keys(&r), [(5, 8)]);
+    let r = run_filtered_search(&h, "i", &[], &["epic"], Some(2)).await;
+    assert_eq!(issue_iids(&r), [20, 40]);
+    assert!(epics(&r).is_empty());
+}
+
+/// A group's work item is counted by its group, apart from the issue of a
+/// project sharing id and number; both apart from the merge requests.
+#[tokio::test]
+async fn record_open_counts_project_and_group_work_items_apart() {
     let (h, _dir) = dormant_handlers();
     seed_corpus(&h);
     seed(
         &h,
         &[issue(5, 7, "same ids", "https://gl/team/p/-/issues/7")],
     );
-    assert_eq!(run_record_epic_open(&h, 5, 7).await, None);
+    let opened = |kind, iid, project_id, group_id| record_open(&h, kind, iid, project_id, group_id);
+    assert_eq!(
+        opened(IssuableKind::work_item, 7, None, Some(5)).await,
+        None
+    );
+    assert_eq!(
+        opened(IssuableKind::work_item, 10, Some(1), None).await,
+        None
+    );
+    assert_eq!(
+        opened(IssuableKind::merge_request, 30, Some(1), None).await,
+        None
+    );
+
+    let usage = h.usage.snapshot().unwrap();
+    let count = |key: &str| usage.entries.get(key).map(|e| e.count);
+    assert_eq!(count(&epic_usage_key(5, 7)), Some(1));
+    assert_eq!(count(&usage_key(Issuable::Issue, 1, 10)), Some(1));
+    assert_eq!(count(&usage_key(Issuable::MergeRequest, 1, 30)), Some(1));
+    assert_eq!(count(&usage_key(Issuable::Issue, 5, 7)), None);
+    assert_eq!(usage.entries.len(), 3);
 
     let r = run_search(&h, "", None, None).await;
-    assert_eq!(r.epics.iter().map(|e| e.iid).collect::<Vec<_>>(), [7]);
-    assert_eq!(r.epics[0].open_count, 1);
-    assert!(r.issues.is_empty(), "the issue 5/7 was never opened");
+    assert_eq!(epic_keys(&r), [(5, 7)]);
+    assert_eq!(epics(&r)[0].open_count, 1);
+    assert_eq!(issue_iids(&r), [10], "the issue 5/7 was never opened");
 
-    let r = run_search(&h, "i", Some(vec![SearchKind::epics]), None).await;
+    let r = run_typed_search(&h, "i", &["epic"], None).await;
     assert_eq!(
-        r.epics.iter().map(|e| e.iid).collect::<Vec<_>>(),
+        iids(&r.work_items),
         [7, 8],
         "the opened older epic outranks the newer one"
     );
+}
 
-    for (group_id, iid) in [(0, 7), (5, 0), (-1, 1)] {
-        let error = run_record_epic_open(&h, group_id, iid).await;
-        assert_eq!(error.as_deref(), Some(GITLAB_ERROR));
+/// A reference that names no single work item or merge request is refused,
+/// and nothing is counted.
+#[tokio::test]
+async fn record_open_refuses_a_malformed_reference() {
+    let (h, _dir) = dormant_handlers();
+    let (item, mr) = (IssuableKind::work_item, IssuableKind::merge_request);
+    for (kind, iid, project_id, group_id) in [
+        (item.clone(), 7, None, None),
+        (item.clone(), 7, Some(1), Some(5)),
+        (mr.clone(), 7, None, Some(5)),
+        (mr.clone(), 7, None, None),
+        (item.clone(), 0, Some(1), None),
+        (item.clone(), 7, Some(0), None),
+        (item.clone(), 7, Some(-1), None),
+        (item.clone(), 0, None, Some(5)),
+        (item.clone(), 7, None, Some(0)),
+        (mr.clone(), -1, Some(1), None),
+    ] {
+        let error = record_open(&h, kind.clone(), iid, project_id, group_id).await;
+        assert_eq!(
+            error.as_deref(),
+            Some(GITLAB_ERROR),
+            "{kind:?} {iid} {project_id:?} {group_id:?}"
+        );
     }
+    assert!(h.usage.snapshot().unwrap().entries.is_empty());
 }
 
 #[tokio::test]
 async fn search_kinds_filter_and_limit_apply_per_kind() {
     let (h, _dir) = dormant_handlers();
     seed_corpus(&h);
-    let r = run_search(&h, "t", Some(vec![SearchKind::issues]), Some(1)).await;
-    assert_eq!(
-        r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(),
-        [20],
-        "newest first, limited"
-    );
+    let r = run_search(&h, "t", Some(vec![SearchKind::work_items]), Some(1)).await;
+    assert_eq!(iids(&r.work_items), [20], "newest first, limited");
     assert!(r.merge_requests.is_empty() && r.projects.is_empty() && r.groups.is_empty());
 }
 
@@ -1343,21 +1777,21 @@ async fn search_kinds_filter_and_limit_apply_per_kind() {
 async fn search_ranks_frequently_opened_first() {
     let (h, _dir) = dormant_handlers();
     seed_corpus(&h);
-    run_record_open(&h, 1, 10, IssuableKind::issue).await;
-    run_record_open(&h, 1, 10, IssuableKind::issue).await;
+    run_record_open(&h, 1, 10, IssuableKind::work_item).await;
+    run_record_open(&h, 1, 10, IssuableKind::work_item).await;
 
     let r = run_search(&h, "", None, None).await;
     assert_eq!(
-        r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(),
+        iids(&r.work_items),
         [10],
         "an empty query lists only opened items"
     );
-    assert_eq!(r.issues[0].open_count, 2);
+    assert_eq!(r.work_items[0].open_count, 2);
     assert!(r.merge_requests.is_empty() && r.projects.is_empty());
 
-    let r = run_search(&h, "t", Some(vec![SearchKind::issues]), None).await;
+    let r = run_typed_search(&h, "t", &["issue"], None).await;
     assert_eq!(
-        r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(),
+        iids(&r.work_items),
         [10, 20],
         "the opened older issue outranks the newer one"
     );
@@ -1370,10 +1804,10 @@ async fn search_hits_carry_their_update_time() {
     seed_corpus(&h);
 
     let r = run_search(&h, "oauth", None, None).await;
-    assert_eq!(r.issues[0].updated_at, 100);
+    assert_eq!(r.work_items[0].updated_at, 100);
     assert_eq!(r.merge_requests[0].updated_at, 50);
-    let r = run_search(&h, "i", Some(vec![SearchKind::epics]), None).await;
-    let updated: Vec<_> = r.epics.iter().map(|e| (e.iid, e.updated_at)).collect();
+    let r = run_typed_search(&h, "i", &["epic"], None).await;
+    let updated: Vec<_> = r.work_items.iter().map(|e| (e.iid, e.updated_at)).collect();
     assert_eq!(updated, [(8, 200), (7, 100)]);
 }
 
@@ -1417,6 +1851,8 @@ async fn search_never_synced_is_honest_about_the_session() {
         None,
         None,
         None,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1425,7 +1861,7 @@ async fn search_never_synced_is_honest_about_the_session() {
     let fake = Arc::new(FakeGitlab::default());
     let (h, _dir) = connected_handlers(&fake);
     let r = run_search(&h, "x", None, None).await;
-    assert!(r.issues.is_empty() && r.projects.is_empty());
+    assert!(r.work_items.is_empty() && r.projects.is_empty());
 }
 
 fn scope(projects: &[i64], groups: &[&str]) -> Option<SearchScope> {
@@ -1485,7 +1921,7 @@ async fn search_scope_by_project_keeps_only_that_project() {
     let (h, _dir) = dormant_handlers();
     seed_scoped_corpus(&h);
     let r = run_scoped_search(&h, "oauth", None, None, scope(&[1], &[])).await;
-    assert_eq!(r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(), [10]);
+    assert_eq!(iids(&r.work_items), [10]);
     assert_eq!(
         r.merge_requests.iter().map(|m| m.iid).collect::<Vec<_>>(),
         [30]
@@ -1498,7 +1934,7 @@ async fn search_scope_by_project_keeps_only_that_project() {
         "any listed project passes"
     );
     assert!(
-        r.groups.is_empty() && r.epics.is_empty(),
+        r.groups.is_empty() && epics(&r).is_empty(),
         "a project scope cannot name a group or an epic: {r:?}"
     );
 }
@@ -1508,11 +1944,7 @@ async fn search_scope_by_group_covers_subgroups_and_epics() {
     let (h, _dir) = dormant_handlers();
     seed_scoped_corpus(&h);
     let r = run_scoped_search(&h, "t", None, None, scope(&[], &["team"])).await;
-    assert_eq!(
-        r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(),
-        [20, 10],
-        "team/p is under team"
-    );
+    assert_eq!(issue_iids(&r), [20, 10], "team/p is under team");
     assert_eq!(
         r.merge_requests.iter().map(|m| m.iid).collect::<Vec<_>>(),
         [30]
@@ -1520,23 +1952,20 @@ async fn search_scope_by_group_covers_subgroups_and_epics() {
     assert_eq!(r.projects.iter().map(|p| p.id).collect::<Vec<_>>(), [4]);
     assert_eq!(r.groups.iter().map(|g| g.id).collect::<Vec<_>>(), [5]);
     assert_eq!(
-        r.epics
-            .iter()
-            .map(|e| (e.group_id, e.iid))
-            .collect::<Vec<_>>(),
+        epic_keys(&r),
         [(7, 1), (5, 7)],
         "the group row names the epics' group; without a row the URL does"
     );
 
     let r = run_scoped_search(&h, "t", None, None, scope(&[], &["tea"])).await;
     assert!(
-        r.issues.is_empty() && r.projects.is_empty() && r.groups.is_empty() && r.epics.is_empty(),
+        r.work_items.is_empty() && r.projects.is_empty() && r.groups.is_empty(),
         "a shared prefix is not a group: {r:?}"
     );
 
     let r = run_scoped_search(&h, "oauth", None, None, scope(&[2], &["team"])).await;
     assert_eq!(
-        r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(),
+        iids(&r.work_items),
         [40, 10],
         "a project or a group: either passes"
     );
@@ -1546,21 +1975,21 @@ async fn search_scope_by_group_covers_subgroups_and_epics() {
 async fn search_scope_applies_before_the_limit() {
     let (h, _dir) = dormant_handlers();
     seed_scoped_corpus(&h);
-    let r = run_search(&h, "oauth", Some(vec![SearchKind::issues]), Some(1)).await;
+    let r = run_search(&h, "oauth", Some(vec![SearchKind::work_items]), Some(1)).await;
     assert_eq!(
-        r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(),
+        iids(&r.work_items),
         [40],
         "unscoped, the newer issue elsewhere wins the one slot"
     );
     let r = run_scoped_search(
         &h,
         "oauth",
-        Some(vec![SearchKind::issues]),
+        Some(vec![SearchKind::work_items]),
         Some(1),
         scope(&[1], &[]),
     )
     .await;
-    assert_eq!(r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(), [10]);
+    assert_eq!(iids(&r.work_items), [10]);
 }
 
 #[tokio::test]
@@ -1568,7 +1997,7 @@ async fn search_empty_scope_is_no_scope() {
     let (h, _dir) = dormant_handlers();
     seed_scoped_corpus(&h);
     let unscoped = run_search(&h, "i", None, None).await;
-    assert!(!unscoped.issues.is_empty() && !unscoped.epics.is_empty());
+    assert!(!issue_iids(&unscoped).is_empty() && !epics(&unscoped).is_empty());
     for empty in [
         scope(&[], &[]),
         Some(SearchScope {
@@ -1611,7 +2040,7 @@ async fn items_carry_their_projects_path() {
     seed_assigned_mrs(&h);
 
     let r = run_search(&h, "oauth", None, None).await;
-    assert_eq!(r.issues[0].project_path, "team/p");
+    assert_eq!(r.work_items[0].namespace_path, "team/p");
     assert_eq!(r.merge_requests[0].project_path, "team/p");
 
     seed(
@@ -1623,7 +2052,7 @@ async fn items_carry_their_projects_path() {
         }],
     );
     let r = run_search(&h, "oauth", None, None).await;
-    assert_eq!(r.issues[0].project_path, "team/moved");
+    assert_eq!(r.work_items[0].namespace_path, "team/moved");
     assert_eq!(r.merge_requests[0].project_path, "team/moved");
     let paths: Vec<String> = assigned_mrs(&h, None)
         .await
@@ -1641,7 +2070,7 @@ async fn search_hits_carry_their_projects_avatar() {
     seed_avatars(&h);
 
     let r = run_search(&h, "oauth", None, None).await;
-    assert_eq!(r.issues[0].project_avatar, avatar_path(&dir, "1-a.png"));
+    assert_eq!(r.work_items[0].project_avatar, avatar_path(&dir, "1-a.png"));
     assert_eq!(
         r.merge_requests[0].project_avatar,
         avatar_path(&dir, "1-a.png")
@@ -1664,12 +2093,12 @@ async fn assigned_items_carry_their_projects_avatar() {
         sorted
     };
     let expected = [(1, avatar_path(&dir, "1-a.png")), (2, String::new())];
-    let issues = assigned_issues(&h, None).await;
+    let issues = assigned_work_items(&h, None).await;
     assert_eq!(
         avatars(
             issues
                 .into_iter()
-                .map(|i| (i.project_id, i.project_avatar))
+                .map(|i| (i.project_id.unwrap(), i.project_avatar))
                 .collect()
         ),
         expected
@@ -1938,7 +2367,7 @@ async fn clear_cache_scopes_drop_their_slice_and_reset_its_jobs() {
 #[tokio::test]
 async fn clear_cache_usage_only_when_listed() {
     let (h, _dir) = dormant_handlers();
-    run_record_open(&h, 1, 10, IssuableKind::issue).await;
+    run_record_open(&h, 1, 10, IssuableKind::work_item).await;
     clear_cache(&h, None).await;
     assert!(
         !h.usage.snapshot().unwrap().entries.is_empty(),
@@ -1958,7 +2387,7 @@ async fn clear_cache_refills_the_foreground_before_replying() {
     seed_assigned_issues(&h);
 
     clear_cache(&h, None).await;
-    let issues = assigned_issues(&h, None).await;
+    let issues = assigned_work_items(&h, None).await;
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0].title, "fresh");
     assert_eq!(fake.calls_to("merge_requests").len(), 1);
@@ -1995,7 +2424,7 @@ async fn clear_cache_waits_for_new_board_columns() {
     let (h, _dir) = connected_handlers(&fake);
 
     clear_cache(&h, Some(vec![CacheScope::assigned])).await;
-    let issues = assigned_issues(&h, None).await;
+    let issues = assigned_work_items(&h, None).await;
     assert_eq!(issues[0].graph_status, "Doing");
 }
 
@@ -2201,23 +2630,32 @@ proptest! {
         query in ".{0,12}",
         kinds in proptest::option::of(proptest::collection::vec(
             proptest::sample::select(vec![
-                SearchKind::issues,
+                SearchKind::work_items,
                 SearchKind::merge_requests,
                 SearchKind::projects,
                 SearchKind::groups,
-                SearchKind::epics,
             ]),
             0..3,
         )),
         limit in proptest::option::of(any::<i64>()),
+        types in proptest::option::of(proptest::collection::vec(
+            proptest::sample::select(vec!["issue", "Epic", "task", "", "?"]),
+            0..3,
+        )),
+        excluded in proptest::option::of(proptest::collection::vec(
+            proptest::sample::select(vec!["issue", "EPIC", "task", "", "?"]),
+            0..3,
+        )),
     ) {
         prop_rt().block_on(async {
             let fake = Arc::new(FakeGitlab::default());
             let (h, _dir) = connected_handlers(&fake);
             seed_corpus(&h);
 
+            let names = |list: Option<Vec<&str>>| list.map(|t| t.into_iter().map(str::to_string).collect());
+            let (types, excluded) = (names(types), names(excluded));
             let mut call = AsyncCall::default();
-            h.search(&mut call as &mut dyn Call_Search, query.clone(), kinds.clone(), limit, None)
+            h.search(&mut call as &mut dyn Call_Search, query.clone(), kinds.clone(), limit, None, types, excluded)
                 .await
                 .unwrap();
             let error = reply_error(&mut call);
@@ -2253,14 +2691,14 @@ proptest! {
             seed(&h, &issues);
             mark_synced(&h, &[Job::MemberProjects]);
 
-            let r = run_search(&h, &needle, Some(vec![SearchKind::issues]), Some(limit)).await;
+            let r = run_search(&h, &needle, Some(vec![SearchKind::work_items]), Some(limit)).await;
             let expected: Vec<i64> = issues
                 .iter()
                 .filter(|i| i.title.contains(&needle))
                 .map(|i| i.id)
                 .take(limit as usize)
                 .collect();
-            assert_eq!(r.issues.iter().map(|i| i.id).collect::<Vec<_>>(), expected);
+            assert_eq!(r.work_items.iter().map(|i| i.id).collect::<Vec<_>>(), expected);
         });
     }
 
@@ -2279,7 +2717,7 @@ proptest! {
                 &mut call as &mut dyn Call_PostTime,
                 project_id,
                 iid,
-                IssuableKind::issue,
+                IssuableKind::work_item,
                 duration.clone(),
                 None,
             )

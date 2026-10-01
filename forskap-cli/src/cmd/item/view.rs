@@ -15,11 +15,12 @@ pub async fn run(kind: RefKind, target: TargetArgs, format: OutputFormat) -> Res
             let sigil = refspec::sigil(kind);
             outln!("{} {}", style::reference(sigil, i.iid), i.title)?;
             field("state", &style::state(&i.state).to_string())?;
-            field("project", &i.project_id.to_string())?;
+            field("project", &i.project_id.unwrap_or_default().to_string())?;
             field("url", &i.web_url)?;
             field("time spent", &i.total_time)?;
             field("status", &i.graph_status)?;
-            field("parent", &i.parent)?;
+            let parent = i.parent.as_ref().and_then(|p| p.web_url.as_deref());
+            field("parent", parent.unwrap_or_default())?;
             opened(i.open_count)
         }),
         Item::Mr(m) => output::emit(format, &m, |m| {

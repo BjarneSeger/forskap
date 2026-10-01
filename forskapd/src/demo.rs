@@ -148,8 +148,25 @@ fn merge_request_url(path: &str, iid: i64) -> String {
     format!("{BASE}/{path}/-/merge_requests/{iid}")
 }
 
+/// An epic's link relative to the instance, as an issue names its epic.
+fn epic_path(group_path: &str, iid: i64) -> String {
+    format!("/groups/{group_path}/-/epics/{iid}")
+}
+
 fn epic_url(group_path: &str, iid: i64) -> String {
-    format!("{BASE}/groups/{group_path}/-/epics/{iid}")
+    format!("{BASE}{}", epic_path(group_path, iid))
+}
+
+/// The epic as an issue under it names it.
+fn epic_ref(epic: &Epic) -> EpicRef {
+    let url = epic.web_url.strip_prefix(BASE).unwrap_or_default();
+    EpicRef {
+        id: epic.id,
+        iid: epic.iid,
+        group_id: epic.group_id,
+        title: epic.title.clone(),
+        url: url.into(),
+    }
 }
 
 /// GitLab's spelling of a time spent: `1h 30m`, `1d 2h` (8-hour days,
@@ -527,18 +544,16 @@ impl GitlabApi for DemoGitlab {
     async fn create_issue(&self, project_id: i64, new: &NewIssue) -> Result<Value> {
         let mut state = self.state.lock().unwrap();
         state.writable(project_id)?;
+        // By its legacy id, as GitLab's REST API takes it.
         let epic = match new.epic_id {
             None => None,
-            Some(id) => {
-                let epic = state
+            Some(id) => Some(epic_ref(
+                state
                     .epics
                     .iter()
                     .find(|e| e.id == id)
-                    .ok_or_else(not_found)?;
-                Some(EpicRef {
-                    url: epic.web_url.clone(),
-                })
-            }
+                    .ok_or_else(not_found)?,
+            )),
         };
         let iid = 1 + state
             .issues
@@ -556,6 +571,7 @@ impl GitlabApi for DemoGitlab {
                 title: new.title.clone(),
                 web_url: issue_url(&path, iid),
                 state: "opened".into(),
+                issue_type: "issue".into(),
                 labels: new.labels.clone(),
                 assignees: if new.assign_self {
                     vec![user(USER_ID)]
@@ -578,6 +594,15 @@ impl GitlabApi for DemoGitlab {
             new.title.clone(),
         );
         Ok(serde_json::to_value(row)?)
+    }
+
+    async fn epic(&self, group_id: i64, iid: i64) -> Result<Value> {
+        let state = self.state.lock().unwrap();
+        let epic = state
+            .epics
+            .iter()
+            .find(|e| e.group_id == group_id && e.iid == iid);
+        Ok(serde_json::to_value(epic.ok_or_else(not_found)?)?)
     }
 
     async fn list(
@@ -661,6 +686,9 @@ const ISSUES: [IssueRow; 13] = [
     (103, 19, "Flaky end-to-end test: checkout flow", "closed", &["ci"], &[USER_ID], ALEX, 9 * DAY),
     (ARCHIVED_PROJECT, 2, "Sunset the legacy portal", "closed", &[], &[USER_ID], USER_ID, 40 * DAY),
 ];
+
+/// The issues of the fixture that are tasks.
+const TASKS: [(i64, i64); 1] = [(101, 16)];
 
 /// A merge request of the fixture: project, iid, title, state, labels,
 /// assignees, and how long ago it was last updated.
@@ -776,31 +804,39 @@ fn fixture(now: u64) -> State {
             .unwrap_or_default()
     };
 
-    let epic =
-        |id: i64, group_id: i64, group_path: &str, iid: i64, title: &str, state: &str| Epic {
-            id,
-            iid,
-            group_id,
-            title: title.into(),
-            web_url: epic_url(group_path, iid),
-            state: state.into(),
-            labels: vec!["roadmap".into()],
-            updated_at: ago(2 * DAY),
-        };
+    // The legacy id and the work item id differ, as on GitLab.
+    let epic = |(id, work_item_id): (i64, i64),
+                (group_id, group_path): (i64, &str),
+                iid: i64,
+                title: &str,
+                state: &str| Epic {
+        id,
+        iid,
+        group_id,
+        work_item_id,
+        title: title.into(),
+        web_url: epic_url(group_path, iid),
+        state: state.into(),
+        labels: vec!["roadmap".into()],
+        updated_at: ago(2 * DAY),
+    };
     let epics = vec![
-        epic(3001, 10, "acme", 1, "Self-service billing", "opened"),
         epic(
-            3002,
-            12,
-            "acme/frontend",
+            (3001, 8101),
+            (10, "acme"),
+            1,
+            "Self-service billing",
+            "opened",
+        ),
+        epic(
+            (3002, 8102),
+            (12, "acme/frontend"),
             1,
             "Accessibility audit",
             "closed",
         ),
     ];
-    let billing_epic = EpicRef {
-        url: epics[0].web_url.clone(),
-    };
+    let billing_epic = epic_ref(&epics[0]);
 
     let issues = ISSUES
         .iter()
@@ -813,6 +849,11 @@ fn fixture(now: u64) -> State {
                     title: title.into(),
                     web_url: issue_url(&path_of(project_id), iid),
                     state: state.into(),
+                    issue_type: if TASKS.contains(&(project_id, iid)) {
+                        "task".into()
+                    } else {
+                        "issue".into()
+                    },
                     labels: labels.iter().map(|l| l.to_string()).collect(),
                     assignees: assignees.iter().map(|&a| user(a)).collect(),
                     // The billing epic holds the billing features.
@@ -1106,7 +1147,8 @@ mod tests {
         };
         let one = issues(&demo, one).await;
         assert_eq!(one[0].id, 102_007);
-        assert_eq!(one[0].parent_url(), "", "a bug is in no epic");
+        assert_eq!(one[0].epic, None, "a bug is in no epic");
+        assert_eq!(one[0].work_item_type(), "issue");
         let featured = issues(
             &demo,
             Listing::Issuable {
@@ -1116,11 +1158,17 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(
-            featured[0].parent_url(),
-            "https://dry-run.invalid/groups/acme/-/epics/1"
-        );
+        // Named like GitLab names it: by its legacy id, the link relative.
+        let epic = featured[0].epic.clone().unwrap();
+        assert_eq!((epic.id, epic.iid, epic.group_id), (3001, 1, 10));
+        assert_eq!(epic.url, "/groups/acme/-/epics/1");
         assert_eq!(featured[0].total_time(), "2h");
+        let task = Listing::Issuable {
+            kind: Issuable::Issue,
+            project_id: 101,
+            iid: 16,
+        };
+        assert_eq!(issues(&demo, task).await[0].work_item_type(), "task");
 
         let limited = demo
             .list(
@@ -1207,10 +1255,9 @@ mod tests {
             created.web_url,
             "https://dry-run.invalid/acme/backend/billing/-/issues/11"
         );
-        assert_eq!(
-            created.parent_url(),
-            "https://dry-run.invalid/groups/acme/-/epics/1"
-        );
+        let parent = created.epic.unwrap();
+        assert_eq!((parent.group_id, parent.iid), (10, 1));
+        assert_eq!(parent.url, "/groups/acme/-/epics/1");
         let authored = Listing::RecentAuthoredIssues {
             updated_after: at(now),
         };
@@ -1246,9 +1293,21 @@ mod tests {
         assert!(
             matches!(bad, Err(Error::Rejected { status: 400, detail }) if detail.starts_with("400"))
         );
+        assert!(matches!(
+            demo.epic(10, 9).await,
+            Err(Error::Rejected { status: 404, .. })
+        ));
         assert!(demo.rotate_token(None).await.is_err());
         let token = demo.token_info().await.unwrap();
         assert_eq!(token.expires_at, None);
+    }
+
+    #[tokio::test]
+    async fn an_epic_is_found_by_its_group_and_number() {
+        let (demo, _) = demo();
+        let epic: model::Epic = serde_json::from_value(demo.epic(12, 1).await.unwrap()).unwrap();
+        assert_eq!((epic.id, epic.work_item_id), (3002, 8102));
+        assert_eq!(epic.title, "Accessibility audit");
     }
 
     #[tokio::test]

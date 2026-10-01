@@ -18,7 +18,7 @@ pub async fn run(kind: RefKind, target: TargetArgs, no_browser: bool) -> Result<
     let web_url = item.web_url();
 
     client
-        .record_open(project_id, iid, refspec::wire(kind))
+        .record_open(refspec::wire(kind), iid, Some(project_id), None)
         .call()
         .await
         .map_err(|e| friendly("RecordOpen", e))?;

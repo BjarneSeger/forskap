@@ -18,7 +18,7 @@ use anyhow::{Result, bail};
 use forskap_api::{Project, SearchKind, VarlinkClient, VarlinkClientInterface};
 
 use crate::friendly::friendly;
-use crate::item::Item;
+use crate::item::{self, Item};
 use crate::refspec::{self, RefKind};
 use crate::{pick, state};
 
@@ -52,6 +52,8 @@ pub async fn by_arg(client: &VarlinkClient, project: &str) -> Result<i64> {
             Some(vec![SearchKind::projects]),
             Some(SEARCH_LIMIT),
             None,
+            None,
+            None,
         )
         .call()
         .await
@@ -83,11 +85,11 @@ async fn by_iid(client: &VarlinkClient, kind: RefKind, iid: i64) -> Result<i64> 
 
     let assigned: Vec<Item> = match kind {
         RefKind::Issue => client
-            .get_assigned_issues(None)
+            .get_assigned_work_items(None)
             .call()
             .await
-            .map_err(|e| friendly("GetAssignedIssues", e))?
-            .issues
+            .map_err(|e| friendly("GetAssignedWorkItems", e))?
+            .work_items
             .into_iter()
             .map(Item::Issue)
             .collect(),
@@ -111,12 +113,14 @@ async fn by_iid(client: &VarlinkClient, kind: RefKind, iid: i64) -> Result<i64> 
             Some(vec![refspec::search_kind(kind)]),
             Some(SEARCH_LIMIT),
             None,
+            None,
+            refspec::excluded_types(kind),
         )
         .call()
         .await
         .map_err(|e| friendly("Search", e))?;
     let corpus: Vec<Item> = match kind {
-        RefKind::Issue => reply.issues.into_iter().map(Item::Issue).collect(),
+        RefKind::Issue => item::issues(reply.work_items).collect(),
         RefKind::Mr => reply.merge_requests.into_iter().map(Item::Mr).collect(),
     };
     match settle(kind, iid, corpus, "projects").await? {

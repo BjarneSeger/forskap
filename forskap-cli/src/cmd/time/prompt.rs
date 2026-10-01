@@ -43,11 +43,11 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
     let cfg = config::load()?;
     let client = client::connect(&client::socket(&cfg)?).await?;
     let issues = client
-        .get_assigned_issues(None)
+        .get_assigned_work_items(None)
         .call()
         .await
-        .map_err(|e| crate::friendly::friendly("GetAssignedIssues", e))?
-        .issues;
+        .map_err(|e| crate::friendly::friendly("GetAssignedWorkItems", e))?
+        .work_items;
     let mrs = client
         .get_assigned_merge_requests(None)
         .call()

@@ -1,9 +1,10 @@
 //! `forskap epic` — view and open epics; `forskap issue create --epic` names
 //! one the same way.
 //!
-//! Epics belong to a group and are numbered within it, so an epic is
-//! addressed by `(group_id, iid)`. An explicit `--group` wins: a number is
-//! the group ID, anything else a full path looked up in the cached groups.
+//! Epics are the work items of the type `epic`. They belong to a group and
+//! are numbered within it, so an epic is addressed by `(group_id, iid)`. An
+//! explicit `--group` wins: a number is the group ID, anything else a full
+//! path looked up in the cached groups.
 //! Without it:
 //! 1. The cached `last_epic` in [`crate::state`] if its IID matches — covers
 //!    re-acting on the epic opened last.
@@ -16,11 +17,11 @@ mod open;
 mod view;
 
 use anyhow::{Result, bail};
-use forskap_api::{Epic, Group, SearchKind, VarlinkClient, VarlinkClientInterface};
+use forskap_api::{Group, SearchKind, VarlinkClient, VarlinkClientInterface, WorkItem};
 
 use crate::cli::{EpicArgs, EpicCommand};
 use crate::friendly::friendly;
-use crate::item::project_path;
+use crate::item::{is_epic, project_path};
 use crate::{client, pick, state};
 
 /// Generous cap for the corpus lookups: the daemon matches substrings (and
@@ -36,7 +37,7 @@ pub async fn run(command: EpicCommand) -> Result<()> {
 }
 
 /// Connect, and find the cached epic the target names.
-async fn locate(target: &EpicArgs) -> Result<(VarlinkClient, Epic)> {
+async fn locate(target: &EpicArgs) -> Result<(VarlinkClient, WorkItem)> {
     let client = client::connect_default().await?;
     let epic = resolve(&client, target.iid, target.group.as_deref()).await?;
     Ok((client, epic))
@@ -44,7 +45,7 @@ async fn locate(target: &EpicArgs) -> Result<(VarlinkClient, Epic)> {
 
 /// The cached epic numbered `iid`: the one in `group` (a numeric ID or a
 /// full path) if given, else found as the module docs describe.
-pub async fn resolve(client: &VarlinkClient, iid: i64, group: Option<&str>) -> Result<Epic> {
+pub async fn resolve(client: &VarlinkClient, iid: i64, group: Option<&str>) -> Result<WorkItem> {
     if let Some(group) = group {
         let group = group_id(client, group).await?;
         return in_group(cached(client, iid).await?, iid, group);
@@ -55,7 +56,7 @@ pub async fn resolve(client: &VarlinkClient, iid: i64, group: Option<&str>) -> R
         .filter(|last| last.iid == iid)
         .map(|last| last.group_id);
     let found = match matches(cached(client, iid).await?, iid, last, pick::interactive())? {
-        Matches::Only(epic) => return Ok(epic),
+        Matches::Only(epic) => return Ok(*epic),
         Matches::Ask(found) => found,
     };
     let message = format!("&{iid} exists in {} groups — which one?", found.len());
@@ -64,9 +65,9 @@ pub async fn resolve(client: &VarlinkClient, iid: i64, group: Option<&str>) -> R
     picked.ok_or_else(|| pick::Cancelled.into())
 }
 
-/// The group path the epic carries; an older daemon has it only in the URL.
-pub fn group_of(e: &Epic) -> Option<&str> {
-    Some(e.group_path.as_str())
+/// The group path the epic carries, else the one in its URL.
+pub fn group_of(e: &WorkItem) -> Option<&str> {
+    Some(e.namespace_path.as_str())
         .filter(|p| !p.is_empty())
         .or_else(|| group_path(&e.web_url))
 }
@@ -77,28 +78,31 @@ fn group_path(web_url: &str) -> Option<&str> {
 }
 
 /// The cached epics numbered `iid`, one per group that has one.
-async fn cached(client: &VarlinkClient, iid: i64) -> Result<Vec<Epic>> {
+async fn cached(client: &VarlinkClient, iid: i64) -> Result<Vec<WorkItem>> {
     let reply = client
         .search(
             format!("&{iid}"),
-            Some(vec![SearchKind::epics]),
+            Some(vec![SearchKind::work_items]),
             Some(SEARCH_LIMIT),
+            None,
+            Some(vec!["epic".into()]),
             None,
         )
         .call()
         .await
         .map_err(|e| friendly("Search", e))?;
-    Ok(reply.epics.into_iter().filter(|e| e.iid == iid).collect())
+    let epics = reply.work_items.into_iter().filter(is_epic);
+    Ok(epics.filter(|e| e.iid == iid).collect())
 }
 
 /// The epic of one known group, for callers that hold the id pair already.
-pub async fn lookup(client: &VarlinkClient, group_id: i64, iid: i64) -> Result<Epic> {
+pub async fn lookup(client: &VarlinkClient, group_id: i64, iid: i64) -> Result<WorkItem> {
     in_group(cached(client, iid).await?, iid, group_id)
 }
 
 /// The one of the cached epics numbered `iid` that is in `group`.
-fn in_group(mut cached: Vec<Epic>, iid: i64, group: i64) -> Result<Epic> {
-    match cached.iter().position(|e| e.group_id == group) {
+fn in_group(mut cached: Vec<WorkItem>, iid: i64, group: i64) -> Result<WorkItem> {
+    match cached.iter().position(|e| e.group_id == Some(group)) {
         Some(at) => Ok(cached.swap_remove(at)),
         None => bail!(
             "&{iid} in group {group} is not in the daemon's caches — epics are synced for \
@@ -111,9 +115,9 @@ fn in_group(mut cached: Vec<Epic>, iid: i64, group: i64) -> Result<Epic> {
 /// What the cached epics carrying the wanted number leave to do.
 #[derive(Debug)]
 enum Matches {
-    Only(Epic),
+    Only(Box<WorkItem>),
     /// Several, and a terminal to ask on.
-    Ask(Vec<Epic>),
+    Ask(Vec<WorkItem>),
 }
 
 /// Choose among the cached epics numbered `iid` when no group was asked for:
@@ -121,17 +125,17 @@ enum Matches {
 /// are only worth asking about when `interactive`: scripts and launchers
 /// keep getting the error.
 fn matches(
-    mut cached: Vec<Epic>,
+    mut cached: Vec<WorkItem>,
     iid: i64,
     last: Option<i64>,
     interactive: bool,
 ) -> Result<Matches> {
-    let of_last = |e: &Epic| Some(e.group_id) == last;
+    let of_last = |e: &WorkItem| last.is_some() && e.group_id == last;
     if let Some(at) = cached.iter().position(of_last) {
-        return Ok(Matches::Only(cached.swap_remove(at)));
+        return Ok(Matches::Only(Box::new(cached.swap_remove(at))));
     }
     Ok(match cached.len() {
-        1 => Matches::Only(cached.swap_remove(0)),
+        1 => Matches::Only(Box::new(cached.swap_remove(0))),
         0 => bail!("no known epic with the number {iid} — pass --group"),
         _ if interactive => Matches::Ask(cached),
         many => bail!("epic {iid} is ambiguous across {many} groups — pass --group"),
@@ -148,6 +152,8 @@ async fn group_id(client: &VarlinkClient, group: &str) -> Result<i64> {
             path.to_string(),
             Some(vec![SearchKind::groups]),
             Some(SEARCH_LIMIT),
+            None,
+            None,
             None,
         )
         .call()
@@ -171,24 +177,12 @@ fn by_path(path: &str, groups: &[Group]) -> Result<i64> {
 mod tests {
     use super::*;
 
-    fn epic(group_id: i64, iid: i64) -> Epic {
-        Epic {
-            id: group_id * 100 + iid,
-            iid,
-            group_id,
-            title: String::new(),
-            web_url: format!("https://gl/groups/g{group_id}/-/epics/{iid}"),
-            state: "opened".into(),
-            open_count: 0,
-            group_path: String::new(),
-            updated_at: 0,
-        }
-    }
+    use crate::item::testing::epic;
 
     /// The group `matches` settled on without asking.
-    fn only(cached: Vec<Epic>, last: Option<i64>, interactive: bool) -> Result<i64> {
+    fn only(cached: Vec<WorkItem>, last: Option<i64>, interactive: bool) -> Result<i64> {
         match matches(cached, 5, last, interactive)? {
-            Matches::Only(epic) => Ok(epic.group_id),
+            Matches::Only(epic) => Ok(epic.group_id.unwrap()),
             Matches::Ask(found) => bail!("asks about {}", found.len()),
         }
     }
@@ -210,7 +204,7 @@ mod tests {
             matches(both(), 5, None, true),
             Ok(Matches::Ask(found)) if found.len() == 2
         ));
-        assert_eq!(in_group(both(), 5, 4).unwrap().group_id, 4);
+        assert_eq!(in_group(both(), 5, 4).unwrap().group_id, Some(4));
     }
 
     #[test]
@@ -245,11 +239,11 @@ mod tests {
     fn the_carried_group_path_beats_the_url() {
         let mut e = epic(3, 5);
         assert_eq!(group_of(&e), Some("g3"));
-        e.group_path = "team/backend".into();
+        e.namespace_path = "team/backend".into();
         assert_eq!(group_of(&e), Some("team/backend"));
         e.web_url = String::new();
         assert_eq!(group_of(&e), Some("team/backend"));
-        e.group_path = String::new();
+        e.namespace_path = String::new();
         assert_eq!(group_of(&e), None);
     }
 

@@ -19,11 +19,11 @@ pub async fn run(kind: RefKind, groups: Vec<String>, format: OutputFormat) -> Re
     match kind {
         RefKind::Issue => {
             let reply = client
-                .get_assigned_issues(filter)
+                .get_assigned_work_items(filter)
                 .call()
                 .await
-                .map_err(|e| friendly("GetAssignedIssues", e))?;
-            output::emit(format, &reply.issues, |issues| {
+                .map_err(|e| friendly("GetAssignedWorkItems", e))?;
+            output::emit(format, &reply.work_items, |issues| {
                 for i in issues {
                     outln!(
                         "{:<6} {:<8} {}  {}",

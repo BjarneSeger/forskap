@@ -35,6 +35,11 @@ reconnect).
   `serve_create(row)` sets the issue the next create answers with (without one it is
   `issue_json(project_id, 1, title)`), `created()` returns the `(project_id, NewIssue)`
   of every attempt, failed ones included.
+- **Epic lookup** (a create's parent): `serve_epic(row)` lets `epic(group_id, iid)`
+  find the row (`epic_json(group_id, iid, title)`, legacy id `group_id * 1000 + iid`)
+  by its group and number, any other epic is a 404; failures go through
+  `fail_next(&epic_path(group_id, iid), err)`, `epic_calls()` logs the lookups (and
+  `read_calls()` counts them).
 - **Token calls**: `serve_token(info)` sets what `token_info` returns (a token
   without expiry by default); the n-th `rotate_token` yields the token `rotated-n`.
   Both fail through `fail_next(TOKEN_PATH | ROTATE_PATH, err)`; `rotations()` logs
@@ -70,12 +75,15 @@ only demanded jobs, so the test decides when GitLab is read. Wrappers:
 Composite seeds: `seed_assigned_issues`, `seed_assigned_mrs`, `seed_recent_issues`,
 `seed_corpus`.
 
-**Driving a varlink method**: helpers wrap `AsyncCall` — `assigned_issues`,
-`assigned_mrs`, `list_issues`, `run_search`, `history`, `post_time`, `close`,
-`unassign`, `clear_cache`,
-`run_record_open`, `create_issue` / `create_issue_with` (they return the call, for
-either of the next two; `created_json(iid, title, assignees)` is a row to
-`serve_create`); `reply::<T_Reply>(&mut call)` parses success,
+**Driving a varlink method**: helpers wrap `AsyncCall` — `assigned_work_items`,
+`assigned_mrs`, `list_work_items`, `run_search` / `run_scoped_search` /
+`run_typed_search` / `run_filtered_search` (work items of some types, or not of
+others; `issue_iids`, `epics`, `epic_keys` split
+a reply's work items), `history`, `post_time`, `close`, `unassign`, `clear_cache`,
+`run_record_open` (a project's item) / `record_open` (any reference, returns the
+error), `create_work_item` / `create_work_item_with` / `create_under(h, parent(group,
+iid))` (they return the call, for either of the next two; `created_json(iid, title,
+assignees)` is a row to `serve_create`); `reply::<T_Reply>(&mut call)` parses success,
 `reply_error(&mut call)` returns the error name (`NOT_AUTHENTICATED`,
 `GITLAB_ERROR` constants).
 

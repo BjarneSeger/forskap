@@ -1,22 +1,33 @@
 interface org.thehoster.forskapd
 
-type Issue (
+type WorkItemRef (
+  project_id: ?int,
+  group_id: ?int,
+  iid: int,
+  type: ?string,
+  title: ?string,
+  web_url: ?string
+)
+
+type WorkItem (
   id: int,
   iid: int,
-  project_id: int,
+  type: string,
+  project_id: ?int,
+  group_id: ?int,
+  namespace_path: string,
   title: string,
   web_url: string,
   state: string,
-  parent: string,
+  parent: ?WorkItemRef,
   total_time: string,
   graph_status: string,
   open_count: int,
   project_avatar: string,
-  project_path: string,
   updated_at: int
 )
 
-type IssuableKind (issue, merge_request)
+type IssuableKind (work_item, merge_request)
 
 type HistorySource (gitlab, queued)
 
@@ -105,39 +116,27 @@ type SyncJob (
   expected: ?int
 )
 
-type Epic (
-  id: int,
-  iid: int,
-  group_id: int,
-  title: string,
-  web_url: string,
-  state: string,
-  open_count: int,
-  group_path: string,
-  updated_at: int
-)
-
 error GitlabError (message: string)
 
 type NotAuthReason (no_credentials, keychain_error, unreachable, token_rejected, logged_out)
 
 error NotAuthenticated (reason: ?NotAuthReason, detail: ?string)
 
-method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
+method GetAssignedWorkItems(groups: ?[]string) -> (work_items: []WorkItem)
 
 method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)
 
-type IssueRole (author, assignee)
+type WorkItemRole (author, assignee)
 
-type IssueState (opened, closed)
+type WorkItemState (opened, closed)
 
-method ListIssues(role: ?IssueRole, updated_after: ?int, states: ?[]IssueState) -> (issues: []Issue)
+method ListWorkItems(role: ?WorkItemRole, updated_after: ?int, states: ?[]WorkItemState) -> (work_items: []WorkItem)
 
-type SearchKind (issues, merge_requests, projects, groups, epics)
+type SearchKind (work_items, merge_requests, projects, groups)
 
 type SearchScope (projects: ?[]int, groups: ?[]string)
 
-method Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)
+method Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope, types: ?[]string, exclude_types: ?[]string) -> (work_items: []WorkItem, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
 
 method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
 
@@ -147,11 +146,9 @@ method AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
 method UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
-method CreateIssue(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, epic_id: ?int) -> (iid: int, web_url: string)
+method CreateWorkItem(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, parent: ?WorkItemRef) -> (iid: int, web_url: string)
 
-method RecordOpen(project_id: int, iid: int, kind: IssuableKind) -> ()
-
-method RecordEpicOpen(group_id: int, iid: int) -> ()
+method RecordOpen(kind: IssuableKind, iid: int, project_id: ?int, group_id: ?int) -> ()
 
 type CacheScope (assigned, search, quick, slow, stale, usage)
 

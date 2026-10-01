@@ -8,7 +8,7 @@ use std::fmt;
 use std::io::IsTerminal;
 
 use anyhow::{Context, Result};
-use forskap_api::Epic;
+use forskap_api::WorkItem;
 use inquire::{InquireError, Select};
 
 use crate::cmd::epic::group_of;
@@ -78,10 +78,10 @@ pub fn by_project(items: Vec<Item>) -> Vec<Labeled<Item>> {
 }
 
 /// Epics sharing a number, told apart by their group.
-pub fn by_group(epics: Vec<Epic>) -> Vec<Labeled<Epic>> {
-    let group = |e: &Epic| match group_of(e) {
+pub fn by_group(epics: Vec<WorkItem>) -> Vec<Labeled<WorkItem>> {
+    let group = |e: &WorkItem| match group_of(e) {
         Some(path) => path.to_string(),
-        None => format!("group {}", e.group_id),
+        None => format!("group {}", e.group_id.unwrap_or_default()),
     };
     by_place(epics, group, |e| &e.title)
 }
@@ -143,16 +143,10 @@ mod tests {
 
     #[test]
     fn by_group_names_the_group_or_its_id() {
-        let epic = |group_id, web_url: &str, title: &str| Epic {
-            id: group_id,
-            iid: 5,
-            group_id,
+        let epic = |group_id, web_url: &str, title: &str| WorkItem {
             title: title.to_string(),
             web_url: web_url.to_string(),
-            state: "opened".to_string(),
-            open_count: 0,
-            group_path: String::new(),
-            updated_at: 0,
+            ..crate::item::testing::epic(group_id, 5)
         };
         let choices = by_group(vec![
             epic(3, "https://gl/groups/team/backend/-/epics/5", "Accounts"),

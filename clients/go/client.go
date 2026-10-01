@@ -25,20 +25,20 @@ const (
 	ReasonLoggedOut     NotAuthReason = "logged_out"
 )
 
-// IssuableKind values selecting what a write method targets, mirroring the
-// .varlink enum the same way the NotAuthReason constants do.
+// IssuableKind values selecting what a write method or RecordOpen targets,
+// mirroring the .varlink enum the same way the NotAuthReason constants do.
+// An issue is a work item.
 const (
-	KindIssue        IssuableKind = "issue"
+	KindWorkItem     IssuableKind = "work_item"
 	KindMergeRequest IssuableKind = "merge_request"
 )
 
 // SearchKind values restricting Search to some of its result sets.
 const (
-	SearchIssues        SearchKind = "issues"
+	SearchWorkItems     SearchKind = "work_items"
 	SearchMergeRequests SearchKind = "merge_requests"
 	SearchProjects      SearchKind = "projects"
 	SearchGroups        SearchKind = "groups"
-	SearchEpics         SearchKind = "epics"
 )
 
 // CacheScope values selecting what ClearCache drops: the assigned lists, the
@@ -52,18 +52,18 @@ const (
 	ScopeUsage    CacheScope = "usage"
 )
 
-// IssueRole values picking one of the two lists ListIssues serves: the issues
-// the authenticated user authored, or the ones assigned to them.
+// WorkItemRole values picking one of the two lists ListWorkItems serves: the
+// issues the authenticated user authored, or the ones assigned to them.
 const (
-	RoleAuthor   IssueRole = "author"
-	RoleAssignee IssueRole = "assignee"
+	RoleAuthor   WorkItemRole = "author"
+	RoleAssignee WorkItemRole = "assignee"
 )
 
-// IssueState values ListIssues filters by; they are the strings Issue.State
-// carries.
+// WorkItemState values ListWorkItems filters by; they are the strings
+// WorkItem.State carries.
 const (
-	StateOpened IssueState = "opened"
-	StateClosed IssueState = "closed"
+	StateOpened WorkItemState = "opened"
+	StateClosed WorkItemState = "closed"
 )
 
 // HistorySource values telling a synced timelog from a PostTime still queued.
@@ -154,10 +154,11 @@ func (c *Client) Close() error {
 // the daemon surface as *GitlabError or *NotAuthenticated (match with errors.As);
 // optional parameters are pointers, where nil omits the field on the wire.
 
-// GetAssignedIssues returns issues assigned to the authenticated user, optionally
-// filtered to the given group paths (nil = all groups).
-func (c *Client) GetAssignedIssues(ctx context.Context, groups *[]string) ([]Issue, error) {
-	return GetAssignedIssues().Call(ctx, c.conn, groups)
+// GetAssignedWorkItems returns the open issues assigned to the authenticated
+// user, work items of their project, optionally filtered to the given group
+// paths (nil = all groups).
+func (c *Client) GetAssignedWorkItems(ctx context.Context, groups *[]string) ([]WorkItem, error) {
+	return GetAssignedWorkItems().Call(ctx, c.conn, groups)
 }
 
 // GetAssignedMergeRequests returns open merge requests assigned to the
@@ -168,36 +169,39 @@ func (c *Client) GetAssignedMergeRequests(ctx context.Context, groups *[]string)
 	return GetAssignedMergeRequests().Call(ctx, c.conn, groups)
 }
 
-// ListIssues returns the issues the authenticated user authored or is assigned
-// to, closed ones included, newest-updated first. role picks one of the Role*
-// lists (nil = both, each issue once); updatedAfter (unix seconds, inclusive)
-// keeps only issues updated since; states keeps only the given State* ones (nil
-// or empty = both). Served from what the daemon synced, which reaches back its
-// search.tracked_retention_hours (90 days by default) and is refreshed daily.
-func (c *Client) ListIssues(ctx context.Context, role *IssueRole, updatedAfter *int64, states *[]IssueState) ([]Issue, error) {
-	return ListIssues().Call(ctx, c.conn, role, updatedAfter, states)
+// ListWorkItems returns the issues the authenticated user authored or is
+// assigned to, closed ones included, newest-updated first. role picks one of
+// the Role* lists (nil = both, each issue once); updatedAfter (unix seconds,
+// inclusive) keeps only issues updated since; states keeps only the given
+// State* ones (nil or empty = both). Served from what the daemon synced, which
+// reaches back its search.tracked_retention_hours (90 days by default) and is
+// refreshed daily.
+func (c *Client) ListWorkItems(ctx context.Context, role *WorkItemRole, updatedAfter *int64, states *[]WorkItemState) ([]WorkItem, error) {
+	return ListWorkItems().Call(ctx, c.conn, role, updatedAfter, states)
 }
 
 // SearchResults groups the per-kind result sets of Search.
 type SearchResults struct {
-	Issues        []Issue
+	WorkItems     []WorkItem
 	MergeRequests []MergeRequest
 	Projects      []Project
 	Groups        []Group
-	Epics         []Epic
 }
 
 // Search searches the daemon's locally cached corpus (no GitLab round-trip).
 // kinds optionally restricts the reply to a subset of the Search* kinds (nil =
-// all five); limit caps each result set separately (nil = daemon default of 50);
-// scope keeps only items in any of its projects (by ID) or groups (by path,
-// subgroups included), applied before limit (nil = everything). Issues, MRs
-// and epics come most-opened first (see RecordOpen, RecordEpicOpen); an empty
+// all four); limit caps each result set separately, the issues and epics
+// together (nil = daemon default of 50); scope keeps only items in any of its
+// projects (by ID) or groups (by path, subgroups included), applied before
+// limit (nil = everything); types keeps only the work items of the given types
+// and excludeTypes drops the ones of its types, both compared case-insensitively
+// ("issue", "task", "epic", …; nil or empty = no filter) and applied before
+// limit. Work items and MRs come most-opened first (see RecordOpen); an empty
 // query lists only items with recorded opens. Epics need GitLab Premium or
 // Ultimate.
-func (c *Client) Search(ctx context.Context, query string, kinds *[]SearchKind, limit *int64, scope *SearchScope) (SearchResults, error) {
-	issues, mrs, projects, groups, epics, err := Search().Call(ctx, c.conn, query, kinds, limit, scope)
-	return SearchResults{issues, mrs, projects, groups, epics}, err
+func (c *Client) Search(ctx context.Context, query string, kinds *[]SearchKind, limit *int64, scope *SearchScope, types, excludeTypes *[]string) (SearchResults, error) {
+	workItems, mrs, projects, groups, err := Search().Call(ctx, c.conn, query, kinds, limit, scope, types, excludeTypes)
+	return SearchResults{workItems, mrs, projects, groups}, err
 }
 
 // PostTime logs a time-tracking entry on an issue or merge request (per kind).
@@ -223,33 +227,30 @@ func (c *Client) UnassignSelf(ctx context.Context, projectID, iid int64, kind Is
 	return UnassignSelf().Call(ctx, c.conn, projectID, iid, kind)
 }
 
-// CreateIssue creates an issue in a project and returns its number and link.
-// description (GitLab Markdown), labels and epicID (the epic's global ID, its
-// Epic.ID; GitLab Premium and up) are optional; assignSelf assigns the issue
-// to the authenticated user (nil = nobody is assigned).
+// CreateWorkItem creates an issue in a project and returns its number and
+// link. description (GitLab Markdown), labels and parent (an epic, named by
+// its Group_id and Iid; GitLab Premium and up) are optional; assignSelf
+// assigns the issue to the authenticated user (nil = nobody is assigned).
 //
 // Unlike the other writes it is never queued: without a live GitLab session
 // it fails with *NotAuthenticated, and any failure of the request, a network
 // error included, is a *GitlabError. Do not retry such a failure blindly:
 // GitLab may have created the issue before the answer was lost, and a second
-// call would file it again. On success Search, ListIssues and (if GitLab
-// assigned it) GetAssignedIssues show the issue at once.
-func (c *Client) CreateIssue(ctx context.Context, projectID int64, title string, description *string, labels *[]string, assignSelf *bool, epicID *int64) (iid int64, webURL string, err error) {
-	return CreateIssue().Call(ctx, c.conn, projectID, title, description, labels, assignSelf, epicID)
+// call would file it again. A parent the daemon can't find fails before
+// anything is created. On success Search, ListWorkItems and (if GitLab
+// assigned it) GetAssignedWorkItems show the issue at once.
+func (c *Client) CreateWorkItem(ctx context.Context, projectID int64, title string, description *string, labels *[]string, assignSelf *bool, parent *WorkItemRef) (iid int64, webURL string, err error) {
+	return CreateWorkItem().Call(ctx, c.conn, projectID, title, description, labels, assignSelf, parent)
 }
 
-// RecordOpen counts one open of an issue or merge request in the daemon's
+// RecordOpen counts one open of a work item or merge request in the daemon's
 // local open statistics; Search ranks frequently opened items first and
-// reports the count as open_count. Local bookkeeping only: it succeeds while
-// the daemon is dormant and never contacts GitLab.
-func (c *Client) RecordOpen(ctx context.Context, projectID, iid int64, kind IssuableKind) error {
-	return RecordOpen().Call(ctx, c.conn, projectID, iid, kind)
-}
-
-// RecordEpicOpen is RecordOpen for an epic, which belongs to a group and is
-// addressed by (groupID, iid).
-func (c *Client) RecordEpicOpen(ctx context.Context, groupID, iid int64) error {
-	return RecordEpicOpen().Call(ctx, c.conn, groupID, iid)
+// reports the count as open_count. Exactly one of projectID and groupID names
+// where it lives: a project for an issue or merge request, a group for an
+// epic. Local bookkeeping only: it succeeds while the daemon is dormant and
+// never contacts GitLab.
+func (c *Client) RecordOpen(ctx context.Context, kind IssuableKind, iid int64, projectID, groupID *int64) error {
+	return RecordOpen().Call(ctx, c.conn, kind, iid, projectID, groupID)
 }
 
 // ClearCache clears the daemon's cache, optionally only the given Scope* slices

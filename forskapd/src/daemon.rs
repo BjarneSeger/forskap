@@ -468,8 +468,8 @@ fn settle_hook(sync: &Arc<SyncHandle>, config: &config::SharedConfig) -> SettleH
 #[cfg(test)]
 mod tests {
     use forskap_api::{
-        ErrorKind as WireError, IssuableKind, Issue, IssueRole, VarlinkClient,
-        VarlinkClientInterface,
+        ErrorKind as WireError, IssuableKind, VarlinkClient, VarlinkClientInterface, WorkItem,
+        WorkItemRef, WorkItemRole,
     };
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
@@ -532,9 +532,9 @@ mod tests {
             assert!(!Path::new(&self.socket).exists(), "the socket is removed");
         }
 
-        async fn assigned_issues(&self) -> Vec<Issue> {
-            let call = self.client.get_assigned_issues(None).call().await;
-            call.unwrap().issues
+        async fn assigned_work_items(&self) -> Vec<WorkItem> {
+            let call = self.client.get_assigned_work_items(None).call().await;
+            call.unwrap().work_items
         }
     }
 
@@ -555,8 +555,9 @@ mod tests {
         }
     }
 
-    fn keys(issues: &[Issue]) -> Vec<(i64, i64)> {
-        issues.iter().map(|i| (i.project_id, i.iid)).collect()
+    fn keys(items: &[WorkItem]) -> Vec<(i64, i64)> {
+        let key = |i: &WorkItem| (i.project_id.unwrap_or_default(), i.iid);
+        items.iter().map(key).collect()
     }
 
     fn gitlab_error(e: forskap_api::Error) -> String {
@@ -617,16 +618,16 @@ mod tests {
 
         assert!(synced(&run.handlers.sync, Duration::from_secs(5)).await);
 
-        let issues = run.assigned_issues().await;
+        let issues = run.assigned_work_items().await;
         assert_eq!(issues.len(), 6);
         assert!(issues.iter().all(|i| !i.graph_status.is_empty()), "boards");
         let rate_limit = issues.iter().find(|i| i.iid == 12).unwrap();
         assert_eq!(rate_limit.graph_status, "Doing");
-        assert_eq!(rate_limit.project_path, "acme/backend/api");
+        assert_eq!(rate_limit.namespace_path, "acme/backend/api");
         assert!(rate_limit.web_url.starts_with("https://dry-run.invalid/"));
         let invoice = issues
             .iter()
-            .find(|i| (i.project_id, i.iid) == (102, 7))
+            .find(|i| (i.project_id, i.iid) == (Some(102), 7))
             .unwrap();
         assert_eq!(invoice.total_time, "1h");
 
@@ -634,20 +635,45 @@ mod tests {
         let mrs = mrs.unwrap().merge_requests;
         assert_eq!(mrs.iter().map(|m| m.iid).collect::<Vec<_>>(), [31, 12, 44]);
 
-        let search = |query: &str| client.search(query.into(), None, None, None);
+        let search = |query: &str| client.search(query.into(), None, None, None, None, None);
         let found = search("billing").call().await.unwrap();
-        assert_eq!(found.issues.len(), 3);
+        let (epics, issues): (Vec<_>, Vec<_>) =
+            found.work_items.iter().partition(|w| w.r#type == "epic");
+        assert_eq!(issues.len(), 3);
         assert_eq!(found.merge_requests[0].iid, 12);
         assert_eq!(found.projects[0].path, "acme/backend/billing");
-        assert_eq!(found.epics[0].title, "Self-service billing");
+        assert_eq!(epics[0].title, "Self-service billing");
+        assert_eq!((epics[0].id, epics[0].group_id), (8101, Some(10)));
+        let featured = issues.iter().find(|i| i.iid == 8).unwrap();
+        let parent = featured.parent.as_ref().unwrap();
+        assert_eq!((parent.group_id, parent.iid), (Some(10), 1));
+        assert_eq!(
+            parent.web_url.as_deref(),
+            Some("https://dry-run.invalid/groups/acme/-/epics/1")
+        );
+        let mut tasks = client.search(
+            "webhook".into(),
+            None,
+            None,
+            None,
+            Some(vec!["task".into()]),
+            None,
+        );
+        let tasks = tasks.call().await.unwrap().work_items;
+        assert_eq!(keys(&tasks), [(101, 16)]);
+        let no_epics = vec!["epic".to_string()];
+        let mut issues = client.search("billing".into(), None, None, None, None, Some(no_epics));
+        let issues = issues.call().await.unwrap().work_items;
+        assert_eq!(issues.len(), 3);
+        assert!(issues.iter().all(|w| w.r#type == "issue"));
         let archived = search("legacy").call().await.unwrap();
         assert!(archived.projects[0].archived);
         let api = search("API").call().await.unwrap().projects;
         let api = api.iter().find(|p| p.id == AVATAR_PROJECT).unwrap();
         assert!(api.avatar.starts_with(scratch.path().to_str().unwrap()));
 
-        let mut mine = client.list_issues(Some(IssueRole::author), None, None);
-        let mine = mine.call().await.unwrap().issues;
+        let mut mine = client.list_work_items(Some(WorkItemRole::author), None, None);
+        let mine = mine.call().await.unwrap().work_items;
         assert_eq!(mine.len(), 7);
         assert!(keys(&mine).contains(&(103, 22)));
 
@@ -674,32 +700,35 @@ mod tests {
         let run = DryRun::start(&scratch).await;
         let client = &run.client;
         until("the assigned issues", async || {
-            (run.assigned_issues().await.len() == 6).then_some(())
+            (run.assigned_work_items().await.len() == 6).then_some(())
         })
         .await;
 
         // A closed issue leaves the list at once and reads closed once the
         // sync picked it up.
         client
-            .close(101, 12, IssuableKind::issue)
+            .close(101, 12, IssuableKind::work_item)
             .call()
             .await
             .unwrap();
-        assert!(!keys(&run.assigned_issues().await).contains(&(101, 12)));
+        assert!(!keys(&run.assigned_work_items().await).contains(&(101, 12)));
         until("the closed issue", async || {
             let found = client
-                .search("#12".into(), None, None, None)
+                .search("#12".into(), None, None, None, None, None)
                 .call()
                 .await
                 .ok()?;
-            let issue = found.issues.into_iter().find(|i| i.project_id == 101)?;
+            let issue = found
+                .work_items
+                .into_iter()
+                .find(|i| i.project_id == Some(101))?;
             (issue.state == "closed").then_some(())
         })
         .await;
 
         // Logged time shows in the history.
         let summary = Some("Dry run".to_string());
-        let mut log = client.post_time(103, 21, IssuableKind::issue, "45m".into(), summary);
+        let mut log = client.post_time(103, 21, IssuableKind::work_item, "45m".into(), summary);
         log.call().await.unwrap();
         until("the logged time", async || {
             let history = client.get_history(Some(1)).call().await.ok()?.events;
@@ -712,7 +741,7 @@ mod tests {
 
         // A created issue is mine, assigned and listed.
         let created = client
-            .create_issue(
+            .create_work_item(
                 102,
                 "Try the dry run".into(),
                 None,
@@ -729,23 +758,51 @@ mod tests {
             "https://dry-run.invalid/acme/backend/billing/-/issues/11"
         );
         until("the created issue", async || {
-            let listed = keys(&run.assigned_issues().await).contains(&(102, 11));
+            let listed = keys(&run.assigned_work_items().await).contains(&(102, 11));
             let mine = client
-                .list_issues(Some(IssueRole::author), None, None)
+                .list_work_items(Some(WorkItemRole::author), None, None)
                 .call()
                 .await;
-            (listed && keys(&mine.ok()?.issues).contains(&(102, 11))).then_some(())
+            (listed && keys(&mine.ok()?.work_items).contains(&(102, 11))).then_some(())
+        })
+        .await;
+
+        // One under an epic lands with it as its parent.
+        let audit = WorkItemRef {
+            project_id: None,
+            group_id: Some(12),
+            iid: 1,
+            r#type: Some("epic".into()),
+            title: None,
+            web_url: None,
+        };
+        let mut create =
+            client.create_work_item(103, "Audit the forms".into(), None, None, None, Some(audit));
+        let created = create.call().await.unwrap();
+        until("the created task's parent", async || {
+            let mine = client
+                .list_work_items(Some(WorkItemRole::author), None, None)
+                .call()
+                .await
+                .ok()?;
+            let item = mine
+                .work_items
+                .into_iter()
+                .find(|i| i.iid == created.iid && i.project_id == Some(103))?;
+            let parent = item.parent?;
+            assert_eq!((parent.group_id, parent.iid), (Some(12), 1));
+            parent.web_url
         })
         .await;
 
         // Assigning and unassigning.
         client
-            .assign_self(103, 22, IssuableKind::issue)
+            .assign_self(103, 22, IssuableKind::work_item)
             .call()
             .await
             .unwrap();
         until("the assigned issue", async || {
-            keys(&run.assigned_issues().await)
+            keys(&run.assigned_work_items().await)
                 .contains(&(103, 22))
                 .then_some(())
         })
@@ -761,7 +818,7 @@ mod tests {
 
         // GitLab's refusals come back as GitLab's.
         let archived = client
-            .close(ARCHIVED_PROJECT, 2, IssuableKind::issue)
+            .close(ARCHIVED_PROJECT, 2, IssuableKind::work_item)
             .call()
             .await;
         assert!(gitlab_error(archived.unwrap_err()).contains("archived"));
@@ -798,20 +855,20 @@ mod tests {
         let scratch = Scratch::create().unwrap();
         let run = DryRun::start(&scratch).await;
         until("the assigned issues", async || {
-            (run.assigned_issues().await.len() == 6).then_some(())
+            (run.assigned_work_items().await.len() == 6).then_some(())
         })
         .await;
 
         run.client.clear_cache(None).call().await.unwrap();
         // The foreground views refill before the reply.
-        assert_eq!(run.assigned_issues().await.len(), 6);
+        assert_eq!(run.assigned_work_items().await.len(), 6);
         until("the search corpus", async || {
             let found = run
                 .client
-                .search("billing".into(), None, None, None)
+                .search("billing".into(), None, None, None, None, None)
                 .call()
                 .await;
-            (!found.ok()?.issues.is_empty()).then_some(())
+            (!found.ok()?.work_items.is_empty()).then_some(())
         })
         .await;
         run.stop().await;
@@ -826,7 +883,7 @@ mod tests {
         runtime.block_on(async {
             let run = DryRun::start(&scratch).await;
             until("the assigned issues", async || {
-                (run.assigned_issues().await.len() == 6).then_some(())
+                (run.assigned_work_items().await.len() == 6).then_some(())
             })
             .await;
             run.stop().await;

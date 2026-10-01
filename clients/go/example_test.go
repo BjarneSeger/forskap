@@ -21,7 +21,7 @@ func Example() {
 	}
 	defer c.Close()
 
-	issues, err := c.GetAssignedIssues(ctx, nil)
+	issues, err := c.GetAssignedWorkItems(ctx, nil)
 	if err != nil {
 		var notAuth *forskap.NotAuthenticated
 		if errors.As(err, &notAuth) {
@@ -44,20 +44,33 @@ func Example() {
 
 	// The issues I authored that are closed by now, newest-updated first.
 	role := forskap.RoleAuthor
-	closed := []forskap.IssueState{forskap.StateClosed}
-	mine, err := c.ListIssues(ctx, &role, nil, &closed)
+	closed := []forskap.WorkItemState{forskap.StateClosed}
+	mine, err := c.ListWorkItems(ctx, &role, nil, &closed)
 	if err != nil {
 		log.Fatal(err)
 	}
 	for _, is := range mine {
-		fmt.Printf("#%d %s (epic: %s)\n", is.Iid, is.Title, is.Parent)
+		if is.Parent != nil {
+			fmt.Printf("#%d %s (epic &%d)\n", is.Iid, is.Title, is.Parent.Iid)
+		}
 	}
 
-	res, err := c.Search(ctx, "billing", nil, nil, nil)
+	// The epics about billing.
+	epics := []string{"epic"}
+	res, err := c.Search(ctx, "billing", nil, nil, nil, &epics, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
-	for _, is := range res.Issues {
-		fmt.Printf("#%d %s\n", is.Iid, is.Title)
+	for _, e := range res.WorkItems {
+		fmt.Printf("&%d %s\n", e.Iid, e.Title)
+	}
+
+	// Everything else about billing: tasks and the types to come included.
+	res, err = c.Search(ctx, "billing", nil, nil, nil, nil, &epics)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, w := range res.WorkItems {
+		fmt.Printf("#%d %s (%s)\n", w.Iid, w.Title, w.Type)
 	}
 }

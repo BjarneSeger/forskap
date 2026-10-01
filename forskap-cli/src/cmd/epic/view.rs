@@ -11,7 +11,8 @@ pub async fn run(target: EpicArgs, format: OutputFormat) -> Result<()> {
     output::emit(format, &epic, |e| {
         outln!("{} {}", style::reference('&', e.iid), e.title)?;
         field("state", &style::state(&e.state).to_string())?;
-        let group = group_of(e).map_or_else(|| e.group_id.to_string(), str::to_string);
+        let id = || e.group_id.unwrap_or_default().to_string();
+        let group = group_of(e).map_or_else(id, str::to_string);
         field("group", &group)?;
         field("url", &e.web_url)?;
         if e.open_count > 0 {

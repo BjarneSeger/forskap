@@ -14,6 +14,9 @@ use support::{dormant_env, seed_search_corpus};
 
 const SIZES: [u64; 3] = [1_000, 10_000, 50_000];
 
+/// The kinds a variant searches, and the work item types it leaves out.
+type Filter = (Option<Vec<SearchKind>>, Option<Vec<String>>);
+
 fn search_handler(c: &mut Criterion) {
     let mut group = c.benchmark_group("search_handler");
     group.sample_size(30);
@@ -22,20 +25,27 @@ fn search_handler(c: &mut Criterion) {
         let env = dormant_env();
         seed_search_corpus(&env, n);
         group.throughput(Throughput::Elements(n));
-        let variants: [(&str, &str, Option<Vec<SearchKind>>); 4] = [
+        // The issues alone: the work items but the epics, as the CLI asks.
+        let issues = || -> Filter {
+            (
+                Some(vec![SearchKind::work_items]),
+                Some(vec!["epic".into()]),
+            )
+        };
+        let variants: [(&str, &str, Filter); 4] = [
             // Needle matching nothing: the pure per-entry filter cost.
-            ("issues_miss", "zzz-nomatch", Some(vec![SearchKind::issues])),
+            ("issues_miss", "zzz-nomatch", issues()),
             // ~1% hits: adds sort + truncate + per-hit boards.get reads.
-            ("issues_hits", "flaky", Some(vec![SearchKind::issues])),
+            ("issues_hits", "flaky", issues()),
             // No kind filter: all four corpora scanned.
-            ("all_kinds", "flaky", None),
+            ("all_kinds", "flaky", (None, None)),
             // Exact-reference query: parse + iid comparison path.
-            ("iid_ref", "#123", Some(vec![SearchKind::issues])),
+            ("iid_ref", "#123", issues()),
         ];
-        for (variant, query, kinds) in variants {
+        for (variant, query, (kinds, excluded)) in variants {
             group.bench_with_input(BenchmarkId::new(variant, n), &n, |b, _| {
                 b.to_async(&env.rt).iter(|| {
-                    let kinds = kinds.clone();
+                    let (kinds, excluded) = (kinds.clone(), excluded.clone());
                     let h = &env.h;
                     async move {
                         let mut call = AsyncCall::default();
@@ -45,6 +55,8 @@ fn search_handler(c: &mut Criterion) {
                             kinds,
                             None,
                             None,
+                            None,
+                            excluded,
                         )
                         .await
                         .unwrap();

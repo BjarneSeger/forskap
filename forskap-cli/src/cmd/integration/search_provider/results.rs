@@ -9,7 +9,7 @@ use forskap_api::Search_Reply;
 use super::query;
 use crate::cli::SearchKind;
 use crate::cmd::epic;
-use crate::item;
+use crate::item::{self, is_epic};
 use crate::refspec::RefKind;
 
 /// One launcher entry. `score` is the daemon's open count.
@@ -61,12 +61,13 @@ pub enum Target {
 /// groups.
 pub fn rows(reply: &Search_Reply) -> Vec<Row> {
     let mut out = Vec::new();
-    for i in &reply.issues {
+    let (epics, issues): (Vec<_>, Vec<_>) = reply.work_items.iter().partition(|w| is_epic(w));
+    for i in issues {
         out.push(Row {
-            id: format!("issues:{}:{}", i.project_id, i.iid),
+            id: format!("issues:{}:{}", i.project_id.unwrap_or_default(), i.iid),
             title: format!("#{} {}", i.iid, i.title),
             subtitle: join(&[
-                project_of(&i.project_path, &i.web_url),
+                project_of(&i.namespace_path, &i.web_url),
                 &i.state,
                 &i.total_time,
             ]),
@@ -87,9 +88,9 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
             avatar: avatar(&m.project_avatar),
         });
     }
-    for e in &reply.epics {
+    for e in epics {
         out.push(Row {
-            id: format!("epic:{}:{}", e.group_id, e.iid),
+            id: format!("epic:{}:{}", e.group_id.unwrap_or_default(), e.iid),
             title: format!("&{} {}", e.iid, e.title),
             subtitle: join(&[epic::group_of(e).unwrap_or_default(), &e.state]),
             kind: SearchKind::Epics,
@@ -168,25 +169,39 @@ fn join(parts: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forskap_api::{Epic, Group, Issue, MergeRequest, Project};
+    use forskap_api::{Group, MergeRequest, Project, WorkItem};
 
     fn reply() -> Search_Reply {
+        let epic = WorkItem {
+            id: 30,
+            title: "Accounts".into(),
+            web_url: "https://gl.example.com/groups/team/-/epics/5".into(),
+            open_count: 2,
+            namespace_path: "team".into(),
+            ..crate::item::testing::epic(3, 5)
+        };
         Search_Reply {
-            issues: vec![Issue {
-                id: 1,
-                iid: 42,
-                project_id: 7,
-                title: "Fix login".into(),
-                web_url: "https://gl.example.com/team/api/-/issues/42".into(),
-                state: "opened".into(),
-                parent: String::new(),
-                total_time: "1h".into(),
-                graph_status: String::new(),
-                open_count: 3,
-                project_avatar: "/cache/avatars/7-a.png".into(),
-                project_path: "team/api".into(),
-                updated_at: 1_782_900_000,
-            }],
+            // As the daemon ranks them: the epic among the issues.
+            work_items: vec![
+                epic,
+                WorkItem {
+                    id: 1,
+                    iid: 42,
+                    r#type: "task".into(),
+                    project_id: Some(7),
+                    group_id: None,
+                    namespace_path: "team/api".into(),
+                    title: "Fix login".into(),
+                    web_url: "https://gl.example.com/team/api/-/issues/42".into(),
+                    state: "opened".into(),
+                    parent: None,
+                    total_time: "1h".into(),
+                    graph_status: String::new(),
+                    open_count: 3,
+                    project_avatar: "/cache/avatars/7-a.png".into(),
+                    updated_at: 1_782_900_000,
+                },
+            ],
             merge_requests: vec![MergeRequest {
                 id: 2,
                 iid: 9,
@@ -214,17 +229,6 @@ mod tests {
                 name: "Team".into(),
                 path: "team".into(),
                 web_url: "https://gl.example.com/groups/team".into(),
-            }],
-            epics: vec![Epic {
-                id: 30,
-                iid: 5,
-                group_id: 3,
-                title: "Accounts".into(),
-                web_url: "https://gl.example.com/groups/team/-/epics/5".into(),
-                state: "opened".into(),
-                open_count: 2,
-                group_path: "team".into(),
-                updated_at: 1_782_900_000,
             }],
         }
     }

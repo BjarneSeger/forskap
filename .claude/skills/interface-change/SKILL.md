@@ -40,7 +40,7 @@ the daemon are the to-do list.
   once, queues on `Unreachable` or a retryable error, and only a real GitLab rejection
   returns `GitlabError`. A write never demotes the session — the sync worker is the
   demotion authority. Extend `Job::affected_by` so the right views re-sync after it.
-  **Exception: a write that creates something** (`CreateIssue`) is not a `WriteOp` and
+  **Exception: a write that creates something** (`CreateWorkItem`) is not a `WriteOp` and
   never goes through `perform_write`/`defer`. `WriteOp`s are persisted and address an
   existing `(kind, project_id, iid)`; a create has no `iid` and no idempotency key, so
   a queued or replayed one could file its item twice. It calls GitLab once from the
@@ -53,8 +53,9 @@ the daemon are the to-do list.
   `Listing` variant (`gitlab.rs`) and a `Job` (`sync/jobs.rs`, planned in
   `sync/planner.rs`), then project it in `handlers/wire.rs`.
 - New GitLab call needed? Reads are a new `Listing` variant (no trait change). A new
-  write method goes on the `GitlabApi` trait in `gitlab.rs` **and** on the shared fake in
-  `testing.rs`.
+  write method, or a read of one object that is no listing (the epic lookup), goes on
+  the `GitlabApi` trait in `gitlab.rs` **and** on the shared fake in `testing.rs` and
+  `DemoGitlab` in `demo.rs`.
 - **New method? Add its arm to the hand-written dispatcher** `handle_forskapd` in
   `forskapd/src/service.rs` (clone the arm of an argument-identical method) plus a
   `dispatch_has_an_arm_for_<method>` test next to `dispatch_has_an_arm_for_search`. A

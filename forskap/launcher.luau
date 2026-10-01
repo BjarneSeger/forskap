@@ -89,10 +89,12 @@ local function projectPath(webUrl)
   return path or ""
 end
 
--- The path the item carries; an older `forskap` has it only in the URL.
+-- The path the item carries (`project_path` from an older `forskap`), else
+-- the one in its URL.
 local function issuableProject(item)
-  if item.project_path ~= nil and item.project_path ~= "" then
-    return item.project_path
+  local path = item.namespace_path or item.project_path
+  if path ~= nil and path ~= "" then
+    return path
   end
   return projectPath(item.web_url)
 end
@@ -136,10 +138,12 @@ local function issuableRow(kind, sigil, item)
   }
 end
 
--- The group path the epic carries; an older `forskap` has it only in the URL.
+-- The group path the epic carries (`group_path` from an older `forskap`),
+-- else the one in its URL.
 local function epicGroup(item)
-  if item.group_path ~= nil and item.group_path ~= "" then
-    return item.group_path
+  local path = item.namespace_path or item.group_path
+  if path ~= nil and path ~= "" then
+    return path
   end
   return groupPath(item.web_url)
 end
@@ -168,15 +172,31 @@ local function urlRow(kind, item)
   }
 end
 
+-- Issues and epics are both work items, told apart by their type.
+local function isEpic(item)
+  return (item.type or ""):lower() == "epic"
+end
+
 local function toResults(reply)
   local results = {}
+  -- An older `forskap` sends `issues` and `epics` instead of `work_items`.
+  local issues, epics = {}, {}
+  for _, w in ipairs(reply.work_items or {}) do
+    table.insert(isEpic(w) and epics or issues, w)
+  end
   for _, i in ipairs(reply.issues or {}) do
+    table.insert(issues, i)
+  end
+  for _, e in ipairs(reply.epics or {}) do
+    table.insert(epics, e)
+  end
+  for _, i in ipairs(issues) do
     table.insert(results, issuableRow("issues", "#", i))
   end
   for _, m in ipairs(reply.merge_requests or {}) do
     table.insert(results, issuableRow("merge_requests", "!", m))
   end
-  for _, e in ipairs(reply.epics or {}) do
+  for _, e in ipairs(epics) do
     table.insert(results, epicRow(e))
   end
   for _, p in ipairs(reply.projects or {}) do

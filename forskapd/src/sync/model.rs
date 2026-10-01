@@ -40,9 +40,20 @@ pub struct UserRef {
     pub username: String,
 }
 
+/// The epic an issue belongs to, as embedded in the issue.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EpicRef {
-    #[serde(default, deserialize_with = "de::nullable")]
+    /// The legacy epic id, not the epic's work item id.
+    #[serde(default, deserialize_with = "de::lenient")]
+    pub id: i64,
+    #[serde(default, deserialize_with = "de::lenient")]
+    pub iid: i64,
+    #[serde(default, deserialize_with = "de::lenient")]
+    pub group_id: i64,
+    #[serde(default, deserialize_with = "de::lenient")]
+    pub title: String,
+    /// Relative to the instance (`/groups/team/-/epics/5`), as GitLab sends it.
+    #[serde(default, deserialize_with = "de::lenient")]
     pub url: String,
 }
 
@@ -68,6 +79,10 @@ pub struct Issue {
     pub web_url: String,
     #[serde(default, deserialize_with = "de::nullable")]
     pub state: String,
+    /// `"issue"`, `"task"`, `"incident"`, `"test_case"`, …; empty in a row
+    /// stored before schema 2.
+    #[serde(default, deserialize_with = "de::lenient")]
+    pub issue_type: String,
     #[serde(default, deserialize_with = "de::labels")]
     pub labels: Vec<String>,
     #[serde(default, deserialize_with = "de::nullable")]
@@ -82,9 +97,12 @@ pub struct Issue {
 }
 
 impl Issue {
-    /// Epic URL, empty when the issue has no parent.
-    pub fn parent_url(&self) -> &str {
-        self.epic.as_ref().map_or("", |e| e.url.as_str())
+    /// Its work item type; a row without one is an issue.
+    pub fn work_item_type(&self) -> &str {
+        match self.issue_type.as_str() {
+            "" => "issue",
+            t => t,
+        }
     }
 
     /// Human-readable `total_time_spent`, empty when none was logged.
@@ -213,6 +231,10 @@ pub struct Epic {
     /// The group the epic itself belongs to.
     #[serde(default, deserialize_with = "de::nullable")]
     pub group_id: i64,
+    /// The id of the epic's work item; `id` is the legacy epic id. GitLab
+    /// sends it from 18.4 on; 0 in a row stored before schema 2.
+    #[serde(default, deserialize_with = "de::lenient")]
+    pub work_item_id: i64,
     #[serde(default, deserialize_with = "de::nullable")]
     pub title: String,
     #[serde(default, deserialize_with = "de::nullable")]
@@ -385,7 +407,8 @@ fn positive(v: i64) -> u64 {
 impl Resource for Issue {
     const NAME: &'static str = "issues";
     const KEYSPACE: &'static str = "gl_issues_v1";
-    const SCHEMA: u32 = 1;
+    /// 2: the work item type and the epic's id, number, group and title.
+    const SCHEMA: u32 = 2;
     fn key(&self) -> RowKey {
         (positive(self.project_id), positive(self.iid))
     }
@@ -434,7 +457,8 @@ impl Resource for Group {
 impl Resource for Epic {
     const NAME: &'static str = "epics";
     const KEYSPACE: &'static str = "gl_epics_v1";
-    const SCHEMA: u32 = 1;
+    /// 2: the work item id.
+    const SCHEMA: u32 = 2;
     fn key(&self) -> RowKey {
         (positive(self.group_id), positive(self.iid))
     }
@@ -625,7 +649,11 @@ mod tests {
         let v = json!({
             "id": 123, "iid": 7, "project_id": 9,
             "title": "Fix it", "web_url": "https://gl/g/p/-/issues/7", "state": "opened",
-            "epic": { "url": "https://gl/epics/1", "id": 3 },
+            "issue_type": "task",
+            "epic": {
+                "id": 3, "iid": 1, "title": "Roadmap", "url": "/groups/g/-/epics/1",
+                "group_id": 4, "human_readable_end_date": null,
+            },
             "time_stats": { "human_total_time_spent": "2h", "time_estimate": 0 },
             "labels": ["bug", 42, null, "high", {"name": "x"}, ["y"], true],
             "assignees": [{ "id": 5, "username": "me", "name": "Me" }],
@@ -635,7 +663,17 @@ mod tests {
         let i: Issue = serde_json::from_value(v).unwrap();
         assert_eq!(i.key(), (9, 7));
         assert!(i.is_valid());
-        assert_eq!(i.parent_url(), "https://gl/epics/1");
+        assert_eq!(i.work_item_type(), "task");
+        assert_eq!(
+            i.epic,
+            Some(EpicRef {
+                id: 3,
+                iid: 1,
+                group_id: 4,
+                title: "Roadmap".into(),
+                url: "/groups/g/-/epics/1".into(),
+            })
+        );
         assert_eq!(i.total_time(), "2h");
         assert_eq!(i.labels, ["bug", "high"], "non-string labels skipped");
         assert_eq!(i.assignees[0].username, "me");
@@ -652,7 +690,8 @@ mod tests {
         });
         let i: Issue = serde_json::from_value(v).unwrap();
         assert_eq!(i.title, "");
-        assert_eq!(i.parent_url(), "");
+        assert_eq!(i.epic, None);
+        assert_eq!(i.work_item_type(), "issue");
         assert_eq!(i.total_time(), "");
         assert!(i.assignees.is_empty() && i.labels.is_empty());
         assert_eq!(i.updated_at, 0);
@@ -710,6 +749,41 @@ mod tests {
 
         let groupless: Epic = serde_json::from_value(json!({"id": 30, "iid": 5})).unwrap();
         assert!(!groupless.is_valid());
+    }
+
+    /// The legacy `id` stays the epic's own next to its work item's.
+    #[test]
+    fn epic_reads_its_work_item_id() {
+        let e: Epic = serde_json::from_value(json!({
+            "id": 30, "iid": 5, "group_id": 3, "work_item_id": 9001,
+        }))
+        .unwrap();
+        assert_eq!((e.id, e.work_item_id), (30, 9001));
+        let stored = serde_json::to_vec(&e).unwrap();
+        assert_eq!(serde_json::from_slice::<Epic>(&stored).unwrap(), e);
+
+        // A row stored before schema 2, and odd values.
+        for odd in [
+            json!({"id": 30, "iid": 5, "group_id": 3}),
+            json!({"id": 30, "iid": 5, "group_id": 3, "work_item_id": null}),
+            json!({"id": 30, "iid": 5, "group_id": 3, "work_item_id": "x"}),
+        ] {
+            let e: Epic = serde_json::from_value(odd.clone()).unwrap();
+            assert_eq!(e.work_item_id, 0, "{odd}");
+            assert!(e.is_valid(), "{odd}");
+        }
+    }
+
+    /// An issue's epic as a row stored before schema 2 has it: the link only.
+    #[test]
+    fn an_old_epic_ref_reads_with_its_link_only() {
+        let i: Issue = serde_json::from_value(json!({
+            "id": 1, "iid": 1, "project_id": 1, "epic": { "url": "/groups/g/-/epics/1" },
+        }))
+        .unwrap();
+        let epic = i.epic.unwrap();
+        assert_eq!((epic.iid, epic.group_id), (0, 0));
+        assert_eq!(epic.url, "/groups/g/-/epics/1");
     }
 
     #[test]
