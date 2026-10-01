@@ -420,7 +420,7 @@ impl WorkItemRow {
 /// filesystem is never asked.
 struct Projects<'a> {
     handlers: &'a Handlers,
-    avatars: HashMap<i64, String>,
+    avatars: HashMap<i64, Option<String>>,
     paths: HashMap<i64, Option<String>>,
 }
 
@@ -449,8 +449,8 @@ impl<'a> Projects<'a> {
         }
     }
 
-    /// The absolute path of the project's avatar, empty when it has none.
-    fn avatar(&mut self, project_id: i64) -> String {
+    /// The absolute path of the project's avatar, `None` without one.
+    fn avatar(&mut self, project_id: i64) -> Option<String> {
         let h = self.handlers;
         self.avatars
             .entry(project_id)
@@ -460,13 +460,10 @@ impl<'a> Projects<'a> {
                     warn!(error = %e, project_id, "avatar read failed");
                     None
                 });
-                avatar
-                    .filter(|a| !a.file.is_empty())
-                    .map(|a| {
-                        let path = h.sync.avatars().path_of(&a.file);
-                        path.to_string_lossy().into_owned()
-                    })
-                    .unwrap_or_default()
+                avatar.filter(|a| !a.file.is_empty()).map(|a| {
+                    let path = h.sync.avatars().path_of(&a.file);
+                    path.to_string_lossy().into_owned()
+                })
             })
             .clone()
     }
@@ -1087,18 +1084,18 @@ impl VarlinkInterface for Handlers {
                             .flatten()
                             .map(|m| (m.title, m.web_url)),
                     }
-                    .unwrap_or_default();
+                    .unzip();
                     events.push(HistoryEvent {
                         timestamp: p.queued_at_secs as i64,
                         source: HistorySource::queued,
                         kind: wire::kind(kind),
                         project_id,
                         iid,
-                        title,
-                        web_url,
+                        title: title.and_then(wire::some),
+                        web_url: web_url.and_then(wire::some),
                         time_spent: None,
                         duration: Some(duration),
-                        summary: summary.unwrap_or_default(),
+                        summary: summary.and_then(wire::some),
                     });
                 }
             }
@@ -1414,7 +1411,8 @@ impl VarlinkInterface for Handlers {
         let (iid, web_url) = match serde_json::from_value::<model::Issue>(created) {
             Ok(issue) => {
                 info!(project_id, iid = issue.iid, "issue created");
-                let shown = (issue.iid, issue.web_url.clone());
+                let iid = Some(issue.iid).filter(|&iid| iid > 0);
+                let shown = (iid, wire::some(issue.web_url.clone()));
                 let by = Identity {
                     host: session.host,
                     user_id: session.user_id,
@@ -1427,7 +1425,7 @@ impl VarlinkInterface for Handlers {
             }
             Err(e) => {
                 warn!(error = %e, project_id, "issue created, but GitLab's answer is unreadable");
-                (0, String::new())
+                (None, None)
             }
         };
         self.sync.refresh_soon(&Job::showing_issues_of(project_id));

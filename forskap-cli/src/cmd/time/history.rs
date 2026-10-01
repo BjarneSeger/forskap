@@ -33,7 +33,7 @@ pub async fn run(days: u32, format: OutputFormat) -> Result<()> {
                 style::state(source(&e.source)),
                 style::reference(sigil, e.iid),
                 spent.unwrap_or_default(),
-                e.title
+                e.title.as_deref().unwrap_or_default()
             )?;
         }
         Ok(())

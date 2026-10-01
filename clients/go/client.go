@@ -231,7 +231,8 @@ func (c *Client) UnassignSelf(ctx context.Context, projectID, iid int64, kind Is
 }
 
 // CreateWorkItem creates an issue in a project and returns its number and
-// link. description (GitLab Markdown), labels and parent (an epic, named by
+// link, both nil where GitLab created it but its answer didn't say them.
+// description (GitLab Markdown), labels and parent (an epic, named by
 // its Group_id and Iid; GitLab Premium and up) are optional; assignSelf
 // assigns the issue to the authenticated user (nil = nobody is assigned).
 //
@@ -242,7 +243,7 @@ func (c *Client) UnassignSelf(ctx context.Context, projectID, iid int64, kind Is
 // and a second call would file it again. A parent the daemon can't find fails
 // before anything is created. On success Search, ListWorkItems and (if GitLab
 // assigned it) GetAssignedWorkItems show the issue at once.
-func (c *Client) CreateWorkItem(ctx context.Context, projectID int64, title string, description *string, labels *[]string, assignSelf *bool, parent *WorkItemRef) (iid int64, webURL string, err error) {
+func (c *Client) CreateWorkItem(ctx context.Context, projectID int64, title string, description *string, labels *[]string, assignSelf *bool, parent *WorkItemRef) (iid *int64, webURL *string, err error) {
 	return CreateWorkItem().Call(ctx, c.conn, projectID, title, description, labels, assignSelf, parent)
 }
 

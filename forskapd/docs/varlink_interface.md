@@ -155,10 +155,10 @@ the image does, so a client may cache images by path: a new image gets a new fil
 while an unchanged one keeps its file, left as it is, though the daemon downloads it
 again whenever GitLab's avatar URL changes (any update of the project does that). A
 file written by a daemon from before this naming (0.12 and older) moves once more, at
-its project's first download after the upgrade. The path is empty until the download
-ran, for projects you are not a member of, for images above 1 MiB, and on GitLab before
-16.9. The file may be gone if the cache directory was emptied; the daemon fetches it
-again at its next start.
+its project's first download after the upgrade. `avatar` (and the items'
+`project_avatar`) is absent until the download ran, for projects you are not a member
+of, for images above 1 MiB, and on GitLab before 16.9. The file may be gone if the
+cache directory was emptied; the daemon fetches it again at its next start.
 
 ## `Group`
 
@@ -444,7 +444,7 @@ showing it before the next sync.
 
 ## Writing directly (never queued)
 
-### `CreateWorkItem(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, parent: ?WorkItemRef) -> (iid: int, web_url: string)`
+### `CreateWorkItem(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, parent: ?WorkItemRef) -> (iid: ?int, web_url: ?string)`
 
 Creates an issue in the project and replies with its number and its link.
 `description` is GitLab Markdown. `labels` are label names; GitLab creates the ones
@@ -485,7 +485,7 @@ the issue unassigned. A list that was never synced still reads as never synced. 
 jobs displaying the issue rerun right after.
 
 Once GitLab created the issue the call replies success, whatever happens then: if
-GitLab's answer is unreadable, `iid` is 0 and `web_url` empty.
+GitLab's answer is unreadable, `iid` and `web_url` are absent.
 
 Work-item status widgets are out of scope (GitLab sets them through GraphQL
 `workItemUpdate`, a second call with another API surface): the issue starts in the

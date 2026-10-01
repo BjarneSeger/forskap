@@ -28,7 +28,7 @@ type WorkItem struct {
 	Type           string       `json:"type"`
 	Project_id     *int64       `json:"project_id,omitempty"`
 	Group_id       *int64       `json:"group_id,omitempty"`
-	Namespace_path string       `json:"namespace_path"`
+	Namespace_path *string      `json:"namespace_path,omitempty"`
 	Title          string       `json:"title"`
 	Web_url        string       `json:"web_url"`
 	State          string       `json:"state"`
@@ -36,8 +36,8 @@ type WorkItem struct {
 	Time_spent     *int64       `json:"time_spent,omitempty"`
 	Graph_status   string       `json:"graph_status"`
 	Open_count     int64        `json:"open_count"`
-	Project_avatar string       `json:"project_avatar"`
-	Updated_at     int64        `json:"updated_at"`
+	Project_avatar *string      `json:"project_avatar,omitempty"`
+	Updated_at     *int64       `json:"updated_at,omitempty"`
 }
 
 // What a write or RecordOpen targets; an issue is a work_item.
@@ -53,21 +53,21 @@ type HistoryEvent struct {
 	Kind       IssuableKind  `json:"kind"`
 	Project_id int64         `json:"project_id"`
 	Iid        int64         `json:"iid"`
-	Title      string        `json:"title"`
-	Web_url    string        `json:"web_url"`
+	Title      *string       `json:"title,omitempty"`
+	Web_url    *string       `json:"web_url,omitempty"`
 	Time_spent *int64        `json:"time_spent,omitempty"`
 	Duration   *string       `json:"duration,omitempty"`
-	Summary    string        `json:"summary"`
+	Summary    *string       `json:"summary,omitempty"`
 }
 
 // One of the user's contribution events (GitLab's GET /events).
 type ActivityEvent struct {
 	Timestamp    int64   `json:"timestamp"`
 	Action       string  `json:"action"`
-	Target_type  string  `json:"target_type"`
+	Target_type  *string `json:"target_type,omitempty"`
 	Target_iid   *int64  `json:"target_iid,omitempty"`
 	Target_title *string `json:"target_title,omitempty"`
-	Project_id   int64   `json:"project_id"`
+	Project_id   *int64  `json:"project_id,omitempty"`
 	Project_path *string `json:"project_path,omitempty"`
 	Web_url      *string `json:"web_url,omitempty"`
 	Ref          *string `json:"ref,omitempty"`
@@ -98,19 +98,19 @@ type MergeRequest struct {
 	State          string   `json:"state"`
 	Assignees      []string `json:"assignees"`
 	Open_count     int64    `json:"open_count"`
-	Project_avatar string   `json:"project_avatar"`
-	Project_path   string   `json:"project_path"`
-	Updated_at     int64    `json:"updated_at"`
+	Project_avatar *string  `json:"project_avatar,omitempty"`
+	Project_path   *string  `json:"project_path,omitempty"`
+	Updated_at     *int64   `json:"updated_at,omitempty"`
 }
 
 // A project the user is a member of.
 type Project struct {
-	Id       int64  `json:"id"`
-	Name     string `json:"name"`
-	Path     string `json:"path"`
-	Web_url  string `json:"web_url"`
-	Avatar   string `json:"avatar"`
-	Archived bool   `json:"archived"`
+	Id       int64   `json:"id"`
+	Name     string  `json:"name"`
+	Path     string  `json:"path"`
+	Web_url  string  `json:"web_url"`
+	Avatar   *string `json:"avatar,omitempty"`
+	Archived bool    `json:"archived"`
 }
 
 // A group the user is a member of.
@@ -848,12 +848,13 @@ func (m UnassignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection
 }
 
 // Creates an issue in a project, optionally under an epic. Sent to GitLab once,
-// never queued.
+// never queued. iid and web_url are absent where GitLab created the issue but
+// its answer didn't say them.
 type CreateWorkItem_methods struct{}
 
 func CreateWorkItem() CreateWorkItem_methods { return CreateWorkItem_methods{} }
 
-func (m CreateWorkItem_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, title_in_ string, description_in_ *string, labels_in_ *[]string, assign_self_in_ *bool, parent_in_ *WorkItemRef) (iid_out_ int64, web_url_out_ string, err_ error) {
+func (m CreateWorkItem_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, title_in_ string, description_in_ *string, labels_in_ *[]string, assign_self_in_ *bool, parent_in_ *WorkItemRef) (iid_out_ *int64, web_url_out_ *string, err_ error) {
 	receive, err_ := m.Send(ctx, c, 0, project_id_in_, title_in_, description_in_, labels_in_, assign_self_in_, parent_in_)
 	if err_ != nil {
 		return
@@ -862,7 +863,7 @@ func (m CreateWorkItem_methods) Call(ctx context.Context, c *varlink.Connection,
 	return
 }
 
-func (m CreateWorkItem_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, title_in_ string, description_in_ *string, labels_in_ *[]string, assign_self_in_ *bool, parent_in_ *WorkItemRef) (func(ctx context.Context) (int64, string, uint64, error), error) {
+func (m CreateWorkItem_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, title_in_ string, description_in_ *string, labels_in_ *[]string, assign_self_in_ *bool, parent_in_ *WorkItemRef) (func(ctx context.Context) (*int64, *string, uint64, error), error) {
 	var in struct {
 		Project_id  int64        `json:"project_id"`
 		Title       string       `json:"title"`
@@ -881,10 +882,10 @@ func (m CreateWorkItem_methods) Send(ctx context.Context, c *varlink.Connection,
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (iid_out_ int64, web_url_out_ string, flags uint64, err error) {
+	return func(context.Context) (iid_out_ *int64, web_url_out_ *string, flags uint64, err error) {
 		var out struct {
-			Iid     int64  `json:"iid"`
-			Web_url string `json:"web_url"`
+			Iid     *int64  `json:"iid,omitempty"`
+			Web_url *string `json:"web_url,omitempty"`
 		}
 		flags, err = receive(ctx, &out)
 		if err != nil {
@@ -897,7 +898,7 @@ func (m CreateWorkItem_methods) Send(ctx context.Context, c *varlink.Connection,
 	}, nil
 }
 
-func (m CreateWorkItem_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, title_in_ string, description_in_ *string, labels_in_ *[]string, assign_self_in_ *bool, parent_in_ *WorkItemRef) (func(ctx context.Context) (iid_out_ int64, web_url_out_ string, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m CreateWorkItem_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, title_in_ string, description_in_ *string, labels_in_ *[]string, assign_self_in_ *bool, parent_in_ *WorkItemRef) (func(ctx context.Context) (iid_out_ *int64, web_url_out_ *string, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
 		Project_id  int64        `json:"project_id"`
 		Title       string       `json:"title"`
@@ -916,10 +917,10 @@ func (m CreateWorkItem_methods) Upgrade(ctx context.Context, c *varlink.Connecti
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (iid_out_ int64, web_url_out_ string, flags uint64, conn varlink.ReadWriterContext, err error) {
+	return func(context.Context) (iid_out_ *int64, web_url_out_ *string, flags uint64, conn varlink.ReadWriterContext, err error) {
 		var out struct {
-			Iid     int64  `json:"iid"`
-			Web_url string `json:"web_url"`
+			Iid     *int64  `json:"iid,omitempty"`
+			Web_url *string `json:"web_url,omitempty"`
 		}
 		flags, conn, err = receive(ctx, &out)
 		if err != nil {
@@ -1818,10 +1819,10 @@ func (c *VarlinkCall) ReplyUnassignSelf(ctx context.Context) error {
 	return c.Reply(ctx, nil)
 }
 
-func (c *VarlinkCall) ReplyCreateWorkItem(ctx context.Context, iid_ int64, web_url_ string) error {
+func (c *VarlinkCall) ReplyCreateWorkItem(ctx context.Context, iid_ *int64, web_url_ *string) error {
 	var out struct {
-		Iid     int64  `json:"iid"`
-		Web_url string `json:"web_url"`
+		Iid     *int64  `json:"iid,omitempty"`
+		Web_url *string `json:"web_url,omitempty"`
 	}
 	out.Iid = iid_
 	out.Web_url = web_url_
@@ -1975,7 +1976,8 @@ func (s *VarlinkInterface) UnassignSelf(ctx context.Context, c VarlinkCall, proj
 }
 
 // Creates an issue in a project, optionally under an epic. Sent to GitLab once,
-// never queued.
+// never queued. iid and web_url are absent where GitLab created the issue but
+// its answer didn't say them.
 func (s *VarlinkInterface) CreateWorkItem(ctx context.Context, c VarlinkCall, project_id_ int64, title_ string, description_ *string, labels_ *[]string, assign_self_ *bool, parent_ *WorkItemRef) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.CreateWorkItem")
 }
@@ -2300,8 +2302,8 @@ type WorkItem (
   # The group of an epic; absent for the rest.
   group_id: ?int,
   # Full path of that project ("team/api") or group ("team"): the stored
-  # one's, else the one in web_url; empty when neither gives it.
-  namespace_path: string,
+  # one's, else the one in web_url; absent when neither gives it.
+  namespace_path: ?string,
   title: string,
   web_url: string,
   # "opened" or "closed".
@@ -2316,11 +2318,11 @@ type WorkItem (
   graph_status: string,
   # Opens recorded through RecordOpen (within usage.retention_hours).
   open_count: int,
-  # File of the project's avatar, see Project.avatar; empty when none, and for
-  # an epic.
-  project_avatar: string,
-  # Unix seconds, GitLab's updated_at as of the last sync; 0 when unknown.
-  updated_at: int
+  # File of the project's avatar, see Project.avatar; absent when none, and
+  # for an epic.
+  project_avatar: ?string,
+  # Unix seconds, GitLab's updated_at as of the last sync; absent when unknown.
+  updated_at: ?int
 )
 
 # What a write or RecordOpen targets; an issue is a work_item.
@@ -2343,16 +2345,18 @@ type HistoryEvent (
   kind: IssuableKind,
   project_id: int,
   iid: int,
-  # Empty on a queued event whose issuable is not in the caches.
-  title: string,
-  web_url: string,
+  # Absent on a queued event whose issuable is not in the caches.
+  title: ?string,
+  # Absent like title.
+  web_url: ?string,
   # Seconds; set on a synced entry, absent on a queued one.
   time_spent: ?int,
   # A queued PostTime's duration as it was given ("1h30m"); absent on a synced
   # entry. The daemon can't turn it into seconds: GitLab's "1d" and "1w" depend
   # on the instance's settings.
   duration: ?string,
-  summary: string
+  # The timelog's note; absent when it has none.
+  summary: ?string
 )
 
 # One of the user's contribution events (GitLab's GET /events).
@@ -2363,13 +2367,13 @@ type ActivityEvent (
   # "joined", …
   action: string,
   # "Issue", "MergeRequest", "Milestone", …; of a comment, what was commented
-  # on; empty on pushes and membership events.
-  target_type: string,
+  # on; absent on pushes and membership events.
+  target_type: ?string,
   # The target's number in its project, where it has one.
   target_iid: ?int,
   target_title: ?string,
-  # 0 for events outside a project.
-  project_id: int,
+  # Absent for events outside a project.
+  project_id: ?int,
   # Absent when neither the project nor the item is in the store.
   project_path: ?string,
   # The issue or MR, a pushed branch's commits, else the project; absent when
@@ -2419,13 +2423,13 @@ type MergeRequest (
   assignees: []string,
   # Opens recorded through RecordOpen (within usage.retention_hours).
   open_count: int,
-  # File of the project's avatar, see Project.avatar; empty when none.
-  project_avatar: string,
+  # File of the project's avatar, see Project.avatar; absent when none.
+  project_avatar: ?string,
   # The project's full path ("team/api"): the stored project's, else the one
-  # in web_url; empty when neither gives it.
-  project_path: string,
-  # Unix seconds, GitLab's updated_at as of the last sync; 0 when unknown.
-  updated_at: int
+  # in web_url; absent when neither gives it.
+  project_path: ?string,
+  # Unix seconds, GitLab's updated_at as of the last sync; absent when unknown.
+  updated_at: ?int
 )
 
 # A project the user is a member of.
@@ -2435,9 +2439,9 @@ type Project (
   # Full namespace path ("team/backend/api").
   path: string,
   web_url: string,
-  # Absolute path of the avatar image on the daemon's machine; empty when the
-  # project has none.
-  avatar: string,
+  # Absolute path of the avatar image on the daemon's machine; absent when
+  # the daemon has none.
+  avatar: ?string,
   # Whether the project is archived (read-only on GitLab).
   archived: bool
 )
@@ -2583,8 +2587,9 @@ method AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 method UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
 # Creates an issue in a project, optionally under an epic. Sent to GitLab once,
-# never queued.
-method CreateWorkItem(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, parent: ?WorkItemRef) -> (iid: int, web_url: string)
+# never queued. iid and web_url are absent where GitLab created the issue but
+# its answer didn't say them.
+method CreateWorkItem(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, parent: ?WorkItemRef) -> (iid: ?int, web_url: ?string)
 
 # Counts an open of a project's work item or merge request, or of a group's
 # epic. Local only: works while dormant.

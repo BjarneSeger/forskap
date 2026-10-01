@@ -103,5 +103,7 @@ func ExampleClient_CreateWorkItem() {
 	case err != nil:
 		log.Fatal(err)
 	}
-	fmt.Printf("#%d %s\n", iid, url)
+	if iid != nil && url != nil {
+		fmt.Printf("#%d %s\n", *iid, *url)
+	}
 }

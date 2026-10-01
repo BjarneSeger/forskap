@@ -394,12 +394,14 @@ async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
     let issues = client.get_assigned_work_items(None).call().await;
     let issues = issues.ok()?.work_items;
-    let paths = issues.iter().map(|i| (&i.namespace_path, &i.web_url));
+    let paths = issues
+        .iter()
+        .map(|i| (i.namespace_path.as_deref(), i.web_url.as_str()));
     let mrs = client.get_assigned_merge_requests(None).call().await.ok()?;
     let paths = paths.chain(
         mrs.merge_requests
             .iter()
-            .map(|m| (&m.project_path, &m.web_url)),
+            .map(|m| (m.project_path.as_deref(), m.web_url.as_str())),
     );
     rows.extend(
         paths

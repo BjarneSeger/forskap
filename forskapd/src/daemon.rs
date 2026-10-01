@@ -631,7 +631,10 @@ mod tests {
         assert!(issues.iter().all(|i| !i.graph_status.is_empty()), "boards");
         let rate_limit = issues.iter().find(|i| i.iid == 12).unwrap();
         assert_eq!(rate_limit.graph_status, "Doing");
-        assert_eq!(rate_limit.namespace_path, "acme/backend/api");
+        assert_eq!(
+            rate_limit.namespace_path.as_deref(),
+            Some("acme/backend/api")
+        );
         assert!(rate_limit.web_url.starts_with("https://dry-run.invalid/"));
         let invoice = issues
             .iter()
@@ -678,7 +681,14 @@ mod tests {
         assert!(archived.projects[0].archived);
         let api = search("API").call().await.unwrap().projects;
         let api = api.iter().find(|p| p.id == AVATAR_PROJECT).unwrap();
-        assert!(api.avatar.starts_with(scratch.path().to_str().unwrap()));
+        let avatar = api.avatar.as_deref().unwrap();
+        assert!(avatar.starts_with(scratch.path().to_str().unwrap()));
+        let others = search("acme").call().await.unwrap().projects;
+        assert!(
+            others
+                .iter()
+                .all(|p| (p.id == AVATAR_PROJECT) == p.avatar.is_some())
+        );
 
         let mut mine = client.list_work_items(Some(WorkItemRole::author), None, None);
         let mine = mine.call().await.unwrap().work_items;
@@ -742,7 +752,7 @@ mod tests {
             let history = client.get_history(Some(1)).call().await.ok()?.events;
             history
                 .iter()
-                .any(|e| e.summary == "Dry run" && e.time_spent == Some(45 * 60))
+                .any(|e| e.summary.as_deref() == Some("Dry run") && e.time_spent == Some(45 * 60))
                 .then_some(())
         })
         .await;
@@ -760,10 +770,10 @@ mod tests {
             .call()
             .await
             .unwrap();
-        assert_eq!(created.iid, 11);
+        assert_eq!(created.iid, Some(11));
         assert_eq!(
-            created.web_url,
-            "https://dry-run.invalid/acme/backend/billing/-/issues/11"
+            created.web_url.as_deref(),
+            Some("https://dry-run.invalid/acme/backend/billing/-/issues/11")
         );
         until("the created issue", async || {
             let listed = keys(&run.assigned_work_items().await).contains(&(102, 11));
@@ -796,7 +806,7 @@ mod tests {
             let item = mine
                 .work_items
                 .into_iter()
-                .find(|i| i.iid == created.iid && i.project_id == Some(103))?;
+                .find(|i| Some(i.iid) == created.iid && i.project_id == Some(103))?;
             let parent = item.parent?;
             assert_eq!((parent.group_id, parent.iid), (Some(12), 1));
             parent.web_url

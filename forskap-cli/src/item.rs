@@ -62,8 +62,8 @@ impl Item {
     /// The project's full path, if known.
     pub fn project_path(&self) -> Option<&str> {
         let path = match self {
-            Item::Issue(i) => &i.namespace_path,
-            Item::Mr(m) => &m.project_path,
+            Item::Issue(i) => i.namespace_path.as_deref(),
+            Item::Mr(m) => m.project_path.as_deref(),
         };
         project_of(path, self.web_url())
     }
@@ -78,8 +78,8 @@ impl Item {
 }
 
 /// The project path a row carries, else the one in its URL.
-pub fn project_of<'a>(project_path: &'a str, web_url: &'a str) -> Option<&'a str> {
-    Some(project_path)
+pub fn project_of<'a>(project_path: Option<&'a str>, web_url: &'a str) -> Option<&'a str> {
+    project_path
         .filter(|p| !p.is_empty())
         .or_else(|| self::project_path(web_url))
 }
@@ -104,6 +104,7 @@ pub mod testing {
             "" => String::new(),
             path => format!("https://gitlab.example.com/{path}/-/{resource}/{iid}"),
         };
+        let path = (!path.is_empty()).then(|| path.to_string());
         match kind {
             RefKind::Issue => Item::Issue(WorkItem {
                 id: project_id * 1000 + iid,
@@ -111,7 +112,7 @@ pub mod testing {
                 r#type: "issue".to_string(),
                 project_id: Some(project_id),
                 group_id: None,
-                namespace_path: path.to_string(),
+                namespace_path: path,
                 title: title.to_string(),
                 web_url: url("issues"),
                 state: "opened".to_string(),
@@ -119,8 +120,8 @@ pub mod testing {
                 time_spent: Some(0),
                 graph_status: String::new(),
                 open_count: 0,
-                project_avatar: String::new(),
-                updated_at: 0,
+                project_avatar: None,
+                updated_at: None,
             }),
             RefKind::Mr => Item::Mr(MergeRequest {
                 id: project_id * 1000 + iid,
@@ -131,9 +132,9 @@ pub mod testing {
                 state: "opened".to_string(),
                 assignees: Vec::new(),
                 open_count: 0,
-                project_avatar: String::new(),
-                project_path: path.to_string(),
-                updated_at: 0,
+                project_avatar: None,
+                project_path: path,
+                updated_at: None,
             }),
         }
     }
@@ -146,7 +147,7 @@ pub mod testing {
             r#type: "epic".into(),
             project_id: None,
             group_id: Some(group_id),
-            namespace_path: String::new(),
+            namespace_path: None,
             title: String::new(),
             web_url: format!("https://gl/groups/g{group_id}/-/epics/{iid}"),
             state: "opened".into(),
@@ -154,8 +155,8 @@ pub mod testing {
             time_spent: None,
             graph_status: String::new(),
             open_count: 0,
-            project_avatar: String::new(),
-            updated_at: 0,
+            project_avatar: None,
+            updated_at: None,
         }
     }
 }
@@ -209,8 +210,8 @@ mod tests {
     #[test]
     fn project_of_prefers_the_field_over_the_url() {
         let url = "https://gitlab.com/old/name/-/issues/1";
-        assert_eq!(project_of("team/api", url), Some("team/api"));
-        assert_eq!(project_of("", url), Some("old/name"));
-        assert_eq!(project_of("", ""), None);
+        assert_eq!(project_of(Some("team/api"), url), Some("team/api"));
+        assert_eq!(project_of(None, url), Some("old/name"));
+        assert_eq!(project_of(None, ""), None);
     }
 }

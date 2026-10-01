@@ -127,10 +127,10 @@ connection releaser. Enum values come from constants: `KindWorkItem` /
 Issues, tasks and epics are all `WorkItem`s, told apart by `Type` (`"issue"`,
 `"task"`, `"incident"`, `"test_case"`, `"epic"`). An issue lives in a project and
 has `Project_id` set, an epic in a group and has `Group_id` set; exactly one of the
-two is. `Namespace_path` is the project's or the group's full path. `Id` is the
-work item's global ID, the one GitLab's work items API knows. An issue under an epic
-carries it as `Parent`, a `WorkItemRef` with the epic's group, number, title and
-absolute link.
+two is. `Namespace_path` is the project's or the group's full path (`nil` when
+unknown). `Id` is the work item's global ID, the one GitLab's work items API knows. An
+issue under an epic carries it as `Parent`, a `WorkItemRef` with the epic's group,
+number, title and absolute link.
 
 `c.Search` returns the issues and epics it finds as one list, ranked together under
 one limit; pass `types` to keep some of them, `excludeTypes` to leave some out
@@ -171,8 +171,9 @@ closed := []forskap.WorkItemState{forskap.StateClosed}
 issues, err := c.ListWorkItems(ctx, &role, &since, &closed)
 ```
 
-`c.CreateWorkItem` files an issue and returns its number and link; the issue
-shows in `Search` and `ListWorkItems` at once. A `parent` puts it under an epic,
+`c.CreateWorkItem` files an issue and returns its number and link (`nil` where GitLab
+created it but its answer didn't say them); the issue shows in `Search` and
+`ListWorkItems` at once. A `parent` puts it under an epic,
 named by its group and number:
 
 ```go

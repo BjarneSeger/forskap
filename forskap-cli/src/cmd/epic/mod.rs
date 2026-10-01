@@ -67,7 +67,8 @@ pub async fn resolve(client: &VarlinkClient, iid: i64, group: Option<&str>) -> R
 
 /// The group path the epic carries, else the one in its URL.
 pub fn group_of(e: &WorkItem) -> Option<&str> {
-    Some(e.namespace_path.as_str())
+    e.namespace_path
+        .as_deref()
         .filter(|p| !p.is_empty())
         .or_else(|| group_path(&e.web_url))
 }
@@ -239,11 +240,11 @@ mod tests {
     fn the_carried_group_path_beats_the_url() {
         let mut e = epic(3, 5);
         assert_eq!(group_of(&e), Some("g3"));
-        e.namespace_path = "team/backend".into();
+        e.namespace_path = Some("team/backend".into());
         assert_eq!(group_of(&e), Some("team/backend"));
         e.web_url = String::new();
         assert_eq!(group_of(&e), Some("team/backend"));
-        e.namespace_path = String::new();
+        e.namespace_path = None;
         assert_eq!(group_of(&e), None);
     }
 

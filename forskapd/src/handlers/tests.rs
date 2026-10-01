@@ -981,8 +981,11 @@ async fn a_created_issue_is_searchable_at_once() {
 
     let mut call = create_work_item(&h, 7, "Fix the login", None).await;
     let created: CreateWorkItem_Reply = reply(&mut call);
-    assert_eq!(created.iid, 12);
-    assert_eq!(created.web_url, "https://gitlab.test/g/p7/-/issues/12");
+    assert_eq!(created.iid, Some(12));
+    assert_eq!(
+        created.web_url.as_deref(),
+        Some("https://gitlab.test/g/p7/-/issues/12")
+    );
 
     let found = run_search(&h, "login", None, None).await.work_items;
     assert_eq!(iids(&found), [12]);
@@ -1010,7 +1013,7 @@ async fn a_created_issue_assigned_to_me_is_listed_at_once() {
         // Held anew: a create restarts the list the one before set off.
         let _held = fake.gate("issues");
         let mut call = create_work_item(&h, 7, title, Some(true)).await;
-        assert_eq!(reply::<CreateWorkItem_Reply>(&mut call).iid, iid);
+        assert_eq!(reply::<CreateWorkItem_Reply>(&mut call).iid, Some(iid));
     }
 
     let assigned = assigned_work_items(&h, None).await;
@@ -1181,13 +1184,18 @@ async fn create_work_item_replies_success_whatever_gitlab_answered() {
     let (h, _dir) = connected_handlers(&fake);
 
     let mut call = create_work_item(&h, 7, "Fix the login", None).await;
-    let unreadable: CreateWorkItem_Reply = reply(&mut call);
-    assert_eq!((unreadable.iid, unreadable.web_url.as_str()), (0, ""));
+    let unreadable = call.take_reply().unwrap();
+    assert_eq!(unreadable.error, None);
+    // Success, with nothing to say: neither field.
+    assert_eq!(unreadable.parameters, Some(serde_json::json!({})));
 
     let mut call = create_work_item(&h, 7, "Fix the login", None).await;
     let created: CreateWorkItem_Reply = reply(&mut call);
-    assert_eq!(created.iid, 12);
-    assert!(created.web_url.ends_with("/issues/12"), "{created:?}");
+    assert_eq!(created.iid, Some(12));
+    assert!(
+        created.web_url.as_deref().unwrap().ends_with("/issues/12"),
+        "{created:?}"
+    );
     assert_eq!(h.sync.store().issues.scan(RowScope::Prefix(7)).unwrap(), []);
 }
 
@@ -1427,10 +1435,10 @@ async fn list_work_items_serves_both_roles_once_newest_first() {
 
     let issues = list_work_items(&h, None, None, None).await;
     assert_eq!(iids(&issues), [1, 2, 3]);
-    let updated: Vec<i64> = issues.iter().map(|i| i.updated_at).collect();
-    assert_eq!(updated, [300, 200, 100]);
+    let updated: Vec<Option<i64>> = issues.iter().map(|i| i.updated_at).collect();
+    assert_eq!(updated, [Some(300), Some(200), Some(100)]);
     assert_eq!(issues[1].state, "closed", "closed ones are listed too");
-    assert_eq!(issues[2].namespace_path, "other/x");
+    assert_eq!(issues[2].namespace_path.as_deref(), Some("other/x"));
     assert_eq!(issues[2].open_count, 1);
     assert_eq!(issues[2].graph_status, "", "its boards never synced");
 }
@@ -1589,7 +1597,7 @@ async fn get_assigned_merge_requests_serves_newest_first_with_group_filter() {
     let all = assigned_mrs(&h, None).await;
     assert_eq!(all.iter().map(|m| m.iid).collect::<Vec<_>>(), [11, 10]);
     assert_eq!(all[0].assignees, ["me"]);
-    assert_eq!(all[0].updated_at, 200);
+    assert_eq!(all[0].updated_at, Some(200));
     let team = assigned_mrs(&h, Some(vec!["team".into()])).await;
     assert_eq!(team.iter().map(|m| m.iid).collect::<Vec<_>>(), [10]);
 }
@@ -1658,9 +1666,14 @@ async fn search_finds_epics_by_title_label_and_reference() {
     );
     let found = epics(&r);
     assert_eq!(found[0].web_url, "https://gl/groups/team/-/epics/7");
-    assert_eq!(found[0].namespace_path, "team", "from the group row");
     assert_eq!(
-        found[1].namespace_path, "other",
+        found[0].namespace_path.as_deref(),
+        Some("team"),
+        "from the group row"
+    );
+    assert_eq!(
+        found[1].namespace_path.as_deref(),
+        Some("other"),
         "no row for group 6: from the link"
     );
     assert!(issue_iids(&r).is_empty() && r.groups.is_empty());
@@ -1696,8 +1709,7 @@ async fn search_serves_an_epic_as_its_groups_work_item() {
     assert_eq!(billing.r#type, "epic");
     assert_eq!((billing.project_id, billing.group_id), (None, Some(5)));
     assert_eq!(billing.parent, None);
-    assert_eq!(billing.time_spent, None);
-    assert!(billing.project_avatar.is_empty());
+    assert_eq!((billing.time_spent, &billing.project_avatar), (None, &None));
 }
 
 /// Issues and epics are ranked together and share one limit.
@@ -1955,11 +1967,11 @@ async fn search_hits_carry_their_update_time() {
     seed_corpus(&h);
 
     let r = run_search(&h, "oauth", None, None).await;
-    assert_eq!(r.work_items[0].updated_at, 100);
-    assert_eq!(r.merge_requests[0].updated_at, 50);
+    assert_eq!(r.work_items[0].updated_at, Some(100));
+    assert_eq!(r.merge_requests[0].updated_at, Some(50));
     let r = run_typed_search(&h, "i", &["epic"], None).await;
     let updated: Vec<_> = r.work_items.iter().map(|e| (e.iid, e.updated_at)).collect();
-    assert_eq!(updated, [(8, 200), (7, 100)]);
+    assert_eq!(updated, [(8, Some(200)), (7, Some(100))]);
 }
 
 /// The flag is all an archived project differs by: it matches and sorts
@@ -2191,8 +2203,8 @@ async fn items_carry_their_projects_path() {
     seed_assigned_mrs(&h);
 
     let r = run_search(&h, "oauth", None, None).await;
-    assert_eq!(r.work_items[0].namespace_path, "team/p");
-    assert_eq!(r.merge_requests[0].project_path, "team/p");
+    assert_eq!(r.work_items[0].namespace_path.as_deref(), Some("team/p"));
+    assert_eq!(r.merge_requests[0].project_path.as_deref(), Some("team/p"));
 
     seed(
         &h,
@@ -2203,14 +2215,23 @@ async fn items_carry_their_projects_path() {
         }],
     );
     let r = run_search(&h, "oauth", None, None).await;
-    assert_eq!(r.work_items[0].namespace_path, "team/moved");
-    assert_eq!(r.merge_requests[0].project_path, "team/moved");
-    let paths: Vec<String> = assigned_mrs(&h, None)
+    assert_eq!(
+        r.work_items[0].namespace_path.as_deref(),
+        Some("team/moved")
+    );
+    assert_eq!(
+        r.merge_requests[0].project_path.as_deref(),
+        Some("team/moved")
+    );
+    let paths: Vec<Option<String>> = assigned_mrs(&h, None)
         .await
         .into_iter()
         .map(|m| m.project_path)
         .collect();
-    assert_eq!(paths, ["other/x", "team/moved"]);
+    assert_eq!(
+        paths,
+        [Some("other/x".to_string()), Some("team/moved".to_string())]
+    );
 }
 
 /// The rows name the files, so a read works without them on disk.
@@ -2221,13 +2242,11 @@ async fn search_hits_carry_their_projects_avatar() {
     seed_avatars(&h);
 
     let r = run_search(&h, "oauth", None, None).await;
-    assert_eq!(r.work_items[0].project_avatar, avatar_path(&dir, "1-a.png"));
-    assert_eq!(
-        r.merge_requests[0].project_avatar,
-        avatar_path(&dir, "1-a.png")
-    );
+    let avatar = Some(avatar_path(&dir, "1-a.png"));
+    assert_eq!(r.work_items[0].project_avatar, avatar);
+    assert_eq!(r.merge_requests[0].project_avatar, avatar);
     let r = run_search(&h, "auth-serv", None, None).await;
-    assert_eq!(r.projects[0].avatar, avatar_path(&dir, "4-b.svg"));
+    assert_eq!(r.projects[0].avatar, Some(avatar_path(&dir, "4-b.svg")));
 }
 
 #[tokio::test]
@@ -2237,13 +2256,13 @@ async fn assigned_items_carry_their_projects_avatar() {
     seed_assigned_mrs(&h);
     seed_avatars(&h);
 
-    let avatars = |project_avatars: Vec<(i64, String)>| -> Vec<(i64, String)> {
+    let avatars = |project_avatars: Vec<(i64, Option<String>)>| -> Vec<(i64, Option<String>)> {
         let mut sorted = project_avatars;
         sorted.sort();
         sorted.dedup();
         sorted
     };
-    let expected = [(1, avatar_path(&dir, "1-a.png")), (2, String::new())];
+    let expected = [(1, Some(avatar_path(&dir, "1-a.png"))), (2, None)];
     let issues = assigned_work_items(&h, None).await;
     assert_eq!(
         avatars(
@@ -2315,14 +2334,17 @@ async fn get_history_merges_queued_and_synced_newest_first() {
     assert_eq!(post_time(&h, 7, 5, IssuableKind::merge_request).await, None);
 
     let events = history(&h, Some(7)).await;
-    let titles: Vec<&str> = events.iter().map(|e| e.title.as_str()).collect();
+    let titles: Vec<&str> = events.iter().filter_map(|e| e.title.as_deref()).collect();
     assert_eq!(
         titles,
         ["queued mr", "newer", "older"],
         "30 days back is outside"
     );
     assert_eq!(events[0].source, HistorySource::queued);
-    assert_eq!(events[0].web_url, "https://gl/g/p/-/merge_requests/5");
+    assert_eq!(
+        events[0].web_url.as_deref(),
+        Some("https://gl/g/p/-/merge_requests/5")
+    );
     // As it was given: the daemon doesn't know GitLab's day or week.
     assert_eq!(
         (events[0].time_spent, events[0].duration.as_deref()),
@@ -2338,6 +2360,21 @@ async fn get_history_merges_queued_and_synced_newest_first() {
     assert!(json.get("time_spent").is_none(), "{json}");
     let json = serde_json::to_value(&events[2]).unwrap();
     assert!(json.get("duration").is_none(), "{json}");
+}
+
+/// A queued entry whose item isn't stored has nothing to name it by, and one
+/// without a summary has none: those fields are left out.
+#[tokio::test]
+async fn a_queued_entry_leaves_out_what_the_daemon_does_not_know() {
+    let (h, _dir) = unreachable_handlers();
+    assert_eq!(post_time(&h, 8, 1, IssuableKind::work_item).await, None);
+    let events = history(&h, Some(1)).await;
+    assert_eq!(events.len(), 1);
+    let json = serde_json::to_value(&events[0]).unwrap();
+    for absent in ["title", "web_url", "summary", "time_spent"] {
+        assert!(json.get(absent).is_none(), "{absent} in {json}");
+    }
+    assert_eq!(json["duration"], "30m");
 }
 
 // ── Activity ───────────────────────────────────────────────────────────
