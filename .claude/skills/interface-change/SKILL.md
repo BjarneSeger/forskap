@@ -13,6 +13,12 @@ this list top to bottom.
 
 - Interface name is `org.thehoster.forskapd`. Keep the existing style: one blank
   line between declarations, optional params/fields as `?type`.
+- Document in the file itself: a short `#` comment on the lines before each new type,
+  method and error, and before each field or enum variant whose name doesn't say it
+  all (units, when it is absent or empty, since which version it is sent). Comments go
+  on their own lines: that is what both generators and systemd's `varlinkctl` parse,
+  and what introspection shows. Leave the `interface` line without one: the Go
+  generator would turn it into a second package comment of the binding.
 - Bump the version in `forskap-api/Cargo.toml` **in the same feature commit**.
   Convention (see git history): the api crate's version moves inside the commit that
   changes the interface; the workspace version moves only in separate
@@ -76,8 +82,10 @@ build and are gitignored.
 
 ## 5. Docs
 
-Update `forskapd/docs/varlink_interface.md` — it documents every method, type,
-and error. Keep it complete; it is the human-facing contract.
+Update `forskapd/docs/varlink_interface.md` with what the `.varlink` comments can't
+say: what a method does beyond its line, ordering, caching, edge cases, tables,
+examples. Don't copy type bodies or field lists there — the doc points to the
+`.varlink` file for the shapes, and a copy drifts.
 
 ## 6. Go binding (CI trap)
 
