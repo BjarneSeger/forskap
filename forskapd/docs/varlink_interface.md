@@ -35,6 +35,60 @@ jobs that display it rerun right after it lands. `CreateWorkItem` is the excepti
 it is sent to GitLab once and never queued, so it fails while GitLab is away (see
 [Writing directly](#writing-directly-never-queued)).
 
+# Finding the socket
+
+The daemon listens on a unix socket of the user it runs as. A client looks for it in
+this order:
+
+1. `$FORSKAPD_SOCKET`, used verbatim as a varlink address (`unix:/path/to.socket`),
+   else the same under its name from before the rename, `$GITLAB_TRACKRD_SOCKET`.
+2. `$XDG_RUNTIME_DIR/forskapd.socket`, where that variable holds an absolute path;
+   not on macOS, which has no runtime directory.
+3. `forskapd/forskapd.socket` in the user's data directory: `$XDG_DATA_HOME` if it is
+   an absolute path, else `~/.local/share`; on macOS `~/Library/Application Support`.
+
+The last two are the daemon's default socket: `forskap_api::default_socket()` to a
+Rust client, `DefaultAddress()` to a Go one. A daemon told to use another
+(`forskapd --socket`, `[server] socket` in its config) is only found through
+`$FORSKAPD_SOCKET`. The `forskap` CLI also takes a `socket` from its own config file,
+after the environment and before the default; that file is the CLI's business, and
+other clients don't read it.
+
+The socket is its user's alone: mode 0600, in a directory of theirs, never a shared
+one like `/tmp` where another user could put a socket first. On Linux the packages
+ship a systemd user socket unit, `forskapd.socket`, listening on the runtime directory's
+path; once it is enabled (`systemctl --user enable --now forskapd.socket`), the first
+connection starts the daemon, so a client needn't check whether it runs. Installed
+through Homebrew, the daemon runs as a `brew services` service and creates the socket
+when it starts.
+
+# Compatibility
+
+Until forskap-api 1.0 the interface still changes incompatibly between minor
+versions. A client tells which version a daemon speaks by `GetStatus.api_version`; a
+daemon that answers `GetStatus` with `MethodNotFound` is older than 0.32.0, and
+ignores an argument it doesn't know instead of refusing it.
+
+From forskap-api 1.0 on, a client can rely on these:
+
+- Nothing is removed or renamed: no method, type, field, enum variant or error.
+- A field new to a reply is optional (`?T`).
+- A new argument is optional, so a call that leaves it out means what it meant before.
+- An enum that appears in replies (`IssuableKind`, `HistorySource`, `SyncJobStatus`,
+  `NotAuthReason`) gets no new variants: a new state is a new optional field.
+  The enums only arguments take (`SearchKind`, `WorkItemRole`, `WorkItemState`,
+  `CacheScope`) may get new ones, which an older daemon refuses.
+- An incompatible change is a new interface, under a new name, served next to the old
+  one.
+
+And it must tolerate these:
+
+- Reply fields it doesn't know: it ignores them. The Rust and Go bindings do.
+- `org.varlink.service.InvalidParameter` for an argument or an enum value the daemon
+  doesn't know: a newer client talking to an older daemon. `parameter` names an
+  unknown field, and says which value for an unknown enum value.
+- `org.varlink.service.MethodNotFound` for a method the daemon doesn't have.
+
 # Types
 
 The fields are described in the definition; this is what their lines leave out.
