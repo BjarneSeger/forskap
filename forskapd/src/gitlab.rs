@@ -744,8 +744,9 @@ struct Page {
 ///
 /// A short page is not the last one: `/events` drops the rows the user may
 /// not see after slicing the page (the `gitlab` crate's paged query stops
-/// there and loses the rest), so only an empty page or a short page without
-/// a successor ends the walk. Pages are retried one at a time.
+/// there and loses the rest), and a page whose rows were all dropped comes
+/// back empty with a successor, so only `limit` or a short page without a
+/// successor ends the walk. Pages are retried one at a time.
 async fn walk_pages<C>(
     client: &C,
     listing: &Listing,
@@ -759,11 +760,10 @@ where
     loop {
         let fetched =
             retry_transient("list", || async { fetch_page(client, listing, page).await }).await?;
-        let empty = fetched.rows.is_empty();
         let short = fetched.rows.len() < PER_PAGE;
         rows.extend(fetched.rows);
         let enough = limit.is_some_and(|l| rows.len() >= l);
-        if empty || enough || (short && !fetched.has_next) {
+        if enough || (short && !fetched.has_next) {
             break;
         }
         page += 1;
@@ -1464,6 +1464,16 @@ mod tests {
         let rows = walk_pages(&fake, &EVENTS, None).await.unwrap();
         assert_eq!(rows.len(), 17);
         assert_eq!(fake.urls().len(), 1);
+    }
+
+    /// A page whose rows were all dropped after slicing is empty but
+    /// announces a successor.
+    #[tokio::test]
+    async fn an_empty_page_with_a_successor_is_followed() {
+        let fake = PagedFake::with(vec![Answer::Rows(0..0, true), Answer::Rows(0..40, false)]);
+        let rows = walk_pages(&fake, &EVENTS, None).await.unwrap();
+        assert_eq!(ids(&rows), (0..40).collect::<Vec<_>>());
+        assert_eq!(fake.urls().len(), 2);
     }
 
     /// GitLab stops counting at 10 000 rows, so a missing successor on a

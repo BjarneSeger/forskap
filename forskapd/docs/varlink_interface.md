@@ -379,7 +379,9 @@ first. They are the events the sync keeps as evidence for the `"tracked"` popula
 so they reach back `search.tracked_retention_hours` (default 90 days) at most: a
 larger `days` returns what is stored. The sync walks every page GitLab announces:
 `/events` drops the rows the user may not see after slicing a page, so a short page
-is not the last one. Events carry no link of their own; `web_url`
+is not the last one; and it re-walks the whole window every
+`search.full_interval_secs`, so an event GitLab showed late or hid at the time is
+picked up. Events carry no link of their own; `web_url`
 and `project_path` come from the stored issue, merge request and project rows and
 are null for events in projects the store doesn't know (the project row exists for
 member projects only). A comment's text is not stored. Served from the store alone;

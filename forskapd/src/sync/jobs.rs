@@ -211,11 +211,13 @@ impl Job {
                 every: c.search.partial_interval_secs,
                 full_every: Some(c.search.full_interval_secs),
             },
-            // Events never change once created: after the first run fills
-            // the window, deltas are all there is.
+            // Events never change once created, but GitLab's answer does: a
+            // row hidden at walk time, an import landing with an old
+            // `created_at`. The full cadence re-walks the window (a few
+            // pages) so nothing stays missed.
             Self::Events => Cadence {
                 every: c.search.partial_interval_secs,
-                full_every: Some(u64::MAX),
+                full_every: Some(c.search.full_interval_secs),
             },
             // Once per avatar: only a changed fingerprint (its URL) makes
             // the job due again.
@@ -877,6 +879,22 @@ mod tests {
         }
     }
 
+    /// GitLab's answer to `/events` changes though events don't, so the
+    /// window is re-walked on the full cadence; a wider window is a new walk.
+    #[test]
+    fn events_rewalk_the_window_on_the_full_cadence() {
+        let cfg = crate::config::defaults();
+        let mut wider = crate::config::defaults();
+        wider.search.tracked_retention_hours *= 2;
+        let cadence = Job::Events.cadence(&cfg);
+        assert_eq!(cadence.every, cfg.search.partial_interval_secs);
+        assert_eq!(cadence.full_every, Some(cfg.search.full_interval_secs));
+        assert_ne!(
+            Job::Events.fingerprint(&cfg),
+            Job::Events.fingerprint(&wider)
+        );
+    }
+
     /// Issue #1 of project 7 as GitLab showed it at `hour` o'clock.
     fn issue_at(hour: u32, title: &str) -> serde_json::Value {
         let mut issue = issue_json(7, 1, title);
@@ -1271,6 +1289,28 @@ mod tests {
                 },
             ],
             "`after` is exclusive and zoned, so each fetch starts two days before"
+        );
+
+        // GitLab's answer changes though events don't: a row it hid at walk
+        // time shows up, one it showed is gone. The full re-walk adds the
+        // first and keeps the second.
+        fake.serve(
+            "events",
+            vec![event_json(3, 9, "commented on", NOW - 20 * DAY)],
+        );
+        run(&s, Job::Events, ctx(&fake, true, NOW - 3600)).await;
+        let mut kept: Vec<i64> = s
+            .events
+            .scan(RowScope::All)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(
+            kept,
+            [1, 3],
+            "a re-walk backfills and drops nothing inside the window"
         );
     }
 

@@ -401,8 +401,10 @@ impl Resource for Event {
     fn key(&self) -> RowKey {
         (self.created_at, positive(self.id))
     }
+    /// A row without a readable `created_at` would sort before every
+    /// window; dropping it here counts it as malformed.
     fn is_valid(&self) -> bool {
-        self.id > 0
+        self.id > 0 && self.created_at > 0
     }
 }
 
@@ -784,6 +786,13 @@ mod tests {
         .unwrap();
         assert_eq!(old.target(), ("Issue", 3));
         assert_eq!(old.note.body, "");
+    }
+
+    #[test]
+    fn an_event_without_a_readable_timestamp_is_malformed() {
+        let e: Event = serde_json::from_value(json!({"id": 1, "created_at": "yesterday"})).unwrap();
+        assert_eq!(e.created_at, 0);
+        assert!(!e.is_valid());
     }
 
     #[test]
