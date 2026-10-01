@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# Point Formula/forskap.rb at a release tag: rewrites its `url` and `sha256`.
+# Point Formula/forskap.rb at a release tag: renders it anew from the
+# release's checksums file (render-formula.sh), so it downloads that
+# release's prebuilt binaries.
 #
 #   bump-formula.sh v1.2.3 [formula]
 #
-# Run by the release workflow after GoReleaser published the tag. Exits 0
-# without touching the formula for a pre-release tag or one that is not newer
-# than what the formula already names, so re-running an old release is safe.
+# Run by the release workflow after GoReleaser published the tag; needs `gh`
+# with a token (GH_TOKEN). Exits 0 without touching the formula for a
+# pre-release tag or one that is not newer than what the formula already
+# names, so re-running an old release is safe. Fails if the release lacks the
+# archive of a platform the formula serves.
 set -euo pipefail
 
 tag="${1:?usage: bump-formula.sh <tag> [formula]}"
@@ -17,7 +21,10 @@ if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 0
 fi
 
-current="$(sed -n 's|^  url ".*/archive/refs/tags/\(v[^"]*\)\.tar\.gz"$|\1|p' "$formula")"
+# The tag of the first url: a source tarball (archive/refs/tags/<tag>.tar.gz,
+# the formula before 0.13) or a release asset (releases/download/<tag>/...).
+current="$(sed -nE 's#^ +url ".*/(archive/refs/tags|releases/download)/(v[0-9][^/"]*)[/"].*#\2#p' "$formula" | head -n 1)"
+current="${current%.tar.gz}"
 if [[ -z "$current" ]]; then
   echo "no release url found in $formula" >&2
   exit 1
@@ -27,18 +34,13 @@ if [[ "$current" != "$tag" && "$(printf '%s\n' "$current" "$tag" | sort -V | tai
   exit 0
 fi
 
-url="https://github.com/$repo/archive/refs/tags/$tag.tar.gz"
-tarball="$(mktemp)"
-trap 'rm -f "$tarball"' EXIT
-curl --fail --silent --show-error --location --retry 5 --output "$tarball" "$url"
-sha="$(sha256sum "$tarball" | cut -d ' ' -f 1)"
+version="${tag#v}"
+checksums="forskap_${version}_checksums.txt"
+dir="$(mktemp -d)"
+trap 'rm -rf "$dir"' EXIT
+gh release download "$tag" --repo "$repo" --pattern "$checksums" --dir "$dir"
 
-sed -i.bak \
-  -e "s|^  url \".*\"\$|  url \"$url\"|" \
-  -e "s|^  sha256 \".*\"\$|  sha256 \"$sha\"|" \
-  "$formula"
-rm -f "$formula.bak"
-
-grep -q "^  url \"$url\"\$" "$formula"
-grep -q "^  sha256 \"$sha\"\$" "$formula"
-echo "$formula now names $tag ($sha)"
+bash "$(dirname "${BASH_SOURCE[0]}")/render-formula.sh" --strict \
+  "$version" "https://github.com/$repo/releases/download/$tag" "$dir/$checksums" >"$dir/forskap.rb"
+mv "$dir/forskap.rb" "$formula"
+echo "$formula now names $tag"

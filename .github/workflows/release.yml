@@ -117,9 +117,10 @@ jobs:
       - name: List the checksums
         run: cat dist/*_checksums.txt
 
-  # Tags only: point the Homebrew formula (Formula/forskap.rb) at the release
-  # just published and commit that to main. A push made with GITHUB_TOKEN
-  # starts no workflow, hence the explicit formula test below.
+  # Tags only: render the Homebrew formula (Formula/forskap.rb) for the
+  # release just published, from its checksums file, and commit that to main.
+  # A push made with GITHUB_TOKEN starts no workflow, hence the explicit
+  # formula test below.
   bump-formula:
     if: github.ref_type == 'tag'
     needs: release
@@ -133,6 +134,8 @@ jobs:
 
       - name: Point the formula at the tag
         run: bash .github/scripts/bump-formula.sh "$GITHUB_REF_NAME"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Commit to main
         id: push

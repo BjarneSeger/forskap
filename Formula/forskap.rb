@@ -1,8 +1,10 @@
 class Forskap < Formula
   desc "Cached GitLab CLI and daemon with time-tracking helpers"
   homepage "https://github.com/BjarneSeger/forskap"
-  # The release workflow rewrites `url` and `sha256` for every stable tag
-  # (.github/scripts/bump-formula.sh).
+  # Builds the source of the release it names. At the next stable tag the
+  # release workflow replaces this file with a formula that installs the
+  # release's prebuilt binaries (.github/scripts/bump-formula.sh renders it
+  # with render-formula.sh).
   url "https://github.com/BjarneSeger/forskap/archive/refs/tags/v0.12.0.tar.gz"
   sha256 "973e4ca319135535c14bd832e2b2b1ad71ab69041cac5b6ce797aa716f12cf63"
   license "GPL-3.0-only"
