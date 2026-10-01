@@ -1,5 +1,8 @@
 /target
 forskap-cli/completions/
+# The macOS release archive, handed to GoReleaser in CI (release.yml); a tag
+# release refuses an untracked file.
+/dist-darwin/
 # Rendered in CI by the goreleaser `before` hook (gen-config-template).
 forskapd/packaging/config.toml
 # Transient copy made by the Go binding's `go generate` step; the generated

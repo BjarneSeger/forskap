@@ -20,16 +20,17 @@ Install the `forskap-utils` package (deb, rpm and arch packages plus prebuilt
 binaries are on the releases tab). It ships the `forskapd` daemon, the `forskap`
 CLI, shell completions, and systemd user units.
 
-On macOS, install with [Homebrew](https://brew.sh). This repository is its own tap;
-the formula builds the daemon and the CLI from the source of the latest release and
-installs the shell completions:
+On macOS, install with [Homebrew](https://brew.sh). This repository is its own tap:
 
 ```sh
 brew tap bjarneseger/forskap https://github.com/BjarneSeger/forskap
 brew install forskap
 ```
 
-This needs a release newer than 0.12.0, which does not build on macOS.
+Starting with the first release after 0.12.0, the formula installs that release's
+prebuilt binaries (macOS on Apple silicon, Linux amd64 and arm64) and the shell
+completions. Intel Macs are not supported by the formula: it refuses to install there
+and points to `brew install --HEAD`, which builds `main` from source.
 
 ## 2. Start the daemon
 

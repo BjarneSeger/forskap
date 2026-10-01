@@ -1,13 +1,14 @@
 name: Homebrew
 
 # Installs the formula of this repository's tap with Homebrew, runs
-# `brew test` and, on macOS, the daemon as a launchd service. This is the
-# only macOS build of the workspace there is. Two modes:
+# `brew test` and, on macOS, the daemon as a launchd service. Two modes:
 #
-# - `checkout` (pushes and pull requests): the formula builds the source of
-#   the checkout, so a change is tried on macOS before it is released.
-# - `stable` (manual runs, and the release workflow after it bumped the
-#   formula): the formula as committed, built from the release tarball it
+# - `checkout` (pushes and pull requests): the checkout is built with cargo,
+#   packed like a release archive and installed through the formula the
+#   release workflow would render for it, so a change is tried on macOS
+#   before it is released.
+# - `stable` (manual runs, and the release workflow after it rendered the
+#   formula for a tag): the formula as committed, downloading the release it
 #   names, the way a user gets it.
 on:
   push:
@@ -16,6 +17,11 @@ on:
     paths:
       - "Formula/**"
       - ".github/workflows/brew.yml"
+      # Pack the archive and render the formula that checkout mode installs.
+      - ".github/scripts/package-release.sh"
+      - ".github/scripts/render-formula.sh"
+      # Gives the Linux release archives the layout the formula expects.
+      - ".goreleaser.yaml"
       # What decides whether the workspace builds on macOS at all: a feature
       # that only a Linux-only dependency enables goes unnoticed elsewhere.
       - "Cargo.toml"
@@ -27,6 +33,9 @@ on:
     paths:
       - "Formula/**"
       - ".github/workflows/brew.yml"
+      - ".github/scripts/package-release.sh"
+      - ".github/scripts/render-formula.sh"
+      - ".goreleaser.yaml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "*/Cargo.toml"
@@ -34,7 +43,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: What the formula builds.
+        description: What the formula installs.
         type: choice
         options:
           - stable
@@ -47,7 +56,7 @@ on:
         type: string
         required: false
       mode:
-        description: "What the formula builds: stable or checkout."
+        description: "What the formula installs: stable or checkout."
         type: string
         default: stable
 
@@ -93,6 +102,61 @@ jobs:
           ln -s "$GITHUB_WORKSPACE" "$taps/homebrew-forskap"
           brew info bjarneseger/forskap/forskap
 
+      # Checkout mode never downloads the release the committed formula
+      # names; this still checks its url and sha256.
+      - name: Fetch the release the formula names
+        if: env.MODE == 'checkout'
+        run: brew fetch --build-from-source bjarneseger/forskap/forskap
+
+      - name: Install Rust
+        if: env.MODE == 'checkout'
+        uses: dtolnay/rust-toolchain@stable
+
+      # The build and the archive of a release: release.yml's macOS job
+      # packs with the same script, GoReleaser gives the Linux archives the
+      # same layout. The archive is named after the workspace version, which
+      # the formula's test compares with `forskap --version`.
+      - name: Build and pack the checkout
+        if: env.MODE == 'checkout'
+        env:
+          # As in release.yml.
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          cargo build --release --locked --package forskapd --package forskap-cli --bin forskapd --bin forskap
+          case "$RUNNER_OS/$RUNNER_ARCH" in
+            macOS/ARM64) platform="darwin arm64" ;;
+            Linux/X64) platform="linux amd64" ;;
+            Linux/ARM64) platform="linux arm64" ;;
+            *) echo "no release archive for $RUNNER_OS/$RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+          # shellcheck disable=SC2086 # $platform is two arguments
+          archive="$(bash .github/scripts/package-release.sh "$version" $platform target/release "$RUNNER_TEMP/dist")"
+          tar -tvzf "$archive"
+          cd "$RUNNER_TEMP/dist"
+          (sha256sum -- *.tar.gz 2>/dev/null || shasum -a 256 -- *.tar.gz) > checksums.txt
+          cat checksums.txt
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      # Deployment target and signature of what the archive carries: the
+      # linker signs ad hoc, nothing notarizes it.
+      - name: Inspect the macOS binaries
+        if: env.MODE == 'checkout' && runner.os == 'macOS'
+        run: |
+          for bin in forskapd forskap; do
+            codesign --display --verbose=2 "target/release/$bin"
+            vtool -show-build "target/release/$bin" | tee "$RUNNER_TEMP/build-version"
+            grep "minos 11.0" "$RUNNER_TEMP/build-version"
+          done
+
+      # Only the tap in this job changes: the formula the release workflow
+      # renders for a tag, here for the one archive packed above.
+      - name: Render the formula for the archive
+        if: env.MODE == 'checkout'
+        run: |
+          bash .github/scripts/render-formula.sh "$VERSION" "file://$RUNNER_TEMP/dist" "$RUNNER_TEMP/dist/checksums.txt" > Formula/forskap.rb
+          sed -n '/^  stable do$/,/^  end$/p' Formula/forskap.rb
+
       # The formula alone: `brew style <tap>` would also lint every workflow
       # of this repository.
       - name: Style and audit
@@ -100,35 +164,8 @@ jobs:
           brew style bjarneseger/forskap/forskap
           brew audit --strict bjarneseger/forskap/forskap
 
-      # Checkout mode never downloads the release the committed formula
-      # names; this still checks its url and sha256.
-      - name: Fetch the release the formula names
-        if: env.MODE == 'checkout'
-        run: brew fetch --build-from-source bjarneseger/forskap/forskap
-
-      # Only the tap in this job changes: the formula gets the url and sha256
-      # of a tarball of the checked-out commit, the two lines a release bump
-      # rewrites. `brew install --HEAD` is no option, as the formula's test
-      # compares its version with `forskap --version`; the tarball is named
-      # after the workspace version for brew to read it from there.
-      - name: Point the formula at the checkout
-        if: env.MODE == 'checkout'
-        run: |
-          version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
-          tarball="$RUNNER_TEMP/forskap-$version.tar.gz"
-          git archive --format=tar.gz --prefix="forskap-$version/" -o "$tarball" HEAD
-          sha="$( (sha256sum "$tarball" 2>/dev/null || shasum -a 256 "$tarball") | cut -d " " -f 1)"
-          sed -i.bak \
-            -e "s|^  url \".*\"\$|  url \"file://$tarball\"|" \
-            -e "s|^  sha256 \".*\"\$|  sha256 \"$sha\"|" \
-            Formula/forskap.rb
-          rm Formula/forskap.rb.bak
-          git diff -- Formula/forskap.rb
-          grep -q "^  url \"file://$tarball\"\$" Formula/forskap.rb
-          grep -q "^  sha256 \"$sha\"\$" Formula/forskap.rb
-
-      - name: Install from source
-        run: brew install --build-from-source bjarneseger/forskap/forskap
+      - name: Install
+        run: brew install bjarneseger/forskap/forskap
 
       - name: Test
         run: brew test bjarneseger/forskap/forskap
@@ -143,6 +180,10 @@ jobs:
           test -s "$prefix/share/zsh/site-functions/_forskap"
           test -s "$prefix/share/fish/vendor_completions.d/forskap.fish"
           forskap --version
+          if [ "$RUNNER_OS" = macOS ]; then
+            codesign --verify --verbose "$prefix/bin/forskapd" "$prefix/bin/forskap"
+            xattr -l "$prefix/bin/forskapd" "$prefix/bin/forskap"
+          fi
 
       - name: Run the daemon as a service
         if: runner.os == 'macOS'
