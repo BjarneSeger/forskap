@@ -400,6 +400,9 @@ the token by a fresh one before that, under the current `[auth]` config: `false`
 a token without an expiry or without the needed scope, with `rotate = "never"`, and
 once GitLab refused to rotate it.
 
+A dry run (`forskapd --dry-run`) answers with the host `dry-run.invalid` and the user
+`demo`; its `Login` and `Logout` reply `GitlabError`.
+
 ## Writing (queued when GitLab is away)
 
 The four methods of this section take the target as `(project_id, iid, kind)` —

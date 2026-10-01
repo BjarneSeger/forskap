@@ -87,6 +87,19 @@ is `Ok`; "did not fire" → `.is_err()`.
   `start_on_demand(store, state)` runs only demanded jobs, for tests of what reaches
   the store beside the fetches (`land_issue`); `seed_views` writes their views.
 
+## Dry-run tests (`src/daemon.rs`, `src/demo.rs`)
+
+- `demo.rs` tests call `DemoGitlab` (the dry run's in-memory GitLab, not the shared
+  fake) directly: listings, writes, refusals.
+- `daemon.rs` tests start whole dry runs and drive them over their socket with the
+  generated `VarlinkClient`: `DryRun::start(&Scratch::create()?)`; `synced(&sync,
+  limit)` waits until every planned job ran (what the dry run announces its socket
+  after); `until(what, async || -> Option<T>)` polls an async probe (5 s);
+  `run.stop()` asserts `keychain.refused() == 0` and the socket's removal. A test
+  that must see the temp dir go drops the runtime first, as `main` does.
+- Handler and bench scaffolding holds `Keychain::disabled()`: no test reaches the OS
+  keychain.
+
 ## Queue and reconnect tests
 
 - `queue.rs` spawns `worker(..)` directly on a channel; `run_worker_one_task[_with]`

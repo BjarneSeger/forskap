@@ -133,6 +133,11 @@ is documented in [the interface docs](forskapd/docs/varlink_interface.md) and
 available as the [`forskap-api`](forskap-api/README.md) Rust crate or the
 [Go binding](clients/go/README.md).
 
+To try a client without an account, or in CI, `forskapd --dry-run` serves a demo
+account from a temporary directory and touches nothing real (no keychain, no GitLab,
+not your daemon's data); it prints its socket's address for `FORSKAPD_SOCKET`
+([details](forskapd/README.md#dry-run)).
+
 ## Noctalia launcher
 
 [`forskap/`](forskap/README.md) is a

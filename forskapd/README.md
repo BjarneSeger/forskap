@@ -22,6 +22,66 @@ brew services start forskap
 Its log is `$(brew --prefix)/var/log/forskapd.log`. On macOS the socket is
 `/tmp/forskapd.socket` unless `[server]` `socket` names another one.
 
+## Running
+
+The systemd user unit and the Homebrew service start `forskapd` without arguments,
+and that is all it needs. It takes a few options:
+
+| Option | Does |
+|---|---|
+| `--dry-run` | Serve a built-in demo account instead of yours, from a private temporary directory; see [Dry run](#dry-run). |
+| `--socket <PATH>` | Listen on this Unix socket. Takes precedence over `[server]` `socket`; under systemd socket activation the socket systemd passes is used, as always. With `--dry-run` it replaces the socket in the temporary directory: it must not exist yet and can't be the daemon's default socket. |
+| `-V`, `--version` | Print `forskapd <version>` and exit. |
+| `-h`, `--help` | Describe the daemon, its environment and its files, and exit. |
+
+Arguments are read before anything else happens: `--version`, `--help` and an unknown
+argument (a usage error, exit code 2) exit without starting a daemon, reading the
+keychain or touching a file.
+
+### Dry run
+
+`forskapd --dry-run` is a daemon for trying clients against — launchers, the Go
+binding, `forskap`, packaging tests, CI — with realistic data and nothing real behind
+it. It serves a demo user (`@demo` on `dry-run.invalid`) in three groups and four
+projects (one archived, one with an avatar): a dozen issues and half a dozen merge
+requests in all states, with labels, board columns and an epic as parent, the group
+epics, contribution events and time logged over the last days. Every link points at
+`https://dry-run.invalid/…`, a domain that never resolves.
+
+The real sync engine fills the demo's own database from an in-memory GitLab, so every
+read runs the production code, and writes round-trip: a closed issue leaves the
+assigned list, logged time shows in the history, a created issue is listed, assigning
+and unassigning work, `ClearCache` refills from the demo. Writes to the archived
+project are refused, as GitLab would. `Login` and `Logout` are refused too: the demo
+account stays.
+
+What it guarantees:
+
+- **No keychain.** The dry run holds a keychain that turns every call down without
+  asking the OS (no Secret Service, no D-Bus, no macOS Keychain); nothing asks it
+  anyway: no login, logout, token rotation or reconnect.
+- **No GitLab and no network.** The daemon opens no outgoing connection at all.
+- **Nothing of the real daemon's.** Neither the config file (the baked-in defaults
+  are used, tuned to sync the small demo quickly) nor the database, the avatar cache
+  or the socket; the pre-rename directories aren't moved.
+- **Nothing left behind.** Its database, avatars and socket live in a new directory
+  `forskapd-dry-run.XXXXXX` (mode 0700) in the temporary directory (`$TMPDIR` or
+  `/tmp`), removed on exit, SIGINT and SIGTERM included. Only a SIGKILL leaves it.
+
+The first line on stdout is the socket's address, in the form `FORSKAPD_SOCKET` takes.
+It is printed once the demo is synced, so every read serves all of it from then on,
+and nothing else is written there; the log goes to stderr:
+
+```sh
+forskapd --dry-run > dry-run.addr &
+until [ -s dry-run.addr ]; do sleep 0.1; done
+export FORSKAPD_SOCKET="$(head -n1 dry-run.addr)"   # unix:/tmp/forskapd-dry-run.Ab12Cd/forskapd.socket
+forskap issue list
+kill %1   # SIGTERM: the directory is removed
+```
+
+Clients can tell a dry run by `WhoAmI`, whose host is `dry-run.invalid`.
+
 ## Configuration
 
 The daemon reads a TOML config file. Values are layered, highest priority first:
@@ -43,7 +103,7 @@ Keys are grouped into TOML tables, one per concern:
 
 | Key | Default | Description |
 |---|---|---|
-| `[server]` `socket` | `$XDG_RUNTIME_DIR/forskapd.socket` (falls back to `/tmp`) | Varlink Unix socket the daemon listens on. Ignored under systemd socket activation. |
+| `[server]` `socket` | `$XDG_RUNTIME_DIR/forskapd.socket` (falls back to `/tmp`) | Varlink Unix socket the daemon listens on. `forskapd --socket` takes precedence; both are ignored under systemd socket activation. |
 | `[refresh.quick]` `interval_secs` | `300` | Seconds between quick syncs of the assigned issue/MR lists and the recent timelog window (floor 60). |
 | `[refresh.quick]` `window_hours` | `24` | How far back the quick timelog sync reaches (last 24h). |
 | `[refresh.slow]` `interval_secs` | `86400` | Seconds between slow syncs of the full timelog history, the board columns, your project/group memberships and the issues you authored or were assigned, closed ones included (once a day; floor 60). |

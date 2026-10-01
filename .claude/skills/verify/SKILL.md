@@ -9,16 +9,50 @@ The daemon (`forskapd`) serves a varlink unix socket; the CLI (`forskap`) is
 the user surface. Both resolve the socket from `$XDG_RUNTIME_DIR/forskapd.socket`
 and data/config/cache from the XDG dirs, so a fully isolated instance only needs env vars.
 
-## Recipe
+Two kinds of instance, pick by what the change is about:
+
+- **Dry run** (`forskapd --dry-run`) for client and CLI changes that only need
+  plausible data: a demo account in a private temp dir, no keychain, no GitLab, no
+  network, nothing of the real daemon's read or written — so write commands are fine
+  here. It runs the real sync engine, read handlers and write cascade against an
+  in-memory GitLab, so it also covers daemon read/write paths that don't depend on
+  GitLab's actual answers.
+- **Isolated real instance** (the recipe below) for anything about GitLab's actual
+  behaviour: the API's answers, pagination, errors, rate limits, auth, token
+  rotation, the keychain.
+
+## Dry run
+
+```bash
+cargo build -p forskapd -p forskap-cli
+./target/debug/forskapd --dry-run > /tmp/dry.addr 2> /tmp/dry.log &   # stdout: the address, once synced
+until [ -s /tmp/dry.addr ]; do sleep 0.1; done
+export FORSKAPD_SOCKET=$(head -n1 /tmp/dry.addr)   # unix:/tmp/forskapd-dry-run.XXXXXX/forskapd.socket
+./target/debug/forskap issue list
+./target/debug/forskap issue close 12 -p acme/backend/api   # writes only change the demo
+kill %1                                                      # SIGTERM/SIGINT remove the temp dir
+```
+
+- Check `FORSKAPD_SOCKET` names the dry run in every command: without it the CLI
+  talks to the production daemon.
+- The CLI keeps its own state (last item time was logged on) in the real XDG dirs;
+  point `XDG_STATE_HOME`/`XDG_CONFIG_HOME` at a scratch dir for the CLI when that
+  matters.
+- `Login`/`Logout` are refused; `WhoAmI` answers `@demo` on `dry-run.invalid`.
+- SIGKILL leaves `/tmp/forskapd-dry-run.*` behind; remove it by hand.
+
+## Isolated real instance
 
 ```bash
 cargo build -p forskapd -p forskap-cli
 
 S=$(mktemp -d /tmp/gt-verify.XXXX)          # KEEP SHORT — socket path must fit SUN_LEN (~108 chars)
-mkdir -p $S/{config,data,cache,runtime}; chmod 700 $S/runtime
+mkdir -p $S/{config/forskapd,data,cache,runtime}; chmod 700 $S/runtime
 export XDG_CONFIG_HOME=$S/config XDG_DATA_HOME=$S/data XDG_CACHE_HOME=$S/cache XDG_RUNTIME_DIR=$S/runtime
+# It shares the real keychain entry: it must never rotate the real token.
+printf '[auth]\nrotate = "never"\n' > $S/config/forskapd/config.toml
 
-RUST_LOG=info ./target/debug/forskapd > $S/daemon.log 2>&1 &
+FORSKAPD_LOG=info ./target/debug/forskapd > $S/daemon.log 2>&1 &
 # wait for $S/runtime/forskapd.socket to appear, then drive:
 ./target/debug/forskap issue list      # issue cache read
 ./target/debug/forskap time history    # timelog history read
@@ -32,6 +66,9 @@ RUST_LOG=info ./target/debug/forskapd > $S/daemon.log 2>&1 &
   real `forskap auth login` credentials and talk to the real GitLab (read-only refresh
   fetches). Avoid driving write commands (`forskap time log`, `forskap issue close`, `forskap mr assign`)
   unless the write target is intentional; they post to the live GitLab.
+- **Token rotation**: an isolated real instance must set `[auth]` `rotate = "never"`
+  in its config (the recipe writes it). Otherwise it may rotate the real token,
+  which revokes the one the production daemon and every other tool use.
 - **Stale socket**: after SIGKILL the daemon leaves the socket file and a
   restart dies with `AddrInUse` — Use SIGTERM or `rm` the socket before restarting.
 - **Avatars**: files under `$XDG_CACHE_HOME/forskapd/avatars/`. Without the

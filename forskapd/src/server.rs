@@ -8,20 +8,21 @@ use varlink::AsyncConnectionHandler;
 
 use crate::error::Result;
 
-/// Build a [`UnixListener`] from the systemd-passed socket FD (socket activation)
-/// or by binding a new socket at `path`.
-pub fn make_listener(socket_path: &str) -> Result<UnixListener> {
-    if is_socket_activated() {
-        // SAFETY: systemd guarantees FD 3 is a valid, bound, listening Unix socket.
-        let std_listener = unsafe {
-            use std::os::unix::io::FromRawFd;
-            std::os::unix::net::UnixListener::from_raw_fd(3)
-        };
-        std_listener.set_nonblocking(true)?;
-        Ok(UnixListener::from_std(std_listener)?)
-    } else {
-        Ok(UnixListener::bind(socket_path)?)
-    }
+/// The [`UnixListener`] systemd passed as FD 3 (socket activation). Only
+/// for a process [`is_socket_activated`].
+pub fn inherited_listener() -> Result<UnixListener> {
+    // SAFETY: systemd guarantees FD 3 is a valid, bound, listening Unix socket.
+    let std_listener = unsafe {
+        use std::os::unix::io::FromRawFd;
+        std::os::unix::net::UnixListener::from_raw_fd(3)
+    };
+    std_listener.set_nonblocking(true)?;
+    Ok(UnixListener::from_std(std_listener)?)
+}
+
+/// A new socket bound at `socket_path`, which must not exist yet.
+pub fn bind(socket_path: &str) -> Result<UnixListener> {
+    Ok(UnixListener::bind(socket_path)?)
 }
 
 /// Returns `true` when the process was socket-activated by systemd.
@@ -29,7 +30,8 @@ pub fn is_socket_activated() -> bool {
     std::env::var("LISTEN_FDS").as_deref() == Ok("1")
 }
 
-/// Accept loop — runs until the process receives a signal.
+/// Accept loop — runs until the caller stops polling it (see
+/// [`crate::daemon::Daemon::serve_until`]).
 pub async fn serve<H: AsyncConnectionHandler + 'static>(
     handler: Arc<H>,
     listener: UnixListener,
