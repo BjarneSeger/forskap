@@ -146,6 +146,8 @@ cat <<'RUBY'
     bash_completion.install completions/"forskap.bash" => "forskap"
     zsh_completion.install completions/"_forskap"
     fish_completion.install completions/"forskap.fish"
+    # Nushell loads every file there at startup.
+    (share/"nushell/vendor/autoload").install completions/"forskap.nu"
   end
 
   service do

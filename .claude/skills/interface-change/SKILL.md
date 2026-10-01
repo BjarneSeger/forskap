@@ -66,12 +66,12 @@ the daemon are the to-do list.
 ## 4. CLI
 
 New subcommand module in its group under `forskap-cli/src/cmd/`, wired into
-`forskap-cli/src/cli.rs` (clap-only: `build.rs` includes it) and covered in
-`forskap-cli/src/cli_tests.rs`. Shell completions are dynamic for bash/zsh/fish (the shell
-calls `forskap`, so a new subcommand completes by itself); a new argument taking an issue/MR
-number or a project gets its completer in `forskap-cli/src/complete.rs` (`cli_tests.rs`
-counts them). The files under `forskap-cli/completions/` (registration scripts, carapace
-spec) regenerate on every build and are gitignored.
+`forskap-cli/src/cli.rs` and covered in `forskap-cli/src/cli_tests.rs`. Shell completions
+are dynamic for bash/zsh/fish/nushell and through carapace (the shell calls `forskap`, so a
+new subcommand completes by itself); a new argument taking an issue/MR number or a project
+gets its completer in `forskap-cli/src/complete.rs` (`cli_tests.rs` counts them). The files
+under `forskap-cli/completions/` (registration scripts, carapace spec) regenerate on every
+build and are gitignored.
 
 ## 5. Docs
 

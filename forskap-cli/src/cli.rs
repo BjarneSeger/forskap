@@ -1,5 +1,4 @@
-// Included verbatim by build.rs for the carapace spec: clap-only, no crate
-// types. The dynamic completers are attached in complete.rs.
+// The dynamic completers are attached in complete.rs.
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]

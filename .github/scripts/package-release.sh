@@ -18,6 +18,7 @@
 #   completions/forskap.bash
 #   completions/_forskap
 #   completions/forskap.fish
+#   completions/forskap.nu
 #
 # The macOS release job and brew.yml's checkout mode pack with this script;
 # GoReleaser packs the Linux archives itself, and its `archives` entry in
@@ -42,11 +43,12 @@ outdir="$(cd "$outdir" && pwd)"
 install -m 0755 "$bindir/forskapd" "$bindir/forskap" "$stage/"
 install -m 0644 "$root/LICENSE" "$root/README.md" "$stage/"
 install -m 0644 "$completions/forskap.bash" "$completions/_forskap" \
-  "$completions/forskap.fish" "$stage/completions/"
+  "$completions/forskap.fish" "$completions/forskap.nu" "$stage/completions/"
 
 archive="$outdir/forskap_${version}_${os}_${arch}.tar.gz"
 # Files only, no directory entries, as GoReleaser writes them. COPYFILE_DISABLE
 # keeps macOS tar from adding AppleDouble (._*) files for extended attributes.
 COPYFILE_DISABLE=1 tar -C "$stage" -czf "$archive" forskapd forskap LICENSE README.md \
-  completions/forskap.bash completions/_forskap completions/forskap.fish
+  completions/forskap.bash completions/_forskap completions/forskap.fish \
+  completions/forskap.nu
 echo "$archive"

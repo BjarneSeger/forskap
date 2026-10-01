@@ -56,7 +56,6 @@ confique = { version = "0.4.0", default-features = false, features = ["toml"] }
 # carries no semver promise, so this is pinned exactly: bump it deliberately
 # and re-check `forskap-cli/src/complete.rs` and `build.rs` when doing so.
 clap_complete = { version = "=4.6.11", features = ["unstable-dynamic"] }
-carapace_spec_clap = "1"
 
 # Desktop integration (GNOME Shell search provider / KRunner plugin)
 zbus = { version = "5", default-features = false, features = ["tokio"] }

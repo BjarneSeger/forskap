@@ -61,6 +61,9 @@ archives:
       - src: forskap-cli/completions/forskap.fish
         dst: completions
         strip_parent: true
+      - src: forskap-cli/completions/forskap.nu
+        dst: completions
+        strip_parent: true
 
 # The macOS archive is built and packed on a macOS runner (release.yml, job
 # `macos`) and handed over in dist-darwin/. Published and checksummed under
@@ -104,6 +107,8 @@ nfpms:
         dst: /usr/share/zsh/site-functions/_forskap
       - src: forskap-cli/completions/forskap.fish
         dst: /usr/share/fish/vendor_completions.d/forskap.fish
+      - src: forskap-cli/completions/forskap.nu
+        dst: /usr/share/nushell/vendor/autoload/forskap.nu
       - src: forskap-cli/completions/forskap.yaml
         dst: /usr/share/carapace/specs/forskap.yaml
       - src: forskapd/packaging/forskapd.service

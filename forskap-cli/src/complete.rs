@@ -2,7 +2,7 @@
 //! paths.
 //!
 //! The scripts `build.rs` writes (and `COMPLETE=<shell> forskap` prints) make
-//! bash, zsh and fish call `forskap` itself on every Tab, with `COMPLETE` set
+//! bash, zsh, fish and nushell call `forskap` itself on every Tab, with `COMPLETE` set
 //! and the command line as arguments. clap_complete's engine answers for the
 //! argument tree; the completers here add what only the daemon's cache knows.
 //!
@@ -15,15 +15,19 @@ use std::ffi::OsStr;
 use std::time::Duration;
 
 use clap::{Arg, Command, CommandFactory};
+use clap_complete::env::{Bash, Elvish, Fish, Powershell, Shells, Zsh};
 use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
 use forskap_api::{Epic, SearchKind, VarlinkClientInterface};
 
+use self::nushell::Nushell;
 use crate::cli::Cli;
 use crate::cmd::epic::group_of;
 use crate::item::{Item, project_of};
 use crate::refspec::{self, RefKind};
 use crate::state::{LastEpic, LastIssue};
 use crate::{client, state};
+
+mod nushell;
 
 /// For everything one completion asks the daemon. Cache reads answer in a few
 /// milliseconds; this only bounds the cases where nothing answers.
@@ -38,11 +42,19 @@ const EPIC_VERBS: [&str; 2] = ["view", "open"];
 /// Answer the shell and exit if this run is a completion request (`COMPLETE`
 /// is set); return otherwise. Must run before anything can print.
 pub fn run() {
-    CompleteEnv::with_factory(command).complete();
+    CompleteEnv::with_factory(command)
+        .shells(Shells(&[
+            &Bash,
+            &Elvish,
+            &Fish,
+            &Powershell,
+            &Zsh,
+            &Nushell,
+        ]))
+        .complete();
 }
 
-/// The argument tree with the completers attached. They are added here
-/// rather than in `cli.rs`, which `build.rs` includes and so stays clap-only.
+/// The argument tree with the completers attached; `cli.rs` only declares it.
 pub fn command() -> Command {
     let mut cmd = Cli::command();
     for (group, kind) in [("issue", RefKind::Issue), ("mr", RefKind::Mr)] {

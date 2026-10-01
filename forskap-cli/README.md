@@ -37,14 +37,14 @@ after 30 minutes when the next cli prompt should appear what you are working on,
 with a list of assigned issues.
 
 ### Completions
-Out of the box, completions are installed for fish, zsh and bash. They are
-dynamic: the shell asks `forskap` on every Tab, so besides commands and flags
-it completes what the daemon has cached — issue and merge request numbers
-(the item you last logged time on, then your assigned ones, then the ones you
-opened before), epic numbers (the ones you opened before), and project and
-group paths for `--project` and `--group`. fish and zsh show the title and
-project or group next to each number; bash only the numbers. Without a running
-daemon you still get the commands and flags.
+Out of the box, completions are installed for fish, zsh, bash and nushell
+(0.108 or newer). They are dynamic: the shell asks `forskap` on every Tab, so
+besides commands and flags it completes what the daemon has cached — issue and
+merge request numbers (the item you last logged time on, then your assigned
+ones, then the ones you opened before), epic numbers (the ones you opened
+before), and project and group paths for `--project` and `--group`. fish, zsh
+and nushell show the title and project or group next to each number; bash only
+the numbers. Without a running daemon you still get the commands and flags.
 
 If you didn't install the package, register them from your shell's rc file:
 
@@ -54,10 +54,23 @@ source <(COMPLETE=zsh forskap)      # ~/.zshrc, after compinit
 COMPLETE=fish forskap | source      # ~/.config/fish/config.fish
 ```
 
-Completions are also provided for carapace, but they need to be manually linked from
-`/usr/share/carapace/specs/forskap.yaml` to `~/.config/carapace/specs/forskap.yaml`, as
-carapace does not currently support globally installed specs. The carapace
-spec is static: commands and flags only. Nushell has no completions of its own.
+Nushell can't source a command's output at startup, so there the script is
+saved once (and again after an update of `forskap`):
+
+```nu
+COMPLETE=nushell forskap | save -f ($nu.user-autoload-dirs | first | path join forskap.nu)
+```
+
+In nushell this takes precedence over an external completer such as carapace,
+which keeps completing everything else.
+
+For carapace in any other shell, the package ships a spec that makes it ask
+`forskap` as well, through carapace's `jj` bridge (tested with carapace 1.8).
+carapace reads no system-wide specs, so link it from
+`/usr/share/carapace/specs/forskap.yaml` to
+`~/.config/carapace/specs/forskap.yaml`, or skip the file and run
+`carapace --choice forskap/jj@bridge`. carapace sorts the candidates by name
+instead of keeping the order above.
 
 ### Ambiguous numbers
 `forskap issue` / `forskap mr` and `forskap time log` take the number alone and find

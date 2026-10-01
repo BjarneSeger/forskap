@@ -29,6 +29,7 @@ on:
       - "*/Cargo.toml"
       # Writes the completion files the formula installs.
       - "forskap-cli/build.rs"
+      - "forskap-cli/src/complete/nushell.nu"
   pull_request:
     paths:
       - "Formula/**"
@@ -40,6 +41,7 @@ on:
       - "Cargo.lock"
       - "*/Cargo.toml"
       - "forskap-cli/build.rs"
+      - "forskap-cli/src/complete/nushell.nu"
   workflow_dispatch:
     inputs:
       mode:
@@ -179,6 +181,10 @@ jobs:
           test -s "$prefix/etc/bash_completion.d/forskap"
           test -s "$prefix/share/zsh/site-functions/_forskap"
           test -s "$prefix/share/fish/vendor_completions.d/forskap.fish"
+          # The release a stable run installs may predate the nushell script.
+          if [ "$MODE" = checkout ]; then
+            test -s "$prefix/share/nushell/vendor/autoload/forskap.nu"
+          fi
           forskap --version
           if [ "$RUNNER_OS" = macOS ]; then
             codesign --verify --verbose "$prefix/bin/forskapd" "$prefix/bin/forskap"
