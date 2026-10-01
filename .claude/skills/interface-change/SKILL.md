@@ -93,7 +93,9 @@ git push origin clients/go/v0.25.0
 A pushed tag is final: proxy.golang.org and the Go checksum database keep the first
 content they saw, so never move or re-create one. A fix to the binding alone (`client.go`,
 its README) bumps the api crate's patch version and gets the next tag. The `Release`
-workflow only reacts to `v*` tags, so this one publishes nothing.
+workflow only reacts to `v*` tags, so this one publishes nothing — and GoReleaser is kept
+from reading it as the project's version (`git.ignore_tags` in `.goreleaser.yaml`, plus
+the tag the workflow picks itself), which would put slashes into the artifact paths.
 
 ## 7. Verify
 

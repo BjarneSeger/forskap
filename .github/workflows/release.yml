@@ -45,6 +45,18 @@ jobs:
           version: v0.28.1
           save-cache: ${{ github.ref == 'refs/heads/main' }}
 
+      # GoReleaser's ignore_tags globs only cover the nearest-tag lookup: a
+      # tag on HEAD itself is compared literally, and main is often tagged
+      # `clients/go/v*` (the Go binding).
+      - name: Pick the release tag
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag=$GITHUB_REF_NAME
+          else
+            tag=$(git describe --tags --abbrev=0 --match 'v*')
+          fi
+          echo "GORELEASER_CURRENT_TAG=$tag" >> "$GITHUB_ENV"
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
         with:
