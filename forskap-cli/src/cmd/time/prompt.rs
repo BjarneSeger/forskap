@@ -41,7 +41,7 @@ pub async fn run() -> Result<()> {
 /// time entry was logged, `false` if the user skipped or had no assigned issues.
 pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Result<bool> {
     let cfg = config::load()?;
-    let client = client::connect(&client::socket(&cfg)).await?;
+    let client = client::connect(&client::socket(&cfg)?).await?;
     let issues = client
         .get_assigned_issues(None)
         .call()

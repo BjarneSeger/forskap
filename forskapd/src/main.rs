@@ -30,7 +30,7 @@ fn main() -> Result<()> {
             None => match Environment::real(&args).await {
                 Ok(env) => env,
                 Err(e) => {
-                    error!(error = %e, "failed to load configuration");
+                    error!("{e}");
                     std::process::exit(1);
                 }
             },

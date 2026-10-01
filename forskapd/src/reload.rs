@@ -83,10 +83,14 @@ pub fn spawn(shared: SharedConfig, on_reload: impl Fn() + Send + 'static) {
             tokio::time::sleep(DEBOUNCE).await;
             while rx.try_recv().is_ok() {}
 
-            let before = shared.read().unwrap().server.resolved_socket();
+            let socket = || {
+                let resolved = shared.read().unwrap().server.resolved_socket();
+                resolved.unwrap_or_default()
+            };
+            let before = socket();
             match config::reload(&shared) {
                 Ok(()) => {
-                    let after = shared.read().unwrap().server.resolved_socket();
+                    let after = socket();
                     if before != after {
                         warn!(
                             old = %before,

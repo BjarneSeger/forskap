@@ -51,7 +51,7 @@ const FAILING_NAMED: usize = 3;
 
 pub async fn run(format: OutputFormat, watch: WatchArgs) -> Result<()> {
     let every = watch::interval(watch, format)?;
-    let socket = client::socket(&config::load()?);
+    let socket = client::socket(&config::load()?)?;
     let socket = socket.as_str();
     match every {
         Some(every) => {
