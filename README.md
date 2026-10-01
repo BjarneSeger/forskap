@@ -29,6 +29,8 @@ brew tap bjarneseger/forskap https://github.com/BjarneSeger/forskap
 brew install forskap
 ```
 
+This needs a release newer than 0.12.0, which does not build on macOS.
+
 ## 2. Start the daemon
 
 The daemon is a systemd user unit — enable and start it:

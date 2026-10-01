@@ -16,7 +16,8 @@ systemctl enable --now --user forskapd.socket
 ```
 
 On macOS, install with [Homebrew](https://brew.sh) from the tap in this repository
-(built from source, daemon included) and run the daemon as a service:
+(built from source, daemon included; needs a release newer than 0.12.0) and run the
+daemon as a service:
 
 ```sh
 brew tap bjarneseger/forskap https://github.com/BjarneSeger/forskap

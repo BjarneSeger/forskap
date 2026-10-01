@@ -18,7 +18,8 @@ brew services start forskap
 ```
 
 Its log is `$(brew --prefix)/var/log/forskapd.log`. On macOS the socket is
-`/tmp/forskapd.socket` unless `[server]` `socket` names another one.
+`/tmp/forskapd.socket` unless `[server]` `socket` names another one. This needs a
+release newer than 0.12.0, which does not build on macOS.
 
 ## Configuration
 
