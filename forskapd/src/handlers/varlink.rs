@@ -1,6 +1,7 @@
 //! The [`VarlinkInterface`] method implementations plus the write cascade they
 //! share. Reads serve the sync store only; see the module docs of
-//! [`super`] for the conventions.
+//! [`super`] for the conventions. `CreateIssue` is the one write outside the
+//! cascade: it has nothing to be replayed by.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -9,35 +10,40 @@ use tracing::{debug, info, instrument, warn};
 
 use forskap_api::{
     ActivityEvent, CacheScope, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
-    Call_DismissFailure, Call_GetActivity, Call_GetAssignedIssues, Call_GetAssignedMergeRequests,
-    Call_GetFailures, Call_GetHistory, Call_GetSyncJobs, Call_ListIssues, Call_Login, Call_Logout,
-    Call_PostTime, Call_RecordEpicOpen, Call_RecordOpen, Call_RetryFailure, Call_Search,
-    Call_UnassignSelf, Call_WhoAmI, Epic, FailedTask, Group, HistoryEvent, HistorySource,
-    IssuableKind, Issue, IssueRole, IssueState, MergeRequest, Project, SearchKind, SearchScope,
-    VarlinkInterface,
+    Call_CreateIssue, Call_DismissFailure, Call_GetActivity, Call_GetAssignedIssues,
+    Call_GetAssignedMergeRequests, Call_GetFailures, Call_GetHistory, Call_GetSyncJobs,
+    Call_ListIssues, Call_Login, Call_Logout, Call_PostTime, Call_RecordEpicOpen, Call_RecordOpen,
+    Call_RetryFailure, Call_Search, Call_UnassignSelf, Call_WhoAmI, Epic, FailedTask, Group,
+    HistoryEvent, HistorySource, IssuableKind, Issue, IssueRole, IssueState, MergeRequest, Project,
+    SearchKind, SearchScope, VarlinkInterface,
 };
 
 use crate::error::{DormancyReason, Error};
-use crate::gitlab::{GitlabClient, Issuable};
+use crate::gitlab::{GitlabClient, Issuable, NewIssue};
 use crate::query::{in_group, namespace_of, parse_epic_query, parse_iid_query, text_matches};
 use crate::secrets::{self, Credentials, Token};
 use crate::sync::jobs::{
     ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, RECENT_ASSIGNED_ISSUES, RECENT_AUTHORED_ISSUES,
 };
 use crate::sync::model::{self, RowKey};
-use crate::sync::store::{RowScope, Stored, SyncStore, View};
+use crate::sync::store::{Identity, RowScope, Stored, SyncStore, View};
 use crate::sync::{Clear, Job};
 use crate::usage::{UsageEntry, UsageRecord};
 use crate::write::{Write, WriteOp};
 
 use super::{
-    ConnState, Handlers, Session, dormant_args, issue_ref_error, looks_like_duration, now_secs,
-    wire,
+    ConnState, Handlers, Session, dormant_args, issue_ref_error, looks_like_duration,
+    new_issue_error, now_secs, wire,
 };
 
 /// How long `GetSyncJobs` waits for the worker, which answers between two
 /// awaits even with a fetch in flight.
 const SYNC_JOBS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long `CreateIssue` waits for the worker to store the new issue before
+/// replying anyway. The worker stores it between two awaits; past this the
+/// issue shows up with the next sync instead.
+const LAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-kind result cap when the caller doesn't pass a `limit`.
 const DEFAULT_SEARCH_LIMIT: usize = 50;
@@ -1241,6 +1247,74 @@ impl VarlinkInterface for Handlers {
             op: WriteOp::UnassignSelf,
         };
         reply_write!(call, self.perform_write(write).await)
+    }
+
+    /// Direct, never queued: a create has no target to address a replay by
+    /// and no idempotency key, so repeating one that may have landed would
+    /// file the issue twice.
+    #[instrument(skip(self, call, description))]
+    async fn create_issue(
+        &self,
+        call: &mut dyn Call_CreateIssue,
+        project_id: i64,
+        title: String,
+        description: Option<String>,
+        labels: Option<Vec<String>>,
+        assign_self: Option<bool>,
+        epic_id: Option<i64>,
+    ) -> varlink::Result<()> {
+        let labels = labels.unwrap_or_default();
+        if let Some(msg) = new_issue_error(project_id, &title, &labels) {
+            return call.reply_gitlab_error(msg);
+        }
+        // Whatever keeps the session away: nothing is deferred.
+        let session = match self.current_session().await {
+            Ok(s) => s,
+            Err(r) => {
+                let (reason, detail) = dormant_args(&r);
+                return call.reply_not_authenticated(reason, detail);
+            }
+        };
+        let new = NewIssue {
+            title,
+            description,
+            labels,
+            assign_self: assign_self.unwrap_or(false),
+            epic_id,
+        };
+        let created = match session.gitlab.create_issue(project_id, &new).await {
+            Ok(created) => created,
+            // Reported, not retried: GitLab may have created it all the
+            // same. The sync worker stays the one to judge the session.
+            Err(e) => {
+                warn!(error = %e, project_id, "creating an issue failed");
+                return call.reply_gitlab_error(e.to_string());
+            }
+        };
+
+        // The issue exists from here on: every path below replies success,
+        // or the caller would create it again.
+        let (iid, web_url) = match serde_json::from_value::<model::Issue>(created) {
+            Ok(issue) => {
+                info!(project_id, iid = issue.iid, "issue created");
+                let shown = (issue.iid, issue.web_url.clone());
+                let by = Identity {
+                    host: session.host,
+                    user_id: session.user_id,
+                };
+                let landed = self.sync.land_issue(issue, by);
+                if tokio::time::timeout(LAND_TIMEOUT, landed).await.is_err() {
+                    warn!(project_id, "the created issue isn't stored yet; replying");
+                }
+                shown
+            }
+            Err(e) => {
+                warn!(error = %e, project_id, "issue created, but GitLab's answer is unreadable");
+                (0, String::new())
+            }
+        };
+        self.sync.refresh_soon(&Job::showing_issues_of(project_id));
+        call.reply(iid, web_url)
     }
 
     #[instrument(skip(self, call, token))]

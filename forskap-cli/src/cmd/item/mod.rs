@@ -1,8 +1,9 @@
 //! `forskap issue` / `forskap mr` — the same verbs for both kinds; the command group
-//! picks the [`RefKind`].
+//! picks the [`RefKind`]. Only issues are created (`forskap issue create`).
 
 mod assign;
 mod close;
+pub mod create;
 mod list;
 mod open;
 mod unassign;

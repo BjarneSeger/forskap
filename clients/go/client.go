@@ -189,6 +189,21 @@ func (c *Client) UnassignSelf(ctx context.Context, projectID, iid int64, kind Is
 	return UnassignSelf().Call(ctx, c.conn, projectID, iid, kind)
 }
 
+// CreateIssue creates an issue in a project and returns its number and link.
+// description (GitLab Markdown), labels and epicID (the epic's global ID, its
+// Epic.ID; GitLab Premium and up) are optional; assignSelf assigns the issue
+// to the authenticated user (nil = nobody is assigned).
+//
+// Unlike the other writes it is never queued: without a live GitLab session
+// it fails with *NotAuthenticated, and any failure of the request, a network
+// error included, is a *GitlabError. Do not retry such a failure blindly:
+// GitLab may have created the issue before the answer was lost, and a second
+// call would file it again. On success Search, ListIssues and (if GitLab
+// assigned it) GetAssignedIssues show the issue at once.
+func (c *Client) CreateIssue(ctx context.Context, projectID int64, title string, description *string, labels *[]string, assignSelf *bool, epicID *int64) (iid int64, webURL string, err error) {
+	return CreateIssue().Call(ctx, c.conn, projectID, title, description, labels, assignSelf, epicID)
+}
+
 // RecordOpen counts one open of an issue or merge request in the daemon's
 // local open statistics; Search ranks frequently opened items first and
 // reports the count as open_count. Local bookkeeping only: it succeeds while

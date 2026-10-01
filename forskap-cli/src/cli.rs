@@ -101,10 +101,10 @@ pub enum ColorChoice {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Issues: list, view, open, close, assign.
+    /// Issues: list, view, open, close, assign, create.
     Issue {
         #[command(subcommand)]
-        command: ItemCommand,
+        command: IssueCommand,
     },
     /// Merge requests: list, view, open, close, assign.
     Mr {
@@ -246,6 +246,49 @@ pub enum ItemCommand {
         #[command(flatten)]
         target: TargetArgs,
     },
+}
+
+/// `forskap issue`: the shared verbs, and the one only issues have.
+#[derive(Subcommand)]
+pub enum IssueCommand {
+    #[command(flatten)]
+    Item(ItemCommand),
+    /// Create an issue.
+    ///
+    /// It is assigned to you unless `--no-assign` is given. The daemon sends
+    /// it to GitLab right away and, unlike the other writes, never queues it:
+    /// while GitLab is unreachable this fails, and nothing is created later.
+    Create(CreateArgs),
+}
+
+#[derive(Args)]
+pub struct CreateArgs {
+    /// The title. Several words are joined by spaces.
+    #[arg(value_name = "TITLE", required = true)]
+    pub title: Vec<String>,
+    /// Project to create the issue in, as numeric ID or full path
+    /// (`group/project`).
+    #[arg(short = 'p', long, value_name = "PROJECT")]
+    pub project: String,
+    /// Description, in GitLab's Markdown.
+    #[arg(long, value_name = "TEXT")]
+    pub description: Option<String>,
+    /// Label to set. Repeat the flag for several.
+    #[arg(long = "label", value_name = "LABEL")]
+    pub labels: Vec<String>,
+    /// Leave the issue unassigned.
+    #[arg(long)]
+    pub no_assign: bool,
+    /// Epic to put the issue under, by its number within the group: the `5`
+    /// of `&5`. Only on GitLab instances that have epics (Premium and up).
+    #[arg(long, value_name = "IID", value_parser = clap::value_parser!(i64).range(1..))]
+    pub epic: Option<i64>,
+    /// Group of that epic, as numeric ID or full path (`team/backend`). If
+    /// omitted, it is found the way `forskap epic` finds it.
+    #[arg(long, value_name = "GROUP", requires = "epic")]
+    pub group: Option<String>,
+    #[command(flatten)]
+    pub output: OutputArgs,
 }
 
 #[derive(Subcommand)]

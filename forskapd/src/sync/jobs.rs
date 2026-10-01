@@ -263,18 +263,23 @@ impl Job {
         let pid = write.project_id;
         match (&write.op, write.kind) {
             (WriteOp::PostTime { .. }, _) => vec![Self::RecentTimelogs],
-            // The recent lists too: without a corpus nothing else shows a
-            // closed issue as closed before their next daily run.
-            (_, Issuable::Issue) => vec![
-                Self::AssignedIssues,
-                Self::ProjectIssues(pid),
-                Self::RecentAuthoredIssues,
-                Self::RecentAssignedIssues,
-            ],
+            (_, Issuable::Issue) => Self::showing_issues_of(pid).to_vec(),
             (_, Issuable::MergeRequest) => {
                 vec![Self::AssignedMergeRequests, Self::ProjectMergeRequests(pid)]
             }
         }
+    }
+
+    /// The jobs displaying an issue of `project_id`, to rerun once one was
+    /// written or created. The recent lists too: without a corpus nothing
+    /// else shows a closed issue as closed before their next daily run.
+    pub fn showing_issues_of(project_id: i64) -> [Job; 4] {
+        [
+            Self::AssignedIssues,
+            Self::ProjectIssues(project_id),
+            Self::RecentAuthoredIssues,
+            Self::RecentAssignedIssues,
+        ]
     }
 
     /// Like [`Self::affected_by`], for a write replayed from the queue: a

@@ -1,4 +1,5 @@
-//! `forskap epic` — view and open epics.
+//! `forskap epic` — view and open epics; `forskap issue create --epic` names
+//! one the same way.
 //!
 //! Epics belong to a group and are numbered within it, so an epic is
 //! addressed by `(group_id, iid)`. An explicit `--group` wins: a number is
@@ -37,28 +38,30 @@ pub async fn run(command: EpicCommand) -> Result<()> {
 /// Connect, and find the cached epic the target names.
 async fn locate(target: &EpicArgs) -> Result<(VarlinkClient, Epic)> {
     let client = client::connect_default().await?;
-    let iid = target.iid;
-    if let Some(group) = target.group.as_deref() {
-        let group = group_id(&client, group).await?;
-        let epic = in_group(cached(&client, iid).await?, iid, group)?;
-        return Ok((client, epic));
+    let epic = resolve(&client, target.iid, target.group.as_deref()).await?;
+    Ok((client, epic))
+}
+
+/// The cached epic numbered `iid`: the one in `group` (a numeric ID or a
+/// full path) if given, else found as the module docs describe.
+pub async fn resolve(client: &VarlinkClient, iid: i64, group: Option<&str>) -> Result<Epic> {
+    if let Some(group) = group {
+        let group = group_id(client, group).await?;
+        return in_group(cached(client, iid).await?, iid, group);
     }
     let last = state::load()
         .ok()
         .and_then(|st| st.last_epic)
         .filter(|last| last.iid == iid)
         .map(|last| last.group_id);
-    let found = match matches(cached(&client, iid).await?, iid, last, pick::interactive())? {
-        Matches::Only(epic) => return Ok((client, epic)),
+    let found = match matches(cached(client, iid).await?, iid, last, pick::interactive())? {
+        Matches::Only(epic) => return Ok(epic),
         Matches::Ask(found) => found,
     };
     let message = format!("&{iid} exists in {} groups — which one?", found.len());
     let picked = tokio::task::spawn_blocking(move || pick::select(&message, pick::by_group(found)))
         .await??;
-    match picked {
-        Some(epic) => Ok((client, epic)),
-        None => Err(pick::Cancelled.into()),
-    }
+    picked.ok_or_else(|| pick::Cancelled.into())
 }
 
 /// The group path the epic carries; an older daemon has it only in the URL.

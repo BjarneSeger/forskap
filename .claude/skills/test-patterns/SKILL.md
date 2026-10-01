@@ -28,6 +28,10 @@ reconnect).
   logs `(op, kind, project_id, iid)`.
   `gate_writes()` holds every write until the returned gate's `release()` (sticky);
   a held write is already in `writes()`, so `writes().len()` counts started attempts.
+  A create is a write too, logged as `("create_issue", Issuable::Issue, project_id, 0)`:
+  `serve_create(row)` sets the issue the next create answers with (without one it is
+  `issue_json(project_id, 1, title)`), `created()` returns the `(project_id, NewIssue)`
+  of every attempt, failed ones included.
 - **Token calls**: `serve_token(info)` sets what `token_info` returns (a token
   without expiry by default); the n-th `rotate_token` yields the token `rotated-n`.
   Both fail through `fail_next(TOKEN_PATH | ROTATE_PATH, err)`; `rotations()` logs
@@ -59,7 +63,9 @@ Composite seeds: `seed_assigned_issues`, `seed_assigned_mrs`, `seed_recent_issue
 **Driving a varlink method**: helpers wrap `AsyncCall` — `assigned_issues`,
 `assigned_mrs`, `list_issues`, `run_search`, `history`, `post_time`, `close`,
 `unassign`, `clear_cache`,
-`run_record_open`; `reply::<T_Reply>(&mut call)` parses success,
+`run_record_open`, `create_issue` / `create_issue_with` (they return the call, for
+either of the next two; `created_json(iid, title, assignees)` is a row to
+`serve_create`); `reply::<T_Reply>(&mut call)` parses success,
 `reply_error(&mut call)` returns the error name (`NOT_AUTHENTICATED`,
 `GITLAB_ERROR` constants).
 
@@ -78,6 +84,8 @@ is `Ok`; "did not fire" → `.is_err()`.
   worker with `instant_config()` (no job gap, no startup spread); drive it with
   `refresh_now`, `clear`, and `eventually`. `start_with_avatars(store, &dir, state)`
   keeps the avatar files in `dir`, for tests that restart or look at them.
+  `start_on_demand(store, state)` runs only demanded jobs, for tests of what reaches
+  the store beside the fetches (`land_issue`); `seed_views` writes their views.
 
 ## Queue and reconnect tests
 

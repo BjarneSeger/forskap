@@ -710,6 +710,89 @@ func (m UnassignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection
 	}, nil
 }
 
+type CreateIssue_methods struct{}
+
+func CreateIssue() CreateIssue_methods { return CreateIssue_methods{} }
+
+func (m CreateIssue_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, title_in_ string, description_in_ *string, labels_in_ *[]string, assign_self_in_ *bool, epic_id_in_ *int64) (iid_out_ int64, web_url_out_ string, err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, project_id_in_, title_in_, description_in_, labels_in_, assign_self_in_, epic_id_in_)
+	if err_ != nil {
+		return
+	}
+	iid_out_, web_url_out_, _, err_ = receive(ctx)
+	return
+}
+
+func (m CreateIssue_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, title_in_ string, description_in_ *string, labels_in_ *[]string, assign_self_in_ *bool, epic_id_in_ *int64) (func(ctx context.Context) (int64, string, uint64, error), error) {
+	var in struct {
+		Project_id  int64     `json:"project_id"`
+		Title       string    `json:"title"`
+		Description *string   `json:"description,omitempty"`
+		Labels      *[]string `json:"labels,omitempty"`
+		Assign_self *bool     `json:"assign_self,omitempty"`
+		Epic_id     *int64    `json:"epic_id,omitempty"`
+	}
+	in.Project_id = project_id_in_
+	in.Title = title_in_
+	in.Description = description_in_
+	in.Labels = labels_in_
+	in.Assign_self = assign_self_in_
+	in.Epic_id = epic_id_in_
+	receive, err := c.Send(ctx, "org.thehoster.forskapd.CreateIssue", in, flags)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (iid_out_ int64, web_url_out_ string, flags uint64, err error) {
+		var out struct {
+			Iid     int64  `json:"iid"`
+			Web_url string `json:"web_url"`
+		}
+		flags, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		iid_out_ = out.Iid
+		web_url_out_ = out.Web_url
+		return
+	}, nil
+}
+
+func (m CreateIssue_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, title_in_ string, description_in_ *string, labels_in_ *[]string, assign_self_in_ *bool, epic_id_in_ *int64) (func(ctx context.Context) (iid_out_ int64, web_url_out_ string, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+	var in struct {
+		Project_id  int64     `json:"project_id"`
+		Title       string    `json:"title"`
+		Description *string   `json:"description,omitempty"`
+		Labels      *[]string `json:"labels,omitempty"`
+		Assign_self *bool     `json:"assign_self,omitempty"`
+		Epic_id     *int64    `json:"epic_id,omitempty"`
+	}
+	in.Project_id = project_id_in_
+	in.Title = title_in_
+	in.Description = description_in_
+	in.Labels = labels_in_
+	in.Assign_self = assign_self_in_
+	in.Epic_id = epic_id_in_
+	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.CreateIssue", in)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (iid_out_ int64, web_url_out_ string, flags uint64, conn varlink.ReadWriterContext, err error) {
+		var out struct {
+			Iid     int64  `json:"iid"`
+			Web_url string `json:"web_url"`
+		}
+		flags, conn, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		iid_out_ = out.Iid
+		web_url_out_ = out.Web_url
+		return
+	}, nil
+}
+
 type RecordOpen_methods struct{}
 
 func RecordOpen() RecordOpen_methods { return RecordOpen_methods{} }
@@ -1420,6 +1503,7 @@ type orgthehosterforskapdInterface interface {
 	Close(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	AssignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	UnassignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
+	CreateIssue(ctx context.Context, c VarlinkCall, project_id_ int64, title_ string, description_ *string, labels_ *[]string, assign_self_ *bool, epic_id_ *int64) error
 	RecordOpen(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	RecordEpicOpen(ctx context.Context, c VarlinkCall, group_id_ int64, iid_ int64) error
 	ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]CacheScope) error
@@ -1510,6 +1594,16 @@ func (c *VarlinkCall) ReplyAssignSelf(ctx context.Context) error {
 
 func (c *VarlinkCall) ReplyUnassignSelf(ctx context.Context) error {
 	return c.Reply(ctx, nil)
+}
+
+func (c *VarlinkCall) ReplyCreateIssue(ctx context.Context, iid_ int64, web_url_ string) error {
+	var out struct {
+		Iid     int64  `json:"iid"`
+		Web_url string `json:"web_url"`
+	}
+	out.Iid = iid_
+	out.Web_url = web_url_
+	return c.Reply(ctx, &out)
 }
 
 func (c *VarlinkCall) ReplyRecordOpen(ctx context.Context) error {
@@ -1626,6 +1720,10 @@ func (s *VarlinkInterface) AssignSelf(ctx context.Context, c VarlinkCall, projec
 
 func (s *VarlinkInterface) UnassignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.UnassignSelf")
+}
+
+func (s *VarlinkInterface) CreateIssue(ctx context.Context, c VarlinkCall, project_id_ int64, title_ string, description_ *string, labels_ *[]string, assign_self_ *bool, epic_id_ *int64) error {
+	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.CreateIssue")
 }
 
 func (s *VarlinkInterface) RecordOpen(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error {
@@ -1778,6 +1876,21 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
 		return s.orgthehosterforskapdInterface.UnassignSelf(ctx, VarlinkCall{call}, in.Project_id, in.Iid, in.Kind)
+
+	case "CreateIssue":
+		var in struct {
+			Project_id  int64     `json:"project_id"`
+			Title       string    `json:"title"`
+			Description *string   `json:"description,omitempty"`
+			Labels      *[]string `json:"labels,omitempty"`
+			Assign_self *bool     `json:"assign_self,omitempty"`
+			Epic_id     *int64    `json:"epic_id,omitempty"`
+		}
+		err := call.GetParameters(&in)
+		if err != nil {
+			return call.ReplyInvalidParameter(ctx, "parameters")
+		}
+		return s.orgthehosterforskapdInterface.CreateIssue(ctx, VarlinkCall{call}, in.Project_id, in.Title, in.Description, in.Labels, in.Assign_self, in.Epic_id)
 
 	case "RecordOpen":
 		var in struct {
@@ -2036,6 +2149,8 @@ method Close(project_id: int, iid: int, kind: IssuableKind) -> ()
 method AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
 method UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
+
+method CreateIssue(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, epic_id: ?int) -> (iid: int, web_url: string)
 
 method RecordOpen(project_id: int, iid: int, kind: IssuableKind) -> ()
 

@@ -16,13 +16,16 @@ issues you authored or were assigned (open or closed, updated within
 methods serve whatever was last synced from the local store
 (`$XDG_DATA_HOME/forskapd/db/`). Reads never trigger a GitLab round-trip.
 
-**Write model**: mutating methods reply success even when GitLab is unreachable — the
+**Write model**: the methods that change an existing issue or merge request reply
+success even when GitLab is unreachable — the
 operation is persisted to a retry queue and drained on reconnect (exponential backoff,
 dead-lettered after the retry window; see `GetFailures`). Only an actual GitLab
 *rejection* surfaces as `GitlabError`. The reads reflect a write at once — a queued
 or just-applied close/unassign hides the item from the assigned lists, and
 `ListIssues` shows the issue as closed or no longer assigned — and the
-jobs that display it rerun right after it lands.
+jobs that display it rerun right after it lands. `CreateIssue` is the exception: it
+is sent to GitLab once and never queued, so it fails while GitLab is away (see
+[Writing directly](#writing-directly-never-queued)).
 
 # Types
 
@@ -206,7 +209,8 @@ doesn't have. `parameter` says what is wrong.
 
 `GitlabError (message: string)` — GitLab rejected the request (invalid input, API
 error, rate limit), or a local precondition failed (malformed issue reference, invalid
-duration, unknown failure id). `message` is human-readable.
+duration, unknown failure id, a new issue without a title). For `CreateIssue` it also
+reports that GitLab could not be reached. `message` is human-readable.
 
 `NotAuthenticated (reason: ?NotAuthReason, detail: ?string)` — the daemon has no live
 GitLab session (it is *dormant*). `reason` says why; `detail` carries free text (host,
@@ -393,8 +397,8 @@ once GitLab refused to rotate it.
 
 ## Writing (queued when GitLab is away)
 
-All four take the target as `(project_id, iid, kind)` — `kind` selects issue vs
-merge request; the same operation works on both. They validate the reference
+The four methods of this section take the target as `(project_id, iid, kind)` —
+`kind` selects issue vs merge request; the same operation works on both. They validate the reference
 eagerly (`project_id`/`iid` must be positive) and reply `GitlabError` on a
 malformed one without attempting or queuing anything. On an unreachable session or
 a transient network failure the operation is queued for retry and the call
@@ -422,6 +426,49 @@ right after the write lands, so it appears within seconds.
 Removes the authenticated user from the issuable's assignees. Immediately
 reflected: the assigned lists, and `ListIssues` for the `assignee` role, stop
 showing it before the next sync.
+
+## Writing directly (never queued)
+
+### `CreateIssue(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, epic_id: ?int) -> (iid: int, web_url: string)`
+
+Creates an issue in the project and replies with its number and its link.
+`description` is GitLab Markdown. `labels` are label names; GitLab creates the ones
+the project doesn't have yet. `assign_self` assigns the issue to the authenticated
+user (omitted: nobody is assigned). `epic_id` puts the issue under an epic, named by
+its global ID (`Epic.id`, not the per-group `iid`); that needs GitLab Premium or
+Ultimate.
+
+Unlike every other write this one is **never queued**: the daemon sends it to GitLab
+once and replies with what came of it.
+
+- A blank `title`, a `project_id` that isn't positive or a label containing a comma
+  (GitLab takes the labels as one comma-separated list) replies `GitlabError`
+  without GitLab being asked.
+- Without a live session it replies `NotAuthenticated`, whatever the reason —
+  `unreachable` too, where the other writes are queued.
+- Any failure of the request replies `GitlabError`: a network error, a 429 or 5xx, a
+  rejection, a 401. None of them demotes the session, and nothing is retried.
+
+The reason is that a create has no idempotency key. The queued writes address an
+existing `(project_id, iid, kind)`; a create has no `iid` yet, and nothing tells a
+replay whether an earlier attempt landed. Replayed after a partial success (GitLab
+created the issue, the answer got lost), it would file the issue a second time. The
+same holds for a caller: after a `GitlabError` that isn't a plain rejection, look
+before calling again.
+
+On success the issue is visible at once, before any sync: `Search` finds it,
+`ListIssues` lists it for the `author` role, and if GitLab assigned it to the user,
+`GetAssignedIssues` and `ListIssues` for the `assignee` role list it too. The daemon
+goes by GitLab's answer there, not by `assign_self`: a user who may not assign gets
+the issue unassigned. A list that was never synced still reads as never synced. The
+jobs displaying the issue rerun right after.
+
+Once GitLab created the issue the call replies success, whatever happens then: if
+GitLab's answer is unreadable, `iid` is 0 and `web_url` empty.
+
+Work-item status widgets are out of scope (GitLab sets them through GraphQL
+`workItemUpdate`, a second call with another API surface): the issue starts in the
+project's default status.
 
 ## Retry-queue failures (dead letters)
 
