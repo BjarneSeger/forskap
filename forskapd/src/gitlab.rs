@@ -194,7 +194,8 @@ impl Listing {
                 p.extend(after(updated_after));
                 p
             }
-            Self::MemberProjects => vec![("membership", "true".into()), ("simple", "true".into())],
+            // Not `simple=true`: that representation leaves out `archived`.
+            Self::MemberProjects => vec![("membership", "true".into())],
             // 10 = Guest, the lowest membership level.
             Self::MemberGroups => vec![("min_access_level", "10".into())],
             // A subgroup's epics belong to its own listing, so a group and
@@ -1526,11 +1527,7 @@ mod tests {
                 "merge_requests",
                 "scope=all",
             ),
-            (
-                Listing::MemberProjects,
-                "projects",
-                "membership=true&simple=true",
-            ),
+            (Listing::MemberProjects, "projects", "membership=true"),
             (Listing::MemberGroups, "groups", "min_access_level=10"),
             (
                 Listing::GroupEpics {

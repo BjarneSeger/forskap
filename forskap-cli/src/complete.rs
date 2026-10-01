@@ -529,6 +529,7 @@ mod tests {
             state: "opened".to_string(),
             open_count: 1,
             group_path: String::new(),
+            updated_at: 0,
         };
         let rows = [
             epic(3, "team", 5, "Accounts"),

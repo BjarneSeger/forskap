@@ -152,6 +152,7 @@ mod tests {
             state: "opened".to_string(),
             open_count: 0,
             group_path: String::new(),
+            updated_at: 0,
         };
         let choices = by_group(vec![
             epic(3, "https://gl/groups/team/backend/-/epics/5", "Accounts"),

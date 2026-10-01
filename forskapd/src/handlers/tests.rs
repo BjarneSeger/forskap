@@ -714,6 +714,7 @@ async fn get_assigned_merge_requests_serves_newest_first_with_group_filter() {
     let all = assigned_mrs(&h, None).await;
     assert_eq!(all.iter().map(|m| m.iid).collect::<Vec<_>>(), [11, 10]);
     assert_eq!(all[0].assignees, ["me"]);
+    assert_eq!(all[0].updated_at, 200);
     let team = assigned_mrs(&h, Some(vec!["team".into()])).await;
     assert_eq!(team.iter().map(|m| m.iid).collect::<Vec<_>>(), [10]);
 }
@@ -862,6 +863,50 @@ async fn search_ranks_frequently_opened_first() {
         r.issues.iter().map(|i| i.iid).collect::<Vec<_>>(),
         [10, 20],
         "the opened older issue outranks the newer one"
+    );
+}
+
+/// Unix seconds, as the rows store them.
+#[tokio::test]
+async fn search_hits_carry_their_update_time() {
+    let (h, _dir) = dormant_handlers();
+    seed_corpus(&h);
+
+    let r = run_search(&h, "oauth", None, None).await;
+    assert_eq!(r.issues[0].updated_at, 100);
+    assert_eq!(r.merge_requests[0].updated_at, 50);
+    let r = run_search(&h, "i", Some(vec![SearchKind::epics]), None).await;
+    let updated: Vec<_> = r.epics.iter().map(|e| (e.iid, e.updated_at)).collect();
+    assert_eq!(updated, [(8, 200), (7, 100)]);
+}
+
+/// The flag is all an archived project differs by: it matches and sorts
+/// like any other.
+#[tokio::test]
+async fn projects_tell_whether_they_are_archived() {
+    let (h, _dir) = dormant_handlers();
+    seed_corpus(&h);
+    seed(
+        &h,
+        &[model::Project {
+            id: 6,
+            name: "auth-legacy".into(),
+            path_with_namespace: "team/auth-legacy".into(),
+            web_url: "https://gl/team/auth-legacy".into(),
+            archived: true,
+            ..Default::default()
+        }],
+    );
+
+    let r = run_search(&h, "auth", Some(vec![SearchKind::projects]), None).await;
+    let archived: Vec<_> = r
+        .projects
+        .iter()
+        .map(|p| (p.path.as_str(), p.archived))
+        .collect();
+    assert_eq!(
+        archived,
+        [("team/auth-legacy", true), ("team/auth-service", false)]
     );
 }
 

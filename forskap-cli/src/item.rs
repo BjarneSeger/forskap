@@ -105,6 +105,7 @@ pub mod testing {
                 open_count: 0,
                 project_avatar: String::new(),
                 project_path: path.to_string(),
+                updated_at: 0,
             }),
             RefKind::Mr => Item::Mr(MergeRequest {
                 id: project_id * 1000 + iid,
@@ -117,6 +118,7 @@ pub mod testing {
                 open_count: 0,
                 project_avatar: String::new(),
                 project_path: path.to_string(),
+                updated_at: 0,
             }),
         }
     }

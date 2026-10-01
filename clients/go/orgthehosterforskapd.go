@@ -24,6 +24,7 @@ type Issue struct {
 	Open_count     int64  `json:"open_count"`
 	Project_avatar string `json:"project_avatar"`
 	Project_path   string `json:"project_path"`
+	Updated_at     int64  `json:"updated_at"`
 }
 
 type IssuableKind string
@@ -80,14 +81,16 @@ type MergeRequest struct {
 	Open_count     int64    `json:"open_count"`
 	Project_avatar string   `json:"project_avatar"`
 	Project_path   string   `json:"project_path"`
+	Updated_at     int64    `json:"updated_at"`
 }
 
 type Project struct {
-	Id      int64  `json:"id"`
-	Name    string `json:"name"`
-	Path    string `json:"path"`
-	Web_url string `json:"web_url"`
-	Avatar  string `json:"avatar"`
+	Id       int64  `json:"id"`
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	Web_url  string `json:"web_url"`
+	Avatar   string `json:"avatar"`
+	Archived bool   `json:"archived"`
 }
 
 type Group struct {
@@ -118,6 +121,7 @@ type Epic struct {
 	State      string `json:"state"`
 	Open_count int64  `json:"open_count"`
 	Group_path string `json:"group_path"`
+	Updated_at int64  `json:"updated_at"`
 }
 
 type NotAuthReason string
@@ -1806,7 +1810,8 @@ type Issue (
   graph_status: string,
   open_count: int,
   project_avatar: string,
-  project_path: string
+  project_path: string,
+  updated_at: int
 )
 
 type IssuableKind (issue, merge_request)
@@ -1862,7 +1867,8 @@ type MergeRequest (
   assignees: []string,
   open_count: int,
   project_avatar: string,
-  project_path: string
+  project_path: string,
+  updated_at: int
 )
 
 type Project (
@@ -1870,7 +1876,8 @@ type Project (
   name: string,
   path: string,
   web_url: string,
-  avatar: string
+  avatar: string,
+  archived: bool
 )
 
 type Group (
@@ -1900,7 +1907,8 @@ type Epic (
   web_url: string,
   state: string,
   open_count: int,
-  group_path: string
+  group_path: string,
+  updated_at: int
 )
 
 error GitlabError (message: string)

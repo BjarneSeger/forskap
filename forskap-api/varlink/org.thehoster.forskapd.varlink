@@ -12,7 +12,8 @@ type Issue (
   graph_status: string,
   open_count: int,
   project_avatar: string,
-  project_path: string
+  project_path: string,
+  updated_at: int
 )
 
 type IssuableKind (issue, merge_request)
@@ -68,7 +69,8 @@ type MergeRequest (
   assignees: []string,
   open_count: int,
   project_avatar: string,
-  project_path: string
+  project_path: string,
+  updated_at: int
 )
 
 type Project (
@@ -76,7 +78,8 @@ type Project (
   name: string,
   path: string,
   web_url: string,
-  avatar: string
+  avatar: string,
+  archived: bool
 )
 
 type Group (
@@ -106,7 +109,8 @@ type Epic (
   web_url: string,
   state: string,
   open_count: int,
-  group_path: string
+  group_path: string,
+  updated_at: int
 )
 
 error GitlabError (message: string)

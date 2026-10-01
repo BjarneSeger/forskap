@@ -38,8 +38,9 @@ type Issue (
                         # board/label matches
   open_count:   int,    # opens recorded through RecordOpen (within usage.retention_hours)
   project_avatar: string, # file of the project's avatar, see Project.avatar; empty when none
-  project_path: string    # the project's full path ("team/api"): the stored project's, else
+  project_path: string,   # the project's full path ("team/api"): the stored project's, else
                           # the one in web_url; empty when neither gives it
+  updated_at:   int       # unix seconds, GitLab's updated_at as of the last sync; 0 when unknown
 )
 ```
 
@@ -134,21 +135,29 @@ type MergeRequest (
   assignees:  []string, # assignee usernames, captured at the last search sync
   open_count: int,      # opens recorded through RecordOpen (within usage.retention_hours)
   project_avatar: string, # file of the project's avatar, see Project.avatar; empty when none
-  project_path: string    # the project's full path ("team/api"): the stored project's, else
+  project_path: string,   # the project's full path ("team/api"): the stored project's, else
                           # the one in web_url; empty when neither gives it
+  updated_at: int         # unix seconds, GitLab's updated_at as of the last sync; 0 when unknown
 )
 ```
 
 ```varlink
 type Project (
-  id:      int,
-  name:    string,
-  path:    string,  # full namespace path ("team/backend/api")
-  web_url: string,
-  avatar:  string   # absolute path of the avatar image on the daemon's machine;
-                    # empty when the project has none
+  id:       int,
+  name:     string,
+  path:     string,  # full namespace path ("team/backend/api")
+  web_url:  string,
+  avatar:   string,  # absolute path of the avatar image on the daemon's machine;
+                     # empty when the project has none
+  archived: bool     # whether the project is archived (read-only on GitLab)
 )
 ```
+
+`archived` is for the client to act on — grey the project out, sort it last, leave it
+out of a picker: the daemon itself treats an archived project like any other, so
+`Search` matches and orders it the same. A project synced by a daemon that didn't store
+the flag reads `false` until the member projects are synced again, which the upgraded
+daemon does at its first start.
 
 The daemon downloads the avatars of the member projects into
 `$XDG_CACHE_HOME/forskapd/avatars/` (a private project's avatar is only readable with
@@ -176,8 +185,9 @@ type Epic (
   web_url:    string,
   state:      string,  # "opened" or "closed"
   open_count: int,     # opens recorded through RecordEpicOpen (within usage.retention_hours)
-  group_path: string   # the group's full path ("team/backend"): the stored group's, else
+  group_path: string,  # the group's full path ("team/backend"): the stored group's, else
                        # the one in web_url; empty when neither gives it
+  updated_at: int      # unix seconds, GitLab's updated_at as of the last sync; 0 when unknown
 )
 ```
 

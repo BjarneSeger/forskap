@@ -192,6 +192,7 @@ mod tests {
             path: path.to_string(),
             web_url: String::new(),
             avatar: String::new(),
+            archived: false,
         }
     }
 
