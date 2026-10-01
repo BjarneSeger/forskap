@@ -24,28 +24,38 @@ pub fn friendly(op: &str, e: ApiError) -> anyhow::Error {
 /// parentheses when present. Unknown codes and a missing reason (older daemon)
 /// fall back to the generic "run `forskap auth login`" line.
 fn message_for(reason: Option<NotAuthReason>, detail: Option<&str>) -> String {
-    let base = match reason {
-        Some(NotAuthReason::no_credentials) => {
-            "Not connected to GitLab. Run `forskap auth login` to authenticate."
-        }
-        Some(NotAuthReason::token_rejected) => {
-            "GitLab rejected the stored token. Run `forskap auth login` to re-authenticate."
-        }
-        Some(NotAuthReason::unreachable) => {
-            "Can't reach GitLab — the daemon is not connected. It retries \
-             automatically unless auto-reconnect is disabled; if so, restart it \
-             once GitLab is reachable."
-        }
-        Some(NotAuthReason::keychain_error) => {
-            "Couldn't read your saved credentials from the keychain. \
-             Run `forskap auth login` to store them again."
-        }
-        Some(NotAuthReason::logged_out) => "Logged out. Run `forskap auth login` to authenticate.",
-        None => "Not connected to GitLab. Run `forskap auth login` to authenticate.",
-    };
+    let base = format!("{} {}", problem(reason.as_ref()), remedy(reason.as_ref()));
     match detail {
         Some(d) if !d.is_empty() => format!("{base} ({d})"),
-        _ => base.to_string(),
+        _ => base,
+    }
+}
+
+/// What a dormancy `reason` means for the user.
+fn problem(reason: Option<&NotAuthReason>) -> &'static str {
+    match reason {
+        Some(NotAuthReason::no_credentials) | None => "Not connected to GitLab.",
+        Some(NotAuthReason::token_rejected) => "GitLab rejected the stored token.",
+        Some(NotAuthReason::unreachable) => "Can't reach GitLab — the daemon is not connected.",
+        Some(NotAuthReason::keychain_error) => {
+            "Couldn't read your saved credentials from the keychain."
+        }
+        Some(NotAuthReason::logged_out) => "Logged out.",
+    }
+}
+
+/// What to do about a dormancy `reason`.
+pub fn remedy(reason: Option<&NotAuthReason>) -> &'static str {
+    match reason {
+        Some(NotAuthReason::no_credentials | NotAuthReason::logged_out) | None => {
+            "Run `forskap auth login` to authenticate."
+        }
+        Some(NotAuthReason::token_rejected) => "Run `forskap auth login` to re-authenticate.",
+        Some(NotAuthReason::unreachable) => {
+            "It retries automatically unless auto-reconnect is disabled; if so, \
+             restart it once GitLab is reachable."
+        }
+        Some(NotAuthReason::keychain_error) => "Run `forskap auth login` to store them again.",
     }
 }
 
@@ -62,6 +72,36 @@ mod tests {
         assert!(message_for(Some(NotAuthReason::unreachable), None).contains("reach GitLab"));
         assert!(message_for(Some(NotAuthReason::keychain_error), None).contains("keychain"));
         assert!(message_for(Some(NotAuthReason::logged_out), None).contains("Logged out"));
+    }
+
+    #[test]
+    fn each_reason_reads_as_problem_then_remedy() {
+        for (reason, message) in [
+            (
+                NotAuthReason::no_credentials,
+                "Not connected to GitLab. Run `forskap auth login` to authenticate.",
+            ),
+            (
+                NotAuthReason::token_rejected,
+                "GitLab rejected the stored token. Run `forskap auth login` to re-authenticate.",
+            ),
+            (
+                NotAuthReason::unreachable,
+                "Can't reach GitLab — the daemon is not connected. It retries automatically \
+                 unless auto-reconnect is disabled; if so, restart it once GitLab is reachable.",
+            ),
+            (
+                NotAuthReason::keychain_error,
+                "Couldn't read your saved credentials from the keychain. \
+                 Run `forskap auth login` to store them again.",
+            ),
+            (
+                NotAuthReason::logged_out,
+                "Logged out. Run `forskap auth login` to authenticate.",
+            ),
+        ] {
+            assert_eq!(message_for(Some(reason), None), message);
+        }
     }
 
     #[test]

@@ -181,6 +181,21 @@ pub enum Command {
         #[command(subcommand)]
         command: QueueCommand,
     },
+    /// Check what may not be working: the daemon, its login, the sync, failed
+    /// writes.
+    ///
+    /// Looks at whether the daemon answers and runs this version, whether it
+    /// is logged in to GitLab, whether sync jobs fail, hang or are left
+    /// waiting, and whether queued writes failed for good. Each check ends in
+    /// `ok`, `warning` or `error`, or `skipped` when an earlier one makes it
+    /// moot. The exit status is non-zero when any check is an error; warnings
+    /// alone exit zero.
+    Status {
+        #[command(flatten)]
+        output: OutputArgs,
+        #[command(flatten)]
+        watch: WatchArgs,
+    },
     /// Inspect or scaffold the user configuration file.
     Config {
         #[command(subcommand)]

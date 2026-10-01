@@ -93,6 +93,7 @@ forskap activity --days 30      # what you did on GitLab: pushes, comments, open
 forskap queue list              # writes that failed permanently; `retry`/`dismiss` them
 forskap sync refresh            # drop the cache and fetch again
 forskap sync jobs               # what the background sync runs now, next, and what failed
+forskap status                  # is anything not working? daemon, login, sync, failed writes
 ```
 
 `forskap issue` and `forskap mr` share their verbs (`list`, `view`, `open`, `close`, `assign`,
@@ -105,12 +106,18 @@ so nothing is created behind your back later. `forskap epic` has `view` and `ope
 ambiguous number takes `-g`. Commands that print data take `-o json` or `-o yaml`.
 On a terminal the text output colours state words, headings and item numbers;
 `--color always|never` overrules that, and `NO_COLOR` is honoured.
-`forskap sync jobs` and `forskap queue list` take `-w`/`--watch [SECS]` to redraw
-their text view every SECS seconds (2 by default) until Ctrl-C; while the daemon
-is away the watch shows the error and keeps trying.
+`forskap sync jobs`, `forskap queue list` and `forskap status` take `-w`/`--watch [SECS]`
+to redraw their text view every SECS seconds (2 by default) until Ctrl-C; while the
+daemon is away the watch shows the error and keeps trying.
 
 `forskap sync jobs` puts the jobs that are done for good (a fetched avatar per
 project) on one line per kind; `-a`/`--all` lists each.
+
+`forskap status` is the first thing to run when forskap seems off. It checks that the
+daemon answers (and runs the CLI's version), that it is logged in to GitLab, that no
+sync job fails, hangs or is left waiting, and that no queued write failed for good.
+Each check comes out `ok`, `warning` or `error`; the exit status is non-zero only when
+one is an error, so a script or a shell prompt can call it too.
 
 ## Config
 

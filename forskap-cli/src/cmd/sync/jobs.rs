@@ -53,7 +53,7 @@ fn settled(job: &SyncJob) -> bool {
 }
 
 /// The key with its ids blanked: `project/7/avatar` is a `project/*/avatar`.
-fn kind(key: &str) -> String {
+pub fn kind(key: &str) -> String {
     let blank = |part| match part {
         "" => part,
         id if id.bytes().all(|b| b.is_ascii_digit()) => "*",
@@ -104,11 +104,8 @@ fn render(jobs: &[SyncJob], paused_until: Option<i64>, now: i64, all: bool) -> S
         return "no sync jobs planned\n".to_string();
     }
     let mut out = String::new();
-    if let Some(until) = paused_until.filter(|&until| until > now) {
-        out.push_str(&format!(
-            "paused by a GitLab rate limit for another {}\n\n",
-            span(until - now)
-        ));
+    if let Some(pause) = pause(paused_until, now) {
+        out.push_str(&format!("{pause}\n\n"));
     }
     let rows = rows(jobs, now, all);
     let header = ["JOB", "STATUS", "LAST SYNC", "NEXT"].map(str::to_string);
@@ -127,16 +124,36 @@ fn render(jobs: &[SyncJob], paused_until: Option<i64>, now: i64, all: bool) -> S
     for row in &rows {
         out.push_str(&line(&row.cells));
         if let Some((error, failures)) = row.error {
-            let times = match failures {
-                0 => String::new(),
-                1 => "failed once: ".to_string(),
-                n => format!("failed {n} times: "),
-            };
-            let error = format!("{times}{error}");
+            let error = failure(failures, Some(error));
             out.push_str(&format!("    {}\n", style::error(&error)));
         }
     }
     out
+}
+
+/// The rate-limit pause, while it lasts.
+pub fn pause(paused_until: Option<i64>, now: i64) -> Option<String> {
+    let until = paused_until.filter(|&until| until > now)?;
+    Some(format!(
+        "paused by a GitLab rate limit for another {}",
+        span(until - now)
+    ))
+}
+
+/// How a job has been failing: `failed 2 times: 403 Forbidden`. The error
+/// is gone after a daemon restart, the count is not.
+pub fn failure(failures: i64, error: Option<&str>) -> String {
+    let times = match failures {
+        0 => None,
+        1 => Some("failed once".to_string()),
+        n => Some(format!("failed {n} times")),
+    };
+    match (times, error) {
+        (Some(times), Some(error)) => format!("{times}: {error}"),
+        (Some(times), None) => times,
+        (None, Some(error)) => error.to_string(),
+        (None, None) => "failing".to_string(),
+    }
 }
 
 fn status(job: &SyncJob) -> &'static str {
@@ -166,7 +183,7 @@ fn next(job: &SyncJob, now: i64) -> String {
 }
 
 /// A span of seconds in its two largest units: `45s`, `12m`, `3h 5m`, `2d 4h`.
-fn span(secs: i64) -> String {
+pub fn span(secs: i64) -> String {
     let secs = secs.max(0);
     let (days, hours, mins) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);
     match (days, hours, mins) {
@@ -211,6 +228,22 @@ mod tests {
         ] {
             assert_eq!(span(secs), text);
         }
+    }
+
+    #[test]
+    fn failure_counts_the_runs_and_keeps_the_error_when_there_is_one() {
+        assert_eq!(
+            failure(1, Some("403 Forbidden")),
+            "failed once: 403 Forbidden"
+        );
+        assert_eq!(
+            failure(8, Some("403 Forbidden")),
+            "failed 8 times: 403 Forbidden"
+        );
+        // After a daemon restart: the count without the error.
+        assert_eq!(failure(3, None), "failed 3 times");
+        assert_eq!(failure(0, Some("403 Forbidden")), "403 Forbidden");
+        assert_eq!(failure(0, None), "failing");
     }
 
     #[test]

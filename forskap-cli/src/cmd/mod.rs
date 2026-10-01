@@ -11,5 +11,6 @@ pub mod item;
 pub mod project;
 pub mod queue;
 pub mod search;
+pub mod status;
 pub mod sync;
 pub mod time;

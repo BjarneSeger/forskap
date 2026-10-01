@@ -2,7 +2,7 @@
 
 mod login;
 mod logout;
-mod status;
+pub mod status;
 
 use anyhow::Result;
 

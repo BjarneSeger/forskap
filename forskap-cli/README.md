@@ -66,9 +66,25 @@ pipes, launchers) this stays an error asking for `--project`.
 
 `forskap epic` does the same across groups, with `--group`.
 
+### Is it working?
+`forskap status` checks the whole setup in one go: whether the daemon answers
+on its socket and runs the same version as the CLI, whether it is logged in to
+GitLab (and how long the token lasts), whether sync jobs fail, hang or are left
+waiting, and whether queued writes failed for good. Each check is `ok`,
+`warning` or `error` — or `skipped`, when the daemon can't be reached at all —
+with a line on what to do. `-o json` gives the same as a document with the
+numbers behind it, and `-w` keeps redrawing it.
+
+The exit status is non-zero only when a check is an error: an unreachable or
+stuck daemon, a login that needs `forskap auth login`, a sync job that hangs.
+Warnings, like a project whose merge requests GitLab refuses, exit zero, so
+`forskap status >/dev/null || …` in a script or prompt fires only when
+something is broken.
+
 ### Colour
 On a terminal the text output colours the state words (`opened`, `merged`, a
-sync job's `running`, …), the headings and the item numbers (`#42`, `!7`, `&5`).
+sync job's `running`, a check's `warning`, …), the headings and the item
+numbers (`#42`, `!7`, `&5`).
 Pipes, scripts and launchers get plain text, and `--output json` is never
 coloured. `--color always` or `--color never` overrules that on any command;
 `NO_COLOR` turns it off and `CLICOLOR_FORCE` on.

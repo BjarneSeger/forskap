@@ -68,6 +68,8 @@ fn main() -> ExitCode {
         Err(e) if e.is::<output::StdoutClosed>() => ExitCode::SUCCESS,
         // The picker already showed the dismissal; exit like a Ctrl-C.
         Err(e) if e.is::<pick::Cancelled>() => ExitCode::from(130),
+        // `forskap status` printed what is wrong already.
+        Err(e) if e.is::<cmd::status::Unhealthy>() => ExitCode::FAILURE,
         Err(e) => {
             eprintln!("Error: {e:?}");
             ExitCode::FAILURE
@@ -104,6 +106,7 @@ async fn run() -> Result<()> {
         Command::Auth { command } => cmd::auth::run(command).await,
         Command::Sync { command } => cmd::sync::run(command).await,
         Command::Queue { command } => cmd::queue::run(command).await,
+        Command::Status { output, watch } => cmd::status::run(output.output, watch).await,
         Command::Config { command } => cmd::config::run(command),
         #[cfg(target_os = "linux")]
         Command::Integration { command } => cmd::integration::run(command).await,
