@@ -65,3 +65,45 @@ jobs:
           args: ${{ github.ref_type == 'tag' && 'release --clean' || 'release --snapshot --clean' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Tags only: point the Homebrew formula (Formula/forskap.rb) at the release
+  # just published and commit that to main. A push made with GITHUB_TOKEN
+  # starts no workflow, hence the explicit formula test below.
+  bump-formula:
+    if: github.ref_type == 'tag'
+    needs: release
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.push.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Point the formula at the tag
+        run: bash .github/scripts/bump-formula.sh "$GITHUB_REF_NAME"
+
+      - name: Commit to main
+        id: push
+        run: |
+          if ! git diff --quiet -- Formula/forskap.rb; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: Bump formula to $GITHUB_REF_NAME" -- Formula/forskap.rb
+            # main may have moved since the checkout.
+            for attempt in 1 2 3 4 5; do
+              git push origin HEAD:main && break
+              [ "$attempt" -lt 5 ] || exit 1
+              sleep $((attempt * 5))
+              git pull --rebase origin main
+            done
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  brew:
+    needs: bump-formula
+    permissions:
+      contents: read
+    uses: ./.github/workflows/brew.yml
+    with:
+      ref: ${{ needs.bump-formula.outputs.sha }}

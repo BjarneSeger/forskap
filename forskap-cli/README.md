@@ -15,6 +15,17 @@ After installing the package, make sure to enable the systemd socket:
 systemctl enable --now --user forskapd.socket
 ```
 
+On macOS, install with [Homebrew](https://brew.sh) from the tap in this repository
+(built from source, daemon included; needs a release newer than 0.12.0) and run the
+daemon as a service:
+
+```sh
+brew tap bjarneseger/forskap https://github.com/BjarneSeger/forskap
+brew install forskap
+brew services start forskap
+```
+
+Then run
 
 ```sh
 forskap time hook <SHELL>
@@ -64,7 +75,8 @@ coloured. `--color always` or `--color never` overrules that on any command;
 
 ## Config
 The config lives at `$XDG_CONFIG_HOME/` or `$HOME/.config/` under
-`forskap/config.toml`. You can run `forskap config path` to see what it 
+`forskap/config.toml` (on macOS: `~/Library/Application Support/forskap/config.toml`).
+You can run `forskap config path` to see what it 
 resolves to on your system. To get a sample config, run
 
 ```sh

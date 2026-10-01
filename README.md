@@ -20,12 +20,29 @@ Install the `forskap-utils` package (deb, rpm and arch packages plus prebuilt
 binaries are on the releases tab). It ships the `forskapd` daemon, the `forskap`
 CLI, shell completions, and systemd user units.
 
+On macOS, install with [Homebrew](https://brew.sh). This repository is its own tap;
+the formula builds the daemon and the CLI from the source of the latest release and
+installs the shell completions:
+
+```sh
+brew tap bjarneseger/forskap https://github.com/BjarneSeger/forskap
+brew install forskap
+```
+
+This needs a release newer than 0.12.0, which does not build on macOS.
+
 ## 2. Start the daemon
 
 The daemon is a systemd user unit — enable and start it:
 
 ```sh
 systemctl enable --now --user forskapd.service
+```
+
+With Homebrew it is a launchd service, logging to `$(brew --prefix)/var/log/forskapd.log`:
+
+```sh
+brew services start forskap
 ```
 
 ## 3. Log in
