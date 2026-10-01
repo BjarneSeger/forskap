@@ -82,6 +82,19 @@ Commit the regenerated `orgthehosterforskapd.go` — never hand-edit it. CI
 (`.github/workflows/go-binding.yml`) regenerates and fails on `git diff` if the
 committed binding is stale.
 
+Once the change is on `main`, tag the binding with the api crate's version and push the
+tag — without one, `go get` only offers consumers a pseudo-version:
+
+```sh
+git tag clients/go/v0.25.0 <commit on main>   # the version in forskap-api/Cargo.toml
+git push origin clients/go/v0.25.0
+```
+
+A pushed tag is final: proxy.golang.org and the Go checksum database keep the first
+content they saw, so never move or re-create one. A fix to the binding alone (`client.go`,
+its README) bumps the api crate's patch version and gets the next tag. The `Release`
+workflow only reacts to `v*` tags, so this one publishes nothing.
+
 ## 7. Verify
 
 `cargo test`, then the `verify` skill to drive the new method end-to-end over the real
