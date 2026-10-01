@@ -1,6 +1,6 @@
 module github.com/BjarneSeger/forskap/clients/go
 
-go 1.26.4
+go 1.24.0
 
 require github.com/varlink/go v0.4.0
 
