@@ -193,12 +193,14 @@ type SearchResults struct {
 // all four); limit caps each result set separately, the issues and epics
 // together (nil = daemon default of 50); scope keeps only items in any of its
 // projects (by ID) or groups (by path, subgroups included), applied before
-// limit (nil = everything); types keeps only the work items of the given types,
-// compared case-insensitively ("issue", "task", "epic", …; nil or empty = all).
-// Work items and MRs come most-opened first (see RecordOpen); an empty query
-// lists only items with recorded opens. Epics need GitLab Premium or Ultimate.
-func (c *Client) Search(ctx context.Context, query string, kinds *[]SearchKind, limit *int64, scope *SearchScope, types *[]string) (SearchResults, error) {
-	workItems, mrs, projects, groups, err := Search().Call(ctx, c.conn, query, kinds, limit, scope, types)
+// limit (nil = everything); types keeps only the work items of the given types
+// and excludeTypes drops the ones of its types, both compared case-insensitively
+// ("issue", "task", "epic", …; nil or empty = no filter) and applied before
+// limit. Work items and MRs come most-opened first (see RecordOpen); an empty
+// query lists only items with recorded opens. Epics need GitLab Premium or
+// Ultimate.
+func (c *Client) Search(ctx context.Context, query string, kinds *[]SearchKind, limit *int64, scope *SearchScope, types, excludeTypes *[]string) (SearchResults, error) {
+	workItems, mrs, projects, groups, err := Search().Call(ctx, c.conn, query, kinds, limit, scope, types, excludeTypes)
 	return SearchResults{workItems, mrs, projects, groups}, err
 }
 

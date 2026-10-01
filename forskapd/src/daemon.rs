@@ -635,7 +635,7 @@ mod tests {
         let mrs = mrs.unwrap().merge_requests;
         assert_eq!(mrs.iter().map(|m| m.iid).collect::<Vec<_>>(), [31, 12, 44]);
 
-        let search = |query: &str| client.search(query.into(), None, None, None, None);
+        let search = |query: &str| client.search(query.into(), None, None, None, None, None);
         let found = search("billing").call().await.unwrap();
         let (epics, issues): (Vec<_>, Vec<_>) =
             found.work_items.iter().partition(|w| w.r#type == "epic");
@@ -657,9 +657,15 @@ mod tests {
             None,
             None,
             Some(vec!["task".into()]),
+            None,
         );
         let tasks = tasks.call().await.unwrap().work_items;
         assert_eq!(keys(&tasks), [(101, 16)]);
+        let no_epics = vec!["epic".to_string()];
+        let mut issues = client.search("billing".into(), None, None, None, None, Some(no_epics));
+        let issues = issues.call().await.unwrap().work_items;
+        assert_eq!(issues.len(), 3);
+        assert!(issues.iter().all(|w| w.r#type == "issue"));
         let archived = search("legacy").call().await.unwrap();
         assert!(archived.projects[0].archived);
         let api = search("API").call().await.unwrap().projects;
@@ -708,7 +714,7 @@ mod tests {
         assert!(!keys(&run.assigned_work_items().await).contains(&(101, 12)));
         until("the closed issue", async || {
             let found = client
-                .search("#12".into(), None, None, None, None)
+                .search("#12".into(), None, None, None, None, None)
                 .call()
                 .await
                 .ok()?;
@@ -859,7 +865,7 @@ mod tests {
         until("the search corpus", async || {
             let found = run
                 .client
-                .search("billing".into(), None, None, None, None)
+                .search("billing".into(), None, None, None, None, None)
                 .call()
                 .await;
             (!found.ok()?.work_items.is_empty()).then_some(())

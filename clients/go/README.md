@@ -74,8 +74,8 @@ Daemon-side errors surface as typed values you match with `errors.As`:
 
 Optional varlink parameters are pointers; pass `nil` to omit them
 (e.g. `c.GetHistory(ctx, nil)` for the daemon's default window,
-`c.Search(ctx, "query", nil, nil, nil, nil)` for all kinds and types, the default
-limit and no project/group scope,
+`c.Search(ctx, "query", nil, nil, nil, nil, nil)` for all kinds and types, the
+default limit and no project/group scope,
 `c.ListWorkItems(ctx, nil, nil, nil)` for the issues you authored or are assigned to
 in any state, or
 `c.PostTime(ctx, pid, iid, forskap.KindWorkItem, "1h", &summary)`). The varlink
@@ -96,11 +96,13 @@ carries it as `Parent`, a `WorkItemRef` with the epic's group, number, title and
 absolute link.
 
 `c.Search` returns the issues and epics it finds as one list, ranked together under
-one limit; pass `types` to keep some of them:
+one limit; pass `types` to keep some of them, `excludeTypes` to leave some out
+(before the limit, so it fills from the rest):
 
 ```go
-epics := []string{"epic"}
-res, err := c.Search(ctx, "billing", nil, nil, nil, &epics)
+epic := []string{"epic"}
+epics, err := c.Search(ctx, "billing", nil, nil, nil, &epic, nil)
+issues, err := c.Search(ctx, "billing", nil, nil, nil, nil, &epic)
 ```
 
 `c.RecordOpen` counts an open of an issue or merge request by its project, or of an

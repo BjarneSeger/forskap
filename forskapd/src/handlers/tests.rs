@@ -271,7 +271,7 @@ fn seed_recent_issues(h: &Handlers) {
 /// Issues "OAuth token refresh" (1/10) and a labeled one (1/20), MR "Fix
 /// oauth flow" (1/30), project `team/auth-service`, group `team` with the
 /// epics "Identity roadmap" (5/7) and "Billing" (5/8).
-fn seed_corpus(h: &Handlers) {
+pub(crate) fn seed_corpus(h: &Handlers) {
     let mut labeled = issue(1, 20, "unrelated title", "https://gl/team/p/-/issues/20");
     labeled.labels = vec!["Backend".into()];
     labeled.updated_at = 200;
@@ -441,7 +441,7 @@ async fn run_scoped_search(
     limit: Option<i64>,
     scope: Option<SearchScope>,
 ) -> Search_Reply {
-    search_with(h, query, kinds, limit, scope, None).await
+    search_with(h, query, kinds, limit, scope, None, None).await
 }
 
 /// `Search` for the work items of `types` only.
@@ -451,9 +451,20 @@ async fn run_typed_search(
     types: &[&str],
     limit: Option<i64>,
 ) -> Search_Reply {
-    let types = Some(types.iter().map(|t| t.to_string()).collect());
+    run_filtered_search(h, query, types, &[], limit).await
+}
+
+/// `Search` for the work items of `types` (empty: any) but not of `excluded`.
+async fn run_filtered_search(
+    h: &Handlers,
+    query: &str,
+    types: &[&str],
+    excluded: &[&str],
+    limit: Option<i64>,
+) -> Search_Reply {
+    let names = |list: &[&str]| Some(list.iter().map(|t| t.to_string()).collect());
     let kinds = Some(vec![SearchKind::work_items]);
-    search_with(h, query, kinds, limit, None, types).await
+    search_with(h, query, kinds, limit, None, names(types), names(excluded)).await
 }
 
 async fn search_with(
@@ -463,6 +474,7 @@ async fn search_with(
     limit: Option<i64>,
     scope: Option<SearchScope>,
     types: Option<Vec<String>>,
+    exclude_types: Option<Vec<String>>,
 ) -> Search_Reply {
     let mut call = AsyncCall::default();
     h.search(
@@ -472,6 +484,7 @@ async fn search_with(
         limit,
         scope,
         types,
+        exclude_types,
     )
     .await
     .unwrap();
@@ -1622,6 +1635,62 @@ async fn search_narrows_work_items_to_types() {
     assert_eq!(found(&[]).await.len(), 4, "no types is every type");
 }
 
+/// `exclude_types` drops the work items of the listed types, in any case;
+/// with `types`, an item must be in the one and not in the other.
+#[tokio::test]
+async fn search_leaves_out_work_items_of_excluded_types() {
+    let (h, _dir) = dormant_handlers();
+    seed_corpus(&h);
+    let mut task = issue(1, 40, "Write the tests", "https://gl/team/p/-/issues/40");
+    task.issue_type = "task".into();
+    seed(&h, &[task]);
+    let found = async |types: &[&str], excluded: &[&str]| -> Vec<i64> {
+        iids(
+            &run_filtered_search(&h, "t", types, excluded, None)
+                .await
+                .work_items,
+        )
+    };
+
+    assert_eq!(found(&[], &[]).await, [20, 10, 7, 40]);
+    assert_eq!(found(&[], &["epic"]).await, [20, 10, 40], "the task stays");
+    assert_eq!(found(&[], &["EPIC", "Task"]).await, [20, 10]);
+    assert_eq!(found(&[], &["incident"]).await, [20, 10, 7, 40]);
+    assert_eq!(found(&["task", "epic"], &["Epic"]).await, [40]);
+    assert!(found(&["epic"], &["epic"]).await.is_empty());
+
+    // The other kinds don't have a type to leave out.
+    let mrs = search_with(
+        &h,
+        "oauth",
+        None,
+        None,
+        None,
+        None,
+        Some(vec!["epic".into()]),
+    )
+    .await;
+    assert_eq!(iids(&mrs.work_items), [10]);
+    assert_eq!(mrs.merge_requests.len(), 1);
+}
+
+/// Left out before the limit: it fills from the work items that remain.
+#[tokio::test]
+async fn search_fills_its_limit_from_what_is_not_excluded() {
+    let (h, _dir) = dormant_handlers();
+    seed_corpus(&h);
+    let mut task = issue(1, 40, "Write the tests", "https://gl/team/p/-/issues/40");
+    task.issue_type = "task".into();
+    seed(&h, &[task]);
+
+    // Issue 20 and epic 8 updated at 200, epic 7 at 100, the task never.
+    let r = run_filtered_search(&h, "i", &[], &[], Some(2)).await;
+    assert_eq!(epic_keys(&r), [(5, 8)]);
+    let r = run_filtered_search(&h, "i", &[], &["epic"], Some(2)).await;
+    assert_eq!(issue_iids(&r), [20, 40]);
+    assert!(epics(&r).is_empty());
+}
+
 /// A group's work item is counted by its group, apart from the issue of a
 /// project sharing id and number; both apart from the merge requests.
 #[tokio::test]
@@ -1779,6 +1848,7 @@ async fn search_never_synced_is_honest_about_the_session() {
     h.search(
         &mut call as &mut dyn Call_Search,
         "x".into(),
+        None,
         None,
         None,
         None,
@@ -2572,15 +2642,20 @@ proptest! {
             proptest::sample::select(vec!["issue", "Epic", "task", "", "?"]),
             0..3,
         )),
+        excluded in proptest::option::of(proptest::collection::vec(
+            proptest::sample::select(vec!["issue", "EPIC", "task", "", "?"]),
+            0..3,
+        )),
     ) {
         prop_rt().block_on(async {
             let fake = Arc::new(FakeGitlab::default());
             let (h, _dir) = connected_handlers(&fake);
             seed_corpus(&h);
 
-            let types = types.map(|t| t.into_iter().map(str::to_string).collect());
+            let names = |list: Option<Vec<&str>>| list.map(|t| t.into_iter().map(str::to_string).collect());
+            let (types, excluded) = (names(types), names(excluded));
             let mut call = AsyncCall::default();
-            h.search(&mut call as &mut dyn Call_Search, query.clone(), kinds.clone(), limit, None, types)
+            h.search(&mut call as &mut dyn Call_Search, query.clone(), kinds.clone(), limit, None, types, excluded)
                 .await
                 .unwrap();
             let error = reply_error(&mut call);

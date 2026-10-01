@@ -53,6 +53,7 @@ pub async fn by_arg(client: &VarlinkClient, project: &str) -> Result<i64> {
             Some(SEARCH_LIMIT),
             None,
             None,
+            None,
         )
         .call()
         .await
@@ -113,6 +114,7 @@ async fn by_iid(client: &VarlinkClient, kind: RefKind, iid: i64) -> Result<i64> 
             Some(SEARCH_LIMIT),
             None,
             None,
+            refspec::excluded_types(kind),
         )
         .call()
         .await

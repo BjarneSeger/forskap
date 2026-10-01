@@ -77,7 +77,8 @@ Composite seeds: `seed_assigned_issues`, `seed_assigned_mrs`, `seed_recent_issue
 
 **Driving a varlink method**: helpers wrap `AsyncCall` — `assigned_work_items`,
 `assigned_mrs`, `list_work_items`, `run_search` / `run_scoped_search` /
-`run_typed_search` (work items of some types; `issue_iids`, `epics`, `epic_keys` split
+`run_typed_search` / `run_filtered_search` (work items of some types, or not of
+others; `issue_iids`, `epics`, `epic_keys` split
 a reply's work items), `history`, `post_time`, `close`, `unassign`, `clear_cache`,
 `run_record_open` (a project's item) / `record_open` (any reference, returns the
 error), `create_work_item` / `create_work_item_with` / `create_under(h, parent(group,

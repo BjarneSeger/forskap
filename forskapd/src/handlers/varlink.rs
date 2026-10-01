@@ -780,6 +780,7 @@ impl VarlinkInterface for Handlers {
         limit: Option<i64>,
         scope: Option<SearchScope>,
         types: Option<Vec<String>>,
+        exclude_types: Option<Vec<String>>,
     ) -> varlink::Result<()> {
         // An empty query is the "frequently opened" view: only work items and
         // MRs with recorded opens, ranked. Projects and groups have no open
@@ -795,7 +796,9 @@ impl VarlinkInterface for Handlers {
         let kinds = kinds.unwrap_or_default();
         let want = |k: SearchKind| kinds.is_empty() || kinds.contains(&k);
         let types = types.unwrap_or_default();
-        let typed = |t: &str| types.is_empty() || types.iter().any(|w| w.eq_ignore_ascii_case(t));
+        let excluded = exclude_types.unwrap_or_default();
+        let listed = |list: &[String], t: &str| list.iter().any(|l| l.eq_ignore_ascii_case(t));
+        let typed = |t: &str| (types.is_empty() || listed(&types, t)) && !listed(&excluded, t);
 
         reply_if_cold!(
             self,

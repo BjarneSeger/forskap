@@ -386,8 +386,8 @@ type Search_methods struct{}
 
 func Search() Search_methods { return Search_methods{} }
 
-func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64, scope_in_ *SearchScope, types_in_ *[]string) (work_items_out_ []WorkItem, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, err_ error) {
-	receive, err_ := m.Send(ctx, c, 0, query_in_, kinds_in_, limit_in_, scope_in_, types_in_)
+func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64, scope_in_ *SearchScope, types_in_ *[]string, exclude_types_in_ *[]string) (work_items_out_ []WorkItem, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, query_in_, kinds_in_, limit_in_, scope_in_, types_in_, exclude_types_in_)
 	if err_ != nil {
 		return
 	}
@@ -395,19 +395,21 @@ func (m Search_methods) Call(ctx context.Context, c *varlink.Connection, query_i
 	return
 }
 
-func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64, scope_in_ *SearchScope, types_in_ *[]string) (func(ctx context.Context) ([]WorkItem, []MergeRequest, []Project, []Group, uint64, error), error) {
+func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64, scope_in_ *SearchScope, types_in_ *[]string, exclude_types_in_ *[]string) (func(ctx context.Context) ([]WorkItem, []MergeRequest, []Project, []Group, uint64, error), error) {
 	var in struct {
-		Query string        `json:"query"`
-		Kinds *[]SearchKind `json:"kinds,omitempty"`
-		Limit *int64        `json:"limit,omitempty"`
-		Scope *SearchScope  `json:"scope,omitempty"`
-		Types *[]string     `json:"types,omitempty"`
+		Query         string        `json:"query"`
+		Kinds         *[]SearchKind `json:"kinds,omitempty"`
+		Limit         *int64        `json:"limit,omitempty"`
+		Scope         *SearchScope  `json:"scope,omitempty"`
+		Types         *[]string     `json:"types,omitempty"`
+		Exclude_types *[]string     `json:"exclude_types,omitempty"`
 	}
 	in.Query = query_in_
 	in.Kinds = kinds_in_
 	in.Limit = limit_in_
 	in.Scope = scope_in_
 	in.Types = types_in_
+	in.Exclude_types = exclude_types_in_
 	receive, err := c.Send(ctx, "org.thehoster.forskapd.Search", in, flags)
 	if err != nil {
 		return nil, err
@@ -432,19 +434,21 @@ func (m Search_methods) Send(ctx context.Context, c *varlink.Connection, flags u
 	}, nil
 }
 
-func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64, scope_in_ *SearchScope, types_in_ *[]string) (func(ctx context.Context) (work_items_out_ []WorkItem, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, query_in_ string, kinds_in_ *[]SearchKind, limit_in_ *int64, scope_in_ *SearchScope, types_in_ *[]string, exclude_types_in_ *[]string) (func(ctx context.Context) (work_items_out_ []WorkItem, merge_requests_out_ []MergeRequest, projects_out_ []Project, groups_out_ []Group, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
-		Query string        `json:"query"`
-		Kinds *[]SearchKind `json:"kinds,omitempty"`
-		Limit *int64        `json:"limit,omitempty"`
-		Scope *SearchScope  `json:"scope,omitempty"`
-		Types *[]string     `json:"types,omitempty"`
+		Query         string        `json:"query"`
+		Kinds         *[]SearchKind `json:"kinds,omitempty"`
+		Limit         *int64        `json:"limit,omitempty"`
+		Scope         *SearchScope  `json:"scope,omitempty"`
+		Types         *[]string     `json:"types,omitempty"`
+		Exclude_types *[]string     `json:"exclude_types,omitempty"`
 	}
 	in.Query = query_in_
 	in.Kinds = kinds_in_
 	in.Limit = limit_in_
 	in.Scope = scope_in_
 	in.Types = types_in_
+	in.Exclude_types = exclude_types_in_
 	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.Search", in)
 	if err != nil {
 		return nil, err
@@ -1450,7 +1454,7 @@ type orgthehosterforskapdInterface interface {
 	GetAssignedWorkItems(ctx context.Context, c VarlinkCall, groups_ *[]string) error
 	GetAssignedMergeRequests(ctx context.Context, c VarlinkCall, groups_ *[]string) error
 	ListWorkItems(ctx context.Context, c VarlinkCall, role_ *WorkItemRole, updated_after_ *int64, states_ *[]WorkItemState) error
-	Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64, scope_ *SearchScope, types_ *[]string) error
+	Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64, scope_ *SearchScope, types_ *[]string, exclude_types_ *[]string) error
 	PostTime(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind, duration_ string, summary_ *string) error
 	Close(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	AssignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
@@ -1647,7 +1651,7 @@ func (s *VarlinkInterface) ListWorkItems(ctx context.Context, c VarlinkCall, rol
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.ListWorkItems")
 }
 
-func (s *VarlinkInterface) Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64, scope_ *SearchScope, types_ *[]string) error {
+func (s *VarlinkInterface) Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64, scope_ *SearchScope, types_ *[]string, exclude_types_ *[]string) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.Search")
 }
 
@@ -1757,17 +1761,18 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 
 	case "Search":
 		var in struct {
-			Query string        `json:"query"`
-			Kinds *[]SearchKind `json:"kinds,omitempty"`
-			Limit *int64        `json:"limit,omitempty"`
-			Scope *SearchScope  `json:"scope,omitempty"`
-			Types *[]string     `json:"types,omitempty"`
+			Query         string        `json:"query"`
+			Kinds         *[]SearchKind `json:"kinds,omitempty"`
+			Limit         *int64        `json:"limit,omitempty"`
+			Scope         *SearchScope  `json:"scope,omitempty"`
+			Types         *[]string     `json:"types,omitempty"`
+			Exclude_types *[]string     `json:"exclude_types,omitempty"`
 		}
 		err := call.GetParameters(&in)
 		if err != nil {
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
-		return s.orgthehosterforskapdInterface.Search(ctx, VarlinkCall{call}, in.Query, in.Kinds, in.Limit, in.Scope, in.Types)
+		return s.orgthehosterforskapdInterface.Search(ctx, VarlinkCall{call}, in.Query, in.Kinds, in.Limit, in.Scope, in.Types, in.Exclude_types)
 
 	case "PostTime":
 		var in struct {
@@ -2075,7 +2080,7 @@ type SearchKind (work_items, merge_requests, projects, groups)
 
 type SearchScope (projects: ?[]int, groups: ?[]string)
 
-method Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope, types: ?[]string) -> (work_items: []WorkItem, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
+method Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope, types: ?[]string, exclude_types: ?[]string) -> (work_items: []WorkItem, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
 
 method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
 

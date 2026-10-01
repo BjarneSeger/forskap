@@ -48,6 +48,7 @@ pub async fn lookup(
     iid: i64,
 ) -> Result<Item> {
     // Scoped to the project: a title can contain `#iid` too, so exact-filter.
+    // No epic passes a project scope, so none needs excluding.
     let scope = SearchScope {
         projects: Some(vec![project_id]),
         groups: None,
@@ -58,6 +59,7 @@ pub async fn lookup(
             Some(vec![refspec::search_kind(kind)]),
             None,
             Some(scope),
+            None,
             None,
         )
         .call()

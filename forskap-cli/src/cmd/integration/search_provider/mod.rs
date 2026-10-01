@@ -158,9 +158,16 @@ impl Provider {
             });
         };
         let client = client::connect(&self.socket).await?;
-        let (kinds, types) = wire_filter(parsed.kind.as_slice());
+        let filter = wire_filter(parsed.kind.as_slice());
         let reply = match client
-            .search(parsed.query, kinds, Some(PER_KIND_LIMIT), None, types)
+            .search(
+                parsed.query,
+                filter.kinds,
+                Some(PER_KIND_LIMIT),
+                None,
+                filter.types,
+                filter.exclude_types,
+            )
             .call()
             .await
         {

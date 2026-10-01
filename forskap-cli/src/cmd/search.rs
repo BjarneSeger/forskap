@@ -13,19 +13,6 @@ use crate::friendly::friendly;
 use crate::item::is_epic;
 use crate::{client, output, style};
 
-/// GitLab's work item types other than the epic: what `--kind issues` asks
-/// for without `--kind epics`.
-const ISSUE_TYPES: [&str; 8] = [
-    "issue",
-    "incident",
-    "test_case",
-    "requirement",
-    "task",
-    "objective",
-    "key_result",
-    "ticket",
-];
-
 pub async fn run(
     query: Vec<String>,
     kinds: Vec<SearchKind>,
@@ -36,7 +23,7 @@ pub async fn run(
 ) -> Result<()> {
     let client = client::connect_default().await?;
     let query = query.join(" ");
-    let (filter, types) = wire_filter(&kinds);
+    let filter = wire_filter(&kinds);
     let projects = match project {
         Some(p) => Some(vec![project::by_arg(&client, &p).await?]),
         None => None,
@@ -48,7 +35,14 @@ pub async fn run(
     // No query → the daemon's "frequently opened" view (only items with opens).
     let frequent_only = query.trim().is_empty();
     let reply = client
-        .search(query, filter, limit, scope, types)
+        .search(
+            query,
+            filter.kinds,
+            limit,
+            scope,
+            filter.types,
+            filter.exclude_types,
+        )
         .call()
         .await
         .map_err(|e| friendly("Search", e))?;
@@ -133,11 +127,19 @@ fn opened(count: i64) -> String {
     }
 }
 
-/// The `Search` kinds and work item types `kinds` ask for; `None` for no
-/// filter. Issues and epics are both work items, told apart by their type.
-pub fn wire_filter(kinds: &[SearchKind]) -> (Option<Vec<WireKind>>, Option<Vec<String>>) {
+/// What `Search` is asked to keep; `None` for no filter.
+#[derive(Debug, Default, PartialEq)]
+pub struct Filter {
+    pub kinds: Option<Vec<WireKind>>,
+    pub types: Option<Vec<String>>,
+    pub exclude_types: Option<Vec<String>>,
+}
+
+/// The `Search` filter `kinds` ask for. Issues and epics are both work
+/// items, told apart by their type: an issue is any work item but an epic.
+pub fn wire_filter(kinds: &[SearchKind]) -> Filter {
     if kinds.is_empty() {
-        return (None, None);
+        return Filter::default();
     }
     let mut wire = Vec::new();
     for kind in kinds {
@@ -151,41 +153,56 @@ pub fn wire_filter(kinds: &[SearchKind]) -> (Option<Vec<WireKind>>, Option<Vec<S
             wire.push(kind);
         }
     }
-    let types: &[&str] = match (
+    let epic = || Some(vec!["epic".to_string()]);
+    let (types, exclude_types) = match (
         kinds.contains(&SearchKind::Issues),
         kinds.contains(&SearchKind::Epics),
     ) {
-        (true, false) => &ISSUE_TYPES,
-        (false, true) => &["epic"],
-        _ => &[],
+        (true, false) => (None, epic()),
+        (false, true) => (epic(), None),
+        _ => (None, None),
     };
-    let types = (!types.is_empty()).then(|| types.iter().map(|t| t.to_string()).collect());
-    (Some(wire), types)
+    Filter {
+        kinds: Some(wire),
+        types,
+        exclude_types,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn types(kinds: &[SearchKind]) -> Option<Vec<String>> {
-        wire_filter(kinds).1
-    }
-
     #[test]
     fn issues_and_epics_are_work_items_of_their_types() {
-        assert_eq!(wire_filter(&[]), (None, None));
-        let (wire, epics) = wire_filter(&[SearchKind::Epics]);
-        assert_eq!(wire, Some(vec![WireKind::work_items]));
-        assert_eq!(epics, Some(vec!["epic".to_string()]));
-
-        let issues = types(&[SearchKind::Issues, SearchKind::Mrs]).unwrap();
-        assert!(issues.contains(&"task".to_string()), "{issues:?}");
-        assert!(!issues.contains(&"epic".to_string()), "{issues:?}");
-
-        let (wire, both) =
-            wire_filter(&[SearchKind::Epics, SearchKind::Projects, SearchKind::Issues]);
-        assert_eq!(wire, Some(vec![WireKind::work_items, WireKind::projects]));
-        assert_eq!(both, None, "every type");
-        assert_eq!(types(&[SearchKind::Groups]), None);
+        let epic = Some(vec!["epic".to_string()]);
+        assert_eq!(wire_filter(&[]), Filter::default());
+        assert_eq!(
+            wire_filter(&[SearchKind::Epics]),
+            Filter {
+                kinds: Some(vec![WireKind::work_items]),
+                types: epic.clone(),
+                exclude_types: None,
+            }
+        );
+        assert_eq!(
+            wire_filter(&[SearchKind::Issues, SearchKind::Mrs]),
+            Filter {
+                kinds: Some(vec![WireKind::work_items, WireKind::merge_requests]),
+                types: None,
+                exclude_types: epic,
+            },
+            "every type but the epic, those to come included"
+        );
+        assert_eq!(
+            wire_filter(&[SearchKind::Epics, SearchKind::Projects, SearchKind::Issues]),
+            Filter {
+                kinds: Some(vec![WireKind::work_items, WireKind::projects]),
+                ..Filter::default()
+            },
+            "every type"
+        );
+        let groups = wire_filter(&[SearchKind::Groups]);
+        assert_eq!((groups.types, groups.exclude_types), (None, None));
     }
 }

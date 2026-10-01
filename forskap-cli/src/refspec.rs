@@ -96,6 +96,15 @@ pub fn search_kind(kind: RefKind) -> SearchKind {
     }
 }
 
+/// The work item types a `Search` for this kind's rows leaves out, so that
+/// none of them takes a place under its limit: an epic is no issue.
+pub fn excluded_types(kind: RefKind) -> Option<Vec<String>> {
+    match kind {
+        RefKind::Issue => Some(vec!["epic".into()]),
+        RefKind::Mr => None,
+    }
+}
+
 pub fn noun(kind: RefKind) -> &'static str {
     match kind {
         RefKind::Issue => "issue",

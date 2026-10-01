@@ -332,7 +332,7 @@ When a list the call needs has never been synced — both of them with `role`
 omitted: replies with an empty list if a session exists (first sync pending),
 `NotAuthenticated` otherwise.
 
-### `Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope, types: ?[]string) -> (work_items: []WorkItem, merge_requests: []MergeRequest, projects: []Project, groups: []Group)`
+### `Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope, types: ?[]string, exclude_types: ?[]string) -> (work_items: []WorkItem, merge_requests: []MergeRequest, projects: []Project, groups: []Group)`
 
 Searches the locally cached corpus — a pure cache read, no GitLab round-trip.
 Matching is a case-insensitive substring test on work item/MR titles and labels and
@@ -349,6 +349,11 @@ type SearchKind (work_items, merge_requests, projects, groups)
 and epics share `work_items`, so they share its limit. `types` keeps only the work
 items of the listed types (`"issue"`, `"task"`, `"epic"`, …), compared
 case-insensitively; omitted or empty = every type. A type nothing has matches nothing.
+`exclude_types` leaves out the work items of the listed types, compared the same way;
+omitted or empty = none. With both, a work item must be of one of `types` and of none
+of `exclude_types`. Both apply before `limit`, so the limit fills from the work items
+that remain, and neither touches the other kinds. `"exclude_types": ["epic"]` asks
+for every type a project has, the ones GitLab adds later included.
 
 ```varlink
 type SearchScope (projects: ?[]int, groups: ?[]string)
@@ -673,6 +678,10 @@ varlinkctl call $SOCKET org.thehoster.forskapd.ListWorkItems \
 # the epics about billing
 varlinkctl call $SOCKET org.thehoster.forskapd.Search \
   '{"query": "billing", "kinds": ["work_items"], "types": ["epic"]}'
+
+# everything about billing but the epics
+varlinkctl call $SOCKET org.thehoster.forskapd.Search \
+  '{"query": "billing", "exclude_types": ["epic"]}'
 
 # count an open of epic &5 of group 9
 varlinkctl call $SOCKET org.thehoster.forskapd.RecordOpen \

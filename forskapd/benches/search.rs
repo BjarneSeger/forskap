@@ -14,7 +14,7 @@ use support::{dormant_env, seed_search_corpus};
 
 const SIZES: [u64; 3] = [1_000, 10_000, 50_000];
 
-/// The kinds and the work item types a variant searches.
+/// The kinds a variant searches, and the work item types it leaves out.
 type Filter = (Option<Vec<SearchKind>>, Option<Vec<String>>);
 
 fn search_handler(c: &mut Criterion) {
@@ -25,11 +25,11 @@ fn search_handler(c: &mut Criterion) {
         let env = dormant_env();
         seed_search_corpus(&env, n);
         group.throughput(Throughput::Elements(n));
-        // The issues alone: the work items of the type `issue`.
+        // The issues alone: the work items but the epics, as the CLI asks.
         let issues = || -> Filter {
             (
                 Some(vec![SearchKind::work_items]),
-                Some(vec!["issue".into()]),
+                Some(vec!["epic".into()]),
             )
         };
         let variants: [(&str, &str, Filter); 4] = [
@@ -42,10 +42,10 @@ fn search_handler(c: &mut Criterion) {
             // Exact-reference query: parse + iid comparison path.
             ("iid_ref", "#123", issues()),
         ];
-        for (variant, query, (kinds, types)) in variants {
+        for (variant, query, (kinds, excluded)) in variants {
             group.bench_with_input(BenchmarkId::new(variant, n), &n, |b, _| {
                 b.to_async(&env.rt).iter(|| {
-                    let (kinds, types) = (kinds.clone(), types.clone());
+                    let (kinds, excluded) = (kinds.clone(), excluded.clone());
                     let h = &env.h;
                     async move {
                         let mut call = AsyncCall::default();
@@ -55,7 +55,8 @@ fn search_handler(c: &mut Criterion) {
                             kinds,
                             None,
                             None,
-                            types,
+                            None,
+                            excluded,
                         )
                         .await
                         .unwrap();

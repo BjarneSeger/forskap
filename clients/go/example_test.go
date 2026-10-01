@@ -57,11 +57,20 @@ func Example() {
 
 	// The epics about billing.
 	epics := []string{"epic"}
-	res, err := c.Search(ctx, "billing", nil, nil, nil, &epics)
+	res, err := c.Search(ctx, "billing", nil, nil, nil, &epics, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 	for _, e := range res.WorkItems {
 		fmt.Printf("&%d %s\n", e.Iid, e.Title)
+	}
+
+	// Everything else about billing: tasks and the types to come included.
+	res, err = c.Search(ctx, "billing", nil, nil, nil, nil, &epics)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, w := range res.WorkItems {
+		fmt.Printf("#%d %s (%s)\n", w.Iid, w.Title, w.Type)
 	}
 }

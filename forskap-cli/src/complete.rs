@@ -375,8 +375,9 @@ async fn fetch_items(kind: RefKind, rows: &mut Vec<Item>) -> Option<()> {
         }
     }
     let kinds = vec![refspec::search_kind(kind)];
+    let excluded = refspec::excluded_types(kind);
     let reply = client
-        .search(String::new(), Some(kinds), None, None, None)
+        .search(String::new(), Some(kinds), None, None, None, excluded)
         .call()
         .await
         .ok()?;
@@ -409,7 +410,7 @@ async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     let query = current.trim_matches('/').to_string();
     let kinds = vec![SearchKind::projects];
     let reply = client
-        .search(query, Some(kinds), None, None, None)
+        .search(query, Some(kinds), None, None, None, None)
         .call()
         .await
         .ok()?;
@@ -423,7 +424,7 @@ async fn fetch_epics(rows: &mut Vec<WorkItem>) -> Option<()> {
     let kinds = vec![SearchKind::work_items];
     let types = vec!["epic".to_string()];
     let reply = client
-        .search(String::new(), Some(kinds), None, None, Some(types))
+        .search(String::new(), Some(kinds), None, None, Some(types), None)
         .call()
         .await
         .ok()?;
@@ -437,7 +438,7 @@ async fn fetch_groups(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     let query = current.trim_matches('/').to_string();
     let kinds = vec![SearchKind::groups];
     let reply = client
-        .search(query, Some(kinds), None, None, None)
+        .search(query, Some(kinds), None, None, None, None)
         .call()
         .await
         .ok()?;

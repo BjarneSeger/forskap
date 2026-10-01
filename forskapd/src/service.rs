@@ -237,6 +237,7 @@ async fn handle_forskapd(
                     args.limit,
                     args.scope,
                     args.types,
+                    args.exclude_types,
                 )
                 .await?;
         }
@@ -358,6 +359,37 @@ mod tests {
                 "Search is missing its dispatch arm in handle_forskapd"
             );
         }
+    }
+
+    /// The arm hands `types` and `exclude_types` on, each to its own end.
+    #[tokio::test]
+    async fn dispatch_passes_the_search_type_filters_on() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        crate::handlers::tests::seed_corpus(&handlers);
+        let found = async |filter: serde_json::Value| -> Vec<String> {
+            let mut params = serde_json::json!({"query": "i", "kinds": ["work_items"]});
+            params
+                .as_object_mut()
+                .unwrap()
+                .extend(filter.as_object().unwrap().clone());
+            let reply = handle_forskapd("org.thehoster.forskapd.Search", Some(params), &handlers)
+                .await
+                .unwrap()
+                .expect("a reply");
+            let items = &reply.parameters.expect("a result")["work_items"];
+            let items = items.as_array().unwrap().iter();
+            items
+                .map(|w| w["type"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(
+            found(serde_json::json!({})).await,
+            ["issue", "epic", "epic"]
+        );
+        let only = found(serde_json::json!({"types": ["epic"]})).await;
+        assert_eq!(only, ["epic", "epic"]);
+        let excluded = found(serde_json::json!({"exclude_types": ["epic"]})).await;
+        assert_eq!(excluded, ["issue"]);
     }
 
     /// The methods the work items replaced are gone, not answered.
