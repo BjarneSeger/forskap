@@ -45,6 +45,7 @@ pub fn issue(
         project_avatar: project.avatar,
         project_path: project_path(project.path, &i.web_url),
         web_url: i.web_url,
+        updated_at: i.updated_at as i64,
     }
 }
 
@@ -64,6 +65,7 @@ pub fn merge_request(
         project_avatar: project.avatar,
         project_path: project_path(project.path, &m.web_url),
         web_url: m.web_url,
+        updated_at: m.updated_at as i64,
     }
 }
 
@@ -74,6 +76,7 @@ pub fn project(p: model::Project, avatar: String) -> Project {
         path: p.path_with_namespace,
         web_url: p.web_url,
         avatar,
+        archived: p.archived,
     }
 }
 
@@ -108,6 +111,7 @@ pub fn epic(e: model::Epic, open_count: i64, group_path: Option<String>) -> Epic
         web_url: e.web_url,
         state: e.state,
         open_count,
+        updated_at: e.updated_at as i64,
     }
 }
 

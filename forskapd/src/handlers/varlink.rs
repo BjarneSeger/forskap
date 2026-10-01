@@ -562,7 +562,8 @@ impl VarlinkInterface for Handlers {
         rows.retain(|m| {
             still_assigned(&m.state, &m.assignees, me) && in_groups(&groups, &m.web_url)
         });
-        // The wire type carries no timestamp, so order for the picker here.
+        // Newest-updated first, as the interface promises: the picker shows
+        // the reply in its order.
         rows.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
 
         let usage = self.usage_or_empty();

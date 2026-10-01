@@ -185,6 +185,7 @@ pub fn project(i: u64) -> Project {
         path_with_namespace: format!("{}/proj{i}", namespace(i)),
         web_url: format!("https://gl/{}/proj{i}", namespace(i)),
         avatar_url: format!("https://gl/uploads/-/system/project/avatar/{i}/logo.png"),
+        archived: false,
     }
 }
 

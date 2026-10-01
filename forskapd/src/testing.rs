@@ -410,8 +410,8 @@ pub fn epic_json(group_id: i64, iid: i64, title: &str) -> Value {
 /// The smallest thing [`crate::sync::avatars::extension`] takes for a PNG.
 pub const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
 
-/// A member project as GitLab's `simple=true` listing returns it, without an
-/// avatar.
+/// A member project as GitLab's listing returns it (the fields the daemon
+/// mirrors), without an avatar and not archived.
 pub fn project_json(id: i64) -> Value {
     serde_json::json!({
         "id": id,
@@ -419,6 +419,7 @@ pub fn project_json(id: i64) -> Value {
         "path_with_namespace": format!("g/p{id}"),
         "web_url": format!("https://gitlab.test/g/p{id}"),
         "avatar_url": null,
+        "archived": false,
     })
 }
 

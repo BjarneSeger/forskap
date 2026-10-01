@@ -178,6 +178,7 @@ mod tests {
             state: "opened".into(),
             open_count: 0,
             group_path: String::new(),
+            updated_at: 0,
         }
     }
 

@@ -185,6 +185,7 @@ mod tests {
                 open_count: 3,
                 project_avatar: "/cache/avatars/7-a.png".into(),
                 project_path: "team/api".into(),
+                updated_at: 1_782_900_000,
             }],
             merge_requests: vec![MergeRequest {
                 id: 2,
@@ -198,6 +199,7 @@ mod tests {
                 project_avatar: "/cache/avatars/7-a.png".into(),
                 // Unknown to the daemon: the URL names the project.
                 project_path: String::new(),
+                updated_at: 1_782_900_000,
             }],
             projects: vec![Project {
                 id: 7,
@@ -205,6 +207,7 @@ mod tests {
                 path: "team/api".into(),
                 web_url: "https://gl.example.com/team/api".into(),
                 avatar: String::new(),
+                archived: false,
             }],
             groups: vec![Group {
                 id: 3,
@@ -221,6 +224,7 @@ mod tests {
                 state: "opened".into(),
                 open_count: 2,
                 group_path: "team".into(),
+                updated_at: 1_782_900_000,
             }],
         }
     }

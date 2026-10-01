@@ -119,7 +119,8 @@ pub struct MergeRequest {
     pub updated_at: u64,
 }
 
-/// `GET /projects?simple=true`.
+/// `GET /projects`, the full representation: the `simple=true` one has no
+/// `archived`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     #[serde(default, deserialize_with = "de::nullable")]
@@ -134,6 +135,10 @@ pub struct Project {
     /// Empty when the project has no avatar.
     #[serde(default, deserialize_with = "de::nullable")]
     pub avatar_url: String,
+    /// An archived project is read-only on GitLab. A row stored before
+    /// schema 3 reads as `false`.
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub archived: bool,
 }
 
 /// `GET /groups`.
@@ -356,7 +361,7 @@ impl Resource for MergeRequest {
 impl Resource for Project {
     const NAME: &'static str = "projects";
     const KEYSPACE: &'static str = "gl_projects_v1";
-    const SCHEMA: u32 = 2;
+    const SCHEMA: u32 = 3;
     fn key(&self) -> RowKey {
         (positive(self.id), 0)
     }
@@ -659,6 +664,30 @@ mod tests {
         for none in [json!({"id": 7, "avatar_url": null}), json!({"id": 7})] {
             let p: Project = serde_json::from_value(none).unwrap();
             assert_eq!(p.avatar_url, "");
+        }
+    }
+
+    #[test]
+    fn project_reads_its_archived_flag() {
+        let p: Project = serde_json::from_value(json!({
+            "id": 7, "name": "API", "path_with_namespace": "team/api",
+            "archived": true, "visibility": "private",
+        }))
+        .unwrap();
+        assert!(p.archived);
+        // The stored form reads back the same.
+        let stored = serde_json::to_vec(&p).unwrap();
+        assert_eq!(serde_json::from_slice::<Project>(&stored).unwrap(), p);
+
+        // A row stored before schema 3 has no such field.
+        let old: Project = serde_json::from_str(
+            r#"{"id":7,"name":"API","path_with_namespace":"team/api","web_url":"","avatar_url":""}"#,
+        )
+        .unwrap();
+        assert!(!old.archived);
+        for none in [json!({"id": 7, "archived": null}), json!({"id": 7})] {
+            let p: Project = serde_json::from_value(none).unwrap();
+            assert!(!p.archived);
         }
     }
 
