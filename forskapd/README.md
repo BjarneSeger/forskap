@@ -22,6 +22,21 @@ brew services start forskap
 Its log is `$(brew --prefix)/var/log/forskapd.log`. On macOS the socket is
 `/tmp/forskapd.socket` unless `[server]` `socket` names another one.
 
+## Running
+
+The systemd user unit and the Homebrew service start `forskapd` without arguments,
+and that is all it needs. It takes a few options:
+
+| Option | Does |
+|---|---|
+| `--socket <PATH>` | Listen on this Unix socket. Takes precedence over `[server]` `socket`; under systemd socket activation the socket systemd passes is used, as always. |
+| `-V`, `--version` | Print `forskapd <version>` and exit. |
+| `-h`, `--help` | Describe the daemon, its environment and its files, and exit. |
+
+Arguments are read before anything else happens: `--version`, `--help` and an unknown
+argument (a usage error, exit code 2) exit without starting a daemon, reading the
+keychain or touching a file.
+
 ## Configuration
 
 The daemon reads a TOML config file. Values are layered, highest priority first:
@@ -43,7 +58,7 @@ Keys are grouped into TOML tables, one per concern:
 
 | Key | Default | Description |
 |---|---|---|
-| `[server]` `socket` | `$XDG_RUNTIME_DIR/forskapd.socket` (falls back to `/tmp`) | Varlink Unix socket the daemon listens on. Ignored under systemd socket activation. |
+| `[server]` `socket` | `$XDG_RUNTIME_DIR/forskapd.socket` (falls back to `/tmp`) | Varlink Unix socket the daemon listens on. `forskapd --socket` takes precedence; both are ignored under systemd socket activation. |
 | `[refresh.quick]` `interval_secs` | `300` | Seconds between quick syncs of the assigned issue/MR lists and the recent timelog window (floor 60). |
 | `[refresh.quick]` `window_hours` | `24` | How far back the quick timelog sync reaches (last 24h). |
 | `[refresh.slow]` `interval_secs` | `86400` | Seconds between slow syncs of the full timelog history, the board columns, your project/group memberships and the issues you authored or were assigned, closed ones included (once a day; floor 60). |

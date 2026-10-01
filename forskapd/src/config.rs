@@ -86,7 +86,8 @@ pub struct Config {
 pub struct ServerConfig {
     /// Unix socket the daemon listens on. If unset, defaults to
     /// `$XDG_RUNTIME_DIR/forskapd.socket` (then `/tmp/...` as a last
-    /// resort). Ignored under systemd socket activation.
+    /// resort). `forskapd --socket` takes precedence; both are ignored under
+    /// systemd socket activation.
     pub socket: Option<String>,
 }
 

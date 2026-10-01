@@ -6,6 +6,7 @@
 //! API. Everything here is an implementation detail with no stability
 //! guarantees — the crate is consumed as binaries only.
 
+pub mod args;
 pub mod config;
 pub mod db;
 pub mod error;

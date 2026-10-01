@@ -1,10 +1,12 @@
 //! `forskapd` — GitLab time-tracking varlink daemon.
 
+use clap::Parser;
 use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use forskapd::args::Args;
 use forskapd::error::{DormancyReason, Result};
 use forskapd::gitlab::GitlabClient;
 use forskapd::handlers::{ConnState, Handlers, Session, SessionSlot};
@@ -34,8 +36,15 @@ const RETIRED_KEYSPACES: [&str; 11] = [
     "search_tracked_v1",
 ];
 
+fn main() -> Result<()> {
+    // Before anything else: `--version`, `--help` and a usage error exit
+    // here, with nothing started, read or moved.
+    let args = Args::parse();
+    run(args)
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run(args: Args) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_env("FORSKAPD_LOG")
@@ -53,7 +62,10 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
     };
-    let socket = config.read().unwrap().server.resolved_socket();
+    let socket = match args.socket {
+        Some(socket) => socket,
+        None => config.read().unwrap().server.resolved_socket(),
+    };
     let data_dir = dirs::data_local_dir()
         .unwrap_or_else(|| "~/.local/share".into())
         .join("forskapd");
