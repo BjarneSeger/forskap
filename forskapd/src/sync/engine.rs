@@ -18,8 +18,9 @@
 //! created ([`SyncHandle::land_issue`]). The worker stores it like a fetched
 //! one and voids the issue lists still in flight, which never saw it.
 //!
-//! The avatar files are the worker's too: written with their row, removed
-//! by a sweep once a commit dropped rows.
+//! The avatar files are the worker's too: written with their row (unless
+//! the file already holds the image), removed once a commit replaced their
+//! row, or by a sweep once a commit dropped rows.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -870,7 +871,6 @@ impl Worker {
             state,
             started,
             windows,
-            fingerprint,
             avatars: self.avatars.clone(),
         };
         let abort = self
@@ -2538,27 +2538,194 @@ mod tests {
         drop(second);
     }
 
+    /// The URL [`project_json_with_avatar`] gives project `id`'s avatar.
+    fn avatar_url(id: i64, file: &str) -> String {
+        let project = project_json_with_avatar(id, file);
+        project["avatar_url"].as_str().unwrap().into()
+    }
+
+    /// Set `path`'s modification time to a fixed old one, and return it.
+    fn age(path: &std::path::Path) -> std::time::SystemTime {
+        let old = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(old).unwrap();
+        old
+    }
+
+    /// A new image under a new URL gets a new file; the old one goes once
+    /// the new row landed.
     #[tokio::test]
-    async fn a_new_avatar_url_replaces_the_file() {
+    async fn a_new_image_replaces_the_file() {
         let (store, dir) = open_store();
         seed_avatar_project(&store, "https://gl/a.png");
         let fake = Arc::new(FakeGitlab::default());
         fake.serve_avatar(7, PNG);
-        fake.serve("projects", vec![project_json_with_avatar(7, "b.gif")]);
+        fake.serve("projects", vec![project_json_with_avatar(7, "b.png")]);
         let env = start_with_avatars(store, &dir, connected(&fake, 1));
         eventually("the avatar", || avatar_file(&env, 7).is_some()).await;
         let old = avatar_file(&env, 7).unwrap();
 
-        fake.serve_avatar(7, b"GIF89a");
+        // Same format, other bytes: only the content tells the names apart.
+        let other = [PNG, b"\0"].concat();
+        fake.serve_avatar(7, &other);
         env.sync.refresh_now(&[Job::MemberProjects]).await;
         eventually("the new avatar", || {
             avatar_file(&env, 7).is_some_and(|f| f != old)
         })
         .await;
         let new = avatar_file(&env, 7).unwrap();
-        assert!(new.ends_with(".gif"), "{new}");
+        assert!(new.ends_with(".png"), "{new}");
+        assert_eq!(std::fs::read(env.avatars.path_of(&new)).unwrap(), other);
         assert_eq!(files(&env.avatars), [new]);
         assert_eq!(fake.avatar_calls(), [7, 7]);
+    }
+
+    /// GitLab's avatar URL ends in `?v=<updated_at>`, so any update of the
+    /// project changes it. The image is downloaded again, but an unchanged
+    /// one keeps its path, and its file stays in place, untouched.
+    #[tokio::test]
+    async fn the_same_image_under_a_new_url_keeps_its_file() {
+        let (store, dir) = open_store();
+        seed_avatar_project(&store, &avatar_url(7, "a.png?v=1"));
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve_avatar(7, PNG);
+        fake.serve("projects", vec![project_json_with_avatar(7, "a.png?v=2")]);
+        let env = start_with_avatars(store, &dir, connected(&fake, 1));
+        eventually("the avatar", || avatar_file(&env, 7).is_some()).await;
+        let file = avatar_file(&env, 7).unwrap();
+        let path = env.avatars.path_of(&file);
+        let old = age(&path);
+        let first = state(&env, Job::ProjectAvatar(7));
+
+        // A thread of its own sees the worker mid-commit, a task would not.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watch = {
+            let (stop, path) = (Arc::clone(&stop), path.clone());
+            std::thread::spawn(move || {
+                let (mut looks, mut misses) = (0, 0);
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    looks += 1;
+                    misses += usize::from(!path.is_file());
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+                (looks, misses)
+            })
+        };
+        env.sync.refresh_now(&[Job::MemberProjects]).await;
+        eventually("the second download", || {
+            state(&env, Job::ProjectAvatar(7)).fingerprint != first.fingerprint
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (looks, misses) = watch.join().unwrap();
+
+        assert_eq!(fake.avatar_calls(), [7, 7], "downloaded again, once");
+        assert_eq!(
+            misses, 0,
+            "the file was missing in {misses} of {looks} looks"
+        );
+        assert_eq!(avatar_file(&env, 7), Some(file.clone()));
+        assert_eq!(files(&env.avatars), [file]);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(modified, old, "the file was written again");
+    }
+
+    /// Two projects with the same image (a group's logo, say) get a file
+    /// each: one replacing or dropping its avatar leaves the other's alone.
+    #[tokio::test]
+    async fn projects_sharing_an_image_keep_a_file_each() {
+        let (store, dir) = open_store();
+        let mut c = store.begin();
+        let project = |id| Project {
+            id,
+            avatar_url: avatar_url(id, "logo.png"),
+            ..Default::default()
+        };
+        c.upsert(&[project(7), project(8)]).unwrap();
+        c.commit().unwrap();
+        mark_synced(&store, &BASE);
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve_avatar(7, PNG);
+        fake.serve_avatar(8, PNG);
+        let env = start_with_avatars(store, &dir, connected(&fake, 1));
+        eventually("both avatars", || {
+            avatar_file(&env, 7).is_some() && avatar_file(&env, 8).is_some()
+        })
+        .await;
+        let seven = avatar_file(&env, 7).unwrap();
+        let eight = avatar_file(&env, 8).unwrap();
+        assert_ne!(seven, eight);
+        let mut both = vec![seven.clone(), eight.clone()];
+        both.sort();
+        assert_eq!(files(&env.avatars), both);
+
+        fake.serve_avatar(8, b"GIF89a");
+        let seven_json = project_json_with_avatar(7, "logo.png");
+        fake.serve(
+            "projects",
+            vec![seven_json.clone(), project_json_with_avatar(8, "new.gif")],
+        );
+        env.sync.refresh_now(&[Job::MemberProjects]).await;
+        eventually("8's new avatar", || {
+            avatar_file(&env, 8).is_some_and(|f| f.ends_with(".gif"))
+        })
+        .await;
+        let mut both = vec![seven.clone(), avatar_file(&env, 8).unwrap()];
+        both.sort();
+        eventually("8's old file to go", || files(&env.avatars) == both).await;
+
+        fake.serve("projects", vec![seven_json, project_json(8)]);
+        env.sync.refresh_now(&[Job::MemberProjects]).await;
+        eventually("8's avatar to go", || avatar_file(&env, 8).is_none()).await;
+        eventually("8's file to go", || {
+            files(&env.avatars) == std::slice::from_ref(&seven)
+        })
+        .await;
+        assert_eq!(std::fs::read(env.avatars.path_of(&seven)).unwrap(), PNG);
+        assert_eq!(avatar_file(&env, 7), Some(seven));
+    }
+
+    /// Before, a file was named by the job's fingerprint. An upgrade
+    /// downloads nothing: such a file keeps its name until its project's
+    /// next download, which moves it to its content name and leaves nothing
+    /// of the old one behind.
+    #[tokio::test]
+    async fn a_file_named_the_old_way_moves_at_its_next_download() {
+        let (store, dir) = open_store();
+        seed_avatar_project(&store, &avatar_url(7, "a.png?v=1"));
+        mark_synced(&store, &[Job::ProjectAvatar(7)]);
+        let synced = store.job_state(&Job::ProjectAvatar(7).key()).unwrap();
+        let legacy = format!("7-{:016x}.png", synced.fingerprint);
+        let mut c = store.begin();
+        c.upsert(&[Avatar {
+            project_id: 7,
+            file: legacy.clone(),
+        }])
+        .unwrap();
+        c.commit().unwrap();
+        avatar_dir(&dir).write(&legacy, PNG).unwrap();
+
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve_avatar(7, PNG);
+        fake.serve("projects", vec![project_json_with_avatar(7, "a.png?v=2")]);
+        let env = start_with_avatars(store, &dir, connected(&fake, 1));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(fake.avatar_calls().is_empty(), "{:?}", fake.calls());
+        assert_eq!(avatar_file(&env, 7).as_ref(), Some(&legacy));
+        assert_eq!(files(&env.avatars), [legacy]);
+
+        env.sync.refresh_now(&[Job::MemberProjects]).await;
+        let named = crate::sync::avatars::file_name(7, PNG).unwrap();
+        eventually("the content name", || {
+            avatar_file(&env, 7).as_ref() == Some(&named)
+        })
+        .await;
+        eventually("the old file to go", || {
+            files(&env.avatars) == std::slice::from_ref(&named)
+        })
+        .await;
+        assert_eq!(fake.avatar_calls(), [7]);
     }
 
     /// GitLab before 16.9 answers 404: recorded as "none", not retried.
