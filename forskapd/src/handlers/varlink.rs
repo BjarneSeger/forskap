@@ -10,19 +10,22 @@ use tracing::{debug, info, instrument, warn};
 use forskap_api::{
     ActivityEvent, CacheScope, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
     Call_DismissFailure, Call_GetActivity, Call_GetAssignedIssues, Call_GetAssignedMergeRequests,
-    Call_GetFailures, Call_GetHistory, Call_GetSyncJobs, Call_Login, Call_Logout, Call_PostTime,
-    Call_RecordEpicOpen, Call_RecordOpen, Call_RetryFailure, Call_Search, Call_UnassignSelf,
-    Call_WhoAmI, Epic, FailedTask, Group, HistoryEvent, HistorySource, IssuableKind, Issue,
-    MergeRequest, Project, SearchKind, SearchScope, VarlinkInterface,
+    Call_GetFailures, Call_GetHistory, Call_GetSyncJobs, Call_ListIssues, Call_Login, Call_Logout,
+    Call_PostTime, Call_RecordEpicOpen, Call_RecordOpen, Call_RetryFailure, Call_Search,
+    Call_UnassignSelf, Call_WhoAmI, Epic, FailedTask, Group, HistoryEvent, HistorySource,
+    IssuableKind, Issue, IssueRole, IssueState, MergeRequest, Project, SearchKind, SearchScope,
+    VarlinkInterface,
 };
 
 use crate::error::{DormancyReason, Error};
 use crate::gitlab::{GitlabClient, Issuable};
 use crate::query::{in_group, namespace_of, parse_epic_query, parse_iid_query, text_matches};
 use crate::secrets::{self, Credentials, Token};
-use crate::sync::jobs::{ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS};
+use crate::sync::jobs::{
+    ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, RECENT_ASSIGNED_ISSUES, RECENT_AUTHORED_ISSUES,
+};
 use crate::sync::model::{self, RowKey};
-use crate::sync::store::{RowScope, Stored, SyncStore};
+use crate::sync::store::{RowScope, Stored, SyncStore, View};
 use crate::sync::{Clear, Job};
 use crate::usage::{UsageEntry, UsageRecord};
 use crate::write::{Write, WriteOp};
@@ -105,38 +108,85 @@ impl Handlers {
         })
     }
 
-    /// The rows the assigned view `name` lists, minus the items a write took
-    /// out of it that the view doesn't reflect yet: closes and unassigns
-    /// still in the retry queue, and ones applied after the view's fetch
-    /// began.
-    fn assigned<R: Stored>(&self, name: &str, kind: Issuable) -> Vec<R> {
-        let view = self.store().view(name).unwrap_or_else(|e| {
+    /// The view `name`; `None` when it was never stored or can't be read.
+    fn view(&self, name: &str) -> Option<View> {
+        self.store().view(name).unwrap_or_else(|e| {
             warn!(error = %e, view = name, "view read failed, treating as empty");
             None
-        });
-        let Some(view) = view else {
-            return Vec::new();
-        };
+        })
+    }
+
+    /// The stored row at `key`, `None` on a read failure too.
+    fn row<R: Stored>(&self, key: RowKey) -> Option<R> {
+        self.store().table::<R>().get(key).unwrap_or_else(|e| {
+            warn!(error = %e, kind = R::NAME, "row read failed, skipping");
+            None
+        })
+    }
+
+    /// The writes to items of `kind` that `view` doesn't reflect yet: the
+    /// ones still in the retry queue, and the ones applied after its fetch
+    /// began.
+    fn unreflected(&self, view: &View, kind: Issuable) -> Vec<Write> {
         let pending = self.queue.pending().unwrap_or_else(|e| {
             warn!(error = %e, "queue scan failed; queued writes not reflected");
             Vec::new()
         });
-        let hidden: HashSet<RowKey> = pending
+        pending
             .into_iter()
             .map(|p| p.write)
             .chain(self.sync.writes_since(view.fetched_at))
-            .filter(|w| w.kind == kind && matches!(w.op, WriteOp::Close | WriteOp::UnassignSelf))
-            .map(|w| (w.project_id.max(0) as u64, w.iid.max(0) as u64))
+            .filter(|w| w.kind == kind)
+            .collect()
+    }
+
+    /// The rows the assigned view `name` lists, minus the items a write took
+    /// out of it that the view doesn't reflect yet (see
+    /// [`Self::unreflected`]): closes and unassigns.
+    fn assigned<R: Stored>(&self, name: &str, kind: Issuable) -> Vec<R> {
+        let Some(view) = self.view(name) else {
+            return Vec::new();
+        };
+        let hidden: HashSet<RowKey> = self
+            .unreflected(&view, kind)
+            .iter()
+            .filter(|w| matches!(w.op, WriteOp::Close | WriteOp::UnassignSelf))
+            .map(written_key)
             .collect();
-        let table = self.store().table::<R>();
         view.keys
             .into_iter()
             .filter(|k| !hidden.contains(k))
-            .filter_map(|k| {
-                table.get(k).unwrap_or_else(|e| {
-                    warn!(error = %e, kind = R::NAME, "row read failed, skipping");
-                    None
-                })
+            .filter_map(|k| self.row(k))
+            .collect()
+    }
+
+    /// The issues the recent view of `role` lists, corrected for the writes
+    /// it doesn't reflect yet (see [`Self::unreflected`]): a closed issue
+    /// reads closed, and one the user unassigned from, or whose current row
+    /// names other assignees, is no longer listed as assigned.
+    fn recent_issues(&self, role: &IssueRole) -> Vec<model::Issue> {
+        let (_, name) = recent_source(role);
+        let Some(view) = self.view(name) else {
+            return Vec::new();
+        };
+        let by_assignment = *role == IssueRole::assignee;
+        let writes = self.unreflected(&view, Issuable::Issue);
+        let written = |op: WriteOp| -> HashSet<RowKey> {
+            let writes = writes.iter().filter(|w| w.op == op);
+            writes.map(written_key).collect()
+        };
+        let (closed, unassigned) = (written(WriteOp::Close), written(WriteOp::UnassignSelf));
+        let me = self.synced_user();
+        view.keys
+            .into_iter()
+            .filter(|k| !(by_assignment && unassigned.contains(k)))
+            .filter_map(|k| Some((k, self.row::<model::Issue>(k)?)))
+            .filter(|(_, i)| !by_assignment || assigned_to(&i.assignees, me))
+            .map(|(k, mut i)| {
+                if closed.contains(&k) {
+                    i.state = wire::issue_state(&IssueState::closed).into();
+                }
+                i
             })
             .collect()
     }
@@ -497,10 +547,28 @@ fn search_item_matches(
 
 /// Whether an item from an assigned view still is open and assigned to `me`
 /// by its current row: a project sync may have updated the row since the
-/// view was fetched. Rows without assignee data aren't second-guessed.
+/// view was fetched.
 fn still_assigned(state: &str, assignees: &[model::UserRef], me: Option<i64>) -> bool {
-    state == "opened"
-        && (assignees.is_empty() || me.is_none_or(|me| assignees.iter().any(|a| a.id == me)))
+    state == "opened" && assigned_to(assignees, me)
+}
+
+/// Whether `me` is among `assignees`. Rows without assignee data aren't
+/// second-guessed.
+fn assigned_to(assignees: &[model::UserRef], me: Option<i64>) -> bool {
+    assignees.is_empty() || me.is_none_or(|me| assignees.iter().any(|a| a.id == me))
+}
+
+/// The row a write went to.
+fn written_key(write: &Write) -> RowKey {
+    (write.project_id.max(0) as u64, write.iid.max(0) as u64)
+}
+
+/// The job syncing the recent issues of `role`, and the view it fills.
+fn recent_source(role: &IssueRole) -> (Job, &'static str) {
+    match role {
+        IssueRole::author => (Job::RecentAuthoredIssues, RECENT_AUTHORED_ISSUES),
+        IssueRole::assignee => (Job::RecentAssignedIssues, RECENT_ASSIGNED_ISSUES),
+    }
 }
 
 /// Whether `web_url` lies in any of `groups` (subgroups included). No filter
@@ -578,6 +646,51 @@ impl VarlinkInterface for Handlers {
             .collect();
         debug!(count = mrs.len(), "serving assigned merge requests");
         call.reply(mrs)
+    }
+
+    #[instrument(skip(self, call))]
+    async fn list_issues(
+        &self,
+        call: &mut dyn Call_ListIssues,
+        role: Option<IssueRole>,
+        updated_after: Option<i64>,
+        states: Option<Vec<IssueState>>,
+    ) -> varlink::Result<()> {
+        let roles = match role {
+            Some(role) => vec![role],
+            None => vec![IssueRole::author, IssueRole::assignee],
+        };
+        for role in &roles {
+            reply_if_cold!(self, call, recent_source(role).0, (Vec::new()));
+        }
+        let since = updated_after.map_or(0, |t| t.max(0) as u64);
+        let states: Vec<&str> = states.iter().flatten().map(wire::issue_state).collect();
+
+        // Each role's view with its own corrections, then every issue once.
+        let mut seen = HashSet::new();
+        let mut rows: Vec<model::Issue> = roles
+            .iter()
+            .flat_map(|role| self.recent_issues(role))
+            .filter(|i| seen.insert((i.project_id, i.iid)))
+            .filter(|i| i.updated_at >= since)
+            .filter(|i| states.is_empty() || states.contains(&i.state.as_str()))
+            .collect();
+        // Newest-updated first; the project and number settle a tie.
+        rows.sort_by_key(|i| (std::cmp::Reverse(i.updated_at), i.project_id, i.iid));
+
+        let usage = self.usage_or_empty();
+        let mut boards = BoardLabels::new(self);
+        let mut projects = Projects::new(self);
+        let issues: Vec<Issue> = rows
+            .into_iter()
+            .map(|i| {
+                let open = open_count_of(usage.get(Issuable::Issue, i.project_id, i.iid));
+                let project = projects.of(i.project_id);
+                boards.wire(i, open, project)
+            })
+            .collect();
+        debug!(count = issues.len(), "serving recent issues");
+        call.reply(issues)
     }
 
     #[instrument(skip(self, call))]

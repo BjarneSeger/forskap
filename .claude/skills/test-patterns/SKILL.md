@@ -12,7 +12,13 @@ GitLab mock; reuse the helpers below instead of inventing new scaffolding.
 
 `FakeGitlab` implements `GitlabApi` for every suite (handlers, sync, queue,
 reconnect).
-- **Reads** are routed by `Listing::path()`: `serve(path, rows)` sets the JSON rows
+- **Reads** are routed by `route(&Listing)`: the listing's `path()`, except for the
+  two recent issue lists. They request `issues` like the assigned list, so the fake
+  routes them by `RECENT_AUTHORED_PATH` (`"issues?authored"`) and
+  `RECENT_ASSIGNED_PATH` (`"issues?assigned"`), and a test serving or counting
+  `"issues"` still means the assigned list (or `AllIssues`). A new listing that
+  shares a path with an existing one gets its own route there too.
+  `serve(path, rows)` sets the JSON rows
   every call to that path returns (empty by default), `serve_next(path, rows)`
   answers only the next call (e.g. a page walk that differs from its follow-up
   delta); `fail_next(path, FakeErr)` queues one-shot failures; `gate(path)` holds the next call until the returned
@@ -45,12 +51,14 @@ only demanded jobs, so the test decides when GitLab is read. Wrappers:
 `unreachable_handlers()`, `connected_handlers(&fake)`. Keep the `TempDir` alive.
 
 **Seeding the store directly**: `seed(&h, &rows)` upserts mirror rows,
-`seed_view(&h, name, keys, fetched_at)` writes an assigned view,
+`seed_view(&h, name, keys, fetched_at)` writes a view (assigned or recent),
 `mark_synced(&h, &[Job::…])` makes the cold-cache guards treat data as warm.
-Composite seeds: `seed_assigned_issues`, `seed_assigned_mrs`, `seed_corpus`.
+Composite seeds: `seed_assigned_issues`, `seed_assigned_mrs`, `seed_recent_issues`,
+`seed_corpus`.
 
 **Driving a varlink method**: helpers wrap `AsyncCall` — `assigned_issues`,
-`assigned_mrs`, `run_search`, `history`, `post_time`, `close`, `clear_cache`,
+`assigned_mrs`, `list_issues`, `run_search`, `history`, `post_time`, `close`,
+`unassign`, `clear_cache`,
 `run_record_open`; `reply::<T_Reply>(&mut call)` parses success,
 `reply_error(&mut call)` returns the error name (`NOT_AUTHENTICATED`,
 `GITLAB_ERROR` constants).

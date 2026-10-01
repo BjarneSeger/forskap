@@ -42,6 +42,17 @@ func Example() {
 		fmt.Printf("!%d %s %v\n", mr.Iid, mr.Title, mr.Assignees)
 	}
 
+	// The issues I authored that are closed by now, newest-updated first.
+	role := forskap.RoleAuthor
+	closed := []forskap.IssueState{forskap.StateClosed}
+	mine, err := c.ListIssues(ctx, &role, nil, &closed)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, is := range mine {
+		fmt.Printf("#%d %s (epic: %s)\n", is.Iid, is.Title, is.Parent)
+	}
+
 	res, err := c.Search(ctx, "billing", nil, nil, nil)
 	if err != nil {
 		log.Fatal(err)

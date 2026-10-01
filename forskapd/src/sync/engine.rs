@@ -28,7 +28,8 @@ use tracing::{debug, error, info, warn};
 
 use super::avatars::{Avatar, AvatarDir};
 use super::jobs::{
-    self, ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, FetchCtx, Job, Lane, Staged, Windows,
+    self, ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, FetchCtx, Job, Lane, RECENT_ASSIGNED_ISSUES,
+    RECENT_AUTHORED_ISSUES, Staged, Windows,
 };
 use super::model::{Board, Epic, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog};
 use super::now_secs;
@@ -57,7 +58,8 @@ const NOTED_WRITE_TTL_SECS: u64 = 86_400;
 pub enum Clear {
     /// Every synced row, view and job state.
     Everything,
-    /// The assigned issue/MR views and the board labels.
+    /// The assigned issue/MR views, the recent issue views and the board
+    /// labels.
     Assigned,
     /// Issues, MRs, epics, projects, groups and the project avatars.
     Corpus,
@@ -71,7 +73,10 @@ impl Clear {
         match self {
             Self::Everything => true,
             Self::Assigned => {
-                key == ASSIGNED_ISSUES || key == ASSIGNED_MERGE_REQUESTS || key.ends_with("/boards")
+                key == ASSIGNED_ISSUES
+                    || key == ASSIGNED_MERGE_REQUESTS
+                    || key.starts_with("recent/")
+                    || key.ends_with("/boards")
             }
             Self::Corpus => {
                 key.starts_with("member/")
@@ -901,10 +906,10 @@ impl Worker {
         }
     }
 
-    /// What a fresh `job` result sets off: the replan it may call for, and
-    /// for an assigned view (listing `before` until now) dropping the rows
-    /// that left it and fetching the board columns it shows that never
-    /// synced, which `waiters` then wait for too.
+    /// What a fresh `job` result sets off: the replan it may call for, for
+    /// a view (listing `before` until now) dropping the rows that left it,
+    /// and for the assigned issues fetching the board columns they show
+    /// that never synced, which `waiters` then wait for too.
     fn after_commit(
         &mut self,
         job: Job,
@@ -1200,6 +1205,8 @@ impl Worker {
                 Clear::Assigned => {
                     c.remove_view(ASSIGNED_ISSUES);
                     c.remove_view(ASSIGNED_MERGE_REQUESTS);
+                    c.remove_view(RECENT_AUTHORED_ISSUES);
+                    c.remove_view(RECENT_ASSIGNED_ISSUES);
                     c.remove_where::<Board>(RowScope::All, |_| false)?;
                 }
                 Clear::Corpus => {
@@ -1407,13 +1414,13 @@ mod tests {
     use crate::gitlab::{GitlabApi, Issuable, Listing};
     use crate::sync::model::{Issue, Project};
     use crate::testing::{
-        FakeErr, FakeGitlab, PNG, epic_json, event_json, eventually, group_json, issue_json,
-        project_json, project_json_with_avatar,
+        FakeErr, FakeGitlab, PNG, RECENT_ASSIGNED_PATH, epic_json, event_json, eventually,
+        group_json, issue_json, project_json, project_json_with_avatar,
     };
     use crate::write::WriteOp;
 
     /// What an empty store plans before any evidence arrives.
-    const BASE: [Job; 7] = [
+    const BASE: [Job; 9] = [
         Job::AssignedIssues,
         Job::AssignedMergeRequests,
         Job::RecentTimelogs,
@@ -1421,6 +1428,8 @@ mod tests {
         Job::Events,
         Job::MemberProjects,
         Job::MemberGroups,
+        Job::RecentAuthoredIssues,
+        Job::RecentAssignedIssues,
     ];
 
     struct Env {
@@ -2192,6 +2201,74 @@ mod tests {
         env.sync.refresh_now(&[Job::AssignedIssues]).await;
         assert!(env.store.issues.get((9, 1)).unwrap().is_none());
         assert!(env.store.issues.get((9, 2)).unwrap().is_some());
+    }
+
+    /// An assigned issue that closed leaves the assigned view, but not the
+    /// recent one: its row stays for that list to update, until it ages out
+    /// there too.
+    #[tokio::test]
+    async fn a_closed_assigned_issue_stays_while_the_recent_list_names_it() {
+        let (store, _dir) = open_store();
+        mark_synced(&store, &BASE);
+        let mut c = store.begin();
+        c.upsert(&[issue_row(9, 1), issue_row(9, 2)]).unwrap();
+        for name in [ASSIGNED_ISSUES, RECENT_ASSIGNED_ISSUES] {
+            let listed = crate::sync::store::View {
+                keys: vec![(9, 1), (9, 2)],
+                fetched_at: now_secs(),
+            };
+            c.set_view(name, &listed).unwrap();
+        }
+        c.commit().unwrap();
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve("issues", vec![issue_json(9, 2, "two")]);
+        let mut closed = issue_json(9, 1, "one");
+        closed["state"] = "closed".into();
+        fake.serve(RECENT_ASSIGNED_PATH, vec![closed, issue_json(9, 2, "two")]);
+        let env = start_on(store, connected(&fake, 1));
+        let state_of = |iid| {
+            let row = env.store.issues.get((9, iid)).unwrap();
+            row.map(|i: Issue| i.state)
+        };
+
+        env.sync.refresh_now(&[Job::AssignedIssues]).await;
+        assert_eq!(state_of(1).as_deref(), Some("opened"), "as last seen");
+        env.sync.refresh_now(&[Job::RecentAssignedIssues]).await;
+        assert_eq!(state_of(1).as_deref(), Some("closed"));
+
+        fake.serve(RECENT_ASSIGNED_PATH, vec![issue_json(9, 2, "two")]);
+        env.sync.refresh_now(&[Job::RecentAssignedIssues]).await;
+        assert_eq!(state_of(1), None, "no view names it any more");
+        assert_eq!(state_of(2).as_deref(), Some("opened"));
+    }
+
+    /// The recent lists go with the assigned ones: both are "my issues".
+    #[tokio::test]
+    async fn clearing_the_assigned_lists_drops_the_recent_views_and_refetches_them() {
+        let (store, _dir) = open_store();
+        mark_synced(&store, &BASE);
+        let mut c = store.begin();
+        for name in [RECENT_AUTHORED_ISSUES, RECENT_ASSIGNED_ISSUES] {
+            c.set_view(name, &Default::default()).unwrap();
+        }
+        c.commit().unwrap();
+        let fake = Arc::new(FakeGitlab::default());
+        // The assigned list runs first and holds the lane of all three.
+        let gate = fake.gate("issues");
+        let env = start_on(store, connected(&fake, 1));
+
+        env.sync.clear(Clear::Assigned).await;
+        for name in [RECENT_AUTHORED_ISSUES, RECENT_ASSIGNED_ISSUES] {
+            assert!(env.store.view(name).unwrap().is_none(), "{name}");
+        }
+        gate.notify_one();
+        eventually("both lists again", || {
+            [Job::RecentAuthoredIssues, Job::RecentAssignedIssues]
+                .iter()
+                .all(|job| state(&env, *job).last_ok > 0)
+        })
+        .await;
+        assert!(env.store.view(RECENT_ASSIGNED_ISSUES).unwrap().is_some());
     }
 
     #[tokio::test]
@@ -3039,6 +3116,8 @@ mod tests {
             [
                 "assigned/issues",
                 "assigned/merge_requests",
+                "recent/authored/issues",
+                "recent/assigned/issues",
                 "project/7/boards"
             ]
         );
@@ -3049,6 +3128,8 @@ mod tests {
                 "assigned/merge_requests",
                 "member/projects",
                 "member/groups",
+                "recent/authored/issues",
+                "recent/assigned/issues",
                 "project/7/issues",
                 "group/3/epics",
                 "all/issues",

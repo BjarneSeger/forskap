@@ -1,8 +1,8 @@
 //! Projections of stored GitLab rows onto the varlink wire types.
 
 use forskap_api::{
-    ActivityEvent, Epic, Group, HistoryEvent, HistorySource, IssuableKind, Issue, MergeRequest,
-    Project, SyncJob, SyncJobStatus,
+    ActivityEvent, Epic, Group, HistoryEvent, HistorySource, IssuableKind, Issue, IssueState,
+    MergeRequest, Project, SyncJob, SyncJobStatus,
 };
 
 use crate::gitlab::{Issuable, format_duration};
@@ -226,6 +226,15 @@ pub fn internal_kind(kind: &IssuableKind) -> Issuable {
     match kind {
         IssuableKind::issue => Issuable::Issue,
         IssuableKind::merge_request => Issuable::MergeRequest,
+    }
+}
+
+/// Wire → GitLab's name of an issue state, which is what the stored rows
+/// (and `Issue.state`) carry.
+pub fn issue_state(state: &IssueState) -> &'static str {
+    match state {
+        IssueState::opened => "opened",
+        IssueState::closed => "closed",
     }
 }
 

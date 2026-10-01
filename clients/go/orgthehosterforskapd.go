@@ -126,6 +126,10 @@ type Epic struct {
 
 type NotAuthReason string
 
+type IssueRole string
+
+type IssueState string
+
 type SearchKind string
 
 type SearchScope struct {
@@ -304,6 +308,73 @@ func (m GetAssignedMergeRequests_methods) Upgrade(ctx context.Context, c *varlin
 			return
 		}
 		merge_requests_out_ = []MergeRequest(out.Merge_requests)
+		return
+	}, nil
+}
+
+type ListIssues_methods struct{}
+
+func ListIssues() ListIssues_methods { return ListIssues_methods{} }
+
+func (m ListIssues_methods) Call(ctx context.Context, c *varlink.Connection, role_in_ *IssueRole, updated_after_in_ *int64, states_in_ *[]IssueState) (issues_out_ []Issue, err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, role_in_, updated_after_in_, states_in_)
+	if err_ != nil {
+		return
+	}
+	issues_out_, _, err_ = receive(ctx)
+	return
+}
+
+func (m ListIssues_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, role_in_ *IssueRole, updated_after_in_ *int64, states_in_ *[]IssueState) (func(ctx context.Context) ([]Issue, uint64, error), error) {
+	var in struct {
+		Role          *IssueRole    `json:"role,omitempty"`
+		Updated_after *int64        `json:"updated_after,omitempty"`
+		States        *[]IssueState `json:"states,omitempty"`
+	}
+	in.Role = role_in_
+	in.Updated_after = updated_after_in_
+	in.States = states_in_
+	receive, err := c.Send(ctx, "org.thehoster.forskapd.ListIssues", in, flags)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (issues_out_ []Issue, flags uint64, err error) {
+		var out struct {
+			Issues []Issue `json:"issues"`
+		}
+		flags, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		issues_out_ = []Issue(out.Issues)
+		return
+	}, nil
+}
+
+func (m ListIssues_methods) Upgrade(ctx context.Context, c *varlink.Connection, role_in_ *IssueRole, updated_after_in_ *int64, states_in_ *[]IssueState) (func(ctx context.Context) (issues_out_ []Issue, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+	var in struct {
+		Role          *IssueRole    `json:"role,omitempty"`
+		Updated_after *int64        `json:"updated_after,omitempty"`
+		States        *[]IssueState `json:"states,omitempty"`
+	}
+	in.Role = role_in_
+	in.Updated_after = updated_after_in_
+	in.States = states_in_
+	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.ListIssues", in)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (issues_out_ []Issue, flags uint64, conn varlink.ReadWriterContext, err error) {
+		var out struct {
+			Issues []Issue `json:"issues"`
+		}
+		flags, conn, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		issues_out_ = []Issue(out.Issues)
 		return
 	}, nil
 }
@@ -1343,6 +1414,7 @@ func (m WhoAmI_methods) Upgrade(ctx context.Context, c *varlink.Connection) (fun
 type orgthehosterforskapdInterface interface {
 	GetAssignedIssues(ctx context.Context, c VarlinkCall, groups_ *[]string) error
 	GetAssignedMergeRequests(ctx context.Context, c VarlinkCall, groups_ *[]string) error
+	ListIssues(ctx context.Context, c VarlinkCall, role_ *IssueRole, updated_after_ *int64, states_ *[]IssueState) error
 	Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64, scope_ *SearchScope) error
 	PostTime(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind, duration_ string, summary_ *string) error
 	Close(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
@@ -1397,6 +1469,14 @@ func (c *VarlinkCall) ReplyGetAssignedMergeRequests(ctx context.Context, merge_r
 		Merge_requests []MergeRequest `json:"merge_requests"`
 	}
 	out.Merge_requests = []MergeRequest(merge_requests_)
+	return c.Reply(ctx, &out)
+}
+
+func (c *VarlinkCall) ReplyListIssues(ctx context.Context, issues_ []Issue) error {
+	var out struct {
+		Issues []Issue `json:"issues"`
+	}
+	out.Issues = []Issue(issues_)
 	return c.Reply(ctx, &out)
 }
 
@@ -1524,6 +1604,10 @@ func (s *VarlinkInterface) GetAssignedMergeRequests(ctx context.Context, c Varli
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetAssignedMergeRequests")
 }
 
+func (s *VarlinkInterface) ListIssues(ctx context.Context, c VarlinkCall, role_ *IssueRole, updated_after_ *int64, states_ *[]IssueState) error {
+	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.ListIssues")
+}
+
 func (s *VarlinkInterface) Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]SearchKind, limit_ *int64, scope_ *SearchScope) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.Search")
 }
@@ -1619,6 +1703,18 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
 		return s.orgthehosterforskapdInterface.GetAssignedMergeRequests(ctx, VarlinkCall{call}, in.Groups)
+
+	case "ListIssues":
+		var in struct {
+			Role          *IssueRole    `json:"role,omitempty"`
+			Updated_after *int64        `json:"updated_after,omitempty"`
+			States        *[]IssueState `json:"states,omitempty"`
+		}
+		err := call.GetParameters(&in)
+		if err != nil {
+			return call.ReplyInvalidParameter(ctx, "parameters")
+		}
+		return s.orgthehosterforskapdInterface.ListIssues(ctx, VarlinkCall{call}, in.Role, in.Updated_after, in.States)
 
 	case "Search":
 		var in struct {
@@ -1920,6 +2016,12 @@ error NotAuthenticated (reason: ?NotAuthReason, detail: ?string)
 method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
 
 method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)
+
+type IssueRole (author, assignee)
+
+type IssueState (opened, closed)
+
+method ListIssues(role: ?IssueRole, updated_after: ?int, states: ?[]IssueState) -> (issues: []Issue)
 
 type SearchKind (issues, merge_requests, projects, groups, epics)
 
