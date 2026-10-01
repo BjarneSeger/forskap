@@ -236,9 +236,15 @@ one. Epics are read-only here: the write methods address a project's work items 
 # Errors
 
 `org.varlink.service.InvalidParameter (parameter: string)` — the call's arguments
-don't fit the method: a required one is missing, or an enum argument (`IssuableKind`,
+don't fit the method: a required one is missing, an enum argument (`IssuableKind`,
 `SearchKind`, `CacheScope`, `WorkItemRole`, `WorkItemState`) carries a value the
-interface doesn't have. `parameter` says what is wrong.
+interface doesn't have, or an argument object has a field the method doesn't know,
+nested ones included (`scope` of `Search`, `parent` of `CreateWorkItem`). `parameter`
+says what is wrong; for an unknown field it is that field's name, `.`-joined below the
+top level (`"labels"`, `"scope.users"`). An argument a newer interface added is thus
+refused by an older daemon rather than ignored. The methods without arguments
+(`GetFailures`, `ClearFailures`, `GetSyncJobs`, `GetStatus`, `Logout`, `WhoAmI`) don't
+read theirs and accept any.
 
 `GitlabError (message: string)` — GitLab rejected the request (invalid input, API
 error, rate limit), or a local precondition failed (malformed issue reference, invalid

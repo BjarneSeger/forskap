@@ -16,6 +16,8 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_derive = "1.0"
 serde_json = "1"
+# The fields serde would drop: an argument the daemon doesn't know is refused.
+serde_ignored = "0.1"
 serde-saphyr = { version = "1.3", default-features = false, features = ["serialize"] }
 thiserror = "2"
 tracing = "0.1"

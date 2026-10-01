@@ -121,17 +121,45 @@ fn handle_varlink_meta(method: &str, request: &varlink::Request) -> Option<Reply
 }
 
 /// The call's arguments, or the `InvalidParameter` reply saying why they
-/// don't parse (a missing field, an unknown enum value). An omitted
-/// `parameters` block reads as an empty one: a valid call of a method whose
-/// arguments are all optional.
+/// don't parse (a missing field, an unknown enum value) or naming a field the
+/// method doesn't have: a newer client's argument this daemon would ignore
+/// unseen. An omitted `parameters` block reads as an empty one: a valid call
+/// of a method whose arguments are all optional.
 fn parse_args<T: DeserializeOwned>(params: Option<serde_json::Value>) -> Result<T, Reply> {
-    let params = params.unwrap_or_else(|| serde_json::json!({}));
-    serde_json::from_value(params).map_err(|e| {
+    let invalid = |parameter: String| {
         Reply::error(
             "org.varlink.service.InvalidParameter",
-            Some(serde_json::json!({"parameter": e.to_string()})),
+            Some(serde_json::json!({ "parameter": parameter })),
         )
+    };
+    let params = params.unwrap_or_else(|| serde_json::json!({}));
+    let mut unknown = None;
+    let args = serde_ignored::deserialize(params, |path| {
+        unknown.get_or_insert_with(|| field_name(&path));
     })
+    .map_err(|e| invalid(e.to_string()))?;
+    match unknown {
+        Some(field) => Err(invalid(field)),
+        None => Ok(args),
+    }
+}
+
+/// `scope.groups`, `parent.iid`: serde_ignored's path without the `?` it puts
+/// in for an optional's content.
+fn field_name(path: &serde_ignored::Path) -> String {
+    use serde_ignored::Path;
+    let (parent, name) = match path {
+        Path::Root => return String::new(),
+        Path::Seq { parent, index } => (parent, index.to_string()),
+        Path::Map { parent, key } => (parent, key.clone()),
+        Path::Some { parent }
+        | Path::NewtypeStruct { parent }
+        | Path::NewtypeVariant { parent } => return field_name(parent),
+    };
+    match field_name(parent) {
+        parent if parent.is_empty() => name,
+        parent => format!("{parent}.{name}"),
+    }
 }
 
 async fn handle_forskapd(
@@ -425,7 +453,8 @@ mod tests {
 
     /// Unparseable arguments are answered, not punished by a dropped
     /// connection: an enum value the interface doesn't have, a missing
-    /// required field.
+    /// required field, a field the method doesn't have (named exactly, in
+    /// quotes), nested ones too.
     #[tokio::test]
     async fn invalid_arguments_get_an_invalid_parameter_reply() {
         let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
@@ -472,6 +501,35 @@ mod tests {
                 "iid",
             ),
             ("Search", Some(serde_json::json!({"kinds": []})), "query"),
+            (
+                "Search",
+                Some(serde_json::json!({"query": "x", "labels": ["bug"]})),
+                r#""labels""#,
+            ),
+            (
+                "Search",
+                Some(serde_json::json!({"query": "x", "scope": {"projects": [1], "users": [2]}})),
+                r#""scope.users""#,
+            ),
+            (
+                "CreateWorkItem",
+                Some(serde_json::json!({
+                    "project_id": 1,
+                    "title": "x",
+                    "parent": {"group_id": 3, "iid": 5, "state": "opened"},
+                })),
+                r#""parent.state""#,
+            ),
+            (
+                "RecordOpen",
+                Some(serde_json::json!({"kind": "work_item", "iid": 2, "project_id": 1, "at": 0})),
+                r#""at""#,
+            ),
+            (
+                "GetHistory",
+                Some(serde_json::json!({"since": 0})),
+                r#""since""#,
+            ),
         ] {
             let reply = handle_forskapd(
                 &format!("org.thehoster.forskapd.{method}"),
