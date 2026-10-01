@@ -46,6 +46,34 @@ archives:
     formats:
       - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # The layout .github/scripts/package-release.sh gives the macOS archive,
+    # which the Homebrew formula installs from: flat, the completions (written
+    # by forskap-cli/build.rs) under completions/.
+    files:
+      - LICENSE
+      - README.md
+      - src: forskap-cli/completions/forskap.bash
+        dst: completions
+        strip_parent: true
+      - src: forskap-cli/completions/_forskap
+        dst: completions
+        strip_parent: true
+      - src: forskap-cli/completions/forskap.fish
+        dst: completions
+        strip_parent: true
+
+# The macOS archive is built and packed on a macOS runner (release.yml, job
+# `macos`) and handed over in dist-darwin/. Published and checksummed under
+# this run's version, so a snapshot names it like the Linux archives.
+checksum:
+  extra_files:
+    - glob: dist-darwin/forskap_*_darwin_arm64.tar.gz
+      name_template: "{{ .ProjectName }}_{{ .Version }}_darwin_arm64.tar.gz"
+
+release:
+  extra_files:
+    - glob: dist-darwin/forskap_*_darwin_arm64.tar.gz
+      name_template: "{{ .ProjectName }}_{{ .Version }}_darwin_arm64.tar.gz"
 
 nfpms:
   - ids:
