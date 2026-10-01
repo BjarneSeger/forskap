@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 
 	"github.com/varlink/go/varlink"
 )
@@ -291,8 +293,9 @@ func (c *Client) GetSyncJobs(ctx context.Context) (jobs []SyncJob, pausedUntil *
 
 // Status is what GetStatus reports.
 type Status struct {
-	// APIVersion is the version of the interface the daemon speaks: the
-	// forskap-api version this binding is tagged with, clients/go/v<APIVersion>.
+	// APIVersion is the version of the interface the daemon speaks, a
+	// forskap-api version like the package's own APIVersion; Compatible
+	// compares the two.
 	APIVersion string
 	// DaemonVersion is the daemon's own version, the one
 	// org.varlink.service.GetInfo reports.
@@ -307,6 +310,44 @@ type Status struct {
 	Host     *string
 	Username *string
 	UserID   *int64
+}
+
+// Compatible tells whether the daemon speaks an interface this binding can use.
+// Before 1.0 that takes the same minor version, as every interface change bumps
+// it; from 1.0 on the same major and a minor at least the binding's. A version
+// that doesn't parse is not compatible.
+func (s Status) Compatible() bool {
+	return compatible(s.APIVersion, APIVersion)
+}
+
+func compatible(daemon, binding string) bool {
+	dMajor, dMinor, ok := majorMinor(daemon)
+	bMajor, bMinor, bOK := majorMinor(binding)
+	if !ok || !bOK || dMajor != bMajor {
+		return false
+	}
+	if bMajor == 0 {
+		return dMinor == bMinor
+	}
+	return dMinor >= bMinor
+}
+
+// majorMinor reads "MAJOR.MINOR.PATCH", the patch (and anything after it)
+// unchecked.
+func majorMinor(version string) (major, minor uint64, ok bool) {
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) != 3 {
+		return 0, 0, false
+	}
+	major, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	minor, err = strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return major, minor, true
 }
 
 // GetStatus returns the interface version the daemon speaks, its own version

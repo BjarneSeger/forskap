@@ -13,8 +13,39 @@ pub const VARLINK_INTERFACE_DESCRIPTION: &str =
     include_str!("../varlink/org.thehoster.forskapd.varlink");
 
 /// The version of the interface above: the daemon reports it in `GetStatus`,
-/// a client compares it with the one it was built against.
+/// a client compares it with the one it was built against ([`compatible`]).
 pub const API_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Whether a daemon whose `GetStatus` says `api_version` speaks an interface
+/// a client built against [`API_VERSION`] can use. Before 1.0 that takes the
+/// same minor version, as every interface change bumps it (a patch is a fix to
+/// a binding alone); from 1.0 on the same major and a minor at least this
+/// one's. A version that doesn't parse is not compatible.
+pub fn compatible(api_version: &str) -> bool {
+    compatible_with(api_version, API_VERSION)
+}
+
+fn compatible_with(daemon: &str, client: &str) -> bool {
+    match (major_minor(daemon), major_minor(client)) {
+        (Some((0, d)), Some((0, c))) => d == c,
+        (Some((dm, d)), Some((cm, c))) => dm == cm && d >= c,
+        _ => false,
+    }
+}
+
+/// `MAJOR.MINOR.PATCH`, the patch (and anything after it) unchecked.
+fn major_minor(version: &str) -> Option<(u64, u64)> {
+    // Digits only: `parse` would take a sign.
+    let number = |s: &str| {
+        let digits = !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        digits.then(|| s.parse().ok()).flatten()
+    };
+    let mut parts = version.splitn(3, '.');
+    let major = number(parts.next()?)?;
+    let minor = number(parts.next()?)?;
+    parts.next()?;
+    Some((major, minor))
+}
 
 const SOCKET_NAME: &str = "forskapd.socket";
 
@@ -40,7 +71,39 @@ fn socket_in(
 mod tests {
     use std::path::PathBuf;
 
-    use super::{SyncJob, SyncJobStatus, WorkItemRef, socket_in};
+    use super::{
+        API_VERSION, SyncJob, SyncJobStatus, WorkItemRef, compatible, compatible_with, socket_in,
+    };
+
+    #[test]
+    fn a_daemon_is_compatible_by_minor_before_1_0_and_by_major_after() {
+        for (daemon, client, expected) in [
+            ("0.32.0", "0.32.0", true),
+            ("0.32.1", "0.32.0", true),
+            ("0.32.0", "0.32.1", true),
+            ("0.33.0", "0.32.0", false),
+            ("0.31.0", "0.32.0", false),
+            ("1.0.0", "0.32.0", false),
+            ("1.0.0", "1.0.0", true),
+            ("1.3.0", "1.2.5", true),
+            ("1.2.0", "1.3.0", false),
+            ("2.0.0", "1.0.0", false),
+            ("1.4.0-rc.1", "1.2.0", true),
+            ("", "0.32.0", false),
+            ("0.32", "0.32.0", false),
+            ("v0.32.0", "0.32.0", false),
+            ("+0.32.0", "0.32.0", false),
+            ("0.x.0", "0.32.0", false),
+            ("0.32.0", "", false),
+        ] {
+            assert_eq!(
+                compatible_with(daemon, client),
+                expected,
+                "{daemon} against {client}"
+            );
+        }
+        assert!(compatible(API_VERSION));
+    }
 
     #[test]
     fn the_default_socket_is_in_the_runtime_dir_or_else_the_data_dir() {

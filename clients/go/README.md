@@ -62,10 +62,26 @@ for _, is := range issues {
 Use `forskap.DialAddress(ctx, "unix:/path/to.socket")` to point elsewhere, or
 `forskap.DefaultAddress()` to inspect what `Dial` would pick.
 
-`c.GetStatus` tells which interface version the daemon speaks (`Status.APIVersion`,
-the version of the binding tag that matches it) and whether it has a GitLab session,
-whatever that session is. A daemon older than `v0.32.0` doesn't have it and answers
-`*varlink.MethodNotFound`.
+To check that the daemon speaks an interface this binding can use, ask it first:
+
+```go
+status, err := c.GetStatus(ctx)
+var missing *varlink.MethodNotFound // github.com/varlink/go/varlink
+switch {
+case errors.As(err, &missing):
+	// a daemon older than v0.32.0: restart it after an upgrade
+case err != nil:
+	return err
+case !status.Compatible():
+	// it speaks status.APIVersion, this binding forskap.APIVersion
+}
+```
+
+`forskap.APIVersion` is the interface version the binding was generated from.
+`Compatible` holds while the minor versions match (from 1.0 on: the same major and a
+daemon minor at least the binding's); a patch apart is a fix to a binding alone.
+`GetStatus` also says whether the daemon has a GitLab session, and never fails for
+want of one.
 
 ### Errors
 
@@ -158,8 +174,9 @@ second call files it again.
 
 ## Regenerating
 
-The generated file `orgthehosterforskapd.go` is committed and marked
-`DO NOT EDIT`. After changing the `.varlink` interface, regenerate it:
+The generated files `orgthehosterforskapd.go` and `version.go` (`APIVersion`, from
+the version in `forskap-api/Cargo.toml`) are committed and marked `DO NOT EDIT`.
+After changing the `.varlink` interface or that version, regenerate them:
 
 ```sh
 cd clients/go
@@ -168,6 +185,6 @@ go generate ./...
 
 The generator is pinned via the `tool` directive in `go.mod`, and the
 [`Go binding`](../../.github/workflows/go-binding.yml) CI workflow re-runs
-`go generate` and fails if the committed file is out of date.
+`go generate` and fails if a committed file is out of date.
 
 Licensed under either Apache-2.0 or MIT license, at your option.

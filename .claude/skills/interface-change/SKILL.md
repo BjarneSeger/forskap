@@ -96,13 +96,16 @@ examples. Don't copy type bodies or field lists there — the doc points to the
 
 ```sh
 cd clients/go
-go generate ./...   # copies the .varlink in, runs varlink-go-interface-generator
+go generate ./...   # copies the .varlink in, runs varlink-go-interface-generator,
+                    # writes version.go from forskap-api/Cargo.toml
 go build ./... && go vet ./...
 ```
 
-Commit the regenerated `orgthehosterforskapd.go` — never hand-edit it. CI
-(`.github/workflows/go-binding.yml`) regenerates and fails on `git diff` if the
-committed binding is stale.
+Commit the regenerated `orgthehosterforskapd.go` and `version.go` — never hand-edit
+them. `version.go` holds `APIVersion`, the api crate's version, so a version bump alone
+makes the binding stale too. CI (`.github/workflows/go-binding.yml`, which also runs on
+`forskap-api/Cargo.toml`) regenerates and fails on `git diff` if the committed binding
+is stale.
 
 Once the change is on `main`, tag the binding with the api crate's version and push the
 tag — without one, `go get` only offers consumers a pseudo-version:

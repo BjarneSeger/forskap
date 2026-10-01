@@ -67,7 +67,11 @@ when it starts.
 Until forskap-api 1.0 the interface still changes incompatibly between minor
 versions. A client tells which version a daemon speaks by `GetStatus.api_version`; a
 daemon that answers `GetStatus` with `MethodNotFound` is older than 0.32.0, and
-ignores an argument it doesn't know instead of refusing it.
+ignores an argument it doesn't know instead of refusing it. A client can use a daemon
+whose `api_version` has its own minor version before 1.0 (every interface change bumps
+the minor; a patch is a fix to a binding alone), and from 1.0 on the same major and a
+minor at least its own. Both bindings carry that rule: `forskap_api::compatible` in
+Rust, `Status.Compatible` in Go, against the version they were built from.
 
 The daemon leaves an optional field without a value out of what it sends, wherever
 the field is; the Rust and Go bindings leave such an argument out too. A daemon
@@ -363,11 +367,11 @@ A dry run (`forskapd --dry-run`) answers with the host `dry-run.invalid` and the
 
 What a client asks first: which version of this interface the daemon speaks and
 whether it has a GitLab session. `api_version` is the version of the `forskap-api`
-crate the daemon was built with (`forskap_api::API_VERSION` to a Rust client, the
-`clients/go/v…` tag to a Go one); `daemon_version` is the daemon's own, the one
-`org.varlink.service.GetInfo` reports, which says nothing about the interface. A
-daemon from before forskap-api 0.32.0 has no `GetStatus` and answers
-`org.varlink.service.MethodNotFound`.
+crate the daemon was built with (`forskap_api::API_VERSION` to a Rust client,
+`APIVersion` to a Go one; see [Compatibility](#compatibility) for which ones fit);
+`daemon_version` is the daemon's own, the one `org.varlink.service.GetInfo` reports,
+which says nothing about the interface. A daemon from before forskap-api 0.32.0 has
+no `GetStatus` and answers `org.varlink.service.MethodNotFound`.
 
 While `connected`, `host`, `username` and `user_id` are set as `WhoAmI` answers them
 and `reason` and `detail` are absent; otherwise `reason` and `detail` are what

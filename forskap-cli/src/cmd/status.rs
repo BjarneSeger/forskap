@@ -25,8 +25,8 @@ use crate::cmd::auth::status::{expiry, token_line};
 use crate::cmd::sync::jobs::{self, failure, kind, pause, span};
 use crate::{client, config, friendly, output, style, watch};
 
-/// The CLI's own version. The daemon's may differ: what has to match is the
-/// interface ([`API_VERSION`]).
+/// The CLI's own version. The daemon's may differ: what has to fit is the
+/// interface ([`forskap_api::compatible`]).
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How long the daemon gets for each answer. It answers from memory and its
@@ -519,7 +519,9 @@ fn daemon(a: &Answers) -> Check<DaemonFacts> {
         (Answer::Got(Info { product, version }), Answer::Got(api)) => {
             let daemon = format!("{product} {version} on {socket}");
             match api {
-                Some(api) if api == API_VERSION => Check::new("daemon", Level::Ok, daemon),
+                Some(api) if forskap_api::compatible(api) => {
+                    Check::new("daemon", Level::Ok, daemon)
+                }
                 Some(api) => Check::new(
                     "daemon",
                     Level::Warning,
@@ -1810,6 +1812,14 @@ healthy
         let facts = daemon.facts.unwrap();
         assert_eq!(facts.version.as_deref(), Some("0.0.1"));
         assert_eq!(facts.api_version.as_deref(), Some(API_VERSION));
+
+        // A patch apart: a fix to a binding alone, the same interface.
+        let (minor, _) = API_VERSION.rsplit_once('.').unwrap();
+        let patched = format!("{minor}.99");
+        let answers = of_version(VERSION, Answer::Got(Some(patched.clone())));
+        let daemon = report(&answers).checks.daemon;
+        assert_eq!(daemon.level, Level::Ok, "{patched}");
+        assert_eq!(daemon.facts.unwrap().api_version, Some(patched));
     }
 
     #[test]
