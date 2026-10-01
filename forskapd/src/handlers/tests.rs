@@ -63,6 +63,8 @@ fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
             config,
             reconnect_signal,
             rotation: Default::default(),
+            // No test reaches the OS keychain.
+            keychain: crate::secrets::Keychain::disabled(),
         },
         dir,
     )

@@ -18,6 +18,7 @@ use forskapd::error::DormancyReason;
 use forskapd::gitlab::Issuable;
 use forskapd::handlers::{ConnState, Handlers, SessionSlot};
 use forskapd::queue::RetryQueue;
+use forskapd::secrets::Keychain;
 use forskapd::sync::jobs::ASSIGNED_MERGE_REQUESTS;
 use forskapd::sync::model::{
     Board, BoardList, Epic, Group, Issue, LabelRef, MergeRequest, Project, Resource, Timelog,
@@ -60,13 +61,15 @@ pub fn dormant_env() -> BenchEnv {
     )));
     let config: SharedConfig = Arc::new(std::sync::RwLock::new(forskapd::config::defaults()));
     let reconnect_signal = Arc::new(Notify::new());
+    // A bench never reaches the OS keychain.
+    let keychain = Keychain::disabled();
     let sync = SyncHandle::spawn(
         Arc::new(SyncStore::open(&db).unwrap()),
         forskapd::sync::AvatarDir::new(dir.path().join("avatars")),
         Arc::clone(&session),
         Arc::clone(&config),
         Arc::clone(&reconnect_signal),
-        forskapd::reconnect::keychain_probe(),
+        forskapd::reconnect::keychain_probe(keychain.clone()),
     );
     let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config)).unwrap();
     let usage = Arc::new(UsageStats::open(&db).unwrap());
@@ -80,6 +83,7 @@ pub fn dormant_env() -> BenchEnv {
             config,
             reconnect_signal,
             rotation: Default::default(),
+            keychain,
         },
         rt,
         _dir: dir,

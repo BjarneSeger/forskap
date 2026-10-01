@@ -185,6 +185,34 @@ jobs:
             xattr -l "$prefix/bin/forskapd" "$prefix/bin/forskap"
           fi
 
+      # A dry run needs no account and must leave nothing behind; the CLI
+      # drives it, a write included. The release a stable run builds may
+      # predate the daemon's flags.
+      - name: Try the daemon's flags and a dry run
+        if: env.MODE == 'checkout'
+        run: |
+          forskapd --version
+          if forskapd --no-such-flag; then exit 1; else test $? -eq 2; fi
+          forskapd --dry-run > "$RUNNER_TEMP/dry-run.addr" &
+          pid=$!
+          for _ in $(seq 1 300); do
+            [ -s "$RUNNER_TEMP/dry-run.addr" ] && break
+            sleep 0.1
+          done
+          FORSKAPD_SOCKET="$(head -n1 "$RUNNER_TEMP/dry-run.addr")"
+          export FORSKAPD_SOCKET
+          echo "dry run at $FORSKAPD_SOCKET"
+          case "$FORSKAPD_SOCKET" in unix:/*/forskapd-dry-run.*/forskapd.socket) ;; *) exit 1 ;; esac
+          dir="$(dirname "${FORSKAPD_SOCKET#unix:}")"
+          forskap auth status | grep -F "dry-run.invalid"
+          forskap issue list
+          test "$(forskap issue list | grep -c '^#')" -eq 6
+          forskap issue close 12 -p acme/backend/api
+          test "$(forskap issue list | grep -c '^#')" -eq 5
+          kill "$pid"
+          wait "$pid"
+          test ! -e "$dir"
+
       - name: Run the daemon as a service
         if: runner.os == 'macOS'
         run: |

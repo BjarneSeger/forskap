@@ -2,7 +2,12 @@
 //! so `--version`, `--help` and a mistyped flag exit without starting a
 //! daemon, reading a keychain or touching a file.
 
-use clap::Parser;
+use std::path::Path;
+
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser};
+
+use crate::config::ServerConfig;
 
 /// The caching GitLab daemon behind `forskap`.
 ///
@@ -14,12 +19,65 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(name = "forskapd", version, max_term_width = 100, after_long_help = AFTER_LONG_HELP)]
 pub struct Args {
+    /// Serve a built-in demo account, to try clients against.
+    ///
+    /// Everything it keeps lives in a new private temporary directory that
+    /// is removed on exit (SIGINT and SIGTERM included): its database, its
+    /// avatars, its socket. It never touches the keychain, GitLab or the
+    /// network, nor the config file, database, cache or socket of the real
+    /// daemon. Writes (time logged, items closed, assigned or created)
+    /// change the demo only; logging in or out is turned down. Once the demo
+    /// is synced, the first line on stdout is the socket's address as
+    /// `FORSKAPD_SOCKET` takes it (`unix:/tmp/forskapd-dry-run.…/forskapd.socket`);
+    /// the log goes to stderr.
+    #[arg(long)]
+    pub dry_run: bool,
+
     /// Listen on this Unix socket.
     ///
     /// Takes precedence over `[server] socket` of the config. Under systemd
-    /// socket activation the socket systemd passes is used, as always.
+    /// socket activation the socket systemd passes is used, as always. With
+    /// `--dry-run` it replaces the socket in the temporary directory; it must
+    /// not exist yet and can't be the daemon's default socket.
     #[arg(long, value_name = "PATH")]
     pub socket: Option<String>,
+}
+
+impl Args {
+    /// [`Parser::parse`], plus the checks clap can't make alone. Exits on
+    /// `--help`, `--version` and a usage error (with code 2).
+    pub fn parse_checked() -> Self {
+        let args = Self::parse();
+        if let Err(e) = args.check() {
+            e.exit();
+        }
+        args
+    }
+
+    /// A dry run must not take the socket the real daemon listens on by
+    /// default: clients would talk to the demo believing it is the real
+    /// one, and the real daemon couldn't start. The config may name another
+    /// socket, but a dry run doesn't read the config; that one exists while
+    /// the daemon runs, and binding an existing path fails.
+    fn check(&self) -> Result<(), clap::Error> {
+        if self.dry_run
+            && let Some(socket) = &self.socket
+            && is_default_socket(socket)
+        {
+            let msg = format!(
+                "--dry-run can't take the daemon's default socket {socket}; \
+                 name another path or leave --socket out"
+            );
+            return Err(Self::command().error(ErrorKind::ArgumentConflict, msg));
+        }
+        Ok(())
+    }
+}
+
+fn is_default_socket(socket: &str) -> bool {
+    let default = ServerConfig { socket: None }.resolved_socket();
+    let absolute = |p: &str| std::path::absolute(p).unwrap_or_else(|_| Path::new(p).into());
+    absolute(socket) == absolute(&default)
 }
 
 /// The environment and files, below the options of `--help`.
@@ -44,8 +102,6 @@ login` stores it there.";
 
 #[cfg(test)]
 mod tests {
-    use clap::error::ErrorKind;
-
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Args, clap::Error> {
@@ -55,7 +111,35 @@ mod tests {
     #[test]
     fn no_arguments_run_the_daemon_as_it_always_ran() {
         let args = parse(&[]).unwrap();
+        assert!(!args.dry_run);
         assert_eq!(args.socket, None);
+        assert!(args.check().is_ok());
+    }
+
+    #[test]
+    fn dry_run_is_a_flag() {
+        let args = parse(&["--dry-run"]).unwrap();
+        assert!(args.dry_run);
+        assert_eq!(args.socket, None);
+        assert!(args.check().is_ok());
+        let e = parse(&["--dry-run=yes"]).unwrap_err();
+        assert_eq!(e.exit_code(), 2, "it takes no value");
+    }
+
+    #[test]
+    fn a_dry_run_takes_any_socket_but_the_default_one() {
+        let args = parse(&["--dry-run", "--socket", "/tmp/demo.socket"]).unwrap();
+        assert_eq!(args.socket.as_deref(), Some("/tmp/demo.socket"));
+        assert!(args.check().is_ok());
+
+        let default = ServerConfig { socket: None }.resolved_socket();
+        let args = parse(&["--dry-run", "--socket", &default]).unwrap();
+        let e = args.check().unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::ArgumentConflict);
+        assert_eq!(e.exit_code(), 2);
+        // The real daemon may be pointed at it, of course.
+        let args = parse(&["--socket", &default]).unwrap();
+        assert!(args.check().is_ok());
     }
 
     #[test]
@@ -81,6 +165,8 @@ mod tests {
             "FORSKAPD_LOG",
             "config.toml",
             "--socket <PATH>",
+            "--dry-run",
+            "FORSKAPD_SOCKET",
             "--version",
             "keychain",
         ] {

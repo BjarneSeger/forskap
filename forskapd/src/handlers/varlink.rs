@@ -21,7 +21,7 @@ use forskap_api::{
 use crate::error::{DormancyReason, Error};
 use crate::gitlab::{GitlabClient, Issuable, NewIssue};
 use crate::query::{in_group, namespace_of, parse_epic_query, parse_iid_query, text_matches};
-use crate::secrets::{self, Credentials, Token};
+use crate::secrets::{Credentials, Token};
 use crate::sync::jobs::{
     ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, RECENT_ASSIGNED_ISSUES, RECENT_AUTHORED_ISSUES,
 };
@@ -1324,6 +1324,12 @@ impl VarlinkInterface for Handlers {
         host: String,
         token: String,
     ) -> varlink::Result<()> {
+        // Without a keychain there is nowhere to keep the token: turned
+        // down before GitLab is asked.
+        if let Err(e) = self.keychain.require() {
+            warn!("Login refused: no keychain");
+            return call.reply_gitlab_error(format!("logging in is disabled: {e}"));
+        }
         let token = Token::new(token);
         let client = match GitlabClient::connect_with_retry(&host, &token).await {
             Ok(c) => c,
@@ -1336,7 +1342,7 @@ impl VarlinkInterface for Handlers {
             host: host.clone(),
             token,
         };
-        if let Err(e) = secrets::store(&creds).await {
+        if let Err(e) = self.keychain.store(&creds).await {
             warn!(error = %e, "Login: keychain write failed");
             return call.reply_gitlab_error(format!("keychain write failed: {e}"));
         }
@@ -1351,9 +1357,14 @@ impl VarlinkInterface for Handlers {
 
     #[instrument(skip(self, call))]
     async fn logout(&self, call: &mut dyn Call_Logout) -> varlink::Result<()> {
+        // Nothing to forget without a keychain: the session stays.
+        if let Err(e) = self.keychain.require() {
+            warn!("Logout refused: no keychain");
+            return call.reply_gitlab_error(format!("logging out is disabled: {e}"));
+        }
         *self.session.write().await = ConnState::Dormant(DormancyReason::LoggedOut);
         self.rotation.reevaluate();
-        if let Err(e) = secrets::delete().await {
+        if let Err(e) = self.keychain.delete().await {
             warn!(error = %e, "Logout: keychain delete failed");
             return call.reply_gitlab_error(format!("keychain delete failed: {e}"));
         }

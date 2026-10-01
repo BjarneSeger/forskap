@@ -25,7 +25,7 @@ use crate::config::{AuthConfig, RotatePolicy, SharedConfig, next_backoff};
 use crate::error::{DormancyReason, Error, Result};
 use crate::gitlab::{GitlabApi, GitlabClient, TokenInfo};
 use crate::handlers::{ConnState, Handlers, Session, SessionSlot};
-use crate::secrets::{self, Credentials, Token};
+use crate::secrets::{Credentials, Token};
 
 /// Widest spread of the rotation point between machines.
 const SPREAD_MAX: TimeDelta = TimeDelta::hours(24);
@@ -212,15 +212,15 @@ impl Env for Live {
     }
 
     async fn load(&self) -> Result<Option<Credentials>> {
-        secrets::load().await
+        self.0.keychain.load().await
     }
 
     async fn store(&self, creds: &Credentials) -> Result<()> {
-        secrets::store(creds).await
+        self.0.keychain.store(creds).await
     }
 
     async fn forget(&self) -> Result<()> {
-        secrets::delete().await
+        self.0.keychain.delete().await
     }
 
     async fn connect(&self, host: &str, token: &Token) -> Result<Session> {

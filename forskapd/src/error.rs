@@ -36,6 +36,10 @@ pub enum Error {
     #[error("secret store: {0}")]
     Secrets(String),
 
+    /// The daemon runs without a keychain (a dry run).
+    #[error("this forskapd is a dry run and has no keychain")]
+    NoKeychain,
+
     #[error(transparent)]
     Fjall(#[from] fjall::Error),
 

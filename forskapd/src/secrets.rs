@@ -5,10 +5,84 @@
 //!
 //! A single entry holds both host and token as a JSON blob — one logged-in
 //! account at a time, matching the daemon's single-host model.
+//!
+//! The daemon reaches the OS keychain only through [`Keychain::Os`]; a dry
+//! run (`--dry-run`) holds [`Keychain::Disabled`], which answers every call
+//! itself.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tracing::warn;
 
 use crate::error::{Error, Result};
+
+/// Where the daemon keeps its credentials.
+#[derive(Debug, Clone)]
+pub enum Keychain {
+    /// The OS keychain: Secret Service on Linux, the Keychain on macOS.
+    Os,
+    /// None at all, for a dry run: every call fails with
+    /// [`Error::NoKeychain`] without reaching the OS. The calls refused so
+    /// far are counted, so a test can tell none was even tried.
+    Disabled(Arc<AtomicUsize>),
+}
+
+impl Keychain {
+    /// A keychain that refuses every call.
+    pub fn disabled() -> Self {
+        Self::Disabled(Arc::default())
+    }
+
+    /// How many calls a disabled keychain refused; always 0 for the OS one.
+    pub fn refused(&self) -> usize {
+        match self {
+            Self::Os => 0,
+            Self::Disabled(refused) => refused.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Whether credentials can be kept here at all: a login needs somewhere
+    /// to store its token, a logout something to forget. Checked before
+    /// either starts, so a disabled keychain turns them down before GitLab
+    /// is asked or the session touched.
+    pub fn require(&self) -> Result<()> {
+        match self {
+            Self::Os => Ok(()),
+            Self::Disabled(_) => Err(Error::NoKeychain),
+        }
+    }
+
+    pub async fn load(&self) -> Result<Option<Credentials>> {
+        match self {
+            Self::Os => load().await,
+            Self::Disabled(refused) => Err(refuse(refused, "read")),
+        }
+    }
+
+    pub async fn store(&self, creds: &Credentials) -> Result<()> {
+        match self {
+            Self::Os => store(creds).await,
+            Self::Disabled(refused) => Err(refuse(refused, "write")),
+        }
+    }
+
+    pub async fn delete(&self) -> Result<()> {
+        match self {
+            Self::Os => delete().await,
+            Self::Disabled(refused) => Err(refuse(refused, "delete")),
+        }
+    }
+}
+
+fn refuse(refused: &AtomicUsize, op: &'static str) -> Error {
+    refused.fetch_add(1, Ordering::SeqCst);
+    warn!(
+        op,
+        "refused a keychain call: this daemon runs without a keychain"
+    );
+    Error::NoKeychain
+}
 
 const SERVICE: &str = "forskapd";
 /// Service name from before the rename; read once, then moved to [`SERVICE`].
@@ -41,7 +115,7 @@ pub struct Credentials {
     pub token: Token,
 }
 
-pub async fn load() -> Result<Option<Credentials>> {
+async fn load() -> Result<Option<Credentials>> {
     if let Some(creds) = platform::load(SERVICE).await? {
         return Ok(Some(creds));
     }
@@ -59,11 +133,11 @@ pub async fn load() -> Result<Option<Credentials>> {
     Ok(Some(creds))
 }
 
-pub async fn store(creds: &Credentials) -> Result<()> {
+async fn store(creds: &Credentials) -> Result<()> {
     platform::store(creds).await
 }
 
-pub async fn delete() -> Result<()> {
+async fn delete() -> Result<()> {
     platform::delete(SERVICE).await?;
     platform::delete(LEGACY_SERVICE).await
 }
@@ -155,6 +229,32 @@ mod tests {
             prop_assert_eq!(back.host, host);
             prop_assert_eq!(back.token.expose(), token);
         }
+    }
+
+    #[tokio::test]
+    async fn a_disabled_keychain_refuses_every_call_without_reaching_the_os() {
+        let keychain = Keychain::disabled();
+        let creds = Credentials {
+            host: "gitlab.test".into(),
+            token: Token::new("glpat-secret"),
+        };
+        assert!(matches!(keychain.load().await, Err(Error::NoKeychain)));
+        assert!(matches!(
+            keychain.store(&creds).await,
+            Err(Error::NoKeychain)
+        ));
+        assert!(matches!(keychain.delete().await, Err(Error::NoKeychain)));
+        assert!(matches!(keychain.require(), Err(Error::NoKeychain)));
+        // A clone counts into the same tally: the one the handlers hold is
+        // the one a test reads.
+        assert_eq!(keychain.clone().refused(), 3, "require() is no call");
+    }
+
+    #[test]
+    fn only_a_disabled_keychain_is_required_in_vain() {
+        assert!(Keychain::Os.require().is_ok());
+        assert_eq!(Keychain::Os.refused(), 0);
+        assert!(Keychain::disabled().require().is_err());
     }
 
     #[test]

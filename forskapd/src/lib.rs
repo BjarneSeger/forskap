@@ -1,6 +1,6 @@
 //! Library surface for `forskapd`.
 //!
-//! The daemon itself lives in `main.rs`. This library target exists so the
+//! `main.rs` parses the arguments and runs [`daemon`]. This library target exists so the
 //! crate's binaries (`forskapd`, `gen-config-template`) and the local
 //! Criterion benches can link the daemon internals; it is **not** a public
 //! API. Everything here is an implementation detail with no stability
@@ -8,7 +8,9 @@
 
 pub mod args;
 pub mod config;
+pub mod daemon;
 pub mod db;
+pub mod demo;
 pub mod error;
 pub mod gitlab;
 pub mod handlers;

@@ -24,7 +24,7 @@ use crate::error::DormancyReason;
 use crate::gitlab::{GitlabApi, GitlabClient};
 use crate::queue::RetryQueue;
 use crate::rotate::Rotation;
-use crate::secrets::Token;
+use crate::secrets::{Keychain, Token};
 use crate::sync::{SyncHandle, now_secs};
 use crate::usage::UsageStats;
 
@@ -104,6 +104,9 @@ pub struct Handlers {
     /// What the rotation supervisor knows about the session's token, and its
     /// wakeup.
     pub rotation: Arc<Rotation>,
+    /// Where `Login` stores the token and `Logout` removes it; the reconnect
+    /// and rotation supervisors read and write it through here too.
+    pub keychain: Keychain,
 }
 
 impl Handlers {

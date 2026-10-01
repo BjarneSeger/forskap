@@ -36,7 +36,7 @@ use crate::config::{SharedConfig, next_backoff};
 use crate::error::DormancyReason;
 use crate::gitlab::{GitlabApi, GitlabClient};
 use crate::handlers::{ConnState, Handlers, Session, SessionSlot};
-use crate::secrets::{self, Credentials};
+use crate::secrets::{Credentials, Keychain};
 use crate::sync::Job;
 
 /// How long a reconnect waits for its probing sync job.
@@ -51,10 +51,12 @@ const KEYCHAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 pub type KeychainProbe =
     Arc<dyn Fn(Session) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
-pub fn keychain_probe() -> KeychainProbe {
-    Arc::new(|session| {
+/// The probe asking `keychain`.
+pub fn keychain_probe(keychain: Keychain) -> KeychainProbe {
+    Arc::new(move |session| {
+        let keychain = keychain.clone();
         Box::pin(async move {
-            match tokio::time::timeout(KEYCHAIN_PROBE_TIMEOUT, secrets::load()).await {
+            match tokio::time::timeout(KEYCHAIN_PROBE_TIMEOUT, keychain.load()).await {
                 Ok(loaded) => holds_another_token(loaded, &session),
                 Err(_) => {
                     warn!("keychain read timed out; not looking for a newer token");
@@ -201,7 +203,8 @@ async fn engage_once(handlers: Arc<Handlers>) -> Engaged {
     if !handlers.config.read().unwrap().reconnect.enabled {
         return Engaged::Stable;
     }
-    let creds = match resolve_credentials(secrets::load().await, &handlers.session).await {
+    let loaded = handlers.keychain.load().await;
+    let creds = match resolve_credentials(loaded, &handlers.session).await {
         Some(c) => c,
         None => return Engaged::Stable,
     };
@@ -492,6 +495,15 @@ mod tests {
             &*session.read().await,
             ConnState::Dormant(DormancyReason::TokenRejected { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn the_probe_of_a_disabled_keychain_finds_no_newer_token() {
+        let keychain = Keychain::disabled();
+        let probe = keychain_probe(keychain.clone());
+        assert!(!probe(connected_session()).await);
+        // Asked through the keychain, which turned it down itself.
+        assert_eq!(keychain.refused(), 1);
     }
 
     #[tokio::test]
