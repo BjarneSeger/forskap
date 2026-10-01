@@ -92,9 +92,11 @@ later rotation revokes the new token and `forskap auth login` is needed.
 ### Project avatars
 
 The avatars of the projects you are a member of are downloaded to
-`$XDG_CACHE_HOME/forskapd/avatars/`, for the launchers to show. Each is fetched once
-and again when the project's avatar changes; `forskap sync refresh --scope search`
-fetches all of them again. Needs GitLab 16.9 or newer.
+`$XDG_CACHE_HOME/forskapd/avatars/`, for the launchers to show. Each is fetched again
+whenever GitLab's avatar URL for the project changes (any update of the project does
+that), but keeps its file name until the image itself changes;
+`forskap sync refresh --scope search` fetches all of them again. Needs GitLab 16.9 or
+newer.
 
 Logging can be set by changing the `FORSKAPD_LOG` environment variable to
 `trace`, `debug`, `info`, `warn` or `error` (ordered from most to least verbose)

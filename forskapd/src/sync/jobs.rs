@@ -325,8 +325,6 @@ pub struct FetchCtx {
     /// Unix seconds the run started; becomes `last_ok` on success.
     pub started: u64,
     pub windows: Windows,
-    /// What the run syncs under; becomes the state's fingerprint on success.
-    pub fingerprint: u64,
     pub avatars: AvatarDir,
 }
 
@@ -438,24 +436,26 @@ pub async fn fetch(job: Job, ctx: FetchCtx) -> Result<Staged> {
     }
 }
 
-/// A project's avatar as a local file. A row is stored either way: without
-/// a file when GitLab has no image a launcher could show, so the job rests
-/// until the avatar changes.
+/// A project's avatar as a local file, named by its bytes: the job runs
+/// whenever GitLab's avatar URL changes, which its `?v=<updated_at>` does on
+/// any update of the project, but only a new image gets a new path. A row
+/// is stored either way: without a file when GitLab has no image a launcher
+/// could show, so the job rests until the URL changes.
 async fn avatar(ctx: &FetchCtx, project_id: i64) -> Result<Staged> {
     let image = ctx
         .gitlab
         .project_avatar(project_id)
         .await?
         .and_then(|bytes| {
-            let ext = avatars::extension(&bytes).filter(|_| bytes.len() <= avatars::MAX_BYTES);
-            if ext.is_none() {
+            let file = avatars::file_name(project_id, &bytes);
+            if file.is_none() {
                 warn!(
                     project_id,
                     bytes = bytes.len(),
                     "skipping a project avatar: too large or not a known image format"
                 );
             }
-            Some((avatars::file_name(project_id, ctx.fingerprint, ext?), bytes))
+            Some((file?, bytes))
         });
     let dir = ctx.avatars.clone();
     Ok(Staged::new(move |c| {
@@ -780,7 +780,6 @@ mod tests {
                 tracked: 30 * DAY,
                 project_cap: 2,
             },
-            fingerprint: 0xabc,
             avatars: AvatarDir::new(avatars),
         }
     }
@@ -1329,7 +1328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_avatar_lands_as_a_file_named_in_its_row() {
+    async fn an_avatar_lands_as_a_file_named_by_its_bytes_in_its_row() {
         let (s, d) = store();
         let dir = d.path().join("avatars");
         let fake = Arc::new(FakeGitlab::default());
@@ -1337,9 +1336,21 @@ mod tests {
         run(&s, Job::ProjectAvatar(7), ctx_in(&fake, true, 0, &dir)).await;
 
         let row = s.avatars.get((7, 0)).unwrap().unwrap();
-        assert_eq!(row.file, "7-0000000000000abc.png");
+        assert_eq!(Some(&row.file), avatars::file_name(7, PNG).as_ref());
         assert_eq!(std::fs::read(dir.join(&row.file)).unwrap(), PNG);
         assert_eq!(fake.avatar_calls(), [7]);
+
+        // Another run (a new `?v=`) names the same image the same; a new
+        // image gets a new name next to the old file, which the worker
+        // removes once the row landed.
+        run(&s, Job::ProjectAvatar(7), ctx_in(&fake, true, 0, &dir)).await;
+        assert_eq!(s.avatars.get((7, 0)).unwrap().unwrap(), row);
+        fake.serve_avatar(7, b"GIF89a");
+        run(&s, Job::ProjectAvatar(7), ctx_in(&fake, true, 0, &dir)).await;
+        let new = s.avatars.get((7, 0)).unwrap().unwrap().file;
+        assert!(new.starts_with("7-") && new.ends_with(".gif"), "{new}");
+        assert_eq!(std::fs::read(dir.join(&new)).unwrap(), b"GIF89a");
+        assert!(dir.join(&row.file).is_file());
     }
 
     /// No avatar (a 404), an oversized one and an HTML error page all leave

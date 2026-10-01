@@ -240,8 +240,8 @@ mod tests {
         assert_eq!(aged(1, u64::MAX, 60), 1);
     }
 
-    /// Fingerprints are stored and name the avatar files: a hash that
-    /// changed would resync everything once more.
+    /// Fingerprints are stored: a hash that changed would resync everything
+    /// once more.
     #[test]
     fn the_hash_is_pinned() {
         assert_eq!(text_hash(""), 0x2d06_8005_38d3_94c2, "the XXH3 spec's");

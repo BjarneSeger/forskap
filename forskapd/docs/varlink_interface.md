@@ -168,10 +168,15 @@ daemon does at its first start.
 The daemon downloads the avatars of the member projects into
 `$XDG_CACHE_HOME/forskapd/avatars/` (a private project's avatar is only readable with
 the token), so a launcher can show the file as it is. The extension tells the format
-(`png`, `jpg`, `gif`, `webp`, `ico`, `bmp`, `tiff`, `svg`). A changed avatar gets a new
-file name, and the path is empty until the download ran, for projects you are not a
-member of, for images above 1 MiB, and on GitLab before 16.9. The file may be gone if
-the cache directory was emptied; the daemon fetches it again at its next start.
+(`png`, `jpg`, `gif`, `webp`, `ico`, `bmp`, `tiff`, `svg`). The path changes only when
+the image does, so a client may cache images by path: a new image gets a new file name,
+while an unchanged one keeps its file, left as it is, though the daemon downloads it
+again whenever GitLab's avatar URL changes (any update of the project does that). A
+file written by a daemon from before this naming (0.12 and older) moves once more, at
+its project's first download after the upgrade. The path is empty until the download
+ran, for projects you are not a member of, for images above 1 MiB, and on GitLab before
+16.9. The file may be gone if the cache directory was emptied; the daemon fetches it
+again at its next start.
 
 ```varlink
 type Group (

@@ -3,6 +3,15 @@
 //!
 //! The sync worker is the only writer of the directory. Each fetch leaves an
 //! [`Avatar`] row naming its file, so reads never look at the filesystem.
+//!
+//! When to download and what to call the file are two questions. GitLab
+//! appends `?v=<updated_at>` to a project's avatar URL, so the URL changes
+//! with any update of the project, and it is also the only sign of a new
+//! image uploaded under the same file name: the job downloads whenever the
+//! URL changes. The file is named by its bytes ([`file_name`]), so its path
+//! changes only when the image does, and a launcher caching images by path
+//! keeps its cache. Files named before (by the job's fingerprint) keep
+//! their name until their project's next download moves them.
 
 use std::collections::HashSet;
 use std::io;
@@ -11,6 +20,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+use xxhash_rust::xxh3::xxh3_64;
 
 use super::model::{Resource, RowKey};
 
@@ -77,10 +87,18 @@ fn is_svg(bytes: &[u8]) -> bool {
     head.starts_with('<') && head.contains("<svg")
 }
 
-/// The file of a project's avatar. `version` changes with the avatar, so a
-/// new image gets a new path and no launcher shows a cached old one.
-pub fn file_name(project_id: i64, version: u64, ext: &str) -> String {
-    format!("{project_id}-{version:016x}.{ext}")
+/// The file for `image` as a project's avatar, named by its content: the
+/// same image downloaded again lands on the same path, a new one on a new
+/// path, so no launcher shows a cached old one. `None` for an image a
+/// launcher couldn't show: too large or of no known format.
+///
+/// XXH3 is stable across runs and platforms (its output is specified), and
+/// only images of one project can meet on a name, so 64 bits make an
+/// accidental collision negligible. A crafted one would only keep the path
+/// of a changed image: the file still gets the new bytes.
+pub fn file_name(project_id: i64, image: &[u8]) -> Option<String> {
+    let ext = extension(image).filter(|_| image.len() <= MAX_BYTES)?;
+    Some(format!("{project_id}-{:016x}.{ext}", xxh3_64(image)))
 }
 
 /// The directory the avatar files live in.
@@ -96,8 +114,13 @@ impl AvatarDir {
         self.0.join(file)
     }
 
-    /// Write `file` whole or not at all: a launcher may read it any time.
+    /// Write `file` whole or not at all: a launcher may read it any time. A
+    /// file already holding `bytes` is left alone, so downloading the same
+    /// image again changes nothing a launcher could notice.
     pub fn write(&self, file: &str, bytes: &[u8]) -> io::Result<()> {
+        if self.holds(file, bytes) {
+            return Ok(());
+        }
         std::fs::create_dir_all(&self.0)?;
         let tmp = self.0.join(format!(".{file}.tmp"));
         std::fs::write(&tmp, bytes)?;
@@ -108,6 +131,14 @@ impl AvatarDir {
 
     pub fn exists(&self, file: &str) -> bool {
         self.path_of(file).is_file()
+    }
+
+    /// Whether `file` exists and holds exactly `bytes`.
+    fn holds(&self, file: &str, bytes: &[u8]) -> bool {
+        let path = self.path_of(file);
+        let same_size =
+            std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == bytes.len() as u64);
+        same_size && std::fs::read(&path).is_ok_and(|held| held == bytes)
     }
 
     pub fn remove(&self, file: &str) {
@@ -176,10 +207,61 @@ mod tests {
         }
     }
 
+    /// Names are stored in the rows and handed to the launchers: a hash
+    /// that changed would move every file once more at its next download.
     #[test]
-    fn the_file_name_follows_the_avatar_version() {
-        assert_eq!(file_name(7, 0xabc, "png"), "7-0000000000000abc.png");
-        assert_ne!(file_name(7, 1, "png"), file_name(7, 2, "png"));
+    fn the_file_name_follows_the_image_and_nothing_else() {
+        let png = b"\x89PNG\r\n\x1a\n";
+        assert_eq!(file_name(7, png).as_deref(), Some("7-95654b8f73afb947.png"));
+        assert_ne!(file_name(7, png), file_name(8, png), "one per project");
+        let other = b"\x89PNG\r\n\x1a\n\0";
+        assert_ne!(file_name(7, png), file_name(7, other));
+        assert_eq!(
+            file_name(7, b"GIF89a").unwrap().rsplit_once('.').unwrap().1,
+            "gif"
+        );
+
+        let mut huge = png.to_vec();
+        huge.resize(MAX_BYTES + 1, 0);
+        assert_eq!(file_name(7, &huge), None);
+        assert_eq!(file_name(7, b"<html>Sign in</html>"), None);
+        assert_eq!(file_name(7, b""), None);
+    }
+
+    /// Downloading the same image again must not touch its file: a
+    /// launcher watching it would load it again.
+    #[test]
+    fn writing_the_bytes_a_file_holds_leaves_it_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = AvatarDir::new(tmp.path().join("avatars"));
+        dir.write("7-1.png", b"one").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let set_old = || {
+            let f = std::fs::File::options()
+                .write(true)
+                .open(dir.path_of("7-1.png"))
+                .unwrap();
+            f.set_modified(old).unwrap();
+        };
+        let modified = || {
+            std::fs::metadata(dir.path_of("7-1.png"))
+                .unwrap()
+                .modified()
+                .unwrap()
+        };
+        set_old();
+
+        dir.write("7-1.png", b"one").unwrap();
+        assert_eq!(modified(), old, "the same bytes: untouched");
+
+        dir.write("7-1.png", b"two").unwrap();
+        assert_eq!(std::fs::read(dir.path_of("7-1.png")).unwrap(), b"two");
+        assert_ne!(modified(), old, "same size, other bytes: replaced");
+
+        set_old();
+        dir.write("7-1.png", b"three").unwrap();
+        assert_eq!(std::fs::read(dir.path_of("7-1.png")).unwrap(), b"three");
+        assert_ne!(modified(), old, "another size: replaced");
     }
 
     #[test]
