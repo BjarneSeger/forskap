@@ -161,10 +161,9 @@ don't fit the method: a required one is missing, an enum argument (`IssuableKind
 interface doesn't have, or an argument object has a field the method doesn't know,
 nested ones included (`scope` of `Search`, `parent` of `CreateWorkItem`). `parameter`
 says what is wrong; for an unknown field it is that field's name, `.`-joined below the
-top level (`"labels"`, `"scope.users"`). An argument a newer interface added is thus
-refused by an older daemon rather than ignored. The methods without arguments
-(`GetFailures`, `ClearFailures`, `GetSyncJobs`, `GetStatus`, `Logout`, `WhoAmI`) don't
-read theirs and accept any.
+top level (`"labels"`, `"scope.users"`), for the methods without arguments too. An
+argument a newer interface added is thus refused by an older daemon rather than
+ignored.
 
 `GitlabError (message: string)` — GitLab rejected the request (invalid input, API
 error, rate limit), or a local precondition failed (malformed issue reference, invalid

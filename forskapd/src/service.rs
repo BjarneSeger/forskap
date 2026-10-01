@@ -15,11 +15,12 @@ use forskap_api::{
     Call_CreateWorkItem, Call_DismissFailure, Call_GetActivity, Call_GetAssignedMergeRequests,
     Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetStatus, Call_GetSyncJobs,
     Call_ListWorkItems, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
-    Call_Search, Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, Close_Args, CreateWorkItem_Args,
-    DismissFailure_Args, GetActivity_Args, GetAssignedMergeRequests_Args,
-    GetAssignedWorkItems_Args, GetHistory_Args, ListWorkItems_Args, Login_Args, PostTime_Args,
-    RecordOpen_Args, RetryFailure_Args, Search_Args, UnassignSelf_Args,
-    VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
+    Call_Search, Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, ClearFailures_Args, Close_Args,
+    CreateWorkItem_Args, DismissFailure_Args, GetActivity_Args, GetAssignedMergeRequests_Args,
+    GetAssignedWorkItems_Args, GetFailures_Args, GetHistory_Args, GetStatus_Args, GetSyncJobs_Args,
+    ListWorkItems_Args, Login_Args, Logout_Args, PostTime_Args, RecordOpen_Args, RetryFailure_Args,
+    Search_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
+    WhoAmI_Args,
 };
 
 use crate::handlers::Handlers;
@@ -203,16 +204,19 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.GetFailures" => {
+            let GetFailures_Args {} = args!();
             handlers
                 .get_failures(&mut call as &mut dyn Call_GetFailures)
                 .await?;
         }
         "org.thehoster.forskapd.GetSyncJobs" => {
+            let GetSyncJobs_Args {} = args!();
             handlers
                 .get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
                 .await?;
         }
         "org.thehoster.forskapd.GetStatus" => {
+            let GetStatus_Args {} = args!();
             handlers
                 .get_status(&mut call as &mut dyn Call_GetStatus)
                 .await?;
@@ -230,6 +234,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.ClearFailures" => {
+            let ClearFailures_Args {} = args!();
             handlers
                 .clear_failures(&mut call as &mut dyn Call_ClearFailures)
                 .await?;
@@ -356,9 +361,11 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.Logout" => {
+            let Logout_Args {} = args!();
             handlers.logout(&mut call as &mut dyn Call_Logout).await?;
         }
         "org.thehoster.forskapd.WhoAmI" => {
+            let WhoAmI_Args {} = args!();
             handlers.who_am_i(&mut call as &mut dyn Call_WhoAmI).await?;
         }
         _ => {
@@ -573,6 +580,37 @@ mod tests {
                 Some(serde_json::json!({"since": 0})),
                 r#""since""#,
             ),
+            // The methods without arguments as well.
+            (
+                "GetFailures",
+                Some(serde_json::json!({"op": "Close"})),
+                r#""op""#,
+            ),
+            (
+                "ClearFailures",
+                Some(serde_json::json!({"ids": [1]})),
+                r#""ids""#,
+            ),
+            (
+                "GetSyncJobs",
+                Some(serde_json::json!({"key": "events"})),
+                r#""key""#,
+            ),
+            (
+                "GetStatus",
+                Some(serde_json::json!({"verbose": true})),
+                r#""verbose""#,
+            ),
+            (
+                "WhoAmI",
+                Some(serde_json::json!({"host": "x"})),
+                r#""host""#,
+            ),
+            (
+                "Logout",
+                Some(serde_json::json!({"forget": true})),
+                r#""forget""#,
+            ),
         ] {
             let reply = handle_forskapd(
                 &format!("org.thehoster.forskapd.{method}"),
@@ -592,18 +630,34 @@ mod tests {
         }
     }
 
-    /// Every argument of these is optional, so a call without a
-    /// `parameters` block is valid.
+    /// Every argument of these is optional, or they have none, so a call
+    /// without a `parameters` block or with an empty one is valid: answered,
+    /// dormant, as the method answers it.
     #[tokio::test]
     async fn optional_arguments_may_be_omitted() {
         let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
-        for method in ["ClearCache", "GetHistory"] {
-            let reply =
-                handle_forskapd(&format!("org.thehoster.forskapd.{method}"), None, &handlers)
-                    .await
-                    .unwrap()
-                    .expect("a reply");
-            assert!(reply.error.is_none(), "{method}: {:?}", reply.error);
+        for (method, error) in [
+            ("ClearCache", None),
+            ("GetHistory", None),
+            ("GetFailures", None),
+            ("ClearFailures", None),
+            ("GetSyncJobs", None),
+            ("GetStatus", None),
+            ("WhoAmI", Some("org.thehoster.forskapd.NotAuthenticated")),
+            // The tests' disabled keychain turns it down.
+            ("Logout", Some("org.thehoster.forskapd.GitlabError")),
+        ] {
+            for params in [None, Some(serde_json::json!({}))] {
+                let reply = handle_forskapd(
+                    &format!("org.thehoster.forskapd.{method}"),
+                    params.clone(),
+                    &handlers,
+                )
+                .await
+                .unwrap()
+                .expect("a reply");
+                assert_eq!(reply.error.as_deref(), error, "{method} {params:?}");
+            }
         }
     }
 

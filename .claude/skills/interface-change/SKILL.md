@@ -65,7 +65,9 @@ the daemon are the to-do list.
 - **New method? Add its arm to the hand-written dispatcher** `handle_forskapd` in
   `forskapd/src/service.rs` (clone the arm of an argument-identical method) plus a
   `dispatch_has_an_arm_for_<method>` test next to `dispatch_has_an_arm_for_search`. A
-  missing arm compiles fine and only fails at runtime as `MethodNotFound`.
+  missing arm compiles fine and only fails at runtime as `MethodNotFound`. Every arm
+  parses its `*_Args` through `args!()`, an empty one too (`let WhoAmI_Args {} =
+  args!();`): that is what refuses an argument the method doesn't have.
 - New field on a wire type? The store holds GitLab mirrors, not wire types: add the
   field to the mirror in `sync/model.rs` (lenient `serde(default)`) and bump that
   resource's `SCHEMA`, so every job syncing it runs full once and refills old rows.
