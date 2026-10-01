@@ -1,9 +1,14 @@
 name: Homebrew
 
-# Installs the formula of this repository's tap the way a user does: built
-# from the source tarball of the release it names, then `brew test`. On macOS
-# it also runs the daemon as a launchd service, which nothing else covers.
-# The release workflow calls this after it bumped the formula.
+# Installs the formula of this repository's tap with Homebrew, runs
+# `brew test` and, on macOS, the daemon as a launchd service. This is the
+# only macOS build of the workspace there is. Two modes:
+#
+# - `checkout` (pushes and pull requests): the formula builds the source of
+#   the checkout, so a change is tried on macOS before it is released.
+# - `stable` (manual runs, and the release workflow after it bumped the
+#   formula): the formula as committed, built from the release tarball it
+#   names, the way a user gets it.
 on:
   push:
     branches:
@@ -11,17 +16,40 @@ on:
     paths:
       - "Formula/**"
       - ".github/workflows/brew.yml"
+      # What decides whether the workspace builds on macOS at all: a feature
+      # that only a Linux-only dependency enables goes unnoticed elsewhere.
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "*/Cargo.toml"
+      # Writes the completion files the formula installs.
+      - "forskap-cli/build.rs"
   pull_request:
     paths:
       - "Formula/**"
       - ".github/workflows/brew.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "*/Cargo.toml"
+      - "forskap-cli/build.rs"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: What the formula builds.
+        type: choice
+        options:
+          - stable
+          - checkout
+        default: stable
   workflow_call:
     inputs:
       ref:
         description: Commit or branch holding the formula to test.
         type: string
         required: false
+      mode:
+        description: "What the formula builds: stable or checkout."
+        type: string
+        default: stable
 
 permissions:
   contents: read
@@ -31,13 +59,14 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  MODE: ${{ inputs.mode || 'checkout' }}
   HOMEBREW_NO_ANALYTICS: "1"
   HOMEBREW_NO_INSTALL_CLEANUP: "1"
   HOMEBREW_NO_ENV_HINTS: "1"
 
 jobs:
   formula:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.os }} (${{ inputs.mode || 'checkout' }})
     strategy:
       fail-fast: false
       matrix:
@@ -71,6 +100,33 @@ jobs:
         run: |
           brew style bjarneseger/forskap/forskap
           brew audit --strict bjarneseger/forskap/forskap
+
+      # Checkout mode never downloads the release the committed formula
+      # names; this still checks its url and sha256.
+      - name: Fetch the release the formula names
+        if: env.MODE == 'checkout'
+        run: brew fetch --build-from-source bjarneseger/forskap/forskap
+
+      # Only the tap in this job changes: the formula gets the url and sha256
+      # of a tarball of the checked-out commit, the two lines a release bump
+      # rewrites. `brew install --HEAD` is no option, as the formula's test
+      # compares its version with `forskap --version`; the tarball is named
+      # after the workspace version for brew to read it from there.
+      - name: Point the formula at the checkout
+        if: env.MODE == 'checkout'
+        run: |
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+          tarball="$RUNNER_TEMP/forskap-$version.tar.gz"
+          git archive --format=tar.gz --prefix="forskap-$version/" -o "$tarball" HEAD
+          sha="$( (sha256sum "$tarball" 2>/dev/null || shasum -a 256 "$tarball") | cut -d " " -f 1)"
+          sed -i.bak \
+            -e "s|^  url \".*\"\$|  url \"file://$tarball\"|" \
+            -e "s|^  sha256 \".*\"\$|  sha256 \"$sha\"|" \
+            Formula/forskap.rb
+          rm Formula/forskap.rb.bak
+          git diff -- Formula/forskap.rb
+          grep -q "^  url \"file://$tarball\"\$" Formula/forskap.rb
+          grep -q "^  sha256 \"$sha\"\$" Formula/forskap.rb
 
       - name: Install from source
         run: brew install --build-from-source bjarneseger/forskap/forskap
