@@ -213,20 +213,39 @@ jobs:
           wait "$pid"
           test ! -e "$dir"
 
+      # All of it is the user's who starts it: the unit, the log, and the
+      # socket in a directory of theirs. The release a stable run installs
+      # may still bind /tmp.
       - name: Run the daemon as a service
         if: runner.os == 'macOS'
         run: |
           brew services start bjarneseger/forskap/forskap
           for _ in $(seq 1 60); do
-            [ -S /tmp/forskapd.socket ] && break
+            forskap queue list --output json > /dev/null 2>&1 && break
             sleep 1
           done
           brew services info forskap
-          test -S /tmp/forskapd.socket
           forskap queue list --output json
           forskap auth status || true
+          # homebrew.mxcl.forskap or sh.brew.forskap, by Homebrew's version.
+          set -- "$HOME"/Library/LaunchAgents/*.forskap.plist
+          test -f "$1"
+          test -s "$HOME/Library/Logs/forskapd.log"
+          socket="$HOME/Library/Application Support/forskapd/forskapd.socket"
+          if [ "$MODE" = checkout ]; then
+            test -S "$socket"
+            test "$(stat -f %Lp "$socket")" = 600
+            test ! -e /tmp/forskapd.socket
+          fi
           brew services stop forskap
+          if [ "$MODE" = checkout ]; then
+            for _ in $(seq 1 10); do
+              [ -e "$socket" ] || break
+              sleep 1
+            done
+            test ! -e "$socket"
+          fi
 
       - name: Service log
         if: always() && runner.os == 'macOS'
-        run: cat "$(brew --prefix)/var/log/forskapd.log" || true
+        run: cat "$HOME/Library/Logs/forskapd.log" || true

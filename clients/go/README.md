@@ -55,8 +55,9 @@ for _, is := range issues {
 `forskap.Dial` resolves the daemon address with the same precedence as `forskap`:
 
 1. `$FORSKAPD_SOCKET` (used verbatim — include the `unix:` scheme)
-2. `unix:$XDG_RUNTIME_DIR/forskapd.socket`
-3. `unix:/tmp/forskapd.socket`
+2. `unix:$XDG_RUNTIME_DIR/forskapd.socket` (not on macOS)
+3. `forskapd/forskapd.socket` in the data directory: `~/Library/Application Support`
+   on macOS, elsewhere `$XDG_DATA_HOME` or `~/.local/share`
 
 Use `forskap.DialAddress(ctx, "unix:/path/to.socket")` to point elsewhere, or
 `forskap.DefaultAddress()` to inspect what `Dial` would pick.

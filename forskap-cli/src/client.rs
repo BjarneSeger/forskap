@@ -14,21 +14,20 @@ use crate::config::{self, Config};
 /// Resolve the daemon's varlink socket address.
 ///
 /// Precedence: `FORSKAPD_SOCKET` env var (or its pre-rename spelling
-/// `GITLAB_TRACKRD_SOCKET`) -> the config file's `socket`
-/// -> `unix:$XDG_RUNTIME_DIR/forskapd.socket` ->
-/// `unix:/tmp/forskapd.socket`. **The defaults must stay in sync with the
-/// daemon's own resolution in `forskapd/src/config.rs`**, or `forskap` will
-/// silently miss the running daemon.
-pub fn socket(cfg: &Config) -> String {
-    std::env::var("FORSKAPD_SOCKET")
+/// `GITLAB_TRACKRD_SOCKET`) -> the config file's `socket` -> the daemon's
+/// default socket ([`forskap_api::default_socket`], which the daemon binds).
+pub fn socket(cfg: &Config) -> Result<String> {
+    let named = std::env::var("FORSKAPD_SOCKET")
         .or_else(|_| std::env::var("GITLAB_TRACKRD_SOCKET"))
         .ok()
-        .or_else(|| cfg.socket.clone())
-        .unwrap_or_else(|| {
-            std::env::var("XDG_RUNTIME_DIR")
-                .map(|d| format!("unix:{d}/forskapd.socket"))
-                .unwrap_or_else(|_| "unix:/tmp/forskapd.socket".to_string())
-        })
+        .or_else(|| cfg.socket.clone());
+    if let Some(address) = named {
+        return Ok(address);
+    }
+    let path = forskap_api::default_socket().context(
+        "no home directory to look for the daemon's socket in; set FORSKAPD_SOCKET to its address",
+    )?;
+    Ok(format!("unix:{}", path.display()))
 }
 
 /// Open an async varlink connection to the daemon.
@@ -44,7 +43,7 @@ pub async fn connect(socket: &str) -> Result<VarlinkClient> {
 
 /// [`connect`] to the socket the config and environment name.
 pub async fn connect_default() -> Result<VarlinkClient> {
-    connect(&socket(&config::load()?)).await
+    connect(&socket(&config::load()?)?).await
 }
 
 /// The bare connection, for the calls outside the forskapd interface; hand

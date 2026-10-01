@@ -69,8 +69,9 @@ FORSKAPD_LOG=info ./target/debug/forskapd > $S/daemon.log 2>&1 &
 - **Token rotation**: an isolated real instance must set `[auth]` `rotate = "never"`
   in its config (the recipe writes it). Otherwise it may rotate the real token,
   which revokes the one the production daemon and every other tool use.
-- **Stale socket**: after SIGKILL the daemon leaves the socket file and a
-  restart dies with `AddrInUse` — Use SIGTERM or `rm` the socket before restarting.
+- **Stale socket**: after SIGKILL the daemon leaves the socket file; the next
+  start replaces it. `AddrInUse` now means another daemon is listening there.
+- **Without `XDG_RUNTIME_DIR`** the socket is `$XDG_DATA_HOME/forskapd/forskapd.socket`.
 - **Avatars**: files under `$XDG_CACHE_HOME/forskapd/avatars/`. Without the
   override the instance sweeps the real daemon's avatar files (it removes files
   its own store doesn't name).

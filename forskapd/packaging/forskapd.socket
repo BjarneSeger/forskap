@@ -3,6 +3,7 @@ Description=GitLab time-tracking varlink daemon
 
 [Socket]
 ListenStream=%t/forskapd.socket
+SocketMode=0600
 FileDescriptorName=varlink
 Service=forskapd.service
 

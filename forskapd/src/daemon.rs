@@ -77,20 +77,39 @@ pub struct Environment {
 pub enum Listen {
     /// The socket systemd passed (socket activation).
     Activated,
-    /// A socket bound at this path, removed again on shutdown.
+    /// A socket bound at this path (see [`server::bind`]), removed again on
+    /// shutdown.
     Bind(String),
+}
+
+/// Why the user's daemon can't be set up.
+#[derive(Debug, thiserror::Error)]
+pub enum SetupError {
+    #[error("failed to load configuration: {0}")]
+    Config(#[from] confique::Error),
+    #[error("no home directory to put the socket in; name one with --socket")]
+    NoSocket,
 }
 
 impl Environment {
     /// The user's daemon: their config, keychain, GitLab and directories.
-    /// Fails only on a config file that doesn't parse.
-    pub async fn real(args: &Args) -> std::result::Result<Self, confique::Error> {
+    /// Fails on a config file that doesn't parse, and where nothing names a
+    /// socket and there is no home directory for the default one.
+    pub async fn real(args: &Args) -> std::result::Result<Self, SetupError> {
         migrate::run();
 
         let config = config::load_shared()?;
-        let socket = match &args.socket {
-            Some(socket) => socket.clone(),
-            None => config.read().unwrap().server.resolved_socket(),
+        let listen = if server::is_socket_activated() {
+            Listen::Activated
+        } else {
+            let socket = match &args.socket {
+                Some(socket) => socket.clone(),
+                None => {
+                    let resolved = config.read().unwrap().server.resolved_socket();
+                    resolved.ok_or(SetupError::NoSocket)?
+                }
+            };
+            Listen::Bind(socket)
         };
         let data_dir = dirs::data_local_dir()
             .unwrap_or_else(|| "~/.local/share".into())
@@ -119,11 +138,6 @@ impl Environment {
 
         let keychain = Keychain::Os;
         let session = connect(&keychain).await;
-        let listen = if server::is_socket_activated() {
-            Listen::Activated
-        } else {
-            Listen::Bind(socket)
-        };
         Ok(Self {
             config,
             watch_config: true,

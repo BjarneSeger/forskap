@@ -40,7 +40,8 @@ The daemon is a systemd user unit — enable and start it:
 systemctl enable --now --user forskapd.service
 ```
 
-With Homebrew it is a launchd service, logging to `$(brew --prefix)/var/log/forskapd.log`:
+With Homebrew it is a service of your user as well, so start it without `sudo`. On
+macOS that is a launchd agent, logging to `~/Library/Logs/forskapd.log`:
 
 ```sh
 brew services start forskap

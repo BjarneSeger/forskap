@@ -28,7 +28,7 @@ pub struct Config {
 
     /// Override the daemon's varlink socket address; the
     /// `FORSKAPD_SOCKET` env var wins over it. If neither is set, the
-    /// same XDG-runtime-dir fallback chain as the daemon is used.
+    /// daemon's default socket is used.
     pub socket: Option<String>,
 
     // Read only by the Linux-only `forskap integration search-provider`.

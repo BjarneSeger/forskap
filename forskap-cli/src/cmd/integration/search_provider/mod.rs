@@ -115,7 +115,7 @@ pub(super) struct Hits {
 impl Provider {
     fn new() -> Result<Self> {
         let cfg = config::load()?;
-        let socket = client::socket(&cfg);
+        let socket = client::socket(&cfg)?;
         let trigger_word = cfg
             .search_provider
             .trigger_word

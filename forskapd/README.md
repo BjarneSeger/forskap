@@ -19,8 +19,11 @@ brew install forskap
 brew services start forskap
 ```
 
-Its log is `$(brew --prefix)/var/log/forskapd.log`. On macOS the socket is
-`/tmp/forskapd.socket` unless `[server]` `socket` names another one.
+Started without `sudo`, as above, it is a service of your user. On macOS its log is
+`~/Library/Logs/forskapd.log` and its socket
+`~/Library/Application Support/forskapd/forskapd.socket`, unless `[server]` `socket`
+names another one. Releases up to 0.12.0 listened on `/tmp/forskapd.socket` there:
+after upgrading from one, `brew services restart forskap`.
 
 ## Running
 
@@ -30,7 +33,7 @@ and that is all it needs. It takes a few options:
 | Option | Does |
 |---|---|
 | `--dry-run` | Serve a built-in demo account instead of yours, from a private temporary directory; see [Dry run](#dry-run). |
-| `--socket <PATH>` | Listen on this Unix socket. Takes precedence over `[server]` `socket`; under systemd socket activation the socket systemd passes is used, as always. With `--dry-run` it replaces the socket in the temporary directory: it must not exist yet and can't be the daemon's default socket. |
+| `--socket <PATH>` | Listen on this Unix socket. Takes precedence over `[server]` `socket`; under systemd socket activation the socket systemd passes is used, as always. With `--dry-run` it replaces the socket in the temporary directory: nothing may be listening on it, and it can't be the daemon's default socket. |
 | `-V`, `--version` | Print `forskapd <version>` and exit. |
 | `-h`, `--help` | Describe the daemon, its environment and its files, and exit. |
 
@@ -103,7 +106,7 @@ Keys are grouped into TOML tables, one per concern:
 
 | Key | Default | Description |
 |---|---|---|
-| `[server]` `socket` | `$XDG_RUNTIME_DIR/forskapd.socket` (falls back to `/tmp`) | Varlink Unix socket the daemon listens on. `forskapd --socket` takes precedence; both are ignored under systemd socket activation. |
+| `[server]` `socket` | `$XDG_RUNTIME_DIR/forskapd.socket`; without a runtime directory (macOS) `forskapd/forskapd.socket` in the data directory | Varlink Unix socket the daemon listens on, readable and writable by you alone. `forskapd --socket` takes precedence; both are ignored under systemd socket activation. |
 | `[refresh.quick]` `interval_secs` | `300` | Seconds between quick syncs of the assigned issue/MR lists and the recent timelog window (floor 60). |
 | `[refresh.quick]` `window_hours` | `24` | How far back the quick timelog sync reaches (last 24h). |
 | `[refresh.slow]` `interval_secs` | `86400` | Seconds between slow syncs of the full timelog history, the board columns, your project/group memberships and the issues you authored or were assigned, closed ones included (once a day; floor 60). |

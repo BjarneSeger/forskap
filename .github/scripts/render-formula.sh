@@ -148,13 +148,17 @@ cat <<'RUBY'
     fish_completion.install completions/"forskap.fish"
   end
 
+  # A unit of the user who starts it, and so is its log; on Linux that
+  # user's journal has it.
   service do
     run opt_bin/"forskapd"
     keep_alive true
     # Keeps colour escapes out of the log file.
     environment_variables NO_COLOR: "1"
-    log_path var/"log/forskapd.log"
-    error_log_path var/"log/forskapd.log"
+    if OS.mac?
+      log_path "~/Library/Logs/forskapd.log"
+      error_log_path "~/Library/Logs/forskapd.log"
+    end
   end
 
   test do

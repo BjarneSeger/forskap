@@ -37,8 +37,8 @@ pub struct Args {
     ///
     /// Takes precedence over `[server] socket` of the config. Under systemd
     /// socket activation the socket systemd passes is used, as always. With
-    /// `--dry-run` it replaces the socket in the temporary directory; it must
-    /// not exist yet and can't be the daemon's default socket.
+    /// `--dry-run` it replaces the socket in the temporary directory; nothing
+    /// may be listening on it, and it can't be the daemon's default socket.
     #[arg(long, value_name = "PATH")]
     pub socket: Option<String>,
 }
@@ -57,8 +57,8 @@ impl Args {
     /// A dry run must not take the socket the real daemon listens on by
     /// default: clients would talk to the demo believing it is the real
     /// one, and the real daemon couldn't start. The config may name another
-    /// socket, but a dry run doesn't read the config; that one exists while
-    /// the daemon runs, and binding an existing path fails.
+    /// socket, but a dry run doesn't read the config; that one is listened
+    /// on while the daemon runs, and binding such a socket fails.
     fn check(&self) -> Result<(), clap::Error> {
         if self.dry_run
             && let Some(socket) = &self.socket
@@ -75,7 +75,9 @@ impl Args {
 }
 
 fn is_default_socket(socket: &str) -> bool {
-    let default = ServerConfig { socket: None }.resolved_socket();
+    let Some(default) = ServerConfig { socket: None }.resolved_socket() else {
+        return false;
+    };
     let absolute = |p: &str| std::path::absolute(p).unwrap_or_else(|_| Path::new(p).into());
     absolute(socket) == absolute(&default)
 }
@@ -87,15 +89,16 @@ Environment:
                 tracing filter such as `forskapd=debug` (default:
                 forskapd=info).
 
-Files (Linux; on macOS the config and the database are under
-~/Library/Application Support, the avatars under ~/Library/Caches and the
-socket is /tmp/forskapd.socket):
+Files (Linux; on macOS the config, the database and the socket are under
+~/Library/Application Support, the avatars under ~/Library/Caches):
   $XDG_CONFIG_HOME/forskapd/config.toml  Your config, re-read when it changes.
   /usr/share/forskapd/config.toml        The package's defaults.
   $XDG_DATA_HOME/forskapd/db             The cache, the retry queue, the open
                                          counts.
   $XDG_CACHE_HOME/forskapd/avatars       The project avatars.
-  $XDG_RUNTIME_DIR/forskapd.socket       The default socket.
+  $XDG_RUNTIME_DIR/forskapd.socket       The default socket. Without a runtime
+                                         directory: forskapd/forskapd.socket
+                                         in $XDG_DATA_HOME.
 
 The GitLab token lives in the OS keychain, never in a file: `forskap auth
 login` stores it there.";
@@ -132,7 +135,7 @@ mod tests {
         assert_eq!(args.socket.as_deref(), Some("/tmp/demo.socket"));
         assert!(args.check().is_ok());
 
-        let default = ServerConfig { socket: None }.resolved_socket();
+        let default = ServerConfig { socket: None }.resolved_socket().unwrap();
         let args = parse(&["--dry-run", "--socket", &default]).unwrap();
         let e = args.check().unwrap_err();
         assert_eq!(e.kind(), ErrorKind::ArgumentConflict);

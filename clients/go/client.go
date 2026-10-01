@@ -9,6 +9,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/varlink/go/varlink"
 )
@@ -76,18 +77,51 @@ const (
 //
 //	$FORSKAPD_SOCKET, if set (used verbatim, so include the "unix:" scheme)
 //	→ $GITLAB_TRACKRD_SOCKET, its name before the rename
-//	→ unix:$XDG_RUNTIME_DIR/forskapd.socket
-//	→ unix:/tmp/forskapd.socket
+//	→ unix:$XDG_RUNTIME_DIR/forskapd.socket (not on macOS)
+//	→ unix:<data>/forskapd/forskapd.socket, <data> being
+//	  ~/Library/Application Support on macOS, elsewhere $XDG_DATA_HOME or
+//	  ~/.local/share
+//
+// The last two are the daemon's default socket. Without a home directory
+// there is none, and the address is empty.
 func DefaultAddress() string {
 	for _, name := range []string{"FORSKAPD_SOCKET", "GITLAB_TRACKRD_SOCKET"} {
 		if s := os.Getenv(name); s != "" {
 			return s
 		}
 	}
-	if x := os.Getenv("XDG_RUNTIME_DIR"); x != "" {
-		return "unix:" + filepath.Join(x, "forskapd.socket")
+	home, _ := os.UserHomeDir()
+	if socket := defaultSocket(runtime.GOOS, os.Getenv, home); socket != "" {
+		return "unix:" + socket
 	}
-	return "unix:/tmp/forskapd.socket"
+	return ""
+}
+
+// defaultSocket mirrors default_socket of the forskap-api crate, which the
+// daemon binds.
+func defaultSocket(goos string, getenv func(string) string, home string) string {
+	const name = "forskapd.socket"
+	xdg := func(key string) string {
+		// As the daemon reads them: not on macOS, and absolute paths only.
+		if dir := getenv(key); goos != "darwin" && filepath.IsAbs(dir) {
+			return dir
+		}
+		return ""
+	}
+	if dir := xdg("XDG_RUNTIME_DIR"); dir != "" {
+		return filepath.Join(dir, name)
+	}
+	data := xdg("XDG_DATA_HOME")
+	if data == "" {
+		if home == "" {
+			return ""
+		}
+		data = filepath.Join(home, ".local", "share")
+		if goos == "darwin" {
+			data = filepath.Join(home, "Library", "Application Support")
+		}
+	}
+	return filepath.Join(data, "forskapd", name)
 }
 
 // Client is a connected varlink client for the org.thehoster.forskapd

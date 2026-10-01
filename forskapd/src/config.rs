@@ -85,22 +85,20 @@ pub struct Config {
 #[derive(Debug, ConfiqueConfig)]
 pub struct ServerConfig {
     /// Unix socket the daemon listens on. If unset, defaults to
-    /// `$XDG_RUNTIME_DIR/forskapd.socket` (then `/tmp/...` as a last
-    /// resort). `forskapd --socket` takes precedence; both are ignored under
-    /// systemd socket activation.
+    /// `$XDG_RUNTIME_DIR/forskapd.socket`, or without a runtime directory
+    /// (macOS) to `forskapd/forskapd.socket` in your data directory.
+    /// `forskapd --socket` takes precedence; both are ignored under systemd
+    /// socket activation.
     pub socket: Option<String>,
 }
 
 impl ServerConfig {
-    /// The configured socket, or the `$XDG_RUNTIME_DIR` -> `/tmp` fallback chain
-    /// when unset.
-    pub fn resolved_socket(&self) -> String {
-        if let Some(socket) = &self.socket {
-            return socket.clone();
-        }
-        dirs::runtime_dir()
-            .map(|d| d.join("forskapd.socket").to_string_lossy().into_owned())
-            .unwrap_or_else(|| "/tmp/forskapd.socket".to_string())
+    /// The configured socket, or [`forskap_api::default_socket`] when unset:
+    /// `None` only without a home directory to put that one in.
+    pub fn resolved_socket(&self) -> Option<String> {
+        self.socket.clone().or_else(|| {
+            forskap_api::default_socket().map(|path| path.to_string_lossy().into_owned())
+        })
     }
 }
 
