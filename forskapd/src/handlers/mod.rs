@@ -228,7 +228,7 @@ fn parent_epic(parent: &WorkItemRef) -> Result<(i64, i64), Invalid> {
             Ok((group_id, parent.iid))
         }
         _ => Err(Invalid::new(
-            "parent",
+            "item.parent",
             "invalid parent: name an epic by its group_id and iid",
         )),
     }
@@ -245,12 +245,12 @@ fn new_issue_error(project_id: i64, title: &str, labels: &[String]) -> Option<In
         ));
     }
     if title.trim().is_empty() {
-        return Some(Invalid::new("title", "an issue needs a title"));
+        return Some(Invalid::new("item.title", "an issue needs a title"));
     }
     let split = labels.iter().find(|l| l.contains(','));
     split.map(|label| {
         let message = format!("invalid label {label:?}: a label can't contain a comma");
-        Invalid::new("labels", message)
+        Invalid::new("item.labels", message)
     })
 }
 

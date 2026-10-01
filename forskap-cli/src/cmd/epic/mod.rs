@@ -17,7 +17,9 @@ mod open;
 mod view;
 
 use anyhow::{Result, bail};
-use forskap_api::{Group, SearchKind, VarlinkClient, VarlinkClientInterface, WorkItem};
+use forskap_api::{
+    Group, SearchKind, SearchOptions, VarlinkClient, VarlinkClientInterface, WorkItem,
+};
 
 use crate::cli::{EpicArgs, EpicCommand};
 use crate::friendly::friendly;
@@ -80,15 +82,14 @@ fn group_path(web_url: &str) -> Option<&str> {
 
 /// The cached epics numbered `iid`, one per group that has one.
 async fn cached(client: &VarlinkClient, iid: i64) -> Result<Vec<WorkItem>> {
+    let options = SearchOptions {
+        kinds: Some(vec![SearchKind::work_items]),
+        limit: Some(SEARCH_LIMIT),
+        types: Some(vec!["epic".into()]),
+        ..Default::default()
+    };
     let reply = client
-        .search(
-            format!("&{iid}"),
-            Some(vec![SearchKind::work_items]),
-            Some(SEARCH_LIMIT),
-            None,
-            Some(vec!["epic".into()]),
-            None,
-        )
+        .search(format!("&{iid}"), Some(options))
         .call()
         .await
         .map_err(|e| friendly("Search", e))?;
@@ -148,15 +149,13 @@ async fn group_id(client: &VarlinkClient, group: &str) -> Result<i64> {
         return Ok(id);
     }
     let path = group.trim_matches('/');
+    let options = SearchOptions {
+        kinds: Some(vec![SearchKind::groups]),
+        limit: Some(SEARCH_LIMIT),
+        ..Default::default()
+    };
     let reply = client
-        .search(
-            path.to_string(),
-            Some(vec![SearchKind::groups]),
-            Some(SEARCH_LIMIT),
-            None,
-            None,
-            None,
-        )
+        .search(path.to_string(), Some(options))
         .call()
         .await
         .map_err(|e| friendly("Search", e))?;

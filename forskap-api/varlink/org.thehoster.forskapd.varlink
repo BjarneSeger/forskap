@@ -229,8 +229,8 @@ type SyncJob (
 
 # The call fits the interface, but an argument's value is not acceptable (a
 # number that isn't positive, a malformed duration, a blank title, …): nothing
-# was sent to GitLab or stored. argument names it ("limit", "project_id",
-# "iid", "duration", "title", "labels", "parent", …).
+# was sent to GitLab or stored. argument names it, a nested value by its path
+# ("project_id", "iid", "duration", "options.limit", "item.title", …).
 error InvalidArgument (argument: string, message: string)
 
 # The daemon has no such thing: a failure id RetryFailure or DismissFailure
@@ -273,12 +273,20 @@ type NotAuthReason (
 # underlying error for the reasons that have one.
 error NotAuthenticated (reason: ?NotAuthReason, detail: ?string)
 
-# Open issues assigned to the user, optionally only those in the given groups.
-method GetAssignedWorkItems(groups: ?[]string) -> (work_items: []WorkItem)
+# The projects and groups a call keeps to: an item passes if it lies in any of
+# them. Nothing listed is no filter.
+type Scope (
+  # Project IDs.
+  projects: ?[]int,
+  # Group paths ("team/backend"), subgroups included.
+  groups: ?[]string
+)
 
-# Open merge requests assigned to the user, optionally only those in the given
-# groups.
-method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)
+# Open issues assigned to the user, optionally only those in the scope.
+method GetAssignedWorkItems(scope: ?Scope) -> (work_items: []WorkItem)
+
+# Open merge requests assigned to the user, optionally only those in the scope.
+method GetAssignedMergeRequests(scope: ?Scope) -> (merge_requests: []MergeRequest)
 
 # Which of ListWorkItems' lists: the issues the user authored, or is assigned to.
 type WorkItemRole (author, assignee)
@@ -286,19 +294,42 @@ type WorkItemRole (author, assignee)
 # The states ListWorkItems filters by; WorkItem.state carries them.
 type WorkItemState (opened, closed)
 
+# Which of the user's own issues ListWorkItems lists; nothing set is all of
+# them.
+type WorkItemFilter (
+  # One of the two lists; absent: both, an issue in both listed once.
+  role: ?WorkItemRole,
+  # Unix seconds: only issues updated at or after it.
+  updated_after: ?int,
+  # Only issues in one of these states; absent or empty: both.
+  states: ?[]WorkItemState
+)
+
 # The user's own issues, closed ones included, updated recently; newest-updated
 # first.
-method ListWorkItems(role: ?WorkItemRole, updated_after: ?int, states: ?[]WorkItemState) -> (work_items: []WorkItem)
+method ListWorkItems(filter: ?WorkItemFilter) -> (work_items: []WorkItem)
 
 # The result sets of a Search.
 type SearchKind (work_items, merge_requests, projects, groups)
 
-# Projects by ID and groups by path (subgroups included) a Search keeps to.
-type SearchScope (projects: ?[]int, groups: ?[]string)
+# How a Search narrows its results; nothing set narrows nothing.
+type SearchOptions (
+  # The result sets to fill; absent or empty: all four.
+  kinds: ?[]SearchKind,
+  # Caps each result set; issues and epics share theirs. Absent: 50.
+  limit: ?int,
+  # Keeps every result set to these projects and groups.
+  scope: ?Scope,
+  # Keeps only the work items of these types ("issue", "task", "epic", …),
+  # compared case-insensitively; absent or empty: every type.
+  types: ?[]string,
+  # Leaves out the work items of these types, compared the same way.
+  exclude_types: ?[]string
+)
 
 # Searches the cached corpus; work items and merge requests rank by their
 # RecordOpen counts.
-method Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope, types: ?[]string, exclude_types: ?[]string) -> (work_items: []WorkItem, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
+method Search(query: string, options: ?SearchOptions) -> (work_items: []WorkItem, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
 
 # Logs spent time on an issue or merge request; queued while GitLab is away.
 method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
@@ -313,10 +344,25 @@ method AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 # GitLab is away.
 method UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
+# The issue CreateWorkItem files.
+type NewWorkItem (
+  # Not blank.
+  title: string,
+  # GitLab Markdown.
+  description: ?string,
+  # Label names, none with a comma; GitLab creates the ones the project lacks.
+  labels: ?[]string,
+  # Assigns the issue to the user; absent: nobody is assigned.
+  assign_self: ?bool,
+  # The epic to put the issue under, by its group_id and iid (type absent or
+  # "epic", title and web_url ignored); needs GitLab Premium.
+  parent: ?WorkItemRef
+)
+
 # Creates an issue in a project, optionally under an epic. Sent to GitLab once,
 # never queued. iid and web_url are absent where GitLab created the issue but
 # its answer didn't say them.
-method CreateWorkItem(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, parent: ?WorkItemRef) -> (iid: ?int, web_url: ?string)
+method CreateWorkItem(project_id: int, item: NewWorkItem) -> (iid: ?int, web_url: ?string)
 
 # Counts an open of a project's work item or merge request, or of a group's
 # epic. Local only: works while dormant.

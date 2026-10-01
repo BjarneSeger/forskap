@@ -13,6 +13,12 @@ this list top to bottom.
 
 - Interface name is `org.thehoster.forskapd`. Keep the existing style: one blank
   line between declarations, optional params/fields as `?type`.
+- A method whose arguments grow takes them in one struct (`SearchOptions`,
+  `WorkItemFilter`, `NewWorkItem`, `Scope`): a new option is a new optional field
+  there, never another argument, which would change both bindings' signatures. A
+  value refused inside one is named by its path (`Invalid::new("options.limit", …)`).
+  `build.rs` derives `Default` for every struct without a required field, so Rust
+  callers write `..Default::default()`.
 - Document in the file itself: a short `#` comment on the lines before each new type,
   method and error, and before each field or enum variant whose name doesn't say it
   all (units, when it is absent or empty, since which version it is sent). Comments go
@@ -31,9 +37,10 @@ this list top to bottom.
 `lib.rs` `include!`s it. No manual step — the next `cargo build` yields the new
 `VarlinkInterface` trait, `Call_*` traits, and request/reply structs. Compile errors in
 the daemon are the to-do list. The build script also gives every `Option` field
-`skip_serializing_if`, so an absent field is left out rather than sent as `null`; it
-fails the build if the `Option` fields it finds don't match the `.varlink` file's
-optional ones (the generator's output changed: adapt `OmitAbsent`).
+`skip_serializing_if`, so an absent field is left out rather than sent as `null`, and
+derives `Default` for every struct without a required field; it fails the build if
+what it finds doesn't match the `.varlink` file's optional fields and structs (the
+generator's output changed: adapt `OmitAbsent` or `DeriveDefault`).
 
 ## 3. Daemon handlers
 

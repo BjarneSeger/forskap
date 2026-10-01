@@ -10,6 +10,14 @@ using the official [`varlink/go`](https://github.com/varlink/go) generator, so t
 binding never drifts from the wire contract. A small hand-written `Client` wraps
 those helpers with socket discovery and one method per varlink method.
 
+`Client` is the surface to build on: its methods keep their signatures as the
+interface grows. A method whose arguments can grow takes them in one struct
+(`SearchOptions`, `WorkItemFilter`, `NewWorkItem`, `Scope`), which gains optional
+fields, and one with several results returns a struct; name the fields you set and
+your code keeps compiling. The generated call helpers (`Search().Call(…)`, …) follow
+the interface definition argument by argument and may change signature when it
+grows.
+
 ## Install
 
 ```sh
@@ -18,7 +26,7 @@ go get github.com/BjarneSeger/forskap/clients/go
 
 Releases are tagged `clients/go/vX.Y.Z` and carry the version of the
 [`forskap-api`](../../forskap-api/README.md) crate they were generated from, so a
-version names one state of the interface. Append `@v0.31.0` to pin one.
+version names one state of the interface. Append `@v0.33.0` to pin one.
 
 The generated package is named after the interface, so import it under an alias:
 
@@ -109,12 +117,14 @@ if errors.As(err, &unknown) {
 
 ### Optional parameters
 
-Optional varlink parameters are pointers; pass `nil` to omit them
+Optional varlink parameters are pointers, and so are the optional fields of an
+argument struct; pass `nil` to omit them
 (e.g. `c.GetHistory(ctx, nil)` for the daemon's default window,
-`c.Search(ctx, "query", nil, nil, nil, nil, nil)` for all kinds and types, the
-default limit and no project/group scope,
-`c.ListWorkItems(ctx, nil, nil, nil)` for the issues you authored or are assigned to
-in any state, or
+`c.Search(ctx, "query", nil)` for all kinds and types, the default limit and no
+project/group scope,
+`c.Search(ctx, "query", &forskap.SearchOptions{Limit: &limit})` for another limit,
+`c.ListWorkItems(ctx, nil)` for the issues you authored or are assigned to in any
+state, or
 `c.PostTime(ctx, pid, iid, forskap.KindWorkItem, "1h", &summary)`). The varlink
 `Close` method maps to `c.CloseIssuable` — the Go name `Close` is taken by the
 connection releaser. Enum values come from constants: `KindWorkItem` /
@@ -133,13 +143,21 @@ issue under an epic carries it as `Parent`, a `WorkItemRef` with the epic's grou
 number, title and absolute link.
 
 `c.Search` returns the issues and epics it finds as one list, ranked together under
-one limit; pass `types` to keep some of them, `excludeTypes` to leave some out
+one limit; set `Types` to keep some of them, `Exclude_types` to leave some out
 (before the limit, so it fills from the rest):
 
 ```go
 epic := []string{"epic"}
-epics, err := c.Search(ctx, "billing", nil, nil, nil, &epic, nil)
-issues, err := c.Search(ctx, "billing", nil, nil, nil, nil, &epic)
+epics, err := c.Search(ctx, "billing", &forskap.SearchOptions{Types: &epic})
+issues, err := c.Search(ctx, "billing", &forskap.SearchOptions{Exclude_types: &epic})
+```
+
+`c.GetAssignedWorkItems` and `c.GetAssignedMergeRequests` take a `Scope` like
+`SearchOptions.Scope`: an item passes in any of its projects or groups.
+
+```go
+backend := []string{"team/backend"}
+issues, err := c.GetAssignedWorkItems(ctx, &forskap.Scope{Groups: &backend})
 ```
 
 `c.RecordOpen` counts an open of an issue or merge request by its project, or of an
@@ -168,20 +186,32 @@ daemon's `search.tracked_retention_hours` (90 days by default):
 role := forskap.RoleAuthor
 since := time.Now().AddDate(0, 0, -30).Unix()
 closed := []forskap.WorkItemState{forskap.StateClosed}
-issues, err := c.ListWorkItems(ctx, &role, &since, &closed)
+issues, err := c.ListWorkItems(ctx, &forskap.WorkItemFilter{
+	Role:          &role,
+	Updated_after: &since,
+	States:        &closed,
+})
 ```
 
 `c.CreateWorkItem` files an issue and returns its number and link (`nil` where GitLab
 created it but its answer didn't say them); the issue shows in `Search` and
-`ListWorkItems` at once. A `parent` puts it under an epic,
+`ListWorkItems` at once. A `Parent` puts it under an epic,
 named by its group and number:
 
 ```go
 assign := true
 labels := []string{"bug"}
 epic := forskap.WorkItemRef{Group_id: &groupID, Iid: 5}
-iid, url, err := c.CreateWorkItem(ctx, projectID, "Fix the login", nil, &labels, &assign, &epic)
+created, err := c.CreateWorkItem(ctx, projectID, forskap.NewWorkItem{
+	Title:       "Fix the login",
+	Labels:      &labels,
+	Assign_self: &assign,
+	Parent:      &epic,
+})
 ```
+
+`c.WhoAmI` returns the `Account` the daemon is connected as, its token's expiry and
+rotation included.
 
 It is the one write the daemon never queues: while GitLab is unreachable it fails
 with `*forskap.NotAuthenticated`, GitLab refusing it (a parent it can't find

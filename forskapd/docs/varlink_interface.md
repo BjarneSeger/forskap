@@ -84,6 +84,11 @@ From forskap-api 1.0 on, a client can rely on these:
 - Nothing is removed or renamed: no method, type, field, enum variant or error.
 - A field new to a reply is optional (`?T`).
 - A new argument is optional, so a call that leaves it out means what it meant before.
+  The methods whose arguments grow take them in one struct (`SearchOptions`,
+  `WorkItemFilter`, `NewWorkItem`, `Scope`), and a new one is a new optional field of
+  it: the bindings' signatures stay, and a caller that fills the struct from `Default`
+  (`SearchOptions { limit: Some(5), ..Default::default() }` in Rust) or names the
+  fields it sets (Go) keeps compiling.
 - An enum that appears in replies (`IssuableKind`, `HistorySource`, `SyncJobStatus`,
   `NotAuthReason`) gets no new variants: a new state is a new optional field.
   The enums only arguments take (`SearchKind`, `WorkItemRole`, `WorkItemState`,
@@ -171,23 +176,24 @@ one. Epics are read-only here: the write methods address a project's work items 
 don't fit the method: a required one is missing, an enum argument (`IssuableKind`,
 `SearchKind`, `CacheScope`, `WorkItemRole`, `WorkItemState`) carries a value the
 interface doesn't have, or an argument object has a field the method doesn't know,
-nested ones included (`scope` of `Search`, `parent` of `CreateWorkItem`). `parameter`
+nested ones included (`options` of `Search`, `item` of `CreateWorkItem`). `parameter`
 says what is wrong; for an unknown field it is that field's name, `.`-joined below the
-top level (`"labels"`, `"scope.users"`), for the methods without arguments too. An
-argument a newer interface added is thus refused by an older daemon rather than
-ignored.
+top level (`"labels"`, `"options.scope.users"`), for the methods without arguments
+too. An argument a newer interface added is thus refused by an older daemon rather
+than ignored.
 
 The errors of the interface itself say what the caller does next; each carries a
 human-readable `message`.
 
 `InvalidArgument (argument: string, message: string)` — the call fits the interface,
 but an argument's value is one the daemon refuses up front: a `project_id`,
-`group_id`, `iid` or `limit` that isn't positive, a `duration` that is no GitLab
-duration, a blank `title`, a label containing a comma (`labels`), a `parent` that
-names no epic, a `RecordOpen` reference that names no single item (`argument` is then
-the ID given too many, or `project_id` when neither is). `argument` is the argument's
-name as the method declares it. Nothing was sent to GitLab, queued or stored, and the
-same call fails the same way again; it is answered whatever the session is.
+`group_id`, `iid` or `options.limit` that isn't positive, a `duration` that is no
+GitLab duration, a blank `item.title`, a label containing a comma (`item.labels`), an
+`item.parent` that names no epic, a `RecordOpen` reference that names no single item
+(`argument` is then the ID given too many, or `project_id` when neither is).
+`argument` is the argument's name as the method declares it, a value inside an
+argument struct named by its path. Nothing was sent to GitLab, queued or stored, and
+the same call fails the same way again; it is answered whatever the session is.
 
 `NotFound (message: string)` — the daemon has no such thing: an `id` that
 `RetryFailure` or `DismissFailure` doesn't know (dismissed, retried already, or never
@@ -235,24 +241,24 @@ reported as `unreachable` for the moment it takes to reconnect with that one.
 
 ## Reading
 
-### `GetAssignedWorkItems(groups: ?[]string) -> (work_items: []WorkItem)`
+### `GetAssignedWorkItems(scope: ?Scope) -> (work_items: []WorkItem)`
 
 Open issues assigned to the authenticated user, work items of their project, served
-purely from the cache, grouped by namespace. `groups` filters to the given group namespaces (parsed from
-each issue's `web_url`, subgroups included); an issue matching several requested
-groups is listed once. Omitted or empty `groups` returns everything. When the list
-has never been synced: replies with an empty list if a session exists (first sync
-pending), `NotAuthenticated` otherwise.
+purely from the cache, grouped by namespace. `scope` keeps the issues in any of its
+projects (by `project_id`) or groups (by the namespace of the issue's `web_url`,
+subgroups included), the rule `Search` applies to an item; an issue matching several
+is listed once. A scope that is omitted, or whose lists are both omitted or empty,
+returns everything. When the list has never been synced: replies with an empty list
+if a session exists (first sync pending), `NotAuthenticated` otherwise.
 
-### `GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)`
+### `GetAssignedMergeRequests(scope: ?Scope) -> (merge_requests: []MergeRequest)`
 
 Open merge requests assigned to the authenticated user, served purely from the
-cache and synced on the quick cadence like the assigned issues. `groups` filters by
-namespace exactly like `GetAssignedWorkItems`. Replies newest-updated first. When the
-list has never been synced: empty list if a session exists, `NotAuthenticated`
-otherwise.
+cache and synced on the quick cadence like the assigned issues. `scope` keeps them
+exactly like `GetAssignedWorkItems`. Replies newest-updated first. When the list has
+never been synced: empty list if a session exists, `NotAuthenticated` otherwise.
 
-### `ListWorkItems(role: ?WorkItemRole, updated_after: ?int, states: ?[]WorkItemState) -> (work_items: []WorkItem)`
+### `ListWorkItems(filter: ?WorkItemFilter) -> (work_items: []WorkItem)`
 
 Your own issues across projects and states: the ones you authored or are assigned
 to that were updated recently, closed ones included, newest-updated first, as work
@@ -260,11 +266,12 @@ items of their project. Served purely from the cache. `WorkItem.parent` carries 
 one's epic, so a client can, for instance, tell which epic most of your recent work
 in a project belongs to.
 
-`role` picks one of the two lists (`WorkItemRole`); omitted, the reply is their union, with an issue
-you both authored and are assigned to listed once. `states` keeps only issues in one
-of the given states (omitted or empty = both). `updated_after` (unix seconds) keeps
-only issues whose `updated_at` is at or after it — inclusive, like GitLab's parameter
-of that name.
+The `filter`'s `role` picks one of the two lists (`WorkItemRole`); omitted, the reply
+is their union, with an issue you both authored and are assigned to listed once.
+`states` keeps only issues in one of the given states (omitted or empty = both).
+`updated_after` (unix seconds) keeps only issues whose `updated_at` is at or after
+it — inclusive, like GitLab's parameter of that name. An omitted `filter` is one with
+nothing set.
 
 The lists reach back `search.tracked_retention_hours` (default 90 days) at most: an
 issue last updated before that is not synced, so an older `updated_after` returns
@@ -289,7 +296,7 @@ When a list the call needs has never been synced — both of them with `role`
 omitted: replies with an empty list if a session exists (first sync pending),
 `NotAuthenticated` otherwise.
 
-### `Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope, types: ?[]string, exclude_types: ?[]string) -> (work_items: []WorkItem, merge_requests: []MergeRequest, projects: []Project, groups: []Group)`
+### `Search(query: string, options: ?SearchOptions) -> (work_items: []WorkItem, merge_requests: []MergeRequest, projects: []Project, groups: []Group)`
 
 Searches the locally cached corpus — a pure cache read, no GitLab round-trip.
 Matching is a case-insensitive substring test on work item/MR titles and labels and
@@ -297,10 +304,11 @@ on project/group names and paths; a query of the exact form `#123` additionally
 matches a project's work items and MRs by their per-project number, one of the form
 `&5` epics by their per-group number. Descriptions are not cached and not searched.
 
-`kinds` restricts the reply to some of its four arrays (omitted or empty = all four).
-`limit` caps each returned array separately (default 50; one that isn't positive
-replies `InvalidArgument`); issues and epics share `work_items`, so they share its
-limit. `types` keeps only the work items of the listed types (`"issue"`, `"task"`,
+The `options` narrow the reply; omitted, it is as if none were set. `kinds` restricts
+the reply to some of its four arrays (omitted or empty = all four). `limit` caps each
+returned array separately (default 50; one that isn't positive replies
+`InvalidArgument` naming `options.limit`); issues and epics share `work_items`, so
+they share its limit. `types` keeps only the work items of the listed types (`"issue"`, `"task"`,
 `"epic"`, …), compared case-insensitively; omitted or empty = every type. A type
 nothing has matches nothing.
 `exclude_types` leaves out the work items of the listed types, compared the same way;
@@ -313,7 +321,7 @@ for every type a project has, the ones GitLab adds later included.
 `limit` so a scoped search fills its `limit` from the scope alone. An item passes
 if it matches *any* listed criterion: a project's work items and merge requests by
 their `project_id` or by the namespace of their `web_url` lying in a group
-(subgroups included, as in `GetAssignedWorkItems`); projects by their `id` or their
+(subgroups included, as `GetAssignedWorkItems` does); projects by their `id` or their
 path lying in a group; groups by their path; epics by the path of their group. What
 no listed criterion can name is left out — `projects` alone yields no groups and no
 epics. A scope that is omitted, or whose lists are both omitted or empty, is no
@@ -444,16 +452,16 @@ showing it before the next sync.
 
 ## Writing directly (never queued)
 
-### `CreateWorkItem(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, parent: ?WorkItemRef) -> (iid: ?int, web_url: ?string)`
+### `CreateWorkItem(project_id: int, item: NewWorkItem) -> (iid: ?int, web_url: ?string)`
 
-Creates an issue in the project and replies with its number and its link.
-`description` is GitLab Markdown. `labels` are label names; GitLab creates the ones
-the project doesn't have yet. `assign_self` assigns the issue to the authenticated
-user (omitted: nobody is assigned). `parent` puts the issue under an epic, named by
-its `group_id` and `iid` (`type` may be omitted or `epic`; `title` and `web_url` are
-ignored); that needs GitLab Premium or Ultimate. GitLab's REST API takes the epic by
-its legacy ID, so the daemon reads that from the stored epic, else asks GitLab for
-the epic (`GET /groups/:id/epics/:iid`) before creating anything.
+Creates the issue `item` describes in the project and replies with its number and its
+link. Its `description` is GitLab Markdown. `labels` are label names; GitLab creates
+the ones the project doesn't have yet. `assign_self` assigns the issue to the
+authenticated user (omitted: nobody is assigned). `parent` puts the issue under an
+epic, named by its `group_id` and `iid` (`type` may be omitted or `epic`; `title` and
+`web_url` are ignored); that needs GitLab Premium or Ultimate. GitLab's REST API takes
+the epic by its legacy ID, so the daemon reads that from the stored epic, else asks
+GitLab for the epic (`GET /groups/:id/epics/:iid`) before creating anything.
 
 Unlike every other write this one is **never queued**: the daemon sends it to GitLab
 once and replies with what came of it.
@@ -461,7 +469,8 @@ once and replies with what came of it.
 - A blank `title`, a `project_id` that isn't positive, a label containing a comma
   (GitLab takes the labels as one comma-separated list) or a `parent` that names no
   epic (no `group_id`, a `project_id`, a number that isn't positive, another type)
-  replies `InvalidArgument` without GitLab being asked.
+  replies `InvalidArgument` (`item.title`, `project_id`, `item.labels`,
+  `item.parent`) without GitLab being asked.
 - Without a live session it replies `NotAuthenticated`, whatever the reason —
   `unreachable` too, where the other writes are queued.
 - GitLab refusing the create (a 401 included) replies `GitlabError`; a network
@@ -640,17 +649,21 @@ varlinkctl call $SOCKET org.thehoster.forskapd.GetStatus '{}'
 # list assigned issues
 varlinkctl call $SOCKET org.thehoster.forskapd.GetAssignedWorkItems '{}'
 
+# the ones in the group team/backend, subgroups included
+varlinkctl call $SOCKET org.thehoster.forskapd.GetAssignedWorkItems \
+  '{"scope": {"groups": ["team/backend"]}}'
+
 # the issues I authored that were closed, updated since 2026-09-01
 varlinkctl call $SOCKET org.thehoster.forskapd.ListWorkItems \
-  '{"role": "author", "states": ["closed"], "updated_after": 1788220800}'
+  '{"filter": {"role": "author", "states": ["closed"], "updated_after": 1788220800}}'
 
 # the epics about billing
 varlinkctl call $SOCKET org.thehoster.forskapd.Search \
-  '{"query": "billing", "kinds": ["work_items"], "types": ["epic"]}'
+  '{"query": "billing", "options": {"kinds": ["work_items"], "types": ["epic"]}}'
 
 # everything about billing but the epics
 varlinkctl call $SOCKET org.thehoster.forskapd.Search \
-  '{"query": "billing", "exclude_types": ["epic"]}'
+  '{"query": "billing", "options": {"exclude_types": ["epic"]}}'
 
 # count an open of epic &5 of group 9; oneway: the daemon runs it and answers
 # nothing, not even an error

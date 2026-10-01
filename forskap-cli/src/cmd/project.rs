@@ -15,7 +15,7 @@
 //! error asking for `--project`.
 
 use anyhow::{Result, bail};
-use forskap_api::{Project, SearchKind, VarlinkClient, VarlinkClientInterface};
+use forskap_api::{Project, SearchKind, SearchOptions, VarlinkClient, VarlinkClientInterface};
 
 use crate::friendly::friendly;
 use crate::item::{self, Item};
@@ -46,15 +46,13 @@ pub async fn by_arg(client: &VarlinkClient, project: &str) -> Result<i64> {
         return Ok(id);
     }
     let path = project.trim_matches('/');
+    let options = SearchOptions {
+        kinds: Some(vec![SearchKind::projects]),
+        limit: Some(SEARCH_LIMIT),
+        ..Default::default()
+    };
     let reply = client
-        .search(
-            path.to_string(),
-            Some(vec![SearchKind::projects]),
-            Some(SEARCH_LIMIT),
-            None,
-            None,
-            None,
-        )
+        .search(path.to_string(), Some(options))
         .call()
         .await
         .map_err(|e| friendly("Search", e))?;
@@ -110,15 +108,14 @@ async fn by_iid(client: &VarlinkClient, kind: RefKind, iid: i64) -> Result<i64> 
         return Ok(project_id);
     }
 
+    let options = SearchOptions {
+        kinds: Some(vec![refspec::search_kind(kind)]),
+        limit: Some(SEARCH_LIMIT),
+        exclude_types: refspec::excluded_types(kind),
+        ..Default::default()
+    };
     let reply = client
-        .search(
-            format!("#{iid}"),
-            Some(vec![refspec::search_kind(kind)]),
-            Some(SEARCH_LIMIT),
-            None,
-            None,
-            refspec::excluded_types(kind),
-        )
+        .search(format!("#{iid}"), Some(options))
         .call()
         .await
         .map_err(|e| friendly("Search", e))?;

@@ -45,7 +45,7 @@ func Example() {
 	// The issues I authored that are closed by now, newest-updated first.
 	role := forskap.RoleAuthor
 	closed := []forskap.WorkItemState{forskap.StateClosed}
-	mine, err := c.ListWorkItems(ctx, &role, nil, &closed)
+	mine, err := c.ListWorkItems(ctx, &forskap.WorkItemFilter{Role: &role, States: &closed})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func Example() {
 
 	// The epics about billing.
 	epics := []string{"epic"}
-	res, err := c.Search(ctx, "billing", nil, nil, nil, &epics, nil)
+	res, err := c.Search(ctx, "billing", &forskap.SearchOptions{Types: &epics})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func Example() {
 	}
 
 	// Everything else about billing: tasks and the types to come included.
-	res, err = c.Search(ctx, "billing", nil, nil, nil, nil, &epics)
+	res, err = c.Search(ctx, "billing", &forskap.SearchOptions{Exclude_types: &epics})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func ExampleClient_CreateWorkItem() {
 	defer c.Close()
 
 	labels := []string{"bug"}
-	iid, url, err := c.CreateWorkItem(ctx, 42, "Fix the login", nil, &labels, nil, nil)
+	created, err := c.CreateWorkItem(ctx, 42, forskap.NewWorkItem{Title: "Fix the login", Labels: &labels})
 	var (
 		invalid *forskap.InvalidArgument
 		refused *forskap.GitlabError
@@ -103,7 +103,7 @@ func ExampleClient_CreateWorkItem() {
 	case err != nil:
 		log.Fatal(err)
 	}
-	if iid != nil && url != nil {
-		fmt.Printf("#%d %s\n", *iid, *url)
+	if created.IID != nil && created.WebURL != nil {
+		fmt.Printf("#%d %s\n", *created.IID, *created.WebURL)
 	}
 }

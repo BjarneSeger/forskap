@@ -6,7 +6,11 @@
 // generated from the interface definition shared with the Rust crates, and
 // APIVersion (version.go) from that definition's version; the Client type
 // (client.go) is a thin, hand-written convenience layer that resolves the
-// daemon socket and exposes one Go method per varlink method.
+// daemon socket and exposes one Go method per varlink method. Client is the
+// stable surface: a method whose arguments grow takes them in one struct, so
+// its signature stays when the interface adds an option. The generated call
+// helpers follow the definition argument by argument and may change signature
+// when it grows.
 //
 // Because the generated package name is derived from the interface name, callers
 // usually import it under a shorter alias:

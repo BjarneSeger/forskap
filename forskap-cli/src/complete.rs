@@ -17,7 +17,7 @@ use std::time::Duration;
 use clap::{Arg, Command, CommandFactory};
 use clap_complete::env::{Bash, Elvish, Fish, Powershell, Shells, Zsh};
 use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
-use forskap_api::{SearchKind, VarlinkClientInterface, WorkItem};
+use forskap_api::{SearchKind, SearchOptions, VarlinkClientInterface, WorkItem};
 
 use self::nushell::Nushell;
 use crate::cli::Cli;
@@ -374,10 +374,13 @@ async fn fetch_items(kind: RefKind, rows: &mut Vec<Item>) -> Option<()> {
             rows.extend(reply.merge_requests.into_iter().map(Item::Mr));
         }
     }
-    let kinds = vec![refspec::search_kind(kind)];
-    let excluded = refspec::excluded_types(kind);
+    let options = SearchOptions {
+        kinds: Some(vec![refspec::search_kind(kind)]),
+        exclude_types: refspec::excluded_types(kind),
+        ..Default::default()
+    };
     let reply = client
-        .search(String::new(), Some(kinds), None, None, None, excluded)
+        .search(String::new(), Some(options))
         .call()
         .await
         .ok()?;
@@ -410,9 +413,8 @@ async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     );
 
     let query = current.trim_matches('/').to_string();
-    let kinds = vec![SearchKind::projects];
     let reply = client
-        .search(query, Some(kinds), None, None, None, None)
+        .search(query, Some(only(SearchKind::projects)))
         .call()
         .await
         .ok()?;
@@ -428,10 +430,12 @@ async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
 /// The epics opened before, most used first (an empty `Search`).
 async fn fetch_epics(rows: &mut Vec<WorkItem>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
-    let kinds = vec![SearchKind::work_items];
-    let types = vec!["epic".to_string()];
+    let options = SearchOptions {
+        types: Some(vec!["epic".to_string()]),
+        ..only(SearchKind::work_items)
+    };
     let reply = client
-        .search(String::new(), Some(kinds), None, None, Some(types), None)
+        .search(String::new(), Some(options))
         .call()
         .await
         .ok()?;
@@ -439,13 +443,20 @@ async fn fetch_epics(rows: &mut Vec<WorkItem>) -> Option<()> {
     Some(())
 }
 
+/// A `Search` for one kind of result.
+fn only(kind: SearchKind) -> SearchOptions {
+    SearchOptions {
+        kinds: Some(vec![kind]),
+        ..Default::default()
+    }
+}
+
 /// The cached groups matching what is typed.
 async fn fetch_groups(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
     let query = current.trim_matches('/').to_string();
-    let kinds = vec![SearchKind::groups];
     let reply = client
-        .search(query, Some(kinds), None, None, None, None)
+        .search(query, Some(only(SearchKind::groups)))
         .call()
         .await
         .ok()?;

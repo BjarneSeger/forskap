@@ -14,8 +14,8 @@ use forskap_api::{
     Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetStatus, Call_GetSyncJobs,
     Call_ListWorkItems, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
     Call_Search, Call_UnassignSelf, Call_WhoAmI, FailedTask, Group, HistoryEvent, HistorySource,
-    IssuableKind, MergeRequest, Project, SearchKind, SearchScope, VarlinkInterface, WorkItem,
-    WorkItemRef, WorkItemRole, WorkItemState,
+    IssuableKind, MergeRequest, NewWorkItem, Project, Scope, SearchKind, SearchOptions,
+    VarlinkInterface, WorkItem, WorkItemFilter, WorkItemRole, WorkItemState,
 };
 
 use crate::error::{DormancyReason, Error};
@@ -500,16 +500,16 @@ impl<'a> Groups<'a> {
     }
 }
 
-/// A search scope with at least one criterion: an item passes when it is in
-/// any listed project or any listed group (subgroups included).
-struct Scope {
+/// A [`Scope`] with at least one criterion: an item passes when it is in any
+/// listed project or any listed group (subgroups included).
+struct Within {
     projects: Vec<i64>,
     groups: Vec<String>,
 }
 
-impl Scope {
+impl Within {
     /// `None` when `scope` names nothing, which means no filter at all.
-    fn new(scope: Option<SearchScope>) -> Option<Self> {
+    fn new(scope: Option<Scope>) -> Option<Self> {
         let scope = scope?;
         let projects = scope.projects.unwrap_or_default();
         let groups = scope.groups.unwrap_or_default();
@@ -647,32 +647,24 @@ fn recent_source(role: &WorkItemRole) -> (Job, &'static str) {
     }
 }
 
-/// Whether `web_url` lies in any of `groups` (subgroups included). No filter
-/// matches everything.
-fn in_groups(groups: &Option<Vec<String>>, web_url: &str) -> bool {
-    match groups {
-        Some(groups) if !groups.is_empty() => {
-            let ns = namespace_of(web_url);
-            groups.iter().any(|g| in_group(&ns, g))
-        }
-        _ => true,
-    }
-}
-
 #[async_trait::async_trait]
 impl VarlinkInterface for Handlers {
     #[instrument(skip(self, call))]
     async fn get_assigned_work_items(
         &self,
         call: &mut dyn Call_GetAssignedWorkItems,
-        groups: Option<Vec<String>>,
+        scope: Option<Scope>,
     ) -> varlink::Result<()> {
         reply_if_cold!(self, call, Job::AssignedIssues, (Vec::new()));
 
+        let within = Within::new(scope);
         let me = self.synced_user();
         let mut rows: Vec<model::Issue> = self.assigned(ASSIGNED_ISSUES, Issuable::Issue);
         rows.retain(|i| {
-            still_assigned(&i.state, &i.assignees, me) && in_groups(&groups, &i.web_url)
+            still_assigned(&i.state, &i.assignees, me)
+                && within
+                    .as_ref()
+                    .is_none_or(|w| w.item(i.project_id, &i.web_url))
         });
         // Grouped by namespace; GitLab's order within each.
         rows.sort_by_cached_key(|i| namespace_of(&i.web_url));
@@ -697,15 +689,19 @@ impl VarlinkInterface for Handlers {
     async fn get_assigned_merge_requests(
         &self,
         call: &mut dyn Call_GetAssignedMergeRequests,
-        groups: Option<Vec<String>>,
+        scope: Option<Scope>,
     ) -> varlink::Result<()> {
         reply_if_cold!(self, call, Job::AssignedMergeRequests, (Vec::new()));
 
+        let within = Within::new(scope);
         let me = self.synced_user();
         let mut rows: Vec<model::MergeRequest> =
             self.assigned(ASSIGNED_MERGE_REQUESTS, Issuable::MergeRequest);
         rows.retain(|m| {
-            still_assigned(&m.state, &m.assignees, me) && in_groups(&groups, &m.web_url)
+            still_assigned(&m.state, &m.assignees, me)
+                && within
+                    .as_ref()
+                    .is_none_or(|w| w.item(m.project_id, &m.web_url))
         });
         // Newest-updated first, as the interface promises: the picker shows
         // the reply in its order.
@@ -729,10 +725,13 @@ impl VarlinkInterface for Handlers {
     async fn list_work_items(
         &self,
         call: &mut dyn Call_ListWorkItems,
-        role: Option<WorkItemRole>,
-        updated_after: Option<i64>,
-        states: Option<Vec<WorkItemState>>,
+        filter: Option<WorkItemFilter>,
     ) -> varlink::Result<()> {
+        let WorkItemFilter {
+            role,
+            updated_after,
+            states,
+        } = filter.unwrap_or_default();
         let roles = match role {
             Some(role) => vec![role],
             None => vec![WorkItemRole::author, WorkItemRole::assignee],
@@ -776,22 +775,28 @@ impl VarlinkInterface for Handlers {
         &self,
         call: &mut dyn Call_Search,
         query: String,
-        kinds: Option<Vec<SearchKind>>,
-        limit: Option<i64>,
-        scope: Option<SearchScope>,
-        types: Option<Vec<String>>,
-        exclude_types: Option<Vec<String>>,
+        options: Option<SearchOptions>,
     ) -> varlink::Result<()> {
+        let SearchOptions {
+            kinds,
+            limit,
+            scope,
+            types,
+            exclude_types,
+        } = options.unwrap_or_default();
         // An empty query is the "frequently opened" view: only work items and
         // MRs with recorded opens, ranked. Projects and groups have no open
         // counts, so they come back empty in that mode.
         let needle = query.trim().to_lowercase();
-        let scope = Scope::new(scope);
+        let scope = Within::new(scope);
         let frequent_only = needle.is_empty();
         let limit = match limit {
             None => DEFAULT_SEARCH_LIMIT,
             Some(n) if n > 0 => n as usize,
-            Some(n) => return Invalid::new("limit", format!("invalid limit: {n}")).reply(call),
+            Some(n) => {
+                let message = format!("invalid limit: {n}");
+                return Invalid::new("options.limit", message).reply(call);
+            }
         };
         let kinds = kinds.unwrap_or_default();
         let want = |k: SearchKind| kinds.is_empty() || kinds.contains(&k);
@@ -1347,17 +1352,20 @@ impl VarlinkInterface for Handlers {
     /// Direct, never queued: a create has no target to address a replay by
     /// and no idempotency key, so repeating one that may have landed would
     /// file the issue twice.
-    #[instrument(skip(self, call, description))]
+    #[instrument(skip(self, call, item), fields(title = %item.title))]
     async fn create_work_item(
         &self,
         call: &mut dyn Call_CreateWorkItem,
         project_id: i64,
-        title: String,
-        description: Option<String>,
-        labels: Option<Vec<String>>,
-        assign_self: Option<bool>,
-        parent: Option<WorkItemRef>,
+        item: NewWorkItem,
     ) -> varlink::Result<()> {
+        let NewWorkItem {
+            title,
+            description,
+            labels,
+            assign_self,
+            parent,
+        } = item;
         let labels = labels.unwrap_or_default();
         if let Some(invalid) = new_issue_error(project_id, &title, &labels) {
             return invalid.reply(call);

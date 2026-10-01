@@ -468,8 +468,8 @@ fn settle_hook(sync: &Arc<SyncHandle>, config: &config::SharedConfig) -> SettleH
 #[cfg(test)]
 mod tests {
     use forskap_api::{
-        ErrorKind as WireError, IssuableKind, VarlinkClient, VarlinkClientInterface, WorkItem,
-        WorkItemRef, WorkItemRole,
+        ErrorKind as WireError, IssuableKind, NewWorkItem, Scope, SearchOptions, VarlinkClient,
+        VarlinkClientInterface, WorkItem, WorkItemFilter, WorkItemRef, WorkItemRole,
     };
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
@@ -552,6 +552,25 @@ mod tests {
                 "timed out waiting for {what}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The issues the user authored.
+    fn authored() -> WorkItemFilter {
+        WorkItemFilter {
+            role: Some(WorkItemRole::author),
+            ..Default::default()
+        }
+    }
+
+    /// An issue with just a title.
+    fn new_work_item(title: &str) -> NewWorkItem {
+        NewWorkItem {
+            title: title.into(),
+            description: None,
+            labels: None,
+            assign_self: None,
+            parent: None,
         }
     }
 
@@ -642,11 +661,34 @@ mod tests {
             .unwrap();
         assert_eq!(invoice.time_spent, Some(3600));
 
+        // A scope keeps to its projects and groups, subgroups included.
+        let scoped = async |scope: Scope| {
+            let call = client.get_assigned_work_items(Some(scope)).call().await;
+            keys(&call.unwrap().work_items)
+        };
+        let under = |path: &str| {
+            let under = |i: &&WorkItem| i.namespace_path.as_deref().unwrap().starts_with(path);
+            let found: Vec<_> = issues.iter().filter(under).cloned().collect();
+            keys(&found)
+        };
+        let api = Scope {
+            projects: Some(vec![AVATAR_PROJECT]),
+            groups: None,
+        };
+        assert_eq!(scoped(api).await, under("acme/backend/api"));
+        let backend = Scope {
+            projects: None,
+            groups: Some(vec!["acme/backend".into()]),
+        };
+        let backend = scoped(backend).await;
+        assert!(backend.len() > 1 && backend.len() < issues.len());
+        assert_eq!(backend, under("acme/backend/"));
+
         let mrs = client.get_assigned_merge_requests(None).call().await;
         let mrs = mrs.unwrap().merge_requests;
         assert_eq!(mrs.iter().map(|m| m.iid).collect::<Vec<_>>(), [31, 12, 44]);
 
-        let search = |query: &str| client.search(query.into(), None, None, None, None, None);
+        let search = |query: &str| client.search(query.into(), None);
         let found = search("billing").call().await.unwrap();
         let (epics, issues): (Vec<_>, Vec<_>) =
             found.work_items.iter().partition(|w| w.r#type == "epic");
@@ -662,18 +704,18 @@ mod tests {
             parent.web_url.as_deref(),
             Some("https://dry-run.invalid/groups/acme/-/epics/1")
         );
-        let mut tasks = client.search(
-            "webhook".into(),
-            None,
-            None,
-            None,
-            Some(vec!["task".into()]),
-            None,
-        );
+        let tasks = SearchOptions {
+            types: Some(vec!["task".into()]),
+            ..Default::default()
+        };
+        let mut tasks = client.search("webhook".into(), Some(tasks));
         let tasks = tasks.call().await.unwrap().work_items;
         assert_eq!(keys(&tasks), [(101, 16)]);
-        let no_epics = vec!["epic".to_string()];
-        let mut issues = client.search("billing".into(), None, None, None, None, Some(no_epics));
+        let no_epics = SearchOptions {
+            exclude_types: Some(vec!["epic".to_string()]),
+            ..Default::default()
+        };
+        let mut issues = client.search("billing".into(), Some(no_epics));
         let issues = issues.call().await.unwrap().work_items;
         assert_eq!(issues.len(), 3);
         assert!(issues.iter().all(|w| w.r#type == "issue"));
@@ -690,7 +732,7 @@ mod tests {
                 .all(|p| (p.id == AVATAR_PROJECT) == p.avatar.is_some())
         );
 
-        let mut mine = client.list_work_items(Some(WorkItemRole::author), None, None);
+        let mut mine = client.list_work_items(Some(authored()));
         let mine = mine.call().await.unwrap().work_items;
         assert_eq!(mine.len(), 7);
         assert!(keys(&mine).contains(&(103, 22)));
@@ -731,11 +773,7 @@ mod tests {
             .unwrap();
         assert!(!keys(&run.assigned_work_items().await).contains(&(101, 12)));
         until("the closed issue", async || {
-            let found = client
-                .search("#12".into(), None, None, None, None, None)
-                .call()
-                .await
-                .ok()?;
+            let found = client.search("#12".into(), None).call().await.ok()?;
             let issue = found
                 .work_items
                 .into_iter()
@@ -758,18 +796,12 @@ mod tests {
         .await;
 
         // A created issue is mine, assigned and listed.
-        let created = client
-            .create_work_item(
-                102,
-                "Try the dry run".into(),
-                None,
-                Some(vec!["demo".into()]),
-                Some(true),
-                None,
-            )
-            .call()
-            .await
-            .unwrap();
+        let item = NewWorkItem {
+            labels: Some(vec!["demo".into()]),
+            assign_self: Some(true),
+            ..new_work_item("Try the dry run")
+        };
+        let created = client.create_work_item(102, item).call().await.unwrap();
         assert_eq!(created.iid, Some(11));
         assert_eq!(
             created.web_url.as_deref(),
@@ -777,10 +809,7 @@ mod tests {
         );
         until("the created issue", async || {
             let listed = keys(&run.assigned_work_items().await).contains(&(102, 11));
-            let mine = client
-                .list_work_items(Some(WorkItemRole::author), None, None)
-                .call()
-                .await;
+            let mine = client.list_work_items(Some(authored())).call().await;
             (listed && keys(&mine.ok()?.work_items).contains(&(102, 11))).then_some(())
         })
         .await;
@@ -794,15 +823,14 @@ mod tests {
             title: None,
             web_url: None,
         };
-        let mut create =
-            client.create_work_item(103, "Audit the forms".into(), None, None, None, Some(audit));
+        let item = NewWorkItem {
+            parent: Some(audit),
+            ..new_work_item("Audit the forms")
+        };
+        let mut create = client.create_work_item(103, item);
         let created = create.call().await.unwrap();
         until("the created task's parent", async || {
-            let mine = client
-                .list_work_items(Some(WorkItemRole::author), None, None)
-                .call()
-                .await
-                .ok()?;
+            let mine = client.list_work_items(Some(authored())).call().await.ok()?;
             let item = mine
                 .work_items
                 .into_iter()
@@ -883,11 +911,7 @@ mod tests {
         // The foreground views refill before the reply.
         assert_eq!(run.assigned_work_items().await.len(), 6);
         until("the search corpus", async || {
-            let found = run
-                .client
-                .search("billing".into(), None, None, None, None, None)
-                .call()
-                .await;
+            let found = run.client.search("billing".into(), None).call().await;
             (!found.ok()?.work_items.is_empty()).then_some(())
         })
         .await;

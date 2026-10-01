@@ -244,7 +244,7 @@ async fn handle_forskapd(
             handlers
                 .get_assigned_work_items(
                     &mut call as &mut dyn Call_GetAssignedWorkItems,
-                    args.groups,
+                    args.scope,
                 )
                 .await?;
         }
@@ -253,33 +253,20 @@ async fn handle_forskapd(
             handlers
                 .get_assigned_merge_requests(
                     &mut call as &mut dyn Call_GetAssignedMergeRequests,
-                    args.groups,
+                    args.scope,
                 )
                 .await?;
         }
         "org.thehoster.forskapd.ListWorkItems" => {
             let args: ListWorkItems_Args = args!();
             handlers
-                .list_work_items(
-                    &mut call as &mut dyn Call_ListWorkItems,
-                    args.role,
-                    args.updated_after,
-                    args.states,
-                )
+                .list_work_items(&mut call as &mut dyn Call_ListWorkItems, args.filter)
                 .await?;
         }
         "org.thehoster.forskapd.Search" => {
             let args: Search_Args = args!();
             handlers
-                .search(
-                    &mut call as &mut dyn Call_Search,
-                    args.query,
-                    args.kinds,
-                    args.limit,
-                    args.scope,
-                    args.types,
-                    args.exclude_types,
-                )
+                .search(&mut call as &mut dyn Call_Search, args.query, args.options)
                 .await?;
         }
         "org.thehoster.forskapd.PostTime" => {
@@ -346,11 +333,7 @@ async fn handle_forskapd(
                 .create_work_item(
                     &mut call as &mut dyn Call_CreateWorkItem,
                     args.project_id,
-                    args.title,
-                    args.description,
-                    args.labels,
-                    args.assign_self,
-                    args.parent,
+                    args.item,
                 )
                 .await?;
         }
@@ -390,7 +373,10 @@ mod tests {
     #[tokio::test]
     async fn dispatch_has_an_arm_for_search() {
         let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
-        let typed = serde_json::json!({"query": "x", "kinds": ["work_items"], "types": ["epic"]});
+        let typed = serde_json::json!({
+            "query": "x",
+            "options": {"kinds": ["work_items"], "types": ["epic"]},
+        });
         for params in [serde_json::json!({"query": "x"}), typed] {
             let reply = handle_forskapd("org.thehoster.forskapd.Search", Some(params), &handlers)
                 .await
@@ -404,17 +390,51 @@ mod tests {
         }
     }
 
+    /// A value inside an argument struct is named by its path.
+    #[tokio::test]
+    async fn a_refused_option_is_named_by_its_path() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        for (method, params, argument) in [
+            (
+                "Search",
+                serde_json::json!({"query": "x", "options": {"limit": 0}}),
+                "options.limit",
+            ),
+            (
+                "CreateWorkItem",
+                serde_json::json!({"project_id": 1, "item": {"title": " "}}),
+                "item.title",
+            ),
+        ] {
+            let reply = handle_forskapd(
+                &format!("org.thehoster.forskapd.{method}"),
+                Some(params),
+                &handlers,
+            )
+            .await
+            .unwrap()
+            .expect("a reply");
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("org.thehoster.forskapd.InvalidArgument"),
+                "{method}"
+            );
+            assert_eq!(reply.parameters.unwrap()["argument"], argument);
+        }
+    }
+
     /// The arm hands `types` and `exclude_types` on, each to its own end.
     #[tokio::test]
     async fn dispatch_passes_the_search_type_filters_on() {
         let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
         crate::handlers::tests::seed_corpus(&handlers);
         let found = async |filter: serde_json::Value| -> Vec<String> {
-            let mut params = serde_json::json!({"query": "i", "kinds": ["work_items"]});
-            params
+            let mut options = serde_json::json!({"kinds": ["work_items"]});
+            options
                 .as_object_mut()
                 .unwrap()
                 .extend(filter.as_object().unwrap().clone());
+            let params = serde_json::json!({"query": "i", "options": options});
             let reply = handle_forskapd("org.thehoster.forskapd.Search", Some(params), &handlers)
                 .await
                 .unwrap()
@@ -511,7 +531,7 @@ mod tests {
         for (method, params, names) in [
             (
                 "Search",
-                Some(serde_json::json!({"query": "x", "kinds": ["boards"]})),
+                Some(serde_json::json!({"query": "x", "options": {"kinds": ["boards"]}})),
                 "boards",
             ),
             (
@@ -521,7 +541,7 @@ mod tests {
             ),
             (
                 "Search",
-                Some(serde_json::json!({"query": "x", "kinds": ["epics"]})),
+                Some(serde_json::json!({"query": "x", "options": {"kinds": ["epics"]}})),
                 "epics",
             ),
             (
@@ -531,44 +551,87 @@ mod tests {
             ),
             (
                 "ListWorkItems",
-                Some(serde_json::json!({"role": "reviewer"})),
+                Some(serde_json::json!({"filter": {"role": "reviewer"}})),
                 "reviewer",
             ),
             (
                 "ListWorkItems",
-                Some(serde_json::json!({"states": ["merged"]})),
+                Some(serde_json::json!({"filter": {"states": ["merged"]}})),
                 "merged",
             ),
             ("Search", None, "query"),
             (
                 "CreateWorkItem",
                 Some(serde_json::json!({"project_id": 1})),
-                "title",
+                "item",
             ),
             (
                 "CreateWorkItem",
-                Some(serde_json::json!({"project_id": 1, "title": "x", "parent": {"group_id": 3}})),
-                "iid",
-            ),
-            ("Search", Some(serde_json::json!({"kinds": []})), "query"),
-            (
-                "Search",
-                Some(serde_json::json!({"query": "x", "labels": ["bug"]})),
-                r#""labels""#,
-            ),
-            (
-                "Search",
-                Some(serde_json::json!({"query": "x", "scope": {"projects": [1], "users": [2]}})),
-                r#""scope.users""#,
+                Some(serde_json::json!({"project_id": 1, "item": {}})),
+                "title",
             ),
             (
                 "CreateWorkItem",
                 Some(serde_json::json!({
                     "project_id": 1,
-                    "title": "x",
-                    "parent": {"group_id": 3, "iid": 5, "state": "opened"},
+                    "item": {"title": "x", "parent": {"group_id": 3}},
                 })),
-                r#""parent.state""#,
+                "iid",
+            ),
+            (
+                "Search",
+                Some(serde_json::json!({"options": {"kinds": []}})),
+                "query",
+            ),
+            (
+                "Search",
+                Some(serde_json::json!({"query": "x", "options": {"labels": ["bug"]}})),
+                r#""options.labels""#,
+            ),
+            (
+                "Search",
+                Some(serde_json::json!({
+                    "query": "x",
+                    "options": {"scope": {"projects": [1], "users": [2]}},
+                })),
+                r#""options.scope.users""#,
+            ),
+            // The arguments the options replaced.
+            (
+                "Search",
+                Some(serde_json::json!({"query": "x", "limit": 5})),
+                r#""limit""#,
+            ),
+            (
+                "GetAssignedWorkItems",
+                Some(serde_json::json!({"groups": ["team"]})),
+                r#""groups""#,
+            ),
+            (
+                "GetAssignedMergeRequests",
+                Some(serde_json::json!({"scope": {"groups": ["team"], "users": [2]}})),
+                r#""scope.users""#,
+            ),
+            (
+                "ListWorkItems",
+                Some(serde_json::json!({"role": "author"})),
+                r#""role""#,
+            ),
+            (
+                "CreateWorkItem",
+                Some(serde_json::json!({"project_id": 1, "title": "x", "item": {"title": "x"}})),
+                r#""title""#,
+            ),
+            (
+                "CreateWorkItem",
+                Some(serde_json::json!({
+                    "project_id": 1,
+                    "item": {
+                        "title": "x",
+                        "parent": {"group_id": 3, "iid": 5, "state": "opened"},
+                    },
+                })),
+                r#""item.parent.state""#,
             ),
             (
                 "RecordOpen",
@@ -723,7 +786,8 @@ mod tests {
     #[tokio::test]
     async fn dispatch_has_an_arm_for_get_assigned_work_items() {
         let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
-        for params in [None, Some(serde_json::json!({"groups": ["team"]}))] {
+        let scoped = serde_json::json!({"scope": {"projects": [1], "groups": ["team"]}});
+        for params in [None, Some(scoped)] {
             let reply = handle_forskapd(
                 "org.thehoster.forskapd.GetAssignedWorkItems",
                 params,
@@ -763,11 +827,11 @@ mod tests {
     #[tokio::test]
     async fn dispatch_has_an_arm_for_list_work_items() {
         let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
-        let filtered = serde_json::json!({
+        let filtered = serde_json::json!({"filter": {
             "role": "author",
             "updated_after": 1_782_900_000,
             "states": ["opened", "closed"],
-        });
+        }});
         for params in [None, Some(filtered)] {
             let reply = handle_forskapd("org.thehoster.forskapd.ListWorkItems", params, &handlers)
                 .await
@@ -788,13 +852,16 @@ mod tests {
         let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
         let full = serde_json::json!({
             "project_id": 1,
-            "title": "x",
-            "description": "y",
-            "labels": ["bug"],
-            "assign_self": true,
-            "parent": {"group_id": 3, "iid": 5, "type": "epic"},
+            "item": {
+                "title": "x",
+                "description": "y",
+                "labels": ["bug"],
+                "assign_self": true,
+                "parent": {"group_id": 3, "iid": 5, "type": "epic"},
+            },
         });
-        for params in [serde_json::json!({"project_id": 1, "title": "x"}), full] {
+        let bare = serde_json::json!({"project_id": 1, "item": {"title": "x"}});
+        for params in [bare, full] {
             let reply = handle_forskapd(
                 "org.thehoster.forskapd.CreateWorkItem",
                 Some(params),

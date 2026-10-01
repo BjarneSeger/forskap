@@ -4,7 +4,7 @@
 //! reaches GitLab now or fails, so a failure never turns into an issue later.
 
 use anyhow::Result;
-use forskap_api::{ErrorKind, VarlinkClientInterface, WorkItemRef};
+use forskap_api::{ErrorKind, NewWorkItem, VarlinkClientInterface, WorkItemRef};
 
 use crate::cli::CreateArgs;
 use crate::cmd::{epic, project};
@@ -28,17 +28,16 @@ pub async fn run(args: CreateArgs) -> Result<()> {
         }
         None => None,
     };
-    let labels = (!args.labels.is_empty()).then_some(args.labels);
+    let item = NewWorkItem {
+        title: args.title.join(" "),
+        description: args.description,
+        labels: (!args.labels.is_empty()).then_some(args.labels),
+        assign_self: Some(!args.no_assign),
+        parent,
+    };
 
     let reply = client
-        .create_work_item(
-            project_id,
-            args.title.join(" "),
-            args.description,
-            labels,
-            Some(!args.no_assign),
-            parent,
-        )
+        .create_work_item(project_id, item)
         .call()
         .await
         .map_err(failed)?;

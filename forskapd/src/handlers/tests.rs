@@ -12,9 +12,9 @@ use forskap_api::{
     Call_ListWorkItems, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
     Call_Search, Call_UnassignSelf, Call_WhoAmI, CreateWorkItem_Reply, GetActivity_Reply,
     GetAssignedMergeRequests_Reply, GetAssignedWorkItems_Reply, GetHistory_Reply, GetStatus_Reply,
-    GetSyncJobs_Reply, HistorySource, IssuableKind, ListWorkItems_Reply, MergeRequest,
-    Search_Reply, SearchKind, SearchScope, SyncJobStatus, VarlinkInterface, WhoAmI_Reply, WorkItem,
-    WorkItemRef, WorkItemRole, WorkItemState,
+    GetSyncJobs_Reply, HistorySource, IssuableKind, ListWorkItems_Reply, MergeRequest, NewWorkItem,
+    Scope, Search_Reply, SearchKind, SearchOptions, SyncJobStatus, VarlinkInterface, WhoAmI_Reply,
+    WorkItem, WorkItemFilter, WorkItemRef, WorkItemRole, WorkItemState,
 };
 
 use crate::config::SharedConfig;
@@ -372,9 +372,9 @@ fn gitlab_status(call: &mut AsyncCall) -> Option<i64> {
     }
 }
 
-async fn assigned_work_items(h: &Handlers, groups: Option<Vec<String>>) -> Vec<WorkItem> {
+async fn assigned_work_items(h: &Handlers, scope: Option<Scope>) -> Vec<WorkItem> {
     let mut call = AsyncCall::default();
-    h.get_assigned_work_items(&mut call as &mut dyn Call_GetAssignedWorkItems, groups)
+    h.get_assigned_work_items(&mut call as &mut dyn Call_GetAssignedWorkItems, scope)
         .await
         .unwrap();
     reply::<GetAssignedWorkItems_Reply>(&mut call).work_items
@@ -387,21 +387,25 @@ async fn list_work_items(
     states: Option<Vec<WorkItemState>>,
 ) -> Vec<WorkItem> {
     let mut call = AsyncCall::default();
-    h.list_work_items(
-        &mut call as &mut dyn Call_ListWorkItems,
+    let filter = WorkItemFilter {
         role,
         updated_after,
         states,
-    )
-    .await
-    .unwrap();
+    };
+    h.list_work_items(&mut call as &mut dyn Call_ListWorkItems, Some(filter))
+        .await
+        .unwrap();
     reply::<ListWorkItems_Reply>(&mut call).work_items
 }
 
 /// The error `ListWorkItems` replies for `role`, `None` for a success.
 async fn list_work_items_error(h: &Handlers, role: Option<WorkItemRole>) -> Option<String> {
     let mut call = AsyncCall::default();
-    h.list_work_items(&mut call as &mut dyn Call_ListWorkItems, role, None, None)
+    let filter = WorkItemFilter {
+        role,
+        ..Default::default()
+    };
+    h.list_work_items(&mut call as &mut dyn Call_ListWorkItems, Some(filter))
         .await
         .unwrap();
     reply_error(&mut call)
@@ -450,9 +454,9 @@ async fn unassign(h: &Handlers, project_id: i64, iid: i64, kind: IssuableKind) -
     reply_error(&mut call)
 }
 
-async fn assigned_mrs(h: &Handlers, groups: Option<Vec<String>>) -> Vec<MergeRequest> {
+async fn assigned_mrs(h: &Handlers, scope: Option<Scope>) -> Vec<MergeRequest> {
     let mut call = AsyncCall::default();
-    h.get_assigned_merge_requests(&mut call as &mut dyn Call_GetAssignedMergeRequests, groups)
+    h.get_assigned_merge_requests(&mut call as &mut dyn Call_GetAssignedMergeRequests, scope)
         .await
         .unwrap();
     reply::<GetAssignedMergeRequests_Reply>(&mut call).merge_requests
@@ -472,9 +476,15 @@ async fn run_scoped_search(
     query: &str,
     kinds: Option<Vec<SearchKind>>,
     limit: Option<i64>,
-    scope: Option<SearchScope>,
+    scope: Option<Scope>,
 ) -> Search_Reply {
-    search_with(h, query, kinds, limit, scope, None, None).await
+    let options = SearchOptions {
+        kinds,
+        limit,
+        scope,
+        ..Default::default()
+    };
+    search_with(h, query, options).await
 }
 
 /// `Search` for the work items of `types` only.
@@ -496,28 +506,22 @@ async fn run_filtered_search(
     limit: Option<i64>,
 ) -> Search_Reply {
     let names = |list: &[&str]| Some(list.iter().map(|t| t.to_string()).collect());
-    let kinds = Some(vec![SearchKind::work_items]);
-    search_with(h, query, kinds, limit, None, names(types), names(excluded)).await
+    let options = SearchOptions {
+        kinds: Some(vec![SearchKind::work_items]),
+        limit,
+        types: names(types),
+        exclude_types: names(excluded),
+        ..Default::default()
+    };
+    search_with(h, query, options).await
 }
 
-async fn search_with(
-    h: &Handlers,
-    query: &str,
-    kinds: Option<Vec<SearchKind>>,
-    limit: Option<i64>,
-    scope: Option<SearchScope>,
-    types: Option<Vec<String>>,
-    exclude_types: Option<Vec<String>>,
-) -> Search_Reply {
+async fn search_with(h: &Handlers, query: &str, options: SearchOptions) -> Search_Reply {
     let mut call = AsyncCall::default();
     h.search(
         &mut call as &mut dyn Call_Search,
         query.to_string(),
-        kinds,
-        limit,
-        scope,
-        types,
-        exclude_types,
+        Some(options),
     )
     .await
     .unwrap();
@@ -595,17 +599,16 @@ async fn create_work_item_with(
     parent: Option<WorkItemRef>,
 ) -> AsyncCall {
     let mut call = AsyncCall::default();
-    h.create_work_item(
-        &mut call as &mut dyn Call_CreateWorkItem,
-        project_id,
-        title.to_string(),
-        description.map(str::to_string),
-        labels.map(|labels| labels.iter().map(|l| l.to_string()).collect()),
+    let item = NewWorkItem {
+        title: title.to_string(),
+        description: description.map(str::to_string),
+        labels: labels.map(|labels| labels.iter().map(|l| l.to_string()).collect()),
         assign_self,
         parent,
-    )
-    .await
-    .unwrap();
+    };
+    h.create_work_item(&mut call as &mut dyn Call_CreateWorkItem, project_id, item)
+        .await
+        .unwrap();
     call
 }
 
@@ -865,8 +868,8 @@ async fn create_work_item_rejects_a_blank_title_or_bad_project() {
     let fake = Arc::new(FakeGitlab::default());
     let (h, _dir) = connected_handlers(&fake);
     for (project_id, title, argument) in [
-        (7, "", "title"),
-        (7, " \t\n", "title"),
+        (7, "", "item.title"),
+        (7, " \t\n", "item.title"),
         (0, "Fix it", "project_id"),
         (-3, "Fix it", "project_id"),
     ] {
@@ -880,7 +883,7 @@ async fn create_work_item_rejects_a_blank_title_or_bad_project() {
     // GitLab would read one label with a comma as two.
     let labels = ["bug", "auth,flow"];
     let mut call = create_work_item_with(&h, 7, "Fix it", None, Some(&labels), None, None).await;
-    assert_eq!(invalid_argument(&mut call), "labels");
+    assert_eq!(invalid_argument(&mut call), "item.labels");
 
     assert!(fake.writes().is_empty(), "refused before GitLab is asked");
     assert_eq!(fake.read_calls(), 0);
@@ -888,7 +891,7 @@ async fn create_work_item_rejects_a_blank_title_or_bad_project() {
     // Refused while dormant too, as what it is: an invalid call.
     let (h, _dir) = dormant_handlers();
     let mut call = create_work_item(&h, 7, "", None).await;
-    assert_eq!(invalid_argument(&mut call), "title");
+    assert_eq!(invalid_argument(&mut call), "item.title");
 }
 
 /// Where the other writes are queued, a create fails: a replay has nothing
@@ -1161,14 +1164,14 @@ async fn create_work_item_refuses_a_parent_that_is_no_epic() {
         parent(-1, 4),
     ] {
         let mut call = create_under(&h, refused.clone()).await;
-        assert_eq!(invalid_argument(&mut call), "parent", "{refused:?}");
+        assert_eq!(invalid_argument(&mut call), "item.parent", "{refused:?}");
     }
     assert_eq!(fake.read_calls(), 0);
     assert!(fake.writes().is_empty());
 
     let (h, _dir) = dormant_handlers();
     let mut call = create_under(&h, parent(9, 0)).await;
-    assert_eq!(invalid_argument(&mut call), "parent");
+    assert_eq!(invalid_argument(&mut call), "item.parent");
 }
 
 /// The issue exists: an answer the daemon can't read must not read as a
@@ -1302,19 +1305,36 @@ async fn get_assigned_work_items_filters_by_group_and_subgroups() {
     seed_assigned_issues(&h);
     let iids = |v: Vec<WorkItem>| v.iter().map(|i| i.iid).collect::<Vec<_>>();
     assert_eq!(
-        iids(assigned_work_items(&h, Some(vec!["team".into()])).await),
+        iids(assigned_work_items(&h, scope(&[], &["team"])).await),
         [1, 2]
     );
     assert_eq!(
-        iids(assigned_work_items(&h, Some(vec!["team/sub".into(), "team".into()])).await),
+        iids(assigned_work_items(&h, scope(&[], &["team/sub", "team"])).await),
         [1, 2],
         "overlapping groups list each issue once"
     );
     assert_eq!(
-        iids(assigned_work_items(&h, Some(vec!["tea".into()])).await),
+        iids(assigned_work_items(&h, scope(&[], &["tea"])).await),
         Vec::<i64>::new(),
         "a shared prefix is not a group"
     );
+}
+
+/// An issue passes in any listed project or any listed group, as in `Search`;
+/// a scope that lists nothing is none.
+#[tokio::test]
+async fn get_assigned_work_items_keeps_to_projects_or_groups() {
+    let (h, _dir) = dormant_handlers();
+    seed_assigned_issues(&h);
+    let iids = |v: Vec<WorkItem>| v.iter().map(|i| i.iid).collect::<Vec<_>>();
+    assert_eq!(iids(assigned_work_items(&h, scope(&[2], &[])).await), [3]);
+    assert_eq!(
+        iids(assigned_work_items(&h, scope(&[2], &["team/sub"])).await),
+        [3, 2]
+    );
+    for nothing in [scope(&[], &[]), Some(Scope::default())] {
+        assert_eq!(iids(assigned_work_items(&h, nothing).await), [3, 1, 2]);
+    }
 }
 
 #[tokio::test]
@@ -1610,8 +1630,10 @@ async fn get_assigned_merge_requests_serves_newest_first_with_group_filter() {
     assert_eq!(all.iter().map(|m| m.iid).collect::<Vec<_>>(), [11, 10]);
     assert_eq!(all[0].assignees, ["me"]);
     assert_eq!(all[0].updated_at, Some(200));
-    let team = assigned_mrs(&h, Some(vec!["team".into()])).await;
+    let team = assigned_mrs(&h, scope(&[], &["team"])).await;
     assert_eq!(team.iter().map(|m| m.iid).collect::<Vec<_>>(), [10]);
+    let either = assigned_mrs(&h, scope(&[2], &["team"])).await;
+    assert_eq!(either.iter().map(|m| m.iid).collect::<Vec<_>>(), [11, 10]);
 }
 
 #[tokio::test]
@@ -1805,16 +1827,11 @@ async fn search_leaves_out_work_items_of_excluded_types() {
     assert!(found(&["epic"], &["epic"]).await.is_empty());
 
     // The other kinds don't have a type to leave out.
-    let mrs = search_with(
-        &h,
-        "oauth",
-        None,
-        None,
-        None,
-        None,
-        Some(vec!["epic".into()]),
-    )
-    .await;
+    let options = SearchOptions {
+        exclude_types: Some(vec!["epic".into()]),
+        ..Default::default()
+    };
+    let mrs = search_with(&h, "oauth", options).await;
     assert_eq!(iids(&mrs.work_items), [10]);
     assert_eq!(mrs.merge_requests.len(), 1);
 }
@@ -1924,18 +1941,18 @@ async fn search_refuses_a_limit_that_is_not_positive() {
     seed_corpus(&h);
     for limit in [0, -1] {
         let mut call = AsyncCall::default();
+        let options = SearchOptions {
+            limit: Some(limit),
+            ..Default::default()
+        };
         h.search(
             &mut call as &mut dyn Call_Search,
             "oauth".into(),
-            None,
-            Some(limit),
-            None,
-            None,
-            None,
+            Some(options),
         )
         .await
         .unwrap();
-        assert_eq!(invalid_argument(&mut call), "limit");
+        assert_eq!(invalid_argument(&mut call), "options.limit");
     }
 }
 
@@ -2020,17 +2037,9 @@ async fn projects_tell_whether_they_are_archived() {
 async fn search_never_synced_is_honest_about_the_session() {
     let (h, _dir) = dormant_handlers();
     let mut call = AsyncCall::default();
-    h.search(
-        &mut call as &mut dyn Call_Search,
-        "x".into(),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    h.search(&mut call as &mut dyn Call_Search, "x".into(), None)
+        .await
+        .unwrap();
     assert_eq!(reply_error(&mut call).as_deref(), Some(NOT_AUTHENTICATED));
 
     let fake = Arc::new(FakeGitlab::default());
@@ -2039,8 +2048,8 @@ async fn search_never_synced_is_honest_about_the_session() {
     assert!(r.work_items.is_empty() && r.projects.is_empty());
 }
 
-fn scope(projects: &[i64], groups: &[&str]) -> Option<SearchScope> {
-    Some(SearchScope {
+fn scope(projects: &[i64], groups: &[&str]) -> Option<Scope> {
+    Some(Scope {
         projects: Some(projects.to_vec()),
         groups: Some(groups.iter().map(|g| g.to_string()).collect()),
     })
@@ -2173,13 +2182,7 @@ async fn search_empty_scope_is_no_scope() {
     seed_scoped_corpus(&h);
     let unscoped = run_search(&h, "i", None, None).await;
     assert!(!issue_iids(&unscoped).is_empty() && !epics(&unscoped).is_empty());
-    for empty in [
-        scope(&[], &[]),
-        Some(SearchScope {
-            projects: None,
-            groups: None,
-        }),
-    ] {
+    for empty in [scope(&[], &[]), Some(Scope::default())] {
         assert_eq!(
             run_scoped_search(&h, "i", None, None, empty).await,
             unscoped
@@ -2970,7 +2973,8 @@ proptest! {
             let names = |list: Option<Vec<&str>>| list.map(|t| t.into_iter().map(str::to_string).collect());
             let (types, excluded) = (names(types), names(excluded));
             let mut call = AsyncCall::default();
-            h.search(&mut call as &mut dyn Call_Search, query.clone(), kinds.clone(), limit, None, types, excluded)
+            let options = SearchOptions { kinds: kinds.clone(), limit, types, exclude_types: excluded, ..Default::default() };
+            h.search(&mut call as &mut dyn Call_Search, query.clone(), Some(options))
                 .await
                 .unwrap();
             let error = reply_error(&mut call);

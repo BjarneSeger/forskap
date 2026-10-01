@@ -7,7 +7,9 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use forskap_api::{AsyncCall, Call_GetAssignedMergeRequests, Call_GetHistory, VarlinkInterface};
+use forskap_api::{
+    AsyncCall, Call_GetAssignedMergeRequests, Call_GetHistory, Scope, VarlinkInterface,
+};
 
 use support::{dormant_env, now_secs, seed_history, seed_mr_corpus};
 
@@ -23,20 +25,24 @@ fn assigned_mrs(c: &mut Criterion) {
         // no longer scales with it.
         seed_mr_corpus(&env, n, 20);
         group.throughput(Throughput::Elements(n));
-        for (variant, groups) in [
+        let team = Scope {
+            projects: None,
+            groups: Some(vec!["team".to_string()]),
+        };
+        for (variant, scope) in [
             ("all", None),
             // Adds the per-MR namespace_of + in_group pass.
-            ("group_filter", Some(vec!["team".to_string()])),
+            ("group_filter", Some(team)),
         ] {
             group.bench_with_input(BenchmarkId::new(variant, n), &n, |b, _| {
                 b.to_async(&env.rt).iter(|| {
-                    let groups = groups.clone();
+                    let scope = scope.clone();
                     let h = &env.h;
                     async move {
                         let mut call = AsyncCall::default();
                         h.get_assigned_merge_requests(
                             &mut call as &mut dyn Call_GetAssignedMergeRequests,
-                            groups,
+                            scope,
                         )
                         .await
                         .unwrap();
