@@ -7,6 +7,8 @@
 //! persisted: the event and timelog windows are the memory. Only tracked
 //! projects the user is a member of get a corpus: an assigned MR in an
 //! upstream like gitlab-org/gitlab must not pull in its whole history.
+//! The recent issue views are no evidence: an issue closed two months ago
+//! doesn't say the user still works in its project.
 //!
 //! Epics follow the corpus one level up: the member groups a corpus project
 //! lies in get their epics synced.
@@ -17,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::avatars::Avatar;
-use super::jobs::{ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, Job};
+use super::jobs::{ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, ISSUE_VIEWS, Job};
 use super::model::{Board, Epic, Event, Issue, MergeRequest, Project, RowKey};
 use super::schedule::{fingerprint, text_hash};
 use super::store::{Commit, RowScope, SyncStore};
@@ -49,7 +51,7 @@ pub struct Evidence {
 }
 
 /// The jobs planned whatever the store holds.
-const BASE: [Job; 7] = [
+const BASE: [Job; 9] = [
     Job::AssignedIssues,
     Job::AssignedMergeRequests,
     Job::RecentTimelogs,
@@ -57,6 +59,8 @@ const BASE: [Job; 7] = [
     Job::Events,
     Job::MemberProjects,
     Job::MemberGroups,
+    Job::RecentAuthoredIssues,
+    Job::RecentAssignedIssues,
 ];
 
 impl Plan {
@@ -212,30 +216,30 @@ fn in_corpus(plan: &Plan, issue: bool, key: RowKey) -> bool {
     }
 }
 
-fn viewed(store: &SyncStore, name: &str) -> Result<HashSet<RowKey>> {
-    Ok(store
-        .view(name)?
-        .unwrap_or_default()
-        .keys
-        .into_iter()
-        .collect())
+/// The rows any of the views `names` lists.
+fn viewed(store: &SyncStore, names: &[&str]) -> Result<HashSet<RowKey>> {
+    let mut keys = HashSet::new();
+    for name in names {
+        keys.extend(store.view(name)?.unwrap_or_default().keys);
+    }
+    Ok(keys)
 }
 
 /// Stage the removal of rows no job in `plan` keeps fresh any more: issues
-/// and MRs of unplanned projects (unless an assigned view lists them),
+/// and MRs of unplanned projects (unless a view lists them),
 /// epics of unplanned groups, boards of untracked projects and avatars of projects that lost theirs or
 /// left the memberships (their files go with the worker's sweep). Returns
 /// how many.
 pub fn collect_garbage(commit: &mut Commit<'_>, store: &SyncStore, plan: &Plan) -> Result<usize> {
     let mut removed = 0;
     if !plan.jobs.contains(&Job::AllIssues) {
-        let kept = viewed(store, ASSIGNED_ISSUES)?;
+        let kept = viewed(store, &ISSUE_VIEWS)?;
         removed += commit.remove_where::<Issue>(RowScope::All, |k| {
             kept.contains(&k) || in_corpus(plan, true, k)
         })?;
     }
     if !plan.jobs.contains(&Job::AllMergeRequests) {
-        let kept = viewed(store, ASSIGNED_MERGE_REQUESTS)?;
+        let kept = viewed(store, &[ASSIGNED_MERGE_REQUESTS])?;
         removed += commit.remove_where::<MergeRequest>(RowScope::All, |k| {
             kept.contains(&k) || in_corpus(plan, false, k)
         })?;
@@ -252,9 +256,9 @@ pub fn collect_garbage(commit: &mut Commit<'_>, store: &SyncStore, plan: &Plan) 
     Ok(removed)
 }
 
-/// Stage the removal of rows that left the assigned view `name` since it
-/// listed `before` and that no corpus job in `plan` keeps fresh: nothing
-/// else would update them. Returns how many.
+/// Stage the removal of rows that left the view `name` since it listed
+/// `before`, that no other view of their kind lists and that no corpus job
+/// in `plan` keeps fresh: nothing else would update them. Returns how many.
 pub fn drop_unviewed(
     commit: &mut Commit<'_>,
     store: &SyncStore,
@@ -262,8 +266,17 @@ pub fn drop_unviewed(
     name: &str,
     before: &[RowKey],
 ) -> Result<usize> {
-    let now = viewed(store, name)?;
-    let issue = name == ASSIGNED_ISSUES;
+    let issue = ISSUE_VIEWS.contains(&name);
+    // Issues and MRs share their keys: a view of neither kind has no rows
+    // to drop, rather than the other kind's.
+    if !issue && name != ASSIGNED_MERGE_REQUESTS {
+        return Ok(0);
+    }
+    let now = if issue {
+        viewed(store, &ISSUE_VIEWS)?
+    } else {
+        viewed(store, &[ASSIGNED_MERGE_REQUESTS])?
+    };
     let mut removed = 0;
     for &key in before {
         if now.contains(&key) || in_corpus(plan, issue, key) {
@@ -282,6 +295,7 @@ pub fn drop_unviewed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::jobs::{RECENT_ASSIGNED_ISSUES, RECENT_AUTHORED_ISSUES};
     use crate::sync::model::{Event, Group, Project, Timelog};
     use crate::sync::store::View;
 
@@ -471,6 +485,116 @@ mod tests {
         c.commit().unwrap();
         assert_eq!(removed, 1);
         assert_eq!(s.issues.keys(RowScope::All).unwrap(), [(2, 1), (2, 2)]);
+    }
+
+    fn listing(keys: &[RowKey]) -> View {
+        View {
+            keys: keys.to_vec(),
+            fetched_at: 0,
+        }
+    }
+
+    /// An issue that closed leaves the assigned view while a recent one
+    /// still names it, and the other way round once it ages out there.
+    #[test]
+    fn a_row_leaving_a_view_stays_while_another_lists_it() {
+        let (s, _d) = store();
+        let mut c = s.begin();
+        c.upsert(&[issue(1, 1), issue(1, 2), issue(1, 3)]).unwrap();
+        c.set_view(ASSIGNED_ISSUES, &listing(&[(1, 3)])).unwrap();
+        c.set_view(RECENT_ASSIGNED_ISSUES, &listing(&[(1, 1)]))
+            .unwrap();
+        c.set_view(RECENT_AUTHORED_ISSUES, &listing(&[])).unwrap();
+        c.commit().unwrap();
+        let p = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+
+        // #1 and #2 left the assigned view; a recent one lists #1.
+        let mut c = s.begin();
+        let before = [(1, 1), (1, 2), (1, 3)];
+        let removed = drop_unviewed(&mut c, &s, &p, ASSIGNED_ISSUES, &before).unwrap();
+        c.commit().unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(s.issues.keys(RowScope::All).unwrap(), [(1, 1), (1, 3)]);
+
+        // #3 left a recent view; the assigned one lists it.
+        let mut c = s.begin();
+        let removed = drop_unviewed(&mut c, &s, &p, RECENT_AUTHORED_ISSUES, &[(1, 3)]).unwrap();
+        c.commit().unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(s.issues.keys(RowScope::All).unwrap(), [(1, 1), (1, 3)]);
+    }
+
+    /// Issues and merge requests number alike: a row leaving an issue view
+    /// is an issue, whatever the view's name.
+    #[test]
+    fn a_recent_view_never_touches_the_merge_requests() {
+        let (s, _d) = store();
+        let mr = MergeRequest {
+            id: 101,
+            iid: 1,
+            project_id: 1,
+            ..Default::default()
+        };
+        let mut c = s.begin();
+        c.upsert(&[mr]).unwrap();
+        c.commit().unwrap();
+        let p = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+
+        for name in [RECENT_AUTHORED_ISSUES, RECENT_ASSIGNED_ISSUES] {
+            let mut c = s.begin();
+            c.upsert(&[issue(1, 1)]).unwrap();
+            c.commit().unwrap();
+            let mut c = s.begin();
+            let removed = drop_unviewed(&mut c, &s, &p, name, &[(1, 1)]).unwrap();
+            c.commit().unwrap();
+            assert_eq!(removed, 1, "{name}");
+            assert!(s.issues.keys(RowScope::All).unwrap().is_empty(), "{name}");
+            assert_eq!(s.merge_requests.keys(RowScope::All).unwrap(), [(1, 1)]);
+        }
+    }
+
+    #[test]
+    fn recent_views_keep_their_rows_from_the_garbage() {
+        let (s, _d) = store();
+        let mut c = s.begin();
+        c.upsert(&[issue(1, 1), issue(2, 1), issue(3, 1)]).unwrap();
+        c.set_view(RECENT_AUTHORED_ISSUES, &listing(&[(1, 1)]))
+            .unwrap();
+        c.set_view(RECENT_ASSIGNED_ISSUES, &listing(&[(2, 1)]))
+            .unwrap();
+        c.commit().unwrap();
+
+        let p = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        let mut c = s.begin();
+        let removed = collect_garbage(&mut c, &s, &p).unwrap();
+        c.commit().unwrap();
+        assert_eq!(removed, 1, "only what no view lists");
+        assert_eq!(s.issues.keys(RowScope::All).unwrap(), [(1, 1), (2, 1)]);
+    }
+
+    /// An issue closed two months ago is no sign of activity: its project
+    /// gets neither a corpus nor boards from it.
+    #[test]
+    fn recent_views_track_no_project() {
+        let (s, _d) = store();
+        let mut c = s.begin();
+        c.upsert(&[member(5), member(6)]).unwrap();
+        c.set_view(RECENT_AUTHORED_ISSUES, &listing(&[(5, 1)]))
+            .unwrap();
+        c.set_view(RECENT_ASSIGNED_ISSUES, &listing(&[(6, 1)]))
+            .unwrap();
+        c.commit().unwrap();
+
+        let plan = plan(&s, SearchPopulation::Tracked, 100).unwrap();
+        assert!(plan.tracked.is_empty());
+        assert_eq!(plan.evidence, Evidence::default());
+        assert_eq!(
+            plan.jobs,
+            Plan::base().jobs,
+            "both lists are always planned"
+        );
+        assert!(plan.jobs.contains(&Job::RecentAuthoredIssues));
+        assert!(plan.jobs.contains(&Job::RecentAssignedIssues));
     }
 
     #[test]

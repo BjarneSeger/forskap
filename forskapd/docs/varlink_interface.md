@@ -10,7 +10,9 @@ issue/MR lists and the recent timelog window every few minutes
 `updated_after` deltas every `search.partial_interval_secs` (default 30 min) with a
 full resync that also reconciles deletions every `search.full_interval_secs`
 (default weekly; the epics of the groups above those projects go the same way),
-and the full timelog history, board columns and project/group memberships daily. Read
+and the full timelog history, board columns, project/group memberships and the
+issues you authored or were assigned (open or closed, updated within
+`search.tracked_retention_hours`) daily (`refresh.slow.interval_secs`). Read
 methods serve whatever was last synced from the local store
 (`$XDG_DATA_HOME/forskapd/db/`). Reads never trigger a GitLab round-trip.
 
@@ -18,7 +20,8 @@ methods serve whatever was last synced from the local store
 operation is persisted to a retry queue and drained on reconnect (exponential backoff,
 dead-lettered after the retry window; see `GetFailures`). Only an actual GitLab
 *rejection* surfaces as `GitlabError`. The reads reflect a write at once — a queued
-or just-applied close/unassign hides the item from the assigned lists — and the
+or just-applied close/unassign hides the item from the assigned lists, and
+`ListIssues` shows the issue as closed or no longer assigned — and the
 jobs that display it rerun right after it lands.
 
 # Types
@@ -77,7 +80,7 @@ type SyncJobStatus (
 )
 
 type SyncJob (
-  key:           string,        # stable job id: "assigned/issues", "timelogs/recent", "events", "project/<id>/issues", …
+  key:           string,        # stable job id: "assigned/issues", "recent/authored/issues", "timelogs/recent", "events", "project/<id>/issues", …
   status:        SyncJobStatus,
   last_ok:       ?int,          # unix seconds, start of the last successful run; absent if it never ran
   next_due:      ?int,          # unix seconds, when the schedule runs it next (the retry time while backing off);
@@ -198,8 +201,8 @@ one. Epics are read-only here: `IssuableKind` and the write methods don't cover 
 
 `org.varlink.service.InvalidParameter (parameter: string)` — the call's arguments
 don't fit the method: a required one is missing, or an enum argument (`IssuableKind`,
-`SearchKind`, `CacheScope`) carries a value the interface doesn't have. `parameter`
-says what is wrong.
+`SearchKind`, `CacheScope`, `IssueRole`, `IssueState`) carries a value the interface
+doesn't have. `parameter` says what is wrong.
 
 `GitlabError (message: string)` — GitLab rejected the request (invalid input, API
 error, rate limit), or a local precondition failed (malformed issue reference, invalid
@@ -249,6 +252,47 @@ namespace exactly like `GetAssignedIssues`. Replies newest-updated first. When t
 list has never been synced: empty list if a session exists, `NotAuthenticated`
 otherwise.
 
+### `ListIssues(role: ?IssueRole, updated_after: ?int, states: ?[]IssueState) -> (issues: []Issue)`
+
+Your own issues across projects and states: the ones you authored or are assigned
+to that were updated recently, closed ones included, newest-updated first. Served
+purely from the cache. `Issue.parent` carries each one's epic, so a client can, for
+instance, tell which epic most of your recent work in a project belongs to.
+
+```varlink
+type IssueRole (author, assignee)
+type IssueState (opened, closed)
+```
+
+`role` picks one of the two lists; omitted, the reply is their union, with an issue
+you both authored and are assigned to listed once. `states` keeps only issues in one
+of the given states (omitted or empty = both). `updated_after` (unix seconds) keeps
+only issues whose `updated_at` is at or after it — inclusive, like GitLab's parameter
+of that name.
+
+The lists reach back `search.tracked_retention_hours` (default 90 days) at most: an
+issue last updated before that is not synced, so an older `updated_after` returns
+what is stored, and an issue drops out once it has gone that long without an update.
+They are synced on the slow cadence (`refresh.slow.interval_secs`, daily by
+default), so an issue created, assigned or changed elsewhere can take a day to
+show. In a project of the search corpus the listed issues' fields follow that sync
+instead (`search.partial_interval_secs`); only which issues are listed waits. Writes through
+the daemon show at once: a queued or just-applied `Close` lists the issue as
+`closed`, an `UnassignSelf` takes it out of the `assignee` list (not out of the
+`author` one), and both lists are synced again right after an issue write lands. An
+issue you were just assigned appears with that sync.
+
+Unlike `GetAssignedIssues`, which keeps every open assigned issue however old and
+is synced every few minutes, this method is bounded by time and not by state; the two
+are synced separately and may briefly disagree. The projects listed here are not
+"tracked" by it: an issue closed two months ago pulls no project into the search
+corpus. `graph_status` therefore stays empty for issues of projects whose boards
+aren't synced (see `Search`).
+
+When a list the call needs has never been synced — both of them with `role`
+omitted: replies with an empty list if a session exists (first sync pending),
+`NotAuthenticated` otherwise.
+
 ### `Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group, epics: []Epic)`
 
 Searches the locally cached corpus — a pure cache read, no GitLab round-trip.
@@ -293,6 +337,7 @@ What the corpus contains depends on the `[search]` daemon config. The default
 active in: where you have assigned issues/MRs, pushed, opened or commented on an issue
 or MR, or logged time within `search.tracked_retention_hours` (default 90 days).
 Activity in a project you aren't a member of only keeps your assigned items there.
+The issues `ListIssues` serves are searchable too, wherever they are.
 Each project contributes at most its `search.max_items_per_project` most recently
 updated issues and MRs. `"member"`
 holds every member project's, `"all"` everything the token can see (`"auto"` is an
@@ -365,7 +410,7 @@ Records spent time on the issuable. `duration` uses GitLab's time-tracking synta
 ### `Close(project_id: int, iid: int, kind: IssuableKind) -> ()`
 
 Closes the issuable. Immediately reflected: the assigned lists stop showing it
-before the next sync.
+before the next sync, and `ListIssues` shows it as `closed`.
 
 ### `AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()`
 
@@ -375,7 +420,8 @@ right after the write lands, so it appears within seconds.
 ### `UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()`
 
 Removes the authenticated user from the issuable's assignees. Immediately
-reflected: the assigned lists stop showing it before the next sync.
+reflected: the assigned lists, and `ListIssues` for the `assignee` role, stop
+showing it before the next sync.
 
 ## Retry-queue failures (dead letters)
 
@@ -449,7 +495,7 @@ clears everything synced. Otherwise each scope selects a slice:
 
 | scope      | clears                                                       |
 |------------|--------------------------------------------------------------|
-| `assigned` | the assigned issue/MR lists and the board columns            |
+| `assigned` | the assigned issue/MR lists, the `ListIssues` lists and the board columns |
 | `search` | the corpus: issues, MRs, epics, projects, groups, project avatars |
 | `quick`  | history inside the quick window (last `refresh.quick.window_hours`) |
 | `slow`   | history between the retention horizon and the quick window     |
@@ -460,7 +506,8 @@ When a session exists, the reply waits (up to 30 s) until what it cleared is
 re-synced: the assigned lists for `assigned`, `search` and the empty scope (plus the
 board columns of their projects that never synced), the recent and full history
 for a history band and the empty scope. Everything else refills in the
-background; `usage` alone makes no GitLab call. Replies success even when
+background — the `ListIssues` lists among it, so that method can reply empty right
+after a clear; `usage` alone makes no GitLab call. Replies success even when
 dormant — the cleared state then stays empty until the next successful sync.
 
 ## Session
@@ -484,6 +531,10 @@ SOCKET=unix:$XDG_RUNTIME_DIR/forskapd.socket
 
 # list assigned issues
 varlinkctl call $SOCKET org.thehoster.forskapd.GetAssignedIssues '{}'
+
+# the issues I authored that were closed, updated since 2026-09-01
+varlinkctl call $SOCKET org.thehoster.forskapd.ListIssues \
+  '{"role": "author", "states": ["closed"], "updated_after": 1788220800}'
 
 # post 1h30m to project 42, issue #7
 varlinkctl call $SOCKET org.thehoster.forskapd.PostTime \

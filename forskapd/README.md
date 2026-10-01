@@ -29,7 +29,7 @@ Keys are grouped into TOML tables, one per concern:
 | `[server]` `socket` | `$XDG_RUNTIME_DIR/forskapd.socket` (falls back to `/tmp`) | Varlink Unix socket the daemon listens on. Ignored under systemd socket activation. |
 | `[refresh.quick]` `interval_secs` | `300` | Seconds between quick syncs of the assigned issue/MR lists and the recent timelog window (floor 60). |
 | `[refresh.quick]` `window_hours` | `24` | How far back the quick timelog sync reaches (last 24h). |
-| `[refresh.slow]` `interval_secs` | `86400` | Seconds between slow syncs of the full timelog history, the board columns and your project/group memberships (once a day; floor 60). |
+| `[refresh.slow]` `interval_secs` | `86400` | Seconds between slow syncs of the full timelog history, the board columns, your project/group memberships and the issues you authored or were assigned, closed ones included (once a day; floor 60). |
 | `[history]` `retention_hours` | `2160` | Total timelog history kept (90 days): synced in full on the slow cadence, anything older is pruned. |
 | `[queue]` `base_delay_secs` | `1` | Retry-queue backoff initial delay. |
 | `[queue]` `max_delay_secs` | `1800` | Retry-queue backoff cap (30 min). |
@@ -42,7 +42,7 @@ Keys are grouped into TOML tables, one per concern:
 | `[search]` `population` | `"tracked"` | What the search corpus holds for issues/MRs: `"tracked"` = the member projects you are active in (assignments, pushes, issues, MRs, comments, timelogs — see `tracked_retention_hours`; activity in a non-member project, such as an upstream you contribute to, only keeps your assigned items there), `"member"` = every member project, `"all"` = everything the token can see (`scope=all`; huge on large instances, rejected by gitlab.com). `"auto"` is an alias of `"tracked"`. Projects and groups are always membership-scoped; epics (GitLab Premium and up) come from the member groups above the corpus projects. |
 | `[search]` `partial_interval_secs` | `1800` | Seconds between incremental syncs of each corpus project (30 min). Restarting inside this window does not re-poll GitLab. |
 | `[search]` `full_interval_secs` | `604800` | Seconds between full resyncs of each corpus project (7 days), which also remove deleted items. |
-| `[search]` `tracked_retention_hours` | `2160` | How long your activity in a project (an assignment, a push, an issue, MR or comment, a timelog) keeps it in the `"tracked"` population (90 days). Your contribution events are kept for the same time, so it also bounds how far back `forskap activity` reaches. |
+| `[search]` `tracked_retention_hours` | `2160` | How long your activity in a project (an assignment, a push, an issue, MR or comment, a timelog) keeps it in the `"tracked"` population (90 days). Your contribution events are kept for the same time, so it also bounds how far back `forskap activity` reaches, and how far back the list of your own issues (`ListIssues`) does. |
 | `[search]` `max_items_per_project` | `1000` | Most issues and most MRs kept per corpus project, and most epics per group — the most recently updated ones (floor 100). Bounds the sync of very large projects. |
 | `[sync]` `jitter` | `0.15` | Random spread applied to every sync interval, as a fraction (0–0.5), so jobs sharing an interval don't hit GitLab together. |
 | `[sync]` `job_gap_ms` | `250` | Pause between starting two sync jobs (jittered), so a backlog of due jobs trickles out. |

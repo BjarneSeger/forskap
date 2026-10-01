@@ -7,11 +7,12 @@ use tokio::sync::{Notify, RwLock};
 
 use forskap_api::{
     AsyncCall, CacheScope, Call_ClearCache, Call_Close, Call_GetActivity, Call_GetAssignedIssues,
-    Call_GetAssignedMergeRequests, Call_GetHistory, Call_GetSyncJobs, Call_PostTime,
-    Call_RecordEpicOpen, Call_RecordOpen, Call_Search, Call_UnassignSelf, Call_WhoAmI,
-    GetActivity_Reply, GetAssignedIssues_Reply, GetAssignedMergeRequests_Reply, GetHistory_Reply,
-    GetSyncJobs_Reply, HistorySource, IssuableKind, Issue, MergeRequest, Search_Reply, SearchKind,
-    SearchScope, SyncJobStatus, VarlinkInterface, WhoAmI_Reply,
+    Call_GetAssignedMergeRequests, Call_GetHistory, Call_GetSyncJobs, Call_ListIssues,
+    Call_PostTime, Call_RecordEpicOpen, Call_RecordOpen, Call_Search, Call_UnassignSelf,
+    Call_WhoAmI, GetActivity_Reply, GetAssignedIssues_Reply, GetAssignedMergeRequests_Reply,
+    GetHistory_Reply, GetSyncJobs_Reply, HistorySource, IssuableKind, Issue, IssueRole, IssueState,
+    ListIssues_Reply, MergeRequest, Search_Reply, SearchKind, SearchScope, SyncJobStatus,
+    VarlinkInterface, WhoAmI_Reply,
 };
 
 use crate::config::SharedConfig;
@@ -19,7 +20,9 @@ use crate::error::DormancyReason;
 use crate::gitlab::Issuable;
 use crate::queue::RetryQueue;
 use crate::sync::avatars::Avatar;
-use crate::sync::jobs::{ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS};
+use crate::sync::jobs::{
+    ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, RECENT_ASSIGNED_ISSUES, RECENT_AUTHORED_ISSUES,
+};
 use crate::sync::model::{self, Board, BoardList, LabelRef, RowKey, UserRef};
 use crate::sync::schedule::JobState;
 use crate::sync::store::{RowScope, Stored, SyncStore, View};
@@ -221,6 +224,42 @@ fn seed_assigned_mrs(h: &Handlers) {
     mark_synced(h, &[Job::AssignedMergeRequests]);
 }
 
+/// The recent views, a minute old: authored are 1/1 (updated at 300) and the
+/// closed 1/2 (at 200), assigned are 1/2 again and 2/3 (at 100).
+fn seed_recent_issues(h: &Handlers) {
+    let at = |mut issue: model::Issue, updated_at, state: &str| {
+        issue.updated_at = updated_at;
+        issue.state = state.into();
+        issue
+    };
+    let (api, web, other) = (
+        issue(1, 1, "api", "https://gl/team/api/-/issues/1"),
+        issue(1, 2, "web", "https://gl/team/api/-/issues/2"),
+        issue(2, 3, "other", "https://gl/other/x/-/issues/3"),
+    );
+    seed(
+        h,
+        &[
+            at(api, 300, "opened"),
+            at(web, 200, "closed"),
+            at(other, 100, "opened"),
+        ],
+    );
+    seed_view(
+        h,
+        RECENT_AUTHORED_ISSUES,
+        &[(1, 2), (1, 1)],
+        now_secs() - 60,
+    );
+    seed_view(
+        h,
+        RECENT_ASSIGNED_ISSUES,
+        &[(2, 3), (1, 2)],
+        now_secs() - 60,
+    );
+    mark_synced(h, &[Job::RecentAuthoredIssues, Job::RecentAssignedIssues]);
+}
+
 /// Issues "OAuth token refresh" (1/10) and a labeled one (1/20), MR "Fix
 /// oauth flow" (1/30), project `team/auth-service`, group `team` with the
 /// epics "Identity roadmap" (5/7) and "Billing" (5/8).
@@ -298,6 +337,50 @@ async fn assigned_issues(h: &Handlers, groups: Option<Vec<String>>) -> Vec<Issue
         .await
         .unwrap();
     reply::<GetAssignedIssues_Reply>(&mut call).issues
+}
+
+async fn list_issues(
+    h: &Handlers,
+    role: Option<IssueRole>,
+    updated_after: Option<i64>,
+    states: Option<Vec<IssueState>>,
+) -> Vec<Issue> {
+    let mut call = AsyncCall::default();
+    h.list_issues(
+        &mut call as &mut dyn Call_ListIssues,
+        role,
+        updated_after,
+        states,
+    )
+    .await
+    .unwrap();
+    reply::<ListIssues_Reply>(&mut call).issues
+}
+
+/// The error `ListIssues` replies for `role`, `None` for a success.
+async fn list_issues_error(h: &Handlers, role: Option<IssueRole>) -> Option<String> {
+    let mut call = AsyncCall::default();
+    h.list_issues(&mut call as &mut dyn Call_ListIssues, role, None, None)
+        .await
+        .unwrap();
+    reply_error(&mut call)
+}
+
+fn iids(issues: &[Issue]) -> Vec<i64> {
+    issues.iter().map(|i| i.iid).collect()
+}
+
+async fn unassign(h: &Handlers, project_id: i64, iid: i64, kind: IssuableKind) -> Option<String> {
+    let mut call = AsyncCall::default();
+    h.unassign_self(
+        &mut call as &mut dyn Call_UnassignSelf,
+        project_id,
+        iid,
+        kind,
+    )
+    .await
+    .unwrap();
+    reply_error(&mut call)
 }
 
 async fn assigned_mrs(h: &Handlers, groups: Option<Vec<String>>) -> Vec<MergeRequest> {
@@ -568,16 +651,7 @@ async fn a_queued_mr_unassign_hides_the_merge_request() {
     let (h, _dir) = unreachable_handlers();
     seed_assigned_mrs(&h);
 
-    let mut call = AsyncCall::default();
-    h.unassign_self(
-        &mut call as &mut dyn Call_UnassignSelf,
-        2,
-        11,
-        IssuableKind::merge_request,
-    )
-    .await
-    .unwrap();
-    assert_eq!(reply_error(&mut call), None);
+    assert_eq!(unassign(&h, 2, 11, IssuableKind::merge_request).await, None);
 
     let iids: Vec<i64> = assigned_mrs(&h, None).await.iter().map(|m| m.iid).collect();
     assert_eq!(iids, [10]);
@@ -703,6 +777,159 @@ async fn get_assigned_issues_overlays_open_counts_and_board_status() {
     assert_eq!(api.graph_status, "Doing");
     let other = issues.iter().find(|i| i.iid == 3).unwrap();
     assert_eq!(other.graph_status, "", "project 2's boards never synced");
+}
+
+// ── Recent issues ──────────────────────────────────────────────────────
+
+/// Served under a dormant session: the read never fetches. 1/2 is in both
+/// views and listed once.
+#[tokio::test]
+async fn list_issues_serves_both_roles_once_newest_first() {
+    let (h, _dir) = dormant_handlers();
+    seed_recent_issues(&h);
+    run_record_open(&h, 2, 3, IssuableKind::issue).await;
+
+    let issues = list_issues(&h, None, None, None).await;
+    assert_eq!(iids(&issues), [1, 2, 3]);
+    let updated: Vec<i64> = issues.iter().map(|i| i.updated_at).collect();
+    assert_eq!(updated, [300, 200, 100]);
+    assert_eq!(issues[1].state, "closed", "closed ones are listed too");
+    assert_eq!(issues[2].project_path, "other/x");
+    assert_eq!(issues[2].open_count, 1);
+    assert_eq!(issues[2].graph_status, "", "its boards never synced");
+}
+
+#[tokio::test]
+async fn list_issues_filters_by_role_state_and_time() {
+    let (h, _dir) = dormant_handlers();
+    seed_recent_issues(&h);
+    let (author, assignee) = (Some(IssueRole::author), Some(IssueRole::assignee));
+    let (opened, closed) = (
+        || Some(vec![IssueState::opened]),
+        || Some(vec![IssueState::closed]),
+    );
+
+    assert_eq!(iids(&list_issues(&h, author, None, None).await), [1, 2]);
+    let assigned = list_issues(&h, assignee.clone(), None, None).await;
+    assert_eq!(iids(&assigned), [2, 3]);
+
+    assert_eq!(iids(&list_issues(&h, None, None, closed()).await), [2]);
+    assert_eq!(iids(&list_issues(&h, None, None, opened()).await), [1, 3]);
+    let both = Some(vec![IssueState::closed, IssueState::opened]);
+    assert_eq!(iids(&list_issues(&h, None, None, both).await), [1, 2, 3]);
+    let none = Some(Vec::new());
+    assert_eq!(
+        iids(&list_issues(&h, None, None, none).await),
+        [1, 2, 3],
+        "no state is every state"
+    );
+
+    assert_eq!(
+        iids(&list_issues(&h, None, Some(200), None).await),
+        [1, 2],
+        "inclusive, as GitLab's updated_after"
+    );
+    assert_eq!(iids(&list_issues(&h, None, Some(201), None).await), [1]);
+    assert_eq!(
+        iids(&list_issues(&h, None, Some(-5), None).await),
+        [1, 2, 3]
+    );
+    let narrow = list_issues(&h, assignee, Some(100), opened()).await;
+    assert_eq!(iids(&narrow), [3], "the filters combine");
+}
+
+#[tokio::test]
+async fn list_issues_never_synced_is_honest_about_the_session() {
+    let (h, _dir) = dormant_handlers();
+    let cold = |role| list_issues_error(&h, role);
+    assert_eq!(cold(None).await.as_deref(), Some(NOT_AUTHENTICATED));
+
+    // One list alone answers for its role, not for both.
+    seed(&h, &[issue(1, 1, "api", "https://gl/team/api/-/issues/1")]);
+    seed_view(&h, RECENT_AUTHORED_ISSUES, &[(1, 1)], now_secs() - 60);
+    mark_synced(&h, &[Job::RecentAuthoredIssues]);
+    assert_eq!(cold(Some(IssueRole::author)).await, None);
+    let assigned = cold(Some(IssueRole::assignee)).await;
+    assert_eq!(assigned.as_deref(), Some(NOT_AUTHENTICATED));
+    assert_eq!(cold(None).await.as_deref(), Some(NOT_AUTHENTICATED));
+
+    let fake = Arc::new(FakeGitlab::default());
+    let (h, _dir) = connected_handlers(&fake);
+    assert!(
+        list_issues(&h, None, None, None).await.is_empty(),
+        "connected: the first sync is pending"
+    );
+    assert_eq!(fake.read_calls(), 0, "reads never fetch");
+}
+
+/// An unassign the list doesn't reflect yet takes the issue out of the
+/// assigned ones, not out of the authored ones; so does a row a project sync
+/// stored with other assignees.
+#[tokio::test]
+async fn list_issues_drops_what_was_unassigned_since() {
+    let (h, _dir) = unreachable_handlers();
+    seed_recent_issues(&h);
+    let mut c = h.sync.store().begin();
+    c.set_identity(&crate::sync::store::Identity {
+        host: "gitlab.test".into(),
+        user_id: 1,
+    })
+    .unwrap();
+    c.commit().unwrap();
+    let assignee = || Some(IssueRole::assignee);
+
+    assert_eq!(unassign(&h, 1, 2, IssuableKind::issue).await, None);
+    assert_eq!(iids(&list_issues(&h, assignee(), None, None).await), [3]);
+    assert_eq!(
+        iids(&list_issues(&h, None, None, None).await),
+        [1, 2, 3],
+        "still authored"
+    );
+
+    let mut reassigned = issue(2, 3, "other", "https://gl/other/x/-/issues/3");
+    reassigned.assignees = vec![UserRef {
+        id: 2,
+        username: "someone".into(),
+    }];
+    seed(&h, &[reassigned]);
+    assert!(list_issues(&h, assignee(), None, None).await.is_empty());
+    assert_eq!(iids(&list_issues(&h, None, None, None).await), [1, 2]);
+}
+
+/// A close the lists don't reflect yet reads as closed, before the state
+/// filter: queued, or applied since the list was fetched.
+#[tokio::test]
+async fn a_just_closed_issue_lists_as_closed() {
+    let (h, _dir) = unreachable_handlers();
+    seed_recent_issues(&h);
+    let closed = || Some(vec![IssueState::closed]);
+    let opened = || Some(vec![IssueState::opened]);
+
+    assert_eq!(close(&h, 1, 1, IssuableKind::issue).await, None);
+    let issues = list_issues(&h, None, None, None).await;
+    assert_eq!(iids(&issues), [1, 2, 3]);
+    assert_eq!(
+        issues[0].state, "closed",
+        "the pending close already applies"
+    );
+    assert_eq!(iids(&list_issues(&h, None, None, closed()).await), [1, 2]);
+    assert_eq!(iids(&list_issues(&h, None, None, opened()).await), [3]);
+
+    h.sync.note_write(&Write {
+        kind: Issuable::Issue,
+        project_id: 2,
+        iid: 3,
+        op: WriteOp::Close,
+    });
+    assert!(list_issues(&h, None, None, opened()).await.is_empty());
+    // A list fetched after the write reflects GitLab, including the write.
+    seed_view(
+        &h,
+        RECENT_ASSIGNED_ISSUES,
+        &[(2, 3), (1, 2)],
+        now_secs() + 5,
+    );
+    assert_eq!(iids(&list_issues(&h, None, None, opened()).await), [3]);
 }
 
 // ── Assigned merge requests ────────────────────────────────────────────
@@ -1403,11 +1630,19 @@ async fn clear_cache_history_bands_split_at_the_windows() {
 async fn clear_cache_scopes_drop_their_slice_and_reset_its_jobs() {
     let (h, _dir) = dormant_handlers();
     seed_assigned_issues(&h);
+    seed_recent_issues(&h);
     seed_corpus(&h);
 
     clear_cache(&h, Some(vec![CacheScope::assigned])).await;
     assert!(h.sync.store().view(ASSIGNED_ISSUES).unwrap().is_none());
     assert!(!h.sync.has_synced(Job::AssignedIssues));
+    for (job, name) in [
+        (Job::RecentAuthoredIssues, RECENT_AUTHORED_ISSUES),
+        (Job::RecentAssignedIssues, RECENT_ASSIGNED_ISSUES),
+    ] {
+        assert!(h.sync.store().view(name).unwrap().is_none(), "{name}");
+        assert!(!h.sync.has_synced(job), "{name}");
+    }
     assert!(h.sync.has_synced(Job::MemberProjects), "search untouched");
 
     clear_cache(&h, Some(vec![CacheScope::search])).await;

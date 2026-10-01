@@ -27,6 +27,19 @@ use crate::write::{Write, WriteOp};
 pub const ASSIGNED_ISSUES: &str = "assigned/issues";
 /// View of the open merge requests assigned to the user.
 pub const ASSIGNED_MERGE_REQUESTS: &str = "assigned/merge_requests";
+/// View of the issues the user authored, open or closed, updated inside
+/// `search.tracked_retention_hours`.
+pub const RECENT_AUTHORED_ISSUES: &str = "recent/authored/issues";
+/// View of the issues assigned to the user, open or closed, updated inside
+/// `search.tracked_retention_hours`.
+pub const RECENT_ASSIGNED_ISSUES: &str = "recent/assigned/issues";
+/// Every view listing issues. A row one of them names is that view's to
+/// keep, whatever the others or a project's cap say.
+pub const ISSUE_VIEWS: [&str; 3] = [
+    ASSIGNED_ISSUES,
+    RECENT_AUTHORED_ISSUES,
+    RECENT_ASSIGNED_ISSUES,
+];
 
 /// How far a delta's `updated_after` cursor reaches back before the previous
 /// run started, so items updated during that run (or under clock skew) are
@@ -70,6 +83,13 @@ pub enum Job {
     GroupEpics(i64),
     AllIssues,
     AllMergeRequests,
+    /// The issues the user authored, any state, updated inside
+    /// `search.tracked_retention_hours`.
+    RecentAuthoredIssues,
+    /// The same for the issues assigned to the user. Not the assigned list
+    /// with another filter: that one is bounded by state and not by time,
+    /// runs every few minutes and feeds the plan.
+    RecentAssignedIssues,
     /// Timelogs inside `history.retention_hours`; prunes older ones.
     AllTimelogs,
     /// A member project's avatar, as a file for the launchers.
@@ -92,6 +112,8 @@ impl Job {
             Self::GroupEpics(g) => format!("group/{g}/epics"),
             Self::AllIssues => "all/issues".into(),
             Self::AllMergeRequests => "all/merge_requests".into(),
+            Self::RecentAuthoredIssues => RECENT_AUTHORED_ISSUES.into(),
+            Self::RecentAssignedIssues => RECENT_ASSIGNED_ISSUES.into(),
             Self::AllTimelogs => "timelogs/all".into(),
             Self::ProjectAvatar(p) => format!("project/{p}/avatar"),
         }
@@ -110,8 +132,8 @@ impl Job {
     }
 
     /// The lane the job runs in. Jobs in different lanes write disjoint
-    /// rows, except an assigned list and a project corpus: both store the
-    /// project's assigned items, and [`drop_outdated`] keeps the newer one.
+    /// rows, except a list and a project corpus: both store the project's
+    /// listed items, and [`drop_outdated`] keeps the newer one.
     pub fn lane(&self) -> Lane {
         match *self {
             Self::ProjectBoards(p)
@@ -119,20 +141,26 @@ impl Job {
             | Self::ProjectMergeRequests(p)
             | Self::ProjectAvatar(p) => Lane::Project(p),
             Self::GroupEpics(g) => Lane::Group(g),
-            // A full `all/*` run reconciles every row, so an assigned list
-            // landing mid-fetch would lose what it just stored.
-            Self::AssignedIssues | Self::AllIssues => Lane::Issues,
+            // A full `all/*` run reconciles every row, so a list landing
+            // mid-fetch would lose what it just stored. And two lists store
+            // the same rows with nothing to tell the newer one.
+            Self::AssignedIssues
+            | Self::AllIssues
+            | Self::RecentAuthoredIssues
+            | Self::RecentAssignedIssues => Lane::Issues,
             Self::AssignedMergeRequests | Self::AllMergeRequests => Lane::MergeRequests,
             Self::RecentTimelogs | Self::AllTimelogs => Lane::Timelogs,
             Self::Events | Self::MemberProjects | Self::MemberGroups => Lane::Own(*self),
         }
     }
 
-    /// The assigned view the job fills, if it is a view job.
+    /// The view the job fills, if it is a view job.
     pub fn view(&self) -> Option<&'static str> {
         match self {
             Self::AssignedIssues => Some(ASSIGNED_ISSUES),
             Self::AssignedMergeRequests => Some(ASSIGNED_MERGE_REQUESTS),
+            Self::RecentAuthoredIssues => Some(RECENT_AUTHORED_ISSUES),
+            Self::RecentAssignedIssues => Some(RECENT_ASSIGNED_ISSUES),
             _ => None,
         }
     }
@@ -167,10 +195,14 @@ impl Job {
                 full_only(c.refresh.quick.interval_secs)
             }
             // Memberships rarely change, and a large one pages for a while.
+            // The recent issue lists are a look back, where a day of lag
+            // is fine.
             Self::ProjectBoards(_)
             | Self::AllTimelogs
             | Self::MemberProjects
-            | Self::MemberGroups => full_only(c.refresh.slow.interval_secs),
+            | Self::MemberGroups
+            | Self::RecentAuthoredIssues
+            | Self::RecentAssignedIssues => full_only(c.refresh.slow.interval_secs),
             Self::ProjectIssues(_)
             | Self::ProjectMergeRequests(_)
             | Self::GroupEpics(_)
@@ -197,7 +229,11 @@ impl Job {
     /// what the store tells.
     pub fn fingerprint(&self, c: &Config) -> u64 {
         let schema = u64::from(match self {
-            Self::AssignedIssues | Self::ProjectIssues(_) | Self::AllIssues => Issue::SCHEMA,
+            Self::AssignedIssues
+            | Self::ProjectIssues(_)
+            | Self::AllIssues
+            | Self::RecentAuthoredIssues
+            | Self::RecentAssignedIssues => Issue::SCHEMA,
             Self::AssignedMergeRequests
             | Self::ProjectMergeRequests(_)
             | Self::AllMergeRequests => MergeRequest::SCHEMA,
@@ -215,7 +251,9 @@ impl Job {
             }
             Self::RecentTimelogs => fingerprint(&[schema, c.refresh.quick.window_hours]),
             Self::AllTimelogs => fingerprint(&[schema, c.history.retention_hours]),
-            Self::Events => fingerprint(&[schema, c.search.tracked_retention_hours]),
+            Self::Events | Self::RecentAuthoredIssues | Self::RecentAssignedIssues => {
+                fingerprint(&[schema, c.search.tracked_retention_hours])
+            }
             _ => fingerprint(&[schema]),
         }
     }
@@ -225,7 +263,14 @@ impl Job {
         let pid = write.project_id;
         match (&write.op, write.kind) {
             (WriteOp::PostTime { .. }, _) => vec![Self::RecentTimelogs],
-            (_, Issuable::Issue) => vec![Self::AssignedIssues, Self::ProjectIssues(pid)],
+            // The recent lists too: without a corpus nothing else shows a
+            // closed issue as closed before their next daily run.
+            (_, Issuable::Issue) => vec![
+                Self::AssignedIssues,
+                Self::ProjectIssues(pid),
+                Self::RecentAuthoredIssues,
+                Self::RecentAssignedIssues,
+            ],
             (_, Issuable::MergeRequest) => {
                 vec![Self::AssignedMergeRequests, Self::ProjectMergeRequests(pid)]
             }
@@ -323,22 +368,22 @@ pub async fn fetch(job: Job, ctx: FetchCtx) -> Result<Staged> {
                 project_id,
                 updated_after,
             };
-            capped_rows::<Issue>(&ctx, listing, project_id, Some(ASSIGNED_ISSUES)).await
+            capped_rows::<Issue>(&ctx, listing, project_id, &ISSUE_VIEWS).await
         }
         Job::ProjectMergeRequests(project_id) => {
             let listing = |updated_after| Listing::ProjectMergeRequests {
                 project_id,
                 updated_after,
             };
-            let view = Some(ASSIGNED_MERGE_REQUESTS);
-            capped_rows::<MergeRequest>(&ctx, listing, project_id, view).await
+            let views = &[ASSIGNED_MERGE_REQUESTS];
+            capped_rows::<MergeRequest>(&ctx, listing, project_id, views).await
         }
         Job::GroupEpics(group_id) => {
             let listing = |updated_after| Listing::GroupEpics {
                 group_id,
                 updated_after,
             };
-            capped_rows::<Epic>(&ctx, listing, group_id, None).await
+            capped_rows::<Epic>(&ctx, listing, group_id, &[]).await
         }
         Job::AllIssues => {
             let listing = Listing::AllIssues {
@@ -351,6 +396,14 @@ pub async fn fetch(job: Job, ctx: FetchCtx) -> Result<Staged> {
                 updated_after: ctx.updated_after(),
             };
             rows::<MergeRequest>(gitlab, listing, ctx.full.then_some(RowScope::All)).await
+        }
+        Job::RecentAuthoredIssues => {
+            let listing = |updated_after| Listing::RecentAuthoredIssues { updated_after };
+            recent_issues(&ctx, listing, RECENT_AUTHORED_ISSUES).await
+        }
+        Job::RecentAssignedIssues => {
+            let listing = |updated_after| Listing::RecentAssignedIssues { updated_after };
+            recent_issues(&ctx, listing, RECENT_ASSIGNED_ISSUES).await
         }
         Job::MemberProjects => {
             rows::<Project>(gitlab, Listing::MemberProjects, Some(RowScope::All)).await
@@ -415,13 +468,13 @@ async fn avatar(ctx: &FetchCtx, project_id: i64) -> Result<Staged> {
 
 /// The issues or MRs of one project, or the epics of one group (`owner`),
 /// newest first and capped: a huge one keeps only its most recently updated
-/// items, and a full run's reconcile drops the rest, except for items the
-/// assigned view `view` lists.
+/// items, and a full run's reconcile drops the rest, except for items one
+/// of `views` lists.
 async fn capped_rows<R: Stored + Dated>(
     ctx: &FetchCtx,
     listing: impl Fn(Option<chrono::DateTime<chrono::Utc>>) -> Listing,
     owner: i64,
-    view: Option<&'static str>,
+    views: &'static [&'static str],
 ) -> Result<Staged> {
     let cap = ctx.windows.project_cap;
     let gitlab = &*ctx.gitlab;
@@ -459,16 +512,16 @@ async fn capped_rows<R: Stored + Dated>(
     Ok(Staged::new(move |c| {
         let rows = fetched.len();
         let mut keep: HashSet<RowKey> = fetched.iter().map(Resource::key).collect();
-        if let Some(view) = view {
+        for view in views {
             let listed = c.view(view)?.unwrap_or_default();
-            let assigned: HashSet<RowKey> =
+            let named: HashSet<RowKey> =
                 listed.keys.into_iter().filter(|k| k.0 == prefix).collect();
             // The list was fetched after this run started and landed first.
             if listed.fetched_at >= started {
-                drop_outdated(c, &mut fetched, |k| Ok(assigned.contains(&k)))?;
+                drop_outdated(c, &mut fetched, |k| Ok(named.contains(&k)))?;
             }
-            // An assigned item older than the cap is still on the list.
-            keep.extend(assigned);
+            // A listed item older than the cap is still on the list.
+            keep.extend(named);
         }
         c.upsert(&fetched)?;
         if whole {
@@ -571,6 +624,19 @@ async fn view<R: Stored + Dated>(
     }))
 }
 
+/// The user's issues of one role in any state, updated inside the tracked
+/// window, as the view `name`. Every run fetches the whole window and
+/// replaces the view, so an issue that aged out of the window leaves it.
+async fn recent_issues(
+    ctx: &FetchCtx,
+    listing: fn(chrono::DateTime<chrono::Utc>) -> Listing,
+    name: &'static str,
+) -> Result<Staged> {
+    let since = ctx.started.saturating_sub(ctx.windows.tracked);
+    let since = chrono::DateTime::from_timestamp(since as i64, 0).unwrap_or_default();
+    view::<Issue>(ctx, listing(since), name, Job::ProjectIssues).await
+}
+
 /// Events inside the tracked window: the whole window on a full run, else
 /// since the last run. Older rows are pruned.
 async fn events(ctx: &FetchCtx) -> Result<Staged> {
@@ -666,7 +732,10 @@ pub async fn fetch_rows<R: Resource>(
 mod tests {
     use super::*;
     use crate::sync::store::SyncStore;
-    use crate::testing::{FakeErr, FakeGitlab, PNG, epic_json, event_json, issue_json};
+    use crate::testing::{
+        FakeErr, FakeGitlab, PNG, RECENT_ASSIGNED_PATH, RECENT_AUTHORED_PATH, epic_json,
+        event_json, issue_json,
+    };
     use serde_json::json;
 
     const DAY: u64 = 86_400;
@@ -743,6 +812,67 @@ mod tests {
         assert_eq!(s.issues.get((1, 9)).unwrap().unwrap().title, "a");
     }
 
+    /// A recent list asks for the whole tracked window on every run, in any
+    /// state, and the view is what that run returned.
+    #[tokio::test]
+    async fn a_recent_list_fetches_its_window_and_replaces_the_view() {
+        let (s, _d) = store();
+        let fake = Arc::new(FakeGitlab::default());
+        let mut closed = issue_json(8, 4, "done");
+        closed["state"] = json!("closed");
+        fake.serve(
+            RECENT_AUTHORED_PATH,
+            vec![issue_json(7, 1, "one"), closed.clone()],
+        );
+        let job = Job::RecentAuthoredIssues;
+        assert_eq!(run(&s, job, ctx(&fake, true, 0)).await, 2);
+
+        let view = s.view(RECENT_AUTHORED_ISSUES).unwrap().unwrap();
+        assert_eq!(view.keys, [(7, 1), (8, 4)]);
+        assert_eq!(view.fetched_at, NOW);
+        assert_eq!(s.issues.get((8, 4)).unwrap().unwrap().state, "closed");
+
+        // #1 aged out of the window. No delta: the cursor stays the window's.
+        fake.serve(RECENT_AUTHORED_PATH, vec![closed]);
+        run(&s, job, ctx(&fake, false, NOW - 3600)).await;
+        let view = s.view(RECENT_AUTHORED_ISSUES).unwrap().unwrap();
+        assert_eq!(view.keys, [(8, 4)]);
+        let updated_after = chrono::DateTime::from_timestamp((NOW - 30 * DAY) as i64, 0).unwrap();
+        assert_eq!(
+            fake.calls_to(RECENT_AUTHORED_PATH),
+            [
+                Listing::RecentAuthoredIssues { updated_after },
+                Listing::RecentAuthoredIssues { updated_after },
+            ]
+        );
+
+        // The other role is its own listing and its own view.
+        run(&s, Job::RecentAssignedIssues, ctx(&fake, true, 0)).await;
+        assert_eq!(
+            fake.calls_to(RECENT_ASSIGNED_PATH),
+            [Listing::RecentAssignedIssues { updated_after }]
+        );
+        let assigned = s.view(RECENT_ASSIGNED_ISSUES).unwrap().unwrap();
+        assert!(assigned.keys.is_empty());
+        assert!(s.view(ASSIGNED_ISSUES).unwrap().is_none());
+    }
+
+    /// A day of lag is fine for a look back, and a wider window is a
+    /// different list.
+    #[test]
+    fn recent_lists_run_daily_and_follow_the_tracked_window() {
+        let cfg = crate::config::defaults();
+        let mut wider = crate::config::defaults();
+        wider.search.tracked_retention_hours *= 2;
+        for job in [Job::RecentAuthoredIssues, Job::RecentAssignedIssues] {
+            let cadence = job.cadence(&cfg);
+            assert_eq!(cadence.every, cfg.refresh.slow.interval_secs);
+            assert_eq!(cadence.full_every, None);
+            assert_ne!(job.fingerprint(&cfg), job.fingerprint(&wider));
+            assert!(!job.feeds_plan());
+        }
+    }
+
     /// Issue #1 of project 7 as GitLab showed it at `hour` o'clock.
     fn issue_at(hour: u32, title: &str) -> serde_json::Value {
         let mut issue = issue_json(7, 1, title);
@@ -788,6 +918,42 @@ mod tests {
         land(&s, Job::ProjectIssues(7), corpus, NOW);
         assert_eq!(title(&s), "fresh");
         assert_eq!(s.issues.keys(RowScope::All).unwrap(), [(7, 1), (7, 2)]);
+    }
+
+    /// The recent lists race a corpus run like the assigned one.
+    #[tokio::test]
+    async fn a_corpus_run_landing_after_a_later_recent_list_keeps_the_newer_row() {
+        let (s, _d) = store();
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve(
+            "projects/7/issues",
+            vec![issue_at(9, "stale"), issue_json(7, 2, "two")],
+        );
+        fake.serve(RECENT_ASSIGNED_PATH, vec![issue_at(11, "fresh")]);
+        let corpus = fetch(Job::ProjectIssues(7), ctx(&fake, true, 0))
+            .await
+            .unwrap();
+        let mut later = ctx(&fake, true, 0);
+        later.started = NOW + 10;
+        let list = fetch(Job::RecentAssignedIssues, later).await.unwrap();
+
+        land(&s, Job::RecentAssignedIssues, list, NOW + 10);
+        land(&s, Job::ProjectIssues(7), corpus, NOW);
+        assert_eq!(title(&s), "fresh");
+        assert_eq!(s.issues.keys(RowScope::All).unwrap(), [(7, 1), (7, 2)]);
+
+        // And the list that started first and lands last.
+        fake.serve(RECENT_ASSIGNED_PATH, vec![issue_at(10, "older")]);
+        let mut first = ctx(&fake, true, 0);
+        first.started = NOW + 20;
+        let list = fetch(Job::RecentAssignedIssues, first).await.unwrap();
+        fake.serve("projects/7/issues", vec![issue_at(12, "newest")]);
+        let mut later = ctx(&fake, true, 0);
+        later.started = NOW + 30;
+        let corpus = fetch(Job::ProjectIssues(7), later).await.unwrap();
+        land(&s, Job::ProjectIssues(7), corpus, NOW + 30);
+        land(&s, Job::RecentAssignedIssues, list, NOW + 20);
+        assert_eq!(title(&s), "newest");
     }
 
     /// The other way round: the list started first and lands last.
@@ -850,6 +1016,11 @@ mod tests {
         assert_ne!(Job::ProjectIssues(8).lane(), Lane::Project(7));
         assert_eq!(Job::RecentTimelogs.lane(), Job::AllTimelogs.lane());
         assert_eq!(Job::AssignedIssues.lane(), Job::AllIssues.lane());
+        // Two lists store the same rows, and nothing tells the newer one.
+        for recent in [Job::RecentAuthoredIssues, Job::RecentAssignedIssues] {
+            assert_eq!(recent.lane(), Job::AssignedIssues.lane());
+            assert_ne!(recent.lane(), Job::ProjectIssues(7).lane());
+        }
         assert_eq!(
             Job::AssignedMergeRequests.lane(),
             Job::AllMergeRequests.lane()
@@ -945,6 +1116,32 @@ mod tests {
     async fn the_cap_never_drops_an_assigned_item() {
         let (s, _d) = store();
         seed_three(&s);
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve(
+            "projects/7/issues",
+            vec![issue_json(7, 3, "new"), issue_json(7, 2, "mid")],
+        );
+        run(&s, Job::ProjectIssues(7), ctx(&fake, true, 0)).await;
+        assert_eq!(
+            s.issues.keys(RowScope::All).unwrap(),
+            [(7, 1), (7, 2), (7, 3)]
+        );
+    }
+
+    /// A closed issue older than the cap stays for the recent list naming
+    /// it, as an assigned one does.
+    #[tokio::test]
+    async fn the_cap_never_drops_a_recently_listed_item() {
+        let (s, _d) = store();
+        seed_three(&s);
+        let mut c = s.begin();
+        c.remove_view(ASSIGNED_ISSUES);
+        let listed = View {
+            keys: vec![(7, 1), (8, 1)],
+            fetched_at: NOW - 100,
+        };
+        c.set_view(RECENT_AUTHORED_ISSUES, &listed).unwrap();
+        c.commit().unwrap();
         let fake = Arc::new(FakeGitlab::default());
         fake.serve(
             "projects/7/issues",
@@ -1180,7 +1377,12 @@ mod tests {
         };
         assert_eq!(
             Job::affected_by(&w(Issuable::Issue, WriteOp::Close)),
-            [Job::AssignedIssues, Job::ProjectIssues(7)]
+            [
+                Job::AssignedIssues,
+                Job::ProjectIssues(7),
+                Job::RecentAuthoredIssues,
+                Job::RecentAssignedIssues,
+            ]
         );
         assert_eq!(
             Job::affected_by(&w(Issuable::MergeRequest, WriteOp::AssignSelf)),

@@ -1,6 +1,7 @@
 //! A configurable in-memory [`GitlabApi`] for the daemon's tests.
 //!
-//! Reads are routed by [`Listing::path`]: each path serves a standing set of
+//! Reads are routed by [`route`], a listing's [`Listing::path`] but for the
+//! recent issue lists: each path serves a standing set of
 //! rows (empty by default), one-shot failures can be queued in front, and a
 //! path can be gated to hold its next call until released. Every call is
 //! recorded for assertions. Writes succeed unless a failure is queued, and
@@ -23,6 +24,22 @@ use crate::sync::model::Timelog;
 pub const TOKEN_PATH: &str = "personal_access_tokens/self";
 /// Path [`FakeGitlab::fail_next`] fails a rotation by.
 pub const ROTATE_PATH: &str = "personal_access_tokens/self/rotate";
+
+/// What the fake routes the recent issues the user authored by.
+pub const RECENT_AUTHORED_PATH: &str = "issues?authored";
+/// What the fake routes the recent issues assigned to the user by.
+pub const RECENT_ASSIGNED_PATH: &str = "issues?assigned";
+
+/// The path a read is served, failed, gated and counted by: the listing's
+/// own, except for the recent issue lists. They share `issues` with the
+/// assigned list, which a test serving or counting that one doesn't mean.
+pub fn route(listing: &Listing) -> String {
+    match listing {
+        Listing::RecentAuthoredIssues { .. } => RECENT_AUTHORED_PATH.into(),
+        Listing::RecentAssignedIssues { .. } => RECENT_ASSIGNED_PATH.into(),
+        other => other.path(),
+    }
+}
 
 /// A failure to inject, turned into the matching [`Error`] on use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,7 +219,7 @@ impl FakeGitlab {
     pub fn calls_to(&self, path: &str) -> Vec<Listing> {
         self.calls()
             .into_iter()
-            .filter(|l| l.path() == path)
+            .filter(|l| route(l) == path)
             .collect()
     }
 
@@ -213,7 +230,7 @@ impl FakeGitlab {
         calls
             .iter()
             .zip(limits.iter())
-            .filter(|(l, _)| l.path() == path)
+            .filter(|(l, _)| route(l) == path)
             .map(|(_, limit)| *limit)
             .collect()
     }
@@ -260,7 +277,7 @@ impl FakeGitlab {
 #[async_trait::async_trait]
 impl GitlabApi for FakeGitlab {
     async fn list(&self, listing: &Listing, limit: Option<usize>) -> Result<Vec<Value>> {
-        let path = listing.path();
+        let path = route(listing);
         self.calls.lock().unwrap().push(listing.clone());
         self.limits.lock().unwrap().push(limit);
         let gate = self.gates.lock().unwrap().remove(&path);

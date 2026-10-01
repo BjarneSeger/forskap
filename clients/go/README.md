@@ -18,7 +18,7 @@ go get github.com/BjarneSeger/forskap/clients/go
 
 Releases are tagged `clients/go/vX.Y.Z` and carry the version of the
 [`forskap-api`](../../forskap-api/README.md) crate they were generated from, so a
-version names one state of the interface. Append `@v0.25.0` to pin one.
+version names one state of the interface. Append `@v0.26.0` to pin one.
 
 The generated package is named after the interface, so import it under an alias:
 
@@ -74,12 +74,26 @@ Daemon-side errors surface as typed values you match with `errors.As`:
 Optional varlink parameters are pointers; pass `nil` to omit them
 (e.g. `c.GetHistory(ctx, nil)` for the daemon's default window,
 `c.Search(ctx, "query", nil, nil, nil)` for all kinds, the default limit and no
-project/group scope, or
+project/group scope,
+`c.ListIssues(ctx, nil, nil, nil)` for the issues you authored or are assigned to in
+any state, or
 `c.PostTime(ctx, pid, iid, forskap.KindIssue, "1h", &summary)`). The varlink
 `Close` method maps to `c.CloseIssuable` — the Go name `Close` is taken by the
 connection releaser. Enum values come from constants: `KindIssue` /
 `KindMergeRequest` for an `IssuableKind`, `Search*` for the kinds of `Search`,
-`Scope*` for the scopes of `ClearCache`.
+`Scope*` for the scopes of `ClearCache`, `RoleAuthor` / `RoleAssignee` and
+`StateOpened` / `StateClosed` for the role and the states of `ListIssues`.
+
+`c.ListIssues` lists your own issues across projects, closed ones included,
+newest-updated first; each carries its epic's URL as `Parent`. It reaches back
+the daemon's `search.tracked_retention_hours` (90 days by default):
+
+```go
+role := forskap.RoleAuthor
+since := time.Now().AddDate(0, 0, -30).Unix()
+closed := []forskap.IssueState{forskap.StateClosed}
+issues, err := c.ListIssues(ctx, &role, &since, &closed)
+```
 
 ## Regenerating
 

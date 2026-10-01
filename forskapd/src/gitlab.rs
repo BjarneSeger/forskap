@@ -123,6 +123,16 @@ pub enum Listing {
     AllMergeRequests {
         updated_after: Option<chrono::DateTime<chrono::Utc>>,
     },
+    /// Issues the user authored, all states, updated at or after
+    /// `updated_after`.
+    RecentAuthoredIssues {
+        updated_after: chrono::DateTime<chrono::Utc>,
+    },
+    /// Issues assigned to the user, all states, updated at or after
+    /// `updated_after`.
+    RecentAssignedIssues {
+        updated_after: chrono::DateTime<chrono::Utc>,
+    },
     /// Projects the user is a member of.
     MemberProjects,
     /// Groups the user is a member of (a bare `GET /groups` would include
@@ -151,7 +161,10 @@ pub enum Listing {
 impl Listing {
     pub fn path(&self) -> String {
         match self {
-            Self::AssignedIssues | Self::AllIssues { .. } => "issues".into(),
+            Self::AssignedIssues
+            | Self::AllIssues { .. }
+            | Self::RecentAuthoredIssues { .. }
+            | Self::RecentAssignedIssues { .. } => "issues".into(),
             Self::AssignedMergeRequests | Self::AllMergeRequests { .. } => "merge_requests".into(),
             Self::ProjectIssues { project_id, .. } => format!("projects/{project_id}/issues"),
             Self::ProjectMergeRequests { project_id, .. } => {
@@ -192,6 +205,19 @@ impl Listing {
             Self::AllIssues { updated_after } | Self::AllMergeRequests { updated_after } => {
                 let mut p = vec![("scope", "all".into())];
                 p.extend(after(updated_after));
+                p
+            }
+            // In GitLab's default order (by creation), not by `updated_at`:
+            // an item updated mid-walk would jump to a page already read
+            // and be missed, and no follow-up delta catches it here.
+            Self::RecentAuthoredIssues { updated_after }
+            | Self::RecentAssignedIssues { updated_after } => {
+                let scope = match self {
+                    Self::RecentAuthoredIssues { .. } => "created_by_me",
+                    _ => "assigned_to_me",
+                };
+                let mut p = vec![("scope", scope.into()), ("state", "all".into())];
+                p.extend(after(&Some(*updated_after)));
                 p
             }
             // Not `simple=true`: that representation leaves out `archived`.
@@ -1526,6 +1552,20 @@ mod tests {
                 },
                 "merge_requests",
                 "scope=all",
+            ),
+            (
+                Listing::RecentAuthoredIssues {
+                    updated_after: t.unwrap(),
+                },
+                "issues",
+                "scope=created_by_me&state=all&updated_after=2026-07-01T10:00:00Z",
+            ),
+            (
+                Listing::RecentAssignedIssues {
+                    updated_after: t.unwrap(),
+                },
+                "issues",
+                "scope=assigned_to_me&state=all&updated_after=2026-07-01T10:00:00Z",
             ),
             (Listing::MemberProjects, "projects", "membership=true"),
             (Listing::MemberGroups, "groups", "min_access_level=10"),

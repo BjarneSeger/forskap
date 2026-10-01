@@ -51,6 +51,20 @@ const (
 	ScopeUsage    CacheScope = "usage"
 )
 
+// IssueRole values picking one of the two lists ListIssues serves: the issues
+// the authenticated user authored, or the ones assigned to them.
+const (
+	RoleAuthor   IssueRole = "author"
+	RoleAssignee IssueRole = "assignee"
+)
+
+// IssueState values ListIssues filters by; they are the strings Issue.State
+// carries.
+const (
+	StateOpened IssueState = "opened"
+	StateClosed IssueState = "closed"
+)
+
 // HistorySource values telling a synced timelog from a PostTime still queued.
 const (
 	SourceGitlab HistorySource = "gitlab"
@@ -118,6 +132,16 @@ func (c *Client) GetAssignedIssues(ctx context.Context, groups *[]string) ([]Iss
 // search sync cadence.
 func (c *Client) GetAssignedMergeRequests(ctx context.Context, groups *[]string) ([]MergeRequest, error) {
 	return GetAssignedMergeRequests().Call(ctx, c.conn, groups)
+}
+
+// ListIssues returns the issues the authenticated user authored or is assigned
+// to, closed ones included, newest-updated first. role picks one of the Role*
+// lists (nil = both, each issue once); updatedAfter (unix seconds, inclusive)
+// keeps only issues updated since; states keeps only the given State* ones (nil
+// or empty = both). Served from what the daemon synced, which reaches back its
+// search.tracked_retention_hours (90 days by default) and is refreshed daily.
+func (c *Client) ListIssues(ctx context.Context, role *IssueRole, updatedAfter *int64, states *[]IssueState) ([]Issue, error) {
+	return ListIssues().Call(ctx, c.conn, role, updatedAfter, states)
 }
 
 // SearchResults groups the per-kind result sets of Search.

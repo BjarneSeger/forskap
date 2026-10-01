@@ -123,6 +123,12 @@ method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
 
 method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)
 
+type IssueRole (author, assignee)
+
+type IssueState (opened, closed)
+
+method ListIssues(role: ?IssueRole, updated_after: ?int, states: ?[]IssueState) -> (issues: []Issue)
+
 type SearchKind (issues, merge_requests, projects, groups, epics)
 
 type SearchScope (projects: ?[]int, groups: ?[]string)

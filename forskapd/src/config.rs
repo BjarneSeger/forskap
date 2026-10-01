@@ -109,14 +109,15 @@ impl ServerConfig {
 /// * `quick` — fast-changing and cheap to fetch: the assigned issue/MR lists
 ///   and your most recent timelogs. Synced frequently.
 /// * `slow` — the large, slow-moving rest: the full timelog history, the
-///   board columns and the memberships. Synced rarely.
+///   board columns, the memberships and your recent issues. Synced rarely.
 #[derive(Debug, ConfiqueConfig)]
 pub struct RefreshConfig {
     /// Quick tier: assigned issues/MRs and recent timelogs.
     #[config(nested)]
     pub quick: QuickRefreshConfig,
 
-    /// Slow tier: the full timelog history and board columns.
+    /// Slow tier: the full timelog history, board columns, memberships and
+    /// your recent issues.
     #[config(nested)]
     pub slow: SlowRefreshConfig,
 }
@@ -155,8 +156,10 @@ impl QuickRefreshConfig {
 #[derive(Debug, ConfiqueConfig)]
 pub struct SlowRefreshConfig {
     /// Seconds between slow syncs of the full timelog history (the whole
-    /// `history.retention_hours`), the board columns, and your project and
-    /// group memberships. Once a day by default.
+    /// `history.retention_hours`), the board columns, your project and
+    /// group memberships, and the issues you authored or were assigned,
+    /// open or closed (the last `search.tracked_retention_hours` of them).
+    /// Once a day by default.
     #[config(default = 86400)]
     pub interval_secs: u64,
 }
@@ -341,7 +344,9 @@ pub struct SearchConfig {
     /// `"tracked"` population after the last time you touched it (an
     /// assignment, a push, an issue, MR or comment, a timelog). Your
     /// contribution events are kept for the same time, so this is also how
-    /// far back `forskap activity` reaches. (90 days by default.)
+    /// far back `forskap activity` reaches, and how long ago an issue you
+    /// authored or were assigned may have been updated to stay listed once
+    /// it is closed. (90 days by default.)
     #[config(default = 2160)]
     pub tracked_retention_hours: u64,
 
