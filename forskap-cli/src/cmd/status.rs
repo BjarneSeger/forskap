@@ -229,6 +229,10 @@ fn is_method_not_found(e: &ApiError) -> bool {
 fn describe(e: &ApiError) -> String {
     match (e.kind(), e.source_varlink_kind()) {
         (ApiErrorKind::GitlabError(Some(args)), _) => args.message.clone(),
+        (ApiErrorKind::GitlabUnavailable(Some(args)), _) => args.message.clone(),
+        (ApiErrorKind::Internal(Some(args)), _) => args.message.clone(),
+        (ApiErrorKind::InvalidArgument(Some(args)), _) => args.message.clone(),
+        (ApiErrorKind::NotFound(Some(args)), _) => args.message.clone(),
         (_, Some(kind)) => varlink_words(kind),
         _ => e.to_string(),
     }
@@ -1869,6 +1873,31 @@ healthy
         assert!(!is_method_not_found(&error(
             varlink::ErrorKind::ConnectionClosed
         )));
+    }
+
+    /// Each of the daemon's errors is told by its message.
+    #[test]
+    fn a_daemon_error_reads_as_its_message() {
+        use forskap_api::{
+            GitlabError_Args, GitlabUnavailable_Args, Internal_Args, InvalidArgument_Args,
+            NotFound_Args,
+        };
+        let message = || "it went wrong".to_string();
+        for kind in [
+            ApiErrorKind::GitlabError(Some(GitlabError_Args {
+                message: message(),
+                status: Some(403),
+            })),
+            ApiErrorKind::GitlabUnavailable(Some(GitlabUnavailable_Args { message: message() })),
+            ApiErrorKind::Internal(Some(Internal_Args { message: message() })),
+            ApiErrorKind::InvalidArgument(Some(InvalidArgument_Args {
+                argument: "limit".into(),
+                message: message(),
+            })),
+            ApiErrorKind::NotFound(Some(NotFound_Args { message: message() })),
+        ] {
+            assert_eq!(describe(&ApiError::from(kind)), "it went wrong");
+        }
     }
 
     #[test]

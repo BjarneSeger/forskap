@@ -153,7 +153,8 @@ func (c *Client) Close() error {
 }
 
 // Methods below map one-to-one onto the varlink interface. Errors returned by
-// the daemon surface as *GitlabError or *NotAuthenticated (match with errors.As);
+// the daemon surface as *InvalidArgument, *NotFound, *GitlabError,
+// *GitlabUnavailable, *Internal or *NotAuthenticated (match with errors.As);
 // optional parameters are pointers, where nil omits the field on the wire.
 
 // GetAssignedWorkItems returns the open issues assigned to the authenticated
@@ -235,11 +236,11 @@ func (c *Client) UnassignSelf(ctx context.Context, projectID, iid int64, kind Is
 // assigns the issue to the authenticated user (nil = nobody is assigned).
 //
 // Unlike the other writes it is never queued: without a live GitLab session
-// it fails with *NotAuthenticated, and any failure of the request, a network
-// error included, is a *GitlabError. Do not retry such a failure blindly:
-// GitLab may have created the issue before the answer was lost, and a second
-// call would file it again. A parent the daemon can't find fails before
-// anything is created. On success Search, ListWorkItems and (if GitLab
+// it fails with *NotAuthenticated, GitLab refusing it with *GitlabError, and
+// a network error, a 429 or a 5xx with *GitlabUnavailable. Do not retry the
+// last blindly: GitLab may have created the issue before the answer was lost,
+// and a second call would file it again. A parent the daemon can't find fails
+// before anything is created. On success Search, ListWorkItems and (if GitLab
 // assigned it) GetAssignedWorkItems show the issue at once.
 func (c *Client) CreateWorkItem(ctx context.Context, projectID int64, title string, description *string, labels *[]string, assignSelf *bool, parent *WorkItemRef) (iid int64, webURL string, err error) {
 	return CreateWorkItem().Call(ctx, c.conn, projectID, title, description, labels, assignSelf, parent)

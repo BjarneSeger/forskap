@@ -159,14 +159,66 @@ type SearchScope struct {
 // What ClearCache clears.
 type CacheScope string
 
-// GitLab rejected the request, or a local precondition failed (a malformed
-// reference or duration, an unknown failure id, …).
+// The call fits the interface, but an argument's value is not acceptable (a
+// number that isn't positive, a malformed duration, a blank title, …): nothing
+// was sent to GitLab or stored. argument names it ("limit", "project_id",
+// "iid", "duration", "title", "labels", "parent", …).
+type InvalidArgument struct {
+	Argument string `json:"argument"`
+	Message  string `json:"message"`
+}
+
+func (e InvalidArgument) Error() string {
+	s := "org.thehoster.forskapd.InvalidArgument"
+	s += fmt.Sprintf("(Argument: %v, Message: %v)", e.Argument, e.Message)
+	return s
+}
+
+// The daemon has no such thing: a failure id RetryFailure or DismissFailure
+// doesn't know.
+type NotFound struct {
+	Message string `json:"message"`
+}
+
+func (e NotFound) Error() string {
+	s := "org.thehoster.forskapd.NotFound"
+	s += fmt.Sprintf("(Message: %v)", e.Message)
+	return s
+}
+
+// GitLab answered and refused the request.
 type GitlabError struct {
 	Message string `json:"message"`
+	Status  *int64 `json:"status,omitempty"`
 }
 
 func (e GitlabError) Error() string {
 	s := "org.thehoster.forskapd.GitlabError"
+	s += fmt.Sprintf("(Message: %v, Status: %v)", e.Message, e.Status)
+	return s
+}
+
+// GitLab could not be reached, or answered 429 or 5xx, and the daemon did not
+// queue the call: whether GitLab carried it out is unknown.
+type GitlabUnavailable struct {
+	Message string `json:"message"`
+}
+
+func (e GitlabUnavailable) Error() string {
+	s := "org.thehoster.forskapd.GitlabUnavailable"
+	s += fmt.Sprintf("(Message: %v)", e.Message)
+	return s
+}
+
+// The daemon could not do it for a reason of its own: its keychain or its
+// storage failed, or the method is switched off (Login and Logout in a dry
+// run).
+type Internal struct {
+	Message string `json:"message"`
+}
+
+func (e Internal) Error() string {
+	s := "org.thehoster.forskapd.Internal"
 	s += fmt.Sprintf("(Message: %v)", e.Message)
 	return s
 }
@@ -187,12 +239,56 @@ func (e NotAuthenticated) Error() string {
 func Dispatch_Error(err error) error {
 	if e, ok := err.(*varlink.Error); ok {
 		switch e.Name {
+		case "org.thehoster.forskapd.InvalidArgument":
+			errorRawParameters := e.Parameters.(*json.RawMessage)
+			if errorRawParameters == nil {
+				return e
+			}
+			var param InvalidArgument
+			err := json.Unmarshal(*errorRawParameters, &param)
+			if err != nil {
+				return e
+			}
+			return &param
+		case "org.thehoster.forskapd.NotFound":
+			errorRawParameters := e.Parameters.(*json.RawMessage)
+			if errorRawParameters == nil {
+				return e
+			}
+			var param NotFound
+			err := json.Unmarshal(*errorRawParameters, &param)
+			if err != nil {
+				return e
+			}
+			return &param
 		case "org.thehoster.forskapd.GitlabError":
 			errorRawParameters := e.Parameters.(*json.RawMessage)
 			if errorRawParameters == nil {
 				return e
 			}
 			var param GitlabError
+			err := json.Unmarshal(*errorRawParameters, &param)
+			if err != nil {
+				return e
+			}
+			return &param
+		case "org.thehoster.forskapd.GitlabUnavailable":
+			errorRawParameters := e.Parameters.(*json.RawMessage)
+			if errorRawParameters == nil {
+				return e
+			}
+			var param GitlabUnavailable
+			err := json.Unmarshal(*errorRawParameters, &param)
+			if err != nil {
+				return e
+			}
+			return &param
+		case "org.thehoster.forskapd.Internal":
+			errorRawParameters := e.Parameters.(*json.RawMessage)
+			if errorRawParameters == nil {
+				return e
+			}
+			var param Internal
 			err := json.Unmarshal(*errorRawParameters, &param)
 			if err != nil {
 				return e
@@ -1612,12 +1708,48 @@ type VarlinkCall struct{ varlink.Call }
 
 // Generated reply methods for all varlink errors
 
-// GitLab rejected the request, or a local precondition failed (a malformed
-// reference or duration, an unknown failure id, …).
-func (c *VarlinkCall) ReplyGitlabError(ctx context.Context, message_ string) error {
+// The call fits the interface, but an argument's value is not acceptable (a
+// number that isn't positive, a malformed duration, a blank title, …): nothing
+// was sent to GitLab or stored. argument names it ("limit", "project_id",
+// "iid", "duration", "title", "labels", "parent", …).
+func (c *VarlinkCall) ReplyInvalidArgument(ctx context.Context, argument_ string, message_ string) error {
+	var out InvalidArgument
+	out.Argument = argument_
+	out.Message = message_
+	return c.ReplyError(ctx, "org.thehoster.forskapd.InvalidArgument", &out)
+}
+
+// The daemon has no such thing: a failure id RetryFailure or DismissFailure
+// doesn't know.
+func (c *VarlinkCall) ReplyNotFound(ctx context.Context, message_ string) error {
+	var out NotFound
+	out.Message = message_
+	return c.ReplyError(ctx, "org.thehoster.forskapd.NotFound", &out)
+}
+
+// GitLab answered and refused the request.
+func (c *VarlinkCall) ReplyGitlabError(ctx context.Context, message_ string, status_ *int64) error {
 	var out GitlabError
 	out.Message = message_
+	out.Status = status_
 	return c.ReplyError(ctx, "org.thehoster.forskapd.GitlabError", &out)
+}
+
+// GitLab could not be reached, or answered 429 or 5xx, and the daemon did not
+// queue the call: whether GitLab carried it out is unknown.
+func (c *VarlinkCall) ReplyGitlabUnavailable(ctx context.Context, message_ string) error {
+	var out GitlabUnavailable
+	out.Message = message_
+	return c.ReplyError(ctx, "org.thehoster.forskapd.GitlabUnavailable", &out)
+}
+
+// The daemon could not do it for a reason of its own: its keychain or its
+// storage failed, or the method is switched off (Login and Logout in a dry
+// run).
+func (c *VarlinkCall) ReplyInternal(ctx context.Context, message_ string) error {
+	var out Internal
+	out.Message = message_
+	return c.ReplyError(ctx, "org.thehoster.forskapd.Internal", &out)
 }
 
 // The daemon has no live GitLab session; detail carries the host and the
@@ -2358,9 +2490,32 @@ type SyncJob (
   expected: ?int
 )
 
-# GitLab rejected the request, or a local precondition failed (a malformed
-# reference or duration, an unknown failure id, …).
-error GitlabError (message: string)
+# The call fits the interface, but an argument's value is not acceptable (a
+# number that isn't positive, a malformed duration, a blank title, …): nothing
+# was sent to GitLab or stored. argument names it ("limit", "project_id",
+# "iid", "duration", "title", "labels", "parent", …).
+error InvalidArgument (argument: string, message: string)
+
+# The daemon has no such thing: a failure id RetryFailure or DismissFailure
+# doesn't know.
+error NotFound (message: string)
+
+# GitLab answered and refused the request.
+error GitlabError (
+  message: string,
+  # The HTTP status of GitLab's answer, 401 for a token it no longer takes;
+  # absent where the daemon has none (an answer it can't read).
+  status: ?int
+)
+
+# GitLab could not be reached, or answered 429 or 5xx, and the daemon did not
+# queue the call: whether GitLab carried it out is unknown.
+error GitlabUnavailable (message: string)
+
+# The daemon could not do it for a reason of its own: its keychain or its
+# storage failed, or the method is switched off (Login and Logout in a dry
+# run).
+error Internal (message: string)
 
 # Why the daemon has no GitLab session.
 type NotAuthReason (

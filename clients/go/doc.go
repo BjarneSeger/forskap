@@ -32,7 +32,8 @@
 //		fmt.Println(is.Iid, is.Title)
 //	}
 //
-// Errors returned by the daemon surface as *GitlabError or *NotAuthenticated;
-// match them with errors.As. Optional parameters are pointers, where nil omits
-// the field on the wire.
+// Errors returned by the daemon surface as *InvalidArgument, *NotFound,
+// *GitlabError, *GitlabUnavailable, *Internal or *NotAuthenticated; match
+// them with errors.As. Optional parameters are pointers, where nil omits the
+// field on the wire.
 package orgthehosterforskapd

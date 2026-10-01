@@ -74,3 +74,34 @@ func Example() {
 		fmt.Printf("#%d %s (%s)\n", w.Iid, w.Title, w.Type)
 	}
 }
+
+// Creating an issue is never queued, so its errors say what to do next.
+func ExampleClient_CreateWorkItem() {
+	ctx := context.Background()
+
+	c, err := forskap.Dial(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer c.Close()
+
+	labels := []string{"bug"}
+	iid, url, err := c.CreateWorkItem(ctx, 42, "Fix the login", nil, &labels, nil, nil)
+	var (
+		invalid *forskap.InvalidArgument
+		refused *forskap.GitlabError
+		unknown *forskap.GitlabUnavailable
+	)
+	switch {
+	case errors.As(err, &invalid):
+		log.Fatalf("%s: %s", invalid.Argument, invalid.Message)
+	case errors.As(err, &refused):
+		log.Fatalf("GitLab refused: %s", refused.Message)
+	case errors.As(err, &unknown):
+		// GitLab may have created it before the answer was lost.
+		log.Fatalf("look for the issue before creating it again: %s", unknown.Message)
+	case err != nil:
+		log.Fatal(err)
+	}
+	fmt.Printf("#%d %s\n", iid, url)
+}

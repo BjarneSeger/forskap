@@ -85,11 +85,27 @@ want of one.
 
 ### Errors
 
-Daemon-side errors surface as typed values you match with `errors.As`:
+Daemon-side errors surface as typed values you match with `errors.As`; each says what
+to do next, and all but `NotAuthenticated` carry a `.Message`:
 
-- `*forskap.GitlabError` — an upstream GitLab API error (`.Message`).
+- `*forskap.InvalidArgument` — an argument's value the daemon refuses up front
+  (`.Argument` names it); nothing was sent or stored.
+- `*forskap.NotFound` — the daemon has no such thing (a failure id it doesn't know).
+- `*forskap.GitlabError` — GitLab refused the request; `.Status` is its HTTP status,
+  `nil` where the daemon has none.
+- `*forskap.GitlabUnavailable` — GitLab was out of reach or answered 429/5xx and the
+  daemon did not queue the call: whether it was carried out is unknown.
+- `*forskap.Internal` — the daemon failed on its own (keychain, storage), or the
+  method is switched off.
 - `*forskap.NotAuthenticated` — no valid credentials; `.Reason` is one of the
   `forskap.Reason*` constants (e.g. `forskap.ReasonLoggedOut`), `.Detail` is optional.
+
+```go
+var unknown *forskap.GitlabUnavailable
+if errors.As(err, &unknown) {
+	// look before creating the issue again
+}
+```
 
 ### Optional parameters
 
@@ -167,10 +183,10 @@ iid, url, err := c.CreateWorkItem(ctx, projectID, "Fix the login", nil, &labels,
 ```
 
 It is the one write the daemon never queues: while GitLab is unreachable it fails
-with `*forskap.NotAuthenticated`, and any failure of the request is a
-`*forskap.GitlabError`, a parent it can't find included. Don't retry a failure
-blindly — GitLab may have created the issue before its answer was lost, and a
-second call files it again.
+with `*forskap.NotAuthenticated`, GitLab refusing it (a parent it can't find
+included) with `*forskap.GitlabError`, and a network error, a 429 or a 5xx with
+`*forskap.GitlabUnavailable`. Don't retry the last blindly — GitLab may have created
+the issue before its answer was lost, and a second call files it again.
 
 ## Regenerating
 

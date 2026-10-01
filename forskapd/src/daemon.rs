@@ -560,10 +560,18 @@ mod tests {
         items.iter().map(key).collect()
     }
 
-    fn gitlab_error(e: forskap_api::Error) -> String {
+    /// The message and status of a `GitlabError`.
+    fn gitlab_error(e: forskap_api::Error) -> (String, Option<i64>) {
         match e.kind() {
-            WireError::GitlabError(Some(args)) => args.message.clone(),
+            WireError::GitlabError(Some(args)) => (args.message.clone(), args.status),
             other => panic!("expected a GitlabError, got {other:?}"),
+        }
+    }
+
+    fn internal(e: forskap_api::Error) -> String {
+        match e.kind() {
+            WireError::Internal(Some(args)) => args.message.clone(),
+            other => panic!("expected an Internal, got {other:?}"),
         }
     }
 
@@ -821,7 +829,9 @@ mod tests {
             .close(ARCHIVED_PROJECT, 2, IssuableKind::work_item)
             .call()
             .await;
-        assert!(gitlab_error(archived.unwrap_err()).contains("archived"));
+        let (refused, status) = gitlab_error(archived.unwrap_err());
+        assert!(refused.contains("archived"), "{refused}");
+        assert_eq!(status, Some(403));
 
         run.stop().await;
     }
@@ -836,13 +846,13 @@ mod tests {
             .login("gitlab.com".into(), "glpat-not-a-token".into())
             .call()
             .await;
-        let refused = gitlab_error(login.unwrap_err());
+        let refused = internal(login.unwrap_err());
         assert!(
             refused.contains("logging in is disabled") && refused.contains("dry run"),
             "{refused}"
         );
         let logout = client.logout().call().await;
-        assert!(gitlab_error(logout.unwrap_err()).contains("logging out is disabled"));
+        assert!(internal(logout.unwrap_err()).contains("logging out is disabled"));
 
         let me = client.who_am_i().call().await.unwrap();
         assert_eq!(me.host, HOST, "still the demo account");

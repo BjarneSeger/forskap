@@ -32,8 +32,8 @@ use crate::usage::{UsageEntry, UsageRecord};
 use crate::write::{Write, WriteOp};
 
 use super::{
-    ConnState, Handlers, Session, dormant_args, issue_ref_error, looks_like_duration,
-    new_issue_error, now_secs, open_key, parent_epic, wire,
+    ConnState, Handlers, Invalid, Session, dormant_args, issue_ref_error, looks_like_duration,
+    new_issue_error, now_secs, open_key, parent_epic, reply_failed, wire,
 };
 
 /// How long `GetSyncJobs` waits for the worker, which answers between two
@@ -65,7 +65,9 @@ enum WriteOutcome {
     /// Applied, or queued for the retry worker.
     Accepted,
     NotAuthenticated(DormancyReason),
-    Rejected(Error),
+    /// Neither applied nor queued: GitLab refused it, or it may have landed
+    /// (a non-idempotent write on a 5xx).
+    Failed(Error),
 }
 
 /// Reply to a read whose source never synced — an honest `NotAuthenticated`
@@ -94,7 +96,7 @@ macro_rules! reply_write {
                 let (reason, detail) = dormant_args(&r);
                 $call.reply_not_authenticated(reason, detail)
             }
-            WriteOutcome::Rejected(e) => $call.reply_gitlab_error(e.to_string()),
+            WriteOutcome::Failed(e) => reply_failed($call, &e, e.to_string()),
         }
     };
 }
@@ -246,7 +248,7 @@ impl Handlers {
 
     /// The shared write cascade: try once while connected; queue the write
     /// when GitLab is unreachable or the failure is retryable; otherwise hand
-    /// the rejection back.
+    /// the failure back.
     async fn perform_write(&self, write: Write) -> WriteOutcome {
         let (kind, project_id, iid, op) =
             (write.kind, write.project_id, write.iid, write.op.name());
@@ -278,8 +280,8 @@ impl Handlers {
                 WriteOutcome::Accepted
             }
             Err(e) => {
-                warn!(error = %e, project_id, iid, op, "write rejected by GitLab");
-                WriteOutcome::Rejected(e)
+                warn!(error = %e, project_id, iid, op, "write failed, not queued");
+                WriteOutcome::Failed(e)
             }
         }
     }
@@ -304,7 +306,8 @@ impl Handlers {
         if let Some(epic) = self.row::<model::Epic>((group_id as u64, iid as u64)) {
             return Ok(epic.id);
         }
-        let epic: model::Epic = serde_json::from_value(gitlab.epic(group_id, iid).await?)?;
+        let epic: model::Epic = serde_json::from_value(gitlab.epic(group_id, iid).await?)
+            .map_err(|e| Error::Gitlab(format!("GitLab's answer is no epic: {e}")))?;
         match epic.id {
             id if id > 0 => Ok(id),
             _ => Err(Error::Gitlab("GitLab's answer carries no epic id".into())),
@@ -791,7 +794,7 @@ impl VarlinkInterface for Handlers {
         let limit = match limit {
             None => DEFAULT_SEARCH_LIMIT,
             Some(n) if n > 0 => n as usize,
-            Some(n) => return call.reply_gitlab_error(format!("invalid limit: {n}")),
+            Some(n) => return Invalid::new("limit", format!("invalid limit: {n}")).reply(call),
         };
         let kinds = kinds.unwrap_or_default();
         let want = |k: SearchKind| kinds.is_empty() || kinds.contains(&k);
@@ -1021,11 +1024,12 @@ impl VarlinkInterface for Handlers {
         duration: String,
         summary: Option<String>,
     ) -> varlink::Result<()> {
-        if let Some(msg) = issue_ref_error(project_id, iid) {
-            return call.reply_gitlab_error(msg);
+        if let Some(invalid) = issue_ref_error(project_id, iid) {
+            return invalid.reply(call);
         }
         if !looks_like_duration(&duration) {
-            return call.reply_gitlab_error(format!("invalid duration: {duration:?}"));
+            let message = format!("invalid duration: {duration:?}");
+            return Invalid::new("duration", message).reply(call);
         }
         let write = Write {
             kind: wire::internal_kind(&kind),
@@ -1218,10 +1222,10 @@ impl VarlinkInterface for Handlers {
                 info!(id, "re-enqueued dead-letter task");
                 call.reply()
             }
-            Ok(false) => call.reply_gitlab_error(format!("no failed task with id {id}")),
+            Ok(false) => call.reply_not_found(format!("no failed task with id {id}")),
             Err(e) => {
                 warn!(error = %e, id, "retry_failure failed");
-                call.reply_gitlab_error(e.to_string())
+                reply_failed(call, &e, e.to_string())
             }
         }
     }
@@ -1237,10 +1241,10 @@ impl VarlinkInterface for Handlers {
                 info!(id, "dismissed dead-letter task");
                 call.reply()
             }
-            Ok(false) => call.reply_gitlab_error(format!("no failed task with id {id}")),
+            Ok(false) => call.reply_not_found(format!("no failed task with id {id}")),
             Err(e) => {
                 warn!(error = %e, id, "dismiss_failure failed");
-                call.reply_gitlab_error(e.to_string())
+                reply_failed(call, &e, e.to_string())
             }
         }
     }
@@ -1249,7 +1253,7 @@ impl VarlinkInterface for Handlers {
     async fn clear_failures(&self, call: &mut dyn Call_ClearFailures) -> varlink::Result<()> {
         if let Err(e) = self.queue.clear_failures() {
             warn!(error = %e, "clear_failures failed");
-            return call.reply_gitlab_error(e.to_string());
+            return reply_failed(call, &e, e.to_string());
         }
         info!("cleared dead-letter queue");
         call.reply()
@@ -1266,7 +1270,7 @@ impl VarlinkInterface for Handlers {
     ) -> varlink::Result<()> {
         let key = match open_key(&kind, iid, project_id, group_id) {
             Ok(key) => key,
-            Err(msg) => return call.reply_gitlab_error(msg),
+            Err(invalid) => return invalid.reply(call),
         };
         // Local bookkeeping only — no GitLab, so it works while dormant.
         let retention_secs = self.config.read().unwrap().usage.retention().as_secs();
@@ -1276,7 +1280,7 @@ impl VarlinkInterface for Handlers {
             .record(&key, now, now.saturating_sub(retention_secs))
         {
             warn!(error = %e, key, "record_open failed");
-            return call.reply_gitlab_error(e.to_string());
+            return reply_failed(call, &e, e.to_string());
         }
         debug!(key, "recorded open");
         call.reply()
@@ -1290,8 +1294,8 @@ impl VarlinkInterface for Handlers {
         iid: i64,
         kind: IssuableKind,
     ) -> varlink::Result<()> {
-        if let Some(msg) = issue_ref_error(project_id, iid) {
-            return call.reply_gitlab_error(msg);
+        if let Some(invalid) = issue_ref_error(project_id, iid) {
+            return invalid.reply(call);
         }
         let write = Write {
             kind: wire::internal_kind(&kind),
@@ -1310,8 +1314,8 @@ impl VarlinkInterface for Handlers {
         iid: i64,
         kind: IssuableKind,
     ) -> varlink::Result<()> {
-        if let Some(msg) = issue_ref_error(project_id, iid) {
-            return call.reply_gitlab_error(msg);
+        if let Some(invalid) = issue_ref_error(project_id, iid) {
+            return invalid.reply(call);
         }
         let write = Write {
             kind: wire::internal_kind(&kind),
@@ -1330,8 +1334,8 @@ impl VarlinkInterface for Handlers {
         iid: i64,
         kind: IssuableKind,
     ) -> varlink::Result<()> {
-        if let Some(msg) = issue_ref_error(project_id, iid) {
-            return call.reply_gitlab_error(msg);
+        if let Some(invalid) = issue_ref_error(project_id, iid) {
+            return invalid.reply(call);
         }
         let write = Write {
             kind: wire::internal_kind(&kind),
@@ -1357,12 +1361,12 @@ impl VarlinkInterface for Handlers {
         parent: Option<WorkItemRef>,
     ) -> varlink::Result<()> {
         let labels = labels.unwrap_or_default();
-        if let Some(msg) = new_issue_error(project_id, &title, &labels) {
-            return call.reply_gitlab_error(msg);
+        if let Some(invalid) = new_issue_error(project_id, &title, &labels) {
+            return invalid.reply(call);
         }
         let parent = match parent.as_ref().map(parent_epic).transpose() {
             Ok(parent) => parent,
-            Err(msg) => return call.reply_gitlab_error(msg),
+            Err(invalid) => return invalid.reply(call),
         };
         // Whatever keeps the session away: nothing is deferred.
         let session = match self.current_session().await {
@@ -1380,9 +1384,9 @@ impl VarlinkInterface for Handlers {
                     Ok(id) => Some(id),
                     Err(e) => {
                         warn!(error = %e, group_id, iid, "looking up the parent epic failed");
-                        return call.reply_gitlab_error(format!(
-                            "looking up the parent epic &{iid} of group {group_id}: {e}"
-                        ));
+                        let message =
+                            format!("looking up the parent epic &{iid} of group {group_id}: {e}");
+                        return reply_failed(call, &e, message);
                     }
                 }
             }
@@ -1400,7 +1404,7 @@ impl VarlinkInterface for Handlers {
             // same. The sync worker stays the one to judge the session.
             Err(e) => {
                 warn!(error = %e, project_id, "creating an issue failed");
-                return call.reply_gitlab_error(e.to_string());
+                return reply_failed(call, &e, e.to_string());
             }
         };
 
@@ -1440,14 +1444,14 @@ impl VarlinkInterface for Handlers {
         // down before GitLab is asked.
         if let Err(e) = self.keychain.require() {
             warn!("Login refused: no keychain");
-            return call.reply_gitlab_error(format!("logging in is disabled: {e}"));
+            return reply_failed(call, &e, format!("logging in is disabled: {e}"));
         }
         let token = Token::new(token);
         let client = match GitlabClient::connect_with_retry(&host, &token).await {
             Ok(c) => c,
             Err(e) => {
                 warn!(error = %e, host, "Login: connecting to GitLab failed");
-                return call.reply_gitlab_error(e.to_string());
+                return reply_failed(call, &e, e.to_string());
             }
         };
         let creds = Credentials {
@@ -1456,7 +1460,7 @@ impl VarlinkInterface for Handlers {
         };
         if let Err(e) = self.keychain.store(&creds).await {
             warn!(error = %e, "Login: keychain write failed");
-            return call.reply_gitlab_error(format!("keychain write failed: {e}"));
+            return reply_failed(call, &e, format!("keychain write failed: {e}"));
         }
         let session = Session::from_client(client);
         info!(host, user_id = session.user_id, "logged in");
@@ -1472,13 +1476,13 @@ impl VarlinkInterface for Handlers {
         // Nothing to forget without a keychain: the session stays.
         if let Err(e) = self.keychain.require() {
             warn!("Logout refused: no keychain");
-            return call.reply_gitlab_error(format!("logging out is disabled: {e}"));
+            return reply_failed(call, &e, format!("logging out is disabled: {e}"));
         }
         *self.session.write().await = ConnState::Dormant(DormancyReason::LoggedOut);
         self.rotation.reevaluate();
         if let Err(e) = self.keychain.delete().await {
             warn!(error = %e, "Logout: keychain delete failed");
-            return call.reply_gitlab_error(format!("keychain delete failed: {e}"));
+            return reply_failed(call, &e, format!("keychain delete failed: {e}"));
         }
         info!("logged out");
         call.reply()

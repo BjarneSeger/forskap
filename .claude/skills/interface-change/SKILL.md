@@ -41,20 +41,26 @@ optional ones (the generator's output changed: adapt `OmitAbsent`).
   (`impl VarlinkInterface for Handlers`). Follow the cascade style: validate eagerly
   (`issue_ref_error`, `looks_like_duration` in `handlers/mod.rs`), consult cache,
   fall back to GitLab, reply.
-- Error replies: GitLab rejection → `call.reply_gitlab_error(msg)`; dormant session →
-  `call.reply_not_authenticated(reason, detail)` via `dormant_args(&e)`.
+- Error replies: a refused argument value → `Invalid::new(argument, msg).reply(call)`
+  (`InvalidArgument`); a failed `Error` → `reply_failed(call, &e, msg)`, which picks
+  `GitlabError` (with the status), `GitlabUnavailable` or `Internal` by `e.verdict()`
+  (`error.rs`); an unknown id → `call.reply_not_found(msg)`; dormant session →
+  `call.reply_not_authenticated(reason, detail)` via `dormant_args(&e)`. Never tell
+  them apart by message text.
 - **Write methods** (anything mutating GitLab) go through the shared cascade: add a
   `WriteOp` variant in `write.rs` (its `apply` arm and `idempotent()` answer), then call
   `perform_write` and `reply_write!` in `varlink.rs` like the existing writes. It tries
-  once, queues on `Unreachable` or a retryable error, and only a real GitLab rejection
-  returns `GitlabError`. A write never demotes the session — the sync worker is the
+  once, queues on `Unreachable` or a retryable error, and replies the rest by its
+  verdict: `GitlabError` for a refusal, `GitlabUnavailable` for a non-idempotent write
+  on a 5xx. A write never demotes the session — the sync worker is the
   demotion authority. Extend `Job::affected_by` so the right views re-sync after it.
   **Exception: a write that creates something** (`CreateWorkItem`) is not a `WriteOp` and
   never goes through `perform_write`/`defer`. `WriteOp`s are persisted and address an
   existing `(kind, project_id, iid)`; a create has no `iid` and no idempotency key, so
   a queued or replayed one could file its item twice. It calls GitLab once from the
-  handler, replies `NotAuthenticated` for every dormancy reason and `GitlabError` for
-  every failure, and after GitLab succeeded it must not fail any more: the created row
+  handler, replies `NotAuthenticated` for every dormancy reason and every failure by
+  its verdict (`GitlabUnavailable`: the outcome is unknown), and after GitLab
+  succeeded it must not fail any more: the created row
   goes to the sync worker (`SyncHandle::land_issue`, the only store writer) and the
   reply is sent whether or not that landed in time.
 - **Read methods** only read the sync store (`self.sync.store()`); never call GitLab.

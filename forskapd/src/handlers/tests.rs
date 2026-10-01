@@ -6,10 +6,11 @@ use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 
 use forskap_api::{
-    AsyncCall, CacheScope, Call_ClearCache, Call_Close, Call_CreateWorkItem, Call_GetActivity,
-    Call_GetAssignedMergeRequests, Call_GetAssignedWorkItems, Call_GetHistory, Call_GetStatus,
-    Call_GetSyncJobs, Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_Search,
-    Call_UnassignSelf, Call_WhoAmI, CreateWorkItem_Reply, GetActivity_Reply,
+    AsyncCall, CacheScope, Call_AssignSelf, Call_ClearCache, Call_Close, Call_CreateWorkItem,
+    Call_DismissFailure, Call_GetActivity, Call_GetAssignedMergeRequests,
+    Call_GetAssignedWorkItems, Call_GetHistory, Call_GetStatus, Call_GetSyncJobs,
+    Call_ListWorkItems, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
+    Call_Search, Call_UnassignSelf, Call_WhoAmI, CreateWorkItem_Reply, GetActivity_Reply,
     GetAssignedMergeRequests_Reply, GetAssignedWorkItems_Reply, GetHistory_Reply, GetStatus_Reply,
     GetSyncJobs_Reply, HistorySource, IssuableKind, ListWorkItems_Reply, MergeRequest,
     Search_Reply, SearchKind, SearchScope, SyncJobStatus, VarlinkInterface, WhoAmI_Reply, WorkItem,
@@ -36,6 +37,10 @@ use crate::write::{Write, WriteOp};
 
 const NOT_AUTHENTICATED: &str = "org.thehoster.forskapd.NotAuthenticated";
 const GITLAB_ERROR: &str = "org.thehoster.forskapd.GitlabError";
+const GITLAB_UNAVAILABLE: &str = "org.thehoster.forskapd.GitlabUnavailable";
+const INVALID_ARGUMENT: &str = "org.thehoster.forskapd.InvalidArgument";
+const NOT_FOUND: &str = "org.thehoster.forskapd.NotFound";
+const INTERNAL: &str = "org.thehoster.forskapd.Internal";
 
 // ── Scaffolding ────────────────────────────────────────────────────────
 
@@ -334,10 +339,37 @@ fn reply<T: serde::de::DeserializeOwned>(call: &mut AsyncCall) -> T {
 }
 
 fn reply_error(call: &mut AsyncCall) -> Option<String> {
-    call.take_reply()
-        .expect("a reply")
-        .error
-        .map(|e| e.to_string())
+    reply_error_with(call).map(|(name, _)| name)
+}
+
+/// The error a call replied and its parameters, `None` for a success.
+fn reply_error_with(call: &mut AsyncCall) -> Option<(String, serde_json::Value)> {
+    let reply = call.take_reply().expect("a reply");
+    Some((
+        reply.error?.to_string(),
+        reply.parameters.unwrap_or_default(),
+    ))
+}
+
+/// The argument an `InvalidArgument` reply names; panics on any other reply.
+fn invalid_argument(call: &mut AsyncCall) -> String {
+    match reply_error_with(call) {
+        Some((name, args)) if name == INVALID_ARGUMENT => {
+            assert!(args["message"].is_string(), "{args}");
+            args["argument"].as_str().unwrap().to_string()
+        }
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}
+
+/// The status a `GitlabError` reply carries; panics on any other reply.
+fn gitlab_status(call: &mut AsyncCall) -> Option<i64> {
+    match reply_error_with(call) {
+        Some((name, args)) if name == GITLAB_ERROR => {
+            args.get("status").map(|s| s.as_i64().unwrap())
+        }
+        other => panic!("expected GitlabError, got {other:?}"),
+    }
 }
 
 async fn assigned_work_items(h: &Handlers, groups: Option<Vec<String>>) -> Vec<WorkItem> {
@@ -641,13 +673,83 @@ fn looks_like_duration_accepts_valid_and_rejects_typos() {
     }
 }
 
+/// Named by the argument that is off, while dormant too.
 #[tokio::test]
-async fn close_rejects_bad_issuable_ref() {
+async fn writes_refuse_a_bad_issuable_ref() {
     let (h, _dir) = dormant_handlers();
-    assert_eq!(
-        close(&h, 0, 42, IssuableKind::work_item).await.as_deref(),
-        Some(GITLAB_ERROR)
-    );
+    for (project_id, iid, argument) in
+        [(0, 42, "project_id"), (7, -1, "iid"), (-1, 0, "project_id")]
+    {
+        let mut call = AsyncCall::default();
+        h.close(
+            &mut call as &mut dyn Call_Close,
+            project_id,
+            iid,
+            IssuableKind::work_item,
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid_argument(&mut call), argument);
+        let mut call = AsyncCall::default();
+        h.assign_self(
+            &mut call as &mut dyn Call_AssignSelf,
+            project_id,
+            iid,
+            IssuableKind::merge_request,
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid_argument(&mut call), argument);
+        let mut call = AsyncCall::default();
+        h.unassign_self(
+            &mut call as &mut dyn Call_UnassignSelf,
+            project_id,
+            iid,
+            IssuableKind::work_item,
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid_argument(&mut call), argument);
+    }
+    let mut call = AsyncCall::default();
+    h.post_time(
+        &mut call as &mut dyn Call_PostTime,
+        7,
+        42,
+        IssuableKind::work_item,
+        "soon".into(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(invalid_argument(&mut call), "duration");
+    assert!(h.queue.pending().unwrap().is_empty());
+}
+
+/// GitLab's refusal of a write comes back with its status, a dead token's
+/// too; nothing is queued.
+#[tokio::test]
+async fn a_refused_write_replies_gitlab_error_with_the_status() {
+    for (err, status) in [
+        (FakeErr::Rejected, Some(403)),
+        (FakeErr::RejectedWith(404), Some(404)),
+        (FakeErr::Unauthorized, Some(401)),
+    ] {
+        let fake = Arc::new(FakeGitlab::default());
+        fake.fail_next_write(err);
+        let (h, _dir) = connected_handlers(&fake);
+        let mut call = AsyncCall::default();
+        h.close(
+            &mut call as &mut dyn Call_Close,
+            7,
+            42,
+            IssuableKind::work_item,
+        )
+        .await
+        .unwrap();
+        assert_eq!(gitlab_status(&mut call), status, "{err:?}");
+        assert!(h.queue.pending().unwrap().is_empty(), "{err:?}");
+    }
 }
 
 // ── Writes ─────────────────────────────────────────────────────────────
@@ -673,18 +775,19 @@ async fn post_time_rejects_when_dormant_but_not_unreachable() {
 }
 
 /// A 429 is refused before GitLab does any work, so even a PostTime is safe
-/// to queue; a 5xx may already have booked the time, so it is reported.
+/// to queue; a 5xx may already have booked the time, so it is reported as an
+/// unknown outcome.
 #[tokio::test]
 async fn post_time_queues_rate_limits_but_reports_server_errors() {
-    for (status, queued) in [(429, true), (502, false)] {
+    for (status, error) in [(429, None), (502, Some(GITLAB_UNAVAILABLE))] {
         let fake = Arc::new(FakeGitlab::default());
         fake.fail_next_write(FakeErr::Throttled(status));
         let (h, _dir) = connected_handlers(&fake);
-        let error = post_time(&h, 7, 42, IssuableKind::work_item).await;
-        assert_eq!(error.is_none(), queued, "{status}");
+        let replied = post_time(&h, 7, 42, IssuableKind::work_item).await;
+        assert_eq!(replied.as_deref(), error, "{status}");
         assert_eq!(
             h.queue.pending().unwrap().len(),
-            usize::from(queued),
+            usize::from(error.is_none()),
             "{status}"
         );
     }
@@ -761,18 +864,23 @@ async fn an_applied_write_reruns_the_jobs_that_show_it() {
 async fn create_work_item_rejects_a_blank_title_or_bad_project() {
     let fake = Arc::new(FakeGitlab::default());
     let (h, _dir) = connected_handlers(&fake);
-    for (project_id, title) in [(7, ""), (7, " \t\n"), (0, "Fix it"), (-3, "Fix it")] {
+    for (project_id, title, argument) in [
+        (7, "", "title"),
+        (7, " \t\n", "title"),
+        (0, "Fix it", "project_id"),
+        (-3, "Fix it", "project_id"),
+    ] {
         let mut call = create_work_item(&h, project_id, title, None).await;
         assert_eq!(
-            reply_error(&mut call).as_deref(),
-            Some(GITLAB_ERROR),
+            invalid_argument(&mut call),
+            argument,
             "{project_id} {title:?}"
         );
     }
     // GitLab would read one label with a comma as two.
     let labels = ["bug", "auth,flow"];
     let mut call = create_work_item_with(&h, 7, "Fix it", None, Some(&labels), None, None).await;
-    assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
+    assert_eq!(invalid_argument(&mut call), "labels");
 
     assert!(fake.writes().is_empty(), "refused before GitLab is asked");
     assert_eq!(fake.read_calls(), 0);
@@ -780,7 +888,7 @@ async fn create_work_item_rejects_a_blank_title_or_bad_project() {
     // Refused while dormant too, as what it is: an invalid call.
     let (h, _dir) = dormant_handlers();
     let mut call = create_work_item(&h, 7, "", None).await;
-    assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
+    assert_eq!(invalid_argument(&mut call), "title");
 }
 
 /// Where the other writes are queued, a create fails: a replay has nothing
@@ -794,7 +902,7 @@ async fn create_work_item_is_never_queued() {
         assert!(h.queue.failures().unwrap().is_empty());
     }
 
-    // The failures every other write is queued on.
+    // The failures every other write is queued on: the outcome is unknown.
     for err in [
         FakeErr::Transient,
         FakeErr::Throttled(429),
@@ -806,7 +914,7 @@ async fn create_work_item_is_never_queued() {
         let mut call = create_work_item(&h, 7, "Fix it", None).await;
         assert_eq!(
             reply_error(&mut call).as_deref(),
-            Some(GITLAB_ERROR),
+            Some(GITLAB_UNAVAILABLE),
             "{err:?}"
         );
         assert!(h.queue.pending().unwrap().is_empty(), "{err:?}");
@@ -820,15 +928,17 @@ async fn create_work_item_is_never_queued() {
     }
 }
 
-/// A 401 included: the sync worker judges the session, not a write.
+/// A refusal with its status, an unknown outcome as such; a 401 included:
+/// the sync worker judges the session, not a write.
 #[tokio::test]
 async fn create_work_item_reports_any_gitlab_failure_without_demoting() {
-    for err in [
-        FakeErr::Transient,
-        FakeErr::Throttled(429),
-        FakeErr::Throttled(502),
-        FakeErr::Rejected,
-        FakeErr::Unauthorized,
+    for (err, replied, status) in [
+        (FakeErr::Transient, GITLAB_UNAVAILABLE, None),
+        (FakeErr::Throttled(429), GITLAB_UNAVAILABLE, None),
+        (FakeErr::Throttled(502), GITLAB_UNAVAILABLE, None),
+        (FakeErr::Rejected, GITLAB_ERROR, Some(403)),
+        (FakeErr::RejectedWith(422), GITLAB_ERROR, Some(422)),
+        (FakeErr::Unauthorized, GITLAB_ERROR, Some(401)),
     ] {
         let fake = Arc::new(FakeGitlab::default());
         fake.fail_next_write(err);
@@ -836,9 +946,11 @@ async fn create_work_item_reports_any_gitlab_failure_without_demoting() {
         seed_recent_issues(&h);
 
         let mut call = create_work_item(&h, 7, "Fix it", Some(true)).await;
+        let (name, args) = reply_error_with(&mut call).unwrap();
+        assert_eq!(name, replied, "{err:?}");
         assert_eq!(
-            reply_error(&mut call).as_deref(),
-            Some(GITLAB_ERROR),
+            args.get("status").and_then(|s| s.as_i64()),
+            status,
             "{err:?}"
         );
         assert!(
@@ -987,10 +1099,12 @@ async fn a_failed_parent_lookup_creates_nothing() {
     // Not served at all: a 404.
     let (h, _dir) = connected_handlers(&fake);
 
-    for _ in 0..3 {
+    for _ in 0..2 {
         let mut call = create_under(&h, parent(9, 4)).await;
-        assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
+        assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_UNAVAILABLE));
     }
+    let mut call = create_under(&h, parent(9, 4)).await;
+    assert_eq!(gitlab_status(&mut call), Some(404));
     assert_eq!(fake.epic_calls().len(), 3, "each looked up once");
     assert!(fake.created().is_empty() && fake.writes().is_empty());
     assert!(h.queue.pending().unwrap().is_empty());
@@ -1003,7 +1117,16 @@ async fn a_failed_parent_lookup_creates_nothing() {
     fake.serve_epic(unnamed);
     let (h, _dir) = connected_handlers(&fake);
     let mut call = create_under(&h, parent(9, 4)).await;
-    assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
+    assert_eq!(gitlab_status(&mut call), None, "no status to an answer");
+    assert!(fake.created().is_empty());
+    // Nor one the epic mirror can't read.
+    let fake = Arc::new(FakeGitlab::default());
+    let mut unreadable = epic_json(9, 4, "Roadmap");
+    unreadable["id"] = "9004".into();
+    fake.serve_epic(unreadable);
+    let (h, _dir) = connected_handlers(&fake);
+    let mut call = create_under(&h, parent(9, 4)).await;
+    assert_eq!(gitlab_status(&mut call), None);
     assert!(fake.created().is_empty());
 }
 
@@ -1035,18 +1158,14 @@ async fn create_work_item_refuses_a_parent_that_is_no_epic() {
         parent(-1, 4),
     ] {
         let mut call = create_under(&h, refused.clone()).await;
-        assert_eq!(
-            reply_error(&mut call).as_deref(),
-            Some(GITLAB_ERROR),
-            "{refused:?}"
-        );
+        assert_eq!(invalid_argument(&mut call), "parent", "{refused:?}");
     }
     assert_eq!(fake.read_calls(), 0);
     assert!(fake.writes().is_empty());
 
     let (h, _dir) = dormant_handlers();
     let mut call = create_under(&h, parent(9, 0)).await;
-    assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
+    assert_eq!(invalid_argument(&mut call), "parent");
 }
 
 /// The issue exists: an answer the daemon can't read must not read as a
@@ -1743,26 +1862,56 @@ async fn record_open_counts_project_and_group_work_items_apart() {
 async fn record_open_refuses_a_malformed_reference() {
     let (h, _dir) = dormant_handlers();
     let (item, mr) = (IssuableKind::work_item, IssuableKind::merge_request);
-    for (kind, iid, project_id, group_id) in [
-        (item.clone(), 7, None, None),
-        (item.clone(), 7, Some(1), Some(5)),
-        (mr.clone(), 7, None, Some(5)),
-        (mr.clone(), 7, None, None),
-        (item.clone(), 0, Some(1), None),
-        (item.clone(), 7, Some(0), None),
-        (item.clone(), 7, Some(-1), None),
-        (item.clone(), 0, None, Some(5)),
-        (item.clone(), 7, None, Some(0)),
-        (mr.clone(), -1, Some(1), None),
+    for (kind, iid, project_id, group_id, argument) in [
+        (item.clone(), 7, None, None, "project_id"),
+        (item.clone(), 7, Some(1), Some(5), "group_id"),
+        (mr.clone(), 7, None, Some(5), "group_id"),
+        (mr.clone(), 7, None, None, "project_id"),
+        (item.clone(), 0, Some(1), None, "iid"),
+        (item.clone(), 7, Some(0), None, "project_id"),
+        (item.clone(), 7, Some(-1), None, "project_id"),
+        (item.clone(), 0, None, Some(5), "iid"),
+        (item.clone(), 7, None, Some(0), "group_id"),
+        (mr.clone(), -1, Some(1), None, "iid"),
     ] {
-        let error = record_open(&h, kind.clone(), iid, project_id, group_id).await;
+        let mut call = AsyncCall::default();
+        h.record_open(
+            &mut call as &mut dyn Call_RecordOpen,
+            kind.clone(),
+            iid,
+            project_id,
+            group_id,
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            error.as_deref(),
-            Some(GITLAB_ERROR),
+            invalid_argument(&mut call),
+            argument,
             "{kind:?} {iid} {project_id:?} {group_id:?}"
         );
     }
     assert!(h.usage.snapshot().unwrap().entries.is_empty());
+}
+
+#[tokio::test]
+async fn search_refuses_a_limit_that_is_not_positive() {
+    let (h, _dir) = dormant_handlers();
+    seed_corpus(&h);
+    for limit in [0, -1] {
+        let mut call = AsyncCall::default();
+        h.search(
+            &mut call as &mut dyn Call_Search,
+            "oauth".into(),
+            None,
+            Some(limit),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid_argument(&mut call), "limit");
+    }
 }
 
 #[tokio::test]
@@ -2429,6 +2578,58 @@ async fn clear_cache_waits_for_new_board_columns() {
     assert_eq!(issues[0].graph_status, "Doing");
 }
 
+// ── Dead letters ───────────────────────────────────────────────────────
+
+/// An id the dead-letter store doesn't hold is the daemon's, not GitLab's.
+#[tokio::test]
+async fn an_unknown_failure_id_is_not_found() {
+    let (h, _dir) = dormant_handlers();
+    let mut call = AsyncCall::default();
+    h.retry_failure(&mut call as &mut dyn Call_RetryFailure, 999)
+        .await
+        .unwrap();
+    assert_eq!(reply_error(&mut call).as_deref(), Some(NOT_FOUND));
+    let mut call = AsyncCall::default();
+    h.dismiss_failure(&mut call as &mut dyn Call_DismissFailure, 999)
+        .await
+        .unwrap();
+    let (name, args) = reply_error_with(&mut call).unwrap();
+    assert_eq!(name, NOT_FOUND);
+    assert_eq!(args["message"], "no failed task with id 999");
+}
+
+// ── Session ────────────────────────────────────────────────────────────
+
+/// Without a keychain both are switched off: the daemon's own refusal,
+/// before GitLab is asked.
+#[tokio::test]
+async fn login_and_logout_without_a_keychain_are_internal() {
+    let fake = Arc::new(FakeGitlab::default());
+    let (h, _dir) = connected_handlers(&fake);
+    let mut call = AsyncCall::default();
+    h.login(
+        &mut call as &mut dyn Call_Login,
+        "gitlab.invalid".into(),
+        "glpat-x".into(),
+    )
+    .await
+    .unwrap();
+    let (name, args) = reply_error_with(&mut call).unwrap();
+    assert_eq!(name, INTERNAL);
+    assert!(
+        args["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("logging in is disabled"),
+        "{args}"
+    );
+    let mut call = AsyncCall::default();
+    h.logout(&mut call as &mut dyn Call_Logout).await.unwrap();
+    assert_eq!(reply_error(&mut call).as_deref(), Some(INTERNAL));
+    assert!(matches!(&*h.session.read().await, ConnState::Connected(_)));
+    assert_eq!(fake.read_calls(), 0);
+}
+
 // ── WhoAmI ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -2713,7 +2914,7 @@ proptest! {
             let error = reply_error(&mut call);
 
             if matches!(limit, Some(n) if n <= 0) {
-                assert_eq!(error.as_deref(), Some(GITLAB_ERROR), "bad args are rejected eagerly");
+                assert_eq!(error.as_deref(), Some(INVALID_ARGUMENT), "bad args are rejected eagerly");
             } else {
                 assert_eq!(error, None, "valid args succeed");
             }
@@ -2777,7 +2978,7 @@ proptest! {
             .unwrap();
 
             let valid = issue_ref_error(project_id, iid).is_none() && looks_like_duration(&duration);
-            let expected = if valid { NOT_AUTHENTICATED } else { GITLAB_ERROR };
+            let expected = if valid { NOT_AUTHENTICATED } else { INVALID_ARGUMENT };
             assert_eq!(reply_error(&mut call).as_deref(), Some(expected));
             assert!(h.queue.pending().unwrap().is_empty());
         });

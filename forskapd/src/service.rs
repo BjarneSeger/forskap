@@ -645,7 +645,7 @@ mod tests {
             ("GetStatus", None),
             ("WhoAmI", Some("org.thehoster.forskapd.NotAuthenticated")),
             // The tests' disabled keychain turns it down.
-            ("Logout", Some("org.thehoster.forskapd.GitlabError")),
+            ("Logout", Some("org.thehoster.forskapd.Internal")),
         ] {
             for params in [None, Some(serde_json::json!({}))] {
                 let reply = handle_forskapd(

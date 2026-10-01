@@ -85,7 +85,10 @@ error), `create_work_item` / `create_work_item_with` / `create_under(h, parent(g
 iid))` (they return the call, for either of the next two; `created_json(iid, title,
 assignees)` is a row to `serve_create`); `reply::<T_Reply>(&mut call)` parses success,
 `reply_error(&mut call)` returns the error name (`NOT_AUTHENTICATED`,
-`GITLAB_ERROR` constants).
+`GITLAB_ERROR`, `GITLAB_UNAVAILABLE`, `INVALID_ARGUMENT`, `NOT_FOUND`, `INTERNAL`
+constants), `reply_error_with` the name and its parameters; `invalid_argument(&mut
+call)` asserts an `InvalidArgument` and returns the argument it names,
+`gitlab_status(&mut call)` asserts a `GitlabError` and returns its status.
 
 **Reconnect-signal assertions**: demotion woke the supervisor →
 `tokio::time::timeout(Duration::from_millis(200), h.reconnect_signal.notified())`

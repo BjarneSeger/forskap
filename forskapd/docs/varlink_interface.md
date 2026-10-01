@@ -27,8 +27,9 @@ methods serve whatever was last synced from the local store
 **Write model**: the methods that change an existing issue or merge request reply
 success even when GitLab is unreachable — the
 operation is persisted to a retry queue and drained on reconnect (exponential backoff,
-dead-lettered after the retry window; see `GetFailures`). Only an actual GitLab
-*rejection* surfaces as `GitlabError`. The reads reflect a write at once — a queued
+dead-lettered after the retry window; see `GetFailures`). Only GitLab *refusing* it
+surfaces as `GitlabError`, and a `PostTime` GitLab answered with a 5xx as
+`GitlabUnavailable` (see [Errors](#errors)). The reads reflect a write at once — a queued
 or just-applied close/unassign hides the item from the assigned lists, and
 `ListWorkItems` shows the issue as closed or no longer assigned — and the
 jobs that display it rerun right after it lands. `CreateWorkItem` is the exception:
@@ -176,11 +177,40 @@ top level (`"labels"`, `"scope.users"`), for the methods without arguments too. 
 argument a newer interface added is thus refused by an older daemon rather than
 ignored.
 
-`GitlabError (message: string)` — GitLab rejected the request (invalid input, API
-error, rate limit), or a local precondition failed (malformed issue reference, invalid
-duration, unknown failure id, a new issue without a title, a parent that is no epic).
-For `CreateWorkItem` it also reports that GitLab could not be reached, or that the
-parent could not be looked up. `message` is human-readable.
+The errors of the interface itself say what the caller does next; each carries a
+human-readable `message`.
+
+`InvalidArgument (argument: string, message: string)` — the call fits the interface,
+but an argument's value is one the daemon refuses up front: a `project_id`,
+`group_id`, `iid` or `limit` that isn't positive, a `duration` that is no GitLab
+duration, a blank `title`, a label containing a comma (`labels`), a `parent` that
+names no epic, a `RecordOpen` reference that names no single item (`argument` is then
+the ID given too many, or `project_id` when neither is). `argument` is the argument's
+name as the method declares it. Nothing was sent to GitLab, queued or stored, and the
+same call fails the same way again; it is answered whatever the session is.
+
+`NotFound (message: string)` — the daemon has no such thing: an `id` that
+`RetryFailure` or `DismissFailure` doesn't know (dismissed, retried already, or never
+there).
+
+`GitlabError (message: string, status: ?int)` — GitLab answered and refused: 403 (no
+permission, an archived project), 404, 400 or 422 (input it won't take), 401 (a token
+it no longer takes). `status` is the HTTP status of GitLab's answer; absent where the
+daemon has none, an answer it could not read. Nothing was done, and calling again
+won't help until what GitLab objected to has changed.
+
+`GitlabUnavailable (message: string)` — GitLab could not be reached, or answered 429
+or 5xx, and the daemon did not queue the call: whether GitLab carried it out is
+unknown. `CreateWorkItem` replies it (for its parent lookup, which creates nothing,
+and for the create itself), `Login` when connecting fails that way, and the queued
+writes for a `PostTime` GitLab answered with a 5xx: it may have booked the time, so
+it is not replayed. Look before calling again — a second `CreateWorkItem` after a lost
+answer files the issue twice.
+
+`Internal (message: string)` — the daemon could not do it for a reason of its own:
+the keychain failed (`Login`, `Logout`), its storage did (`RecordOpen`,
+`RetryFailure`, `DismissFailure`, `ClearFailures`), or the method is switched off
+(`Login` and `Logout` in a dry run). Not GitLab's doing; the daemon's log says more.
 
 `NotAuthenticated (reason: ?NotAuthReason, detail: ?string)` — the daemon has no live
 GitLab session (it is *dormant*). `reason` says why; `detail` carries free text (host,
@@ -268,10 +298,11 @@ matches a project's work items and MRs by their per-project number, one of the f
 `&5` epics by their per-group number. Descriptions are not cached and not searched.
 
 `kinds` restricts the reply to some of its four arrays (omitted or empty = all four).
-`limit` caps each returned array separately (default 50; must be positive); issues
-and epics share `work_items`, so they share its limit. `types` keeps only the work
-items of the listed types (`"issue"`, `"task"`, `"epic"`, …), compared
-case-insensitively; omitted or empty = every type. A type nothing has matches nothing.
+`limit` caps each returned array separately (default 50; one that isn't positive
+replies `InvalidArgument`); issues and epics share `work_items`, so they share its
+limit. `types` keeps only the work items of the listed types (`"issue"`, `"task"`,
+`"epic"`, …), compared case-insensitively; omitted or empty = every type. A type
+nothing has matches nothing.
 `exclude_types` leaves out the work items of the listed types, compared the same way;
 omitted or empty = none. With both, a work item must be of one of `types` and of none
 of `exclude_types`. Both apply before `limit`, so the limit fills from the work items
@@ -361,7 +392,7 @@ a token without an expiry or without the needed scope, with `rotate = "never"`, 
 once GitLab refused to rotate it.
 
 A dry run (`forskapd --dry-run`) answers with the host `dry-run.invalid` and the user
-`demo`; its `Login` and `Logout` reply `GitlabError`.
+`demo`; its `Login` and `Logout` reply `Internal`.
 
 ### `GetStatus() -> (api_version: string, daemon_version: string, connected: bool, reason: ?NotAuthReason, detail: ?string, host: ?string, username: ?string, user_id: ?int)`
 
@@ -382,17 +413,18 @@ served whatever the session is, without a GitLab round-trip.
 
 The four methods of this section take the target as `(project_id, iid, kind)` —
 `kind` selects issue vs merge request; the same operation works on both. They validate the reference
-eagerly (`project_id`/`iid` must be positive) and reply `GitlabError` on a
-malformed one without attempting or queuing anything. On an unreachable session or
-a transient network failure the operation is queued for retry and the call
-**replies success**; a GitLab rejection replies `GitlabError`. Other dormancy
-reasons reply `NotAuthenticated`.
+eagerly (`project_id`/`iid` must be positive) and reply `InvalidArgument` on a
+malformed one without attempting or queuing anything. On an unreachable session, a
+network failure, a 429 or a 5xx the operation is queued for retry and the call
+**replies success**, except a `PostTime` GitLab answered with a 5xx: it may have
+booked the time, so it is not queued and replies `GitlabUnavailable`. GitLab refusing
+it replies `GitlabError`. Other dormancy reasons reply `NotAuthenticated`.
 
 ### `PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()`
 
 Records spent time on the issuable. `duration` uses GitLab's time-tracking syntax
-(`"1h30m"`, `"45m"`, `"2d"`); an obviously malformed duration is rejected up front.
-`summary` becomes the timelog note.
+(`"1h30m"`, `"45m"`, `"2d"`); an obviously malformed duration replies
+`InvalidArgument` up front. `summary` becomes the timelog note.
 
 ### `Close(project_id: int, iid: int, kind: IssuableKind) -> ()`
 
@@ -429,20 +461,21 @@ once and replies with what came of it.
 - A blank `title`, a `project_id` that isn't positive, a label containing a comma
   (GitLab takes the labels as one comma-separated list) or a `parent` that names no
   epic (no `group_id`, a `project_id`, a number that isn't positive, another type)
-  replies `GitlabError` without GitLab being asked.
+  replies `InvalidArgument` without GitLab being asked.
 - Without a live session it replies `NotAuthenticated`, whatever the reason —
   `unreachable` too, where the other writes are queued.
-- Any failure of the request replies `GitlabError`: a network error, a 429 or 5xx, a
-  rejection, a 401. None of them demotes the session, and nothing is retried.
-- A parent epic GitLab doesn't find (or that can't be looked up for any of these
-  reasons) replies `GitlabError`, and nothing is created.
+- GitLab refusing the create (a 401 included) replies `GitlabError`; a network
+  error, a 429 or a 5xx replies `GitlabUnavailable`: the issue may exist all the
+  same. None of them demotes the session, and nothing is retried.
+- A parent epic GitLab doesn't find replies `GitlabError`, one that can't be looked
+  up for a network error, a 429 or a 5xx `GitlabUnavailable`; either way nothing is
+  created.
 
 The reason is that a create has no idempotency key. The queued writes address an
 existing `(project_id, iid, kind)`; a create has no `iid` yet, and nothing tells a
 replay whether an earlier attempt landed. Replayed after a partial success (GitLab
 created the issue, the answer got lost), it would file the issue a second time. The
-same holds for a caller: after a `GitlabError` that isn't a plain rejection, look
-before calling again.
+same holds for a caller: after a `GitlabUnavailable`, look before calling again.
 
 On success the issue is visible at once, before any sync: `Search` finds it,
 `ListWorkItems` lists it for the `author` role, and if GitLab assigned it to the user,
@@ -469,12 +502,12 @@ Lists dead-lettered tasks. Never errors; storage trouble degrades to an empty li
 
 ### `RetryFailure(id: int) -> ()`
 
-Moves a dead-lettered task back into the retry queue. `GitlabError` when `id` is
+Moves a dead-lettered task back into the retry queue. `NotFound` when `id` is
 unknown.
 
 ### `DismissFailure(id: int) -> ()`
 
-Deletes one dead-lettered task. `GitlabError` when `id` is unknown.
+Deletes one dead-lettered task. `NotFound` when `id` is unknown.
 
 ### `ClearFailures() -> ()`
 
@@ -550,7 +583,7 @@ Exactly one of `project_id` and `group_id` names where the item lives: a project
 an issue or merge request, a group for an epic (`kind` `work_item`). A group's work
 items are counted apart from a project's, so a group and a project sharing an ID
 don't share counters. Both or neither given, a merge request by its group, or a
-number or ID that isn't positive is an eager `GitlabError`.
+number or ID that isn't positive is an eager `InvalidArgument`.
 
 ## Cache control
 
@@ -585,13 +618,16 @@ daemon answers the calls of one connection one after the other.
 
 Connects to `host` with the personal access token, stores the credentials in the OS
 keychain, and flips the daemon to connected (waking the retry-queue drain).
-`GitlabError` when GitLab rejects the token or the keychain write fails. Prefer
-`forskap auth login`, which walks through creating a PAT with the right scopes.
+`GitlabError` when GitLab rejects the token, `GitlabUnavailable` when it can't be
+reached (a network error is tried four times) or answers 429 or 5xx, `Internal` when
+the keychain write fails. Prefer `forskap auth login`, which walks through creating a
+PAT with the right scopes.
 
 ### `Logout() -> ()`
 
 Drops the session (subsequent calls reply `NotAuthenticated` with reason
-`logged_out`) and deletes the stored credentials from the keychain.
+`logged_out`) and deletes the stored credentials from the keychain. `Internal` when
+the keychain delete fails; the session is dropped all the same.
 
 # Calling from the shell
 
