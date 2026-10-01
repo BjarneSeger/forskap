@@ -90,3 +90,5 @@ go generate ./...
 The generator is pinned via the `tool` directive in `go.mod`, and the
 [`Go binding`](../../.github/workflows/go-binding.yml) CI workflow re-runs
 `go generate` and fails if the committed file is out of date.
+
+Licensed under either Apache-2.0 or MIT license, at your option.
