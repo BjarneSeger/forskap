@@ -1344,10 +1344,16 @@ async fn get_assigned_work_items_overlays_open_counts_and_board_status() {
         &h,
         &[
             labeled,
+            issue(1, 2, "web", "https://gl/team/api/-/issues/2"),
             issue(2, 3, "other", "https://gl/other/x/-/issues/3"),
         ],
     );
-    seed_view(&h, ASSIGNED_ISSUES, &[(1, 1), (2, 3)], now_secs() - 60);
+    seed_view(
+        &h,
+        ASSIGNED_ISSUES,
+        &[(1, 1), (1, 2), (2, 3)],
+        now_secs() - 60,
+    );
     seed(
         &h,
         &[Board {
@@ -1366,9 +1372,15 @@ async fn get_assigned_work_items_overlays_open_counts_and_board_status() {
     let issues = assigned_work_items(&h, None).await;
     let api = issues.iter().find(|i| i.iid == 1).unwrap();
     assert_eq!(api.open_count, 1);
-    assert_eq!(api.graph_status, "Doing");
+    assert_eq!(api.board_column.as_deref(), Some("Doing"));
+    let web = issues.iter().find(|i| i.iid == 2).unwrap();
+    assert_eq!(
+        web.board_column.as_deref(),
+        Some("opened"),
+        "no list's label: the Open list"
+    );
     let other = issues.iter().find(|i| i.iid == 3).unwrap();
-    assert_eq!(other.graph_status, "", "project 2's boards never synced");
+    assert_eq!(other.board_column, None, "project 2's boards never synced");
 }
 
 /// Assigned issues are work items of their project, of their type, under
@@ -1440,7 +1452,7 @@ async fn list_work_items_serves_both_roles_once_newest_first() {
     assert_eq!(issues[1].state, "closed", "closed ones are listed too");
     assert_eq!(issues[2].namespace_path.as_deref(), Some("other/x"));
     assert_eq!(issues[2].open_count, 1);
-    assert_eq!(issues[2].graph_status, "", "its boards never synced");
+    assert_eq!(issues[2].board_column, None, "its boards never synced");
 }
 
 #[tokio::test]
@@ -1635,9 +1647,9 @@ async fn search_matches_title_labels_and_paths_case_insensitively() {
     );
 
     let r = run_search(&h, "auth-serv", None, None).await;
-    assert_eq!(r.projects[0].path, "team/auth-service");
+    assert_eq!(r.projects[0].full_path, "team/auth-service");
     let r = run_search(&h, "tea", None, None).await;
-    assert_eq!(r.groups[0].path, "team");
+    assert_eq!(r.groups[0].full_path, "team");
 }
 
 #[tokio::test]
@@ -1996,7 +2008,7 @@ async fn projects_tell_whether_they_are_archived() {
     let archived: Vec<_> = r
         .projects
         .iter()
-        .map(|p| (p.path.as_str(), p.archived))
+        .map(|p| (p.full_path.as_str(), p.archived))
         .collect();
     assert_eq!(
         archived,
@@ -2625,7 +2637,7 @@ async fn clear_cache_waits_for_new_board_columns() {
 
     clear_cache(&h, Some(vec![CacheScope::assigned])).await;
     let issues = assigned_work_items(&h, None).await;
-    assert_eq!(issues[0].graph_status, "Doing");
+    assert_eq!(issues[0].board_column.as_deref(), Some("Doing"));
 }
 
 // ── Dead letters ───────────────────────────────────────────────────────

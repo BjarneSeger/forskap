@@ -6,7 +6,7 @@ use forskap_api::{
 };
 
 use crate::gitlab::Issuable;
-use crate::query::{graph_status_from, namespace_of};
+use crate::query::{board_column, namespace_of};
 use crate::sync::{JobInfo, JobStatus, model};
 
 /// What a wire item shows of its project.
@@ -34,7 +34,7 @@ fn known(secs: u64) -> Option<i64> {
 pub const EPIC: &str = "epic";
 
 /// `board_labels` are the issue's project board lists, `None` when never
-/// synced (then `graph_status` stays empty). `epic_url` is the link of the
+/// synced (then `board_column` is absent). `epic_url` is the link of the
 /// stored epic the issue names as its parent, `None` without a row.
 pub fn issue(
     i: model::Issue,
@@ -44,7 +44,7 @@ pub fn issue(
     epic_url: Option<String>,
 ) -> WorkItem {
     WorkItem {
-        graph_status: graph_status_from(board_labels, &i.labels, &i.state),
+        board_column: board_column(board_labels, &i.labels, &i.state),
         parent: i
             .epic
             .as_ref()
@@ -125,7 +125,7 @@ pub fn project(p: model::Project, avatar: Option<String>) -> Project {
     Project {
         id: p.id,
         name: p.name,
-        path: p.path_with_namespace,
+        full_path: p.path_with_namespace,
         web_url: p.web_url,
         avatar,
         archived: p.archived,
@@ -136,7 +136,7 @@ pub fn group(g: model::Group) -> Group {
     Group {
         id: g.id,
         name: g.name,
-        path: g.full_path,
+        full_path: g.full_path,
         web_url: g.web_url,
     }
 }
@@ -167,7 +167,7 @@ pub fn epic(e: model::Epic, open_count: i64, group_path: Option<String>) -> Work
         state: e.state,
         parent: None,
         time_spent: None,
-        graph_status: String::new(),
+        board_column: None,
         open_count,
         project_avatar: None,
         updated_at: known(e.updated_at),
@@ -583,7 +583,7 @@ mod tests {
         assert_eq!(e.parent, None);
         assert_eq!(e.open_count, 2);
         assert_eq!((e.time_spent, e.project_avatar), (None, None));
-        assert!(e.graph_status.is_empty());
+        assert_eq!(e.board_column, None);
     }
 
     #[test]

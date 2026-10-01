@@ -165,7 +165,10 @@ async fn group_id(client: &VarlinkClient, group: &str) -> Result<i64> {
 
 /// GitLab paths are case-insensitive.
 fn by_path(path: &str, groups: &[Group]) -> Result<i64> {
-    match groups.iter().find(|g| g.path.eq_ignore_ascii_case(path)) {
+    match groups
+        .iter()
+        .find(|g| g.full_path.eq_ignore_ascii_case(path))
+    {
         Some(g) => Ok(g.id),
         None => bail!(
             "no cached group with the path {path:?} — pass the full path \
@@ -253,7 +256,7 @@ mod tests {
         let group = |id, path: &str| Group {
             id,
             name: String::new(),
-            path: path.to_string(),
+            full_path: path.to_string(),
             web_url: String::new(),
         };
         // The daemon matches substrings: `team` also returns `team/backend`.

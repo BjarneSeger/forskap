@@ -63,7 +63,10 @@ pub async fn by_arg(client: &VarlinkClient, project: &str) -> Result<i64> {
 
 /// GitLab paths are case-insensitive.
 fn by_path(path: &str, projects: &[Project]) -> Result<i64> {
-    match projects.iter().find(|p| p.path.eq_ignore_ascii_case(path)) {
+    match projects
+        .iter()
+        .find(|p| p.full_path.eq_ignore_ascii_case(path))
+    {
         Some(p) => Ok(p.id),
         None => bail!(
             "no cached project with the path {path:?} — pass the full path \
@@ -193,7 +196,7 @@ mod tests {
         Project {
             id,
             name: String::new(),
-            path: path.to_string(),
+            full_path: path.to_string(),
             web_url: String::new(),
             avatar: None,
             archived: false,

@@ -98,7 +98,7 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
     for p in &reply.projects {
         out.push(Row {
             id: format!("url:{}", p.web_url),
-            title: p.path.clone(),
+            title: p.full_path.clone(),
             subtitle: p.name.clone(),
             kind: SearchKind::Projects,
             score: 0,
@@ -109,7 +109,7 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
     for g in &reply.groups {
         out.push(Row {
             id: format!("url:{}", g.web_url),
-            title: g.path.clone(),
+            title: g.full_path.clone(),
             subtitle: g.name.clone(),
             kind: SearchKind::Groups,
             score: 0,
@@ -192,7 +192,7 @@ mod tests {
                     state: "opened".into(),
                     parent: None,
                     time_spent: Some(3600),
-                    graph_status: String::new(),
+                    board_column: None,
                     open_count: 3,
                     project_avatar: Some("/cache/avatars/7-a.png".into()),
                     updated_at: Some(1_782_900_000),
@@ -215,7 +215,7 @@ mod tests {
             projects: vec![Project {
                 id: 7,
                 name: "API".into(),
-                path: "team/api".into(),
+                full_path: "team/api".into(),
                 web_url: "https://gl.example.com/team/api".into(),
                 avatar: None,
                 archived: false,
@@ -223,7 +223,7 @@ mod tests {
             groups: vec![Group {
                 id: 3,
                 name: "Team".into(),
-                path: "team".into(),
+                full_path: "team".into(),
                 web_url: "https://gl.example.com/groups/team".into(),
             }],
         }

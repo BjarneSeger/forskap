@@ -34,7 +34,7 @@ type WorkItem struct {
 	State          string       `json:"state"`
 	Parent         *WorkItemRef `json:"parent,omitempty"`
 	Time_spent     *int64       `json:"time_spent,omitempty"`
-	Graph_status   string       `json:"graph_status"`
+	Board_column   *string      `json:"board_column,omitempty"`
 	Open_count     int64        `json:"open_count"`
 	Project_avatar *string      `json:"project_avatar,omitempty"`
 	Updated_at     *int64       `json:"updated_at,omitempty"`
@@ -105,20 +105,20 @@ type MergeRequest struct {
 
 // A project the user is a member of.
 type Project struct {
-	Id       int64   `json:"id"`
-	Name     string  `json:"name"`
-	Path     string  `json:"path"`
-	Web_url  string  `json:"web_url"`
-	Avatar   *string `json:"avatar,omitempty"`
-	Archived bool    `json:"archived"`
+	Id        int64   `json:"id"`
+	Name      string  `json:"name"`
+	Full_path string  `json:"full_path"`
+	Web_url   string  `json:"web_url"`
+	Avatar    *string `json:"avatar,omitempty"`
+	Archived  bool    `json:"archived"`
 }
 
 // A group the user is a member of.
 type Group struct {
-	Id      int64  `json:"id"`
-	Name    string `json:"name"`
-	Path    string `json:"path"`
-	Web_url string `json:"web_url"`
+	Id        int64  `json:"id"`
+	Name      string `json:"name"`
+	Full_path string `json:"full_path"`
+	Web_url   string `json:"web_url"`
 }
 
 // Where a SyncJob stands.
@@ -2313,9 +2313,11 @@ type WorkItem (
   # Seconds spent on it, GitLab's time_stats.total_time_spent: 0 when none is
   # logged; absent for an epic.
   time_spent: ?int,
-  # Board column the issue sits in, from its labels and the project's issue
-  # board; empty when no board or label matches, and for an epic.
-  graph_status: string,
+  # Board column the issue sits in: the first of its labels that is a list on
+  # the project's issue boards, else its state ("opened", "closed": a board's
+  # Open and Closed lists). Absent when the project's boards never synced, and
+  # for an epic.
+  board_column: ?string,
   # Opens recorded through RecordOpen (within usage.retention_hours).
   open_count: int,
   # File of the project's avatar, see Project.avatar; absent when none, and
@@ -2437,7 +2439,7 @@ type Project (
   id: int,
   name: string,
   # Full namespace path ("team/backend/api").
-  path: string,
+  full_path: string,
   web_url: string,
   # Absolute path of the avatar image on the daemon's machine; absent when
   # the daemon has none.
@@ -2451,7 +2453,7 @@ type Group (
   id: int,
   name: string,
   # Full group path ("team/backend").
-  path: string,
+  full_path: string,
   web_url: string
 )
 

@@ -628,9 +628,9 @@ mod tests {
 
         let issues = run.assigned_work_items().await;
         assert_eq!(issues.len(), 6);
-        assert!(issues.iter().all(|i| !i.graph_status.is_empty()), "boards");
+        assert!(issues.iter().all(|i| i.board_column.is_some()), "boards");
         let rate_limit = issues.iter().find(|i| i.iid == 12).unwrap();
-        assert_eq!(rate_limit.graph_status, "Doing");
+        assert_eq!(rate_limit.board_column.as_deref(), Some("Doing"));
         assert_eq!(
             rate_limit.namespace_path.as_deref(),
             Some("acme/backend/api")
@@ -652,7 +652,7 @@ mod tests {
             found.work_items.iter().partition(|w| w.r#type == "epic");
         assert_eq!(issues.len(), 3);
         assert_eq!(found.merge_requests[0].iid, 12);
-        assert_eq!(found.projects[0].path, "acme/backend/billing");
+        assert_eq!(found.projects[0].full_path, "acme/backend/billing");
         assert_eq!(epics[0].title, "Self-service billing");
         assert_eq!((epics[0].id, epics[0].group_id), (8101, Some(10)));
         let featured = issues.iter().find(|i| i.iid == 8).unwrap();

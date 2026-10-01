@@ -282,7 +282,7 @@ Unlike `GetAssignedWorkItems`, which keeps every open assigned issue however old
 is synced every few minutes, this method is bounded by time and not by state; the two
 are synced separately and may briefly disagree. The projects listed here are not
 "tracked" by it: an issue closed two months ago pulls no project into the search
-corpus. `graph_status` therefore stays empty for issues of projects whose boards
+corpus. `board_column` is therefore absent for issues of projects whose boards
 aren't synced (see `Search`).
 
 When a list the call needs has never been synced — both of them with `role`
@@ -343,8 +343,8 @@ every member group), each group contributing at most its
 `search.max_items_per_project` most recently updated ones. Epics need GitLab Premium
 or Ultimate: on other instances there are none among the work items, and the daemon
 asks each group only once a day.
-Issue `graph_status` comes from the synced board columns of the issue's project and
-is empty for projects whose boards were never synced (only those of assigned issues'
+Issue `board_column` comes from the synced board columns of the issue's project and
+is absent for projects whose boards were never synced (only those of assigned issues'
 projects and of tracked member projects are). A project's switched-off features are
 left out: no issues or boards where its issues are off, no MRs where its merge requests
 are (see *Unavailable jobs* under `GetSyncJobs`).

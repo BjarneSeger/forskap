@@ -316,7 +316,7 @@ impl Handlers {
 }
 
 /// Board list labels per project, read at most once per request. `None` for
-/// a project whose boards never synced, so its `graph_status` stays empty.
+/// a project whose boards never synced, so its `board_column` is absent.
 struct BoardLabels<'a> {
     handlers: &'a Handlers,
     by_project: HashMap<i64, Option<Vec<String>>>,
@@ -356,7 +356,7 @@ impl<'a> BoardLabels<'a> {
             .as_deref()
     }
 
-    /// The work item for `i`, with its `graph_status` from the board labels
+    /// The work item for `i`, with its `board_column` from the board labels
     /// and its parent's link from `epics`.
     fn wire(
         &mut self,

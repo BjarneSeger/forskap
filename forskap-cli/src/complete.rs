@@ -416,7 +416,12 @@ async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
         .call()
         .await
         .ok()?;
-    rows.extend(reply.projects.into_iter().map(|p| (p.path, Some(p.name))));
+    rows.extend(
+        reply
+            .projects
+            .into_iter()
+            .map(|p| (p.full_path, Some(p.name))),
+    );
     Some(())
 }
 
@@ -444,7 +449,12 @@ async fn fetch_groups(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
         .call()
         .await
         .ok()?;
-    rows.extend(reply.groups.into_iter().map(|g| (g.path, Some(g.name))));
+    rows.extend(
+        reply
+            .groups
+            .into_iter()
+            .map(|g| (g.full_path, Some(g.name))),
+    );
     Some(())
 }
 

@@ -186,10 +186,11 @@ local function epicRow(item)
   }
 end
 
+-- `path` from an older `forskap`.
 local function urlRow(kind, item)
   return {
     id = "url:" .. (item.web_url or ""),
-    title = item.path,
+    title = item.full_path or item.path,
     subtitle = item.name,
     glyph = GLYPH[kind],
     icon = avatarIcon(item.avatar),

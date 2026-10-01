@@ -20,7 +20,7 @@ pub async fn run(kind: RefKind, target: TargetArgs, format: OutputFormat) -> Res
             field("url", &i.web_url)?;
             let spent = i.time_spent.filter(|&s| s > 0).map(time::spent);
             field("time spent", spent.as_deref().unwrap_or_default())?;
-            field("status", &i.graph_status)?;
+            field("status", i.board_column.as_deref().unwrap_or_default())?;
             let parent = i.parent.as_ref().and_then(|p| p.web_url.as_deref());
             field("parent", parent.unwrap_or_default())?;
             opened(i.open_count)

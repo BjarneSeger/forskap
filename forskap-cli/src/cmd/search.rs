@@ -105,13 +105,13 @@ pub async fn run(
         if !reply.projects.is_empty() {
             outln!("{}", style::heading("Projects:"))?;
             for p in &reply.projects {
-                outln!("  {}  {}", p.path, p.web_url)?;
+                outln!("  {}  {}", p.full_path, p.web_url)?;
             }
         }
         if !reply.groups.is_empty() {
             outln!("{}", style::heading("Groups:"))?;
             for g in &reply.groups {
-                outln!("  {}  {}", g.path, g.web_url)?;
+                outln!("  {}  {}", g.full_path, g.web_url)?;
             }
         }
         Ok(())
