@@ -406,7 +406,8 @@ pub enum SyncCommand {
     ///
     /// Without `--scope` that is everything synced; open counts only go with
     /// an explicit `--scope usage`. Waits for the assigned lists and the time
-    /// history; the search corpus refills in the background.
+    /// history, and says on a terminal how far their sync is; the search
+    /// corpus refills in the background.
     Refresh {
         /// What to drop. Repeat the flag to combine.
         #[arg(long = "scope", value_enum, value_name = "SCOPE")]

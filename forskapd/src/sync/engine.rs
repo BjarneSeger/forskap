@@ -50,7 +50,7 @@ use super::schedule::{
 use super::store::{Identity, NotedWrite, RowScope, SyncStore};
 use crate::config::{Config, SharedConfig};
 use crate::error::{Error, Result};
-use crate::gitlab::GitlabApi;
+use crate::gitlab::{GitlabApi, Progress};
 use crate::handlers::{ConnState, Session, SessionSlot};
 use crate::reconnect::KeychainProbe;
 use crate::write::Write;
@@ -164,6 +164,13 @@ pub struct JobInfo {
     pub next_due: Option<u64>,
     /// When the running fetch started.
     pub running_since: Option<u64>,
+    /// Whether the running fetch is a full run rather than a delta; `None`
+    /// for a job whose every run is full.
+    pub full: Option<bool>,
+    /// Rows the running fetch has so far.
+    pub fetched: Option<u64>,
+    /// Rows GitLab announced for it, if it did.
+    pub expected: Option<u64>,
     /// Consecutive failures.
     pub failures: u32,
     /// Why the last run failed, until a run succeeds. Kept in memory only.
@@ -453,6 +460,8 @@ struct Flight {
     /// The session it reads with.
     session: Session,
     abort: AbortHandle,
+    /// Written by the fetch, read for the snapshot.
+    progress: Arc<Progress>,
 }
 
 struct Worker {
@@ -660,6 +669,8 @@ impl Worker {
                 let (at, state, cadence) = self.due(job, &cfg);
                 let flight = self.flights.values().find(|f| f.job == job);
                 let running_since = flight.map(|f| f.started);
+                // Only where a delta exists does "full" say anything.
+                let delta = cadence.full_every.is_some();
                 let unavailable = job.unavailable(&state);
                 let (status, order) = if let Some(since) = running_since {
                     (JobStatus::Running, (0, 0, since))
@@ -685,6 +696,9 @@ impl Worker {
                     last_ok: state.last_ok,
                     next_due: Some(at).filter(|&at| scheduled && at > 0 && at < u64::MAX),
                     running_since,
+                    full: flight.filter(|_| delta).map(|f| f.full),
+                    fetched: flight.map(|f| f.progress.fetched()),
+                    expected: flight.and_then(|f| f.progress.expected()),
                     failures: state.failures,
                     last_error: self.errors.get(&key).cloned(),
                     unavailable,
@@ -878,6 +892,7 @@ impl Worker {
         debug!(job = %key, full, "sync job starting");
         self.runs += 1;
         let run = self.runs;
+        let progress = Arc::new(Progress::default());
         let ctx = FetchCtx {
             gitlab: Arc::clone(&session.gitlab),
             full,
@@ -885,6 +900,7 @@ impl Worker {
             started,
             windows,
             avatars: self.avatars.clone(),
+            progress: Arc::clone(&progress),
         };
         let abort = self
             .fetches
@@ -899,6 +915,7 @@ impl Worker {
             waiters,
             session: session.clone(),
             abort,
+            progress,
         };
         self.flights.insert(run, flight);
     }
@@ -935,6 +952,7 @@ impl Worker {
             mut waiters,
             session,
             abort: _,
+            progress: _,
         } = flight;
         match outcome {
             Ok(Ok(staged)) => {
@@ -2000,6 +2018,11 @@ mod tests {
         assert_eq!(running.status, JobStatus::Running);
         assert!(running.running_since.is_some_and(|at| at >= before));
         assert_eq!((running.last_ok, running.next_due), (0, None));
+        // No row yet, nothing announced, and no delta to tell a full run from.
+        assert_eq!(
+            (running.full, running.fetched, running.expected),
+            (None, Some(0), None)
+        );
         // Demanded runs ahead of the jobs that are merely due.
         let demanded = &snapshot.jobs[1];
         assert_eq!(demanded.key, Job::MemberGroups.key());
@@ -2007,6 +2030,7 @@ mod tests {
         for job in &snapshot.jobs[2..] {
             assert_eq!(job.status, JobStatus::Due, "{job:?}");
             assert_eq!(job.running_since, None);
+            assert_eq!((job.full, job.fetched, job.expected), (None, None, None));
         }
 
         gate.notify_one();
@@ -2022,6 +2046,45 @@ mod tests {
             done.next_due.is_some_and(|at| at > done.last_ok),
             "{done:?}"
         );
+    }
+
+    /// A project's first run walks twice (the listing, then the late pass):
+    /// the snapshot follows the rows through both, and forgets them with the
+    /// flight.
+    #[tokio::test]
+    async fn the_snapshot_follows_a_running_fetch() {
+        let fake = Arc::new(FakeGitlab::default());
+        serve_tracked_project(&fake);
+        fake.serve(
+            "projects/7/issues",
+            vec![issue_json(7, 1, "one"), issue_json(7, 2, "two")],
+        );
+        let gate = fake.gate("projects/7/issues");
+        let env = start(connected(&fake, 1));
+        let progress = |j: JobInfo| (j.full, j.fetched, j.expected);
+
+        tokio::time::timeout(Duration::from_secs(2), fake.gated.notified())
+            .await
+            .expect("the project fetch starts");
+        let walking = info(&env, Job::ProjectIssues(7)).await;
+        assert_eq!(walking.status, JobStatus::Running);
+        assert_eq!(progress(walking), (Some(true), Some(0), Some(2)));
+
+        let late = fake.gate("projects/7/issues");
+        gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), fake.gated.notified())
+            .await
+            .expect("the late pass starts");
+        let again = info(&env, Job::ProjectIssues(7)).await;
+        assert_eq!(progress(again), (Some(true), Some(2), Some(4)));
+
+        late.notify_one();
+        eventually("the project's issues", || {
+            state(&env, Job::ProjectIssues(7)).last_ok > 0
+        })
+        .await;
+        let done = info(&env, Job::ProjectIssues(7)).await;
+        assert_eq!(progress(done), (None, None, None));
     }
 
     #[tokio::test]

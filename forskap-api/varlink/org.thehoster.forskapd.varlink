@@ -99,7 +99,10 @@ type SyncJob (
   running_since: ?int,
   failures: int,
   last_error: ?string,
-  unavailable: ?bool
+  unavailable: ?bool,
+  full: ?bool,
+  fetched: ?int,
+  expected: ?int
 )
 
 type Epic (

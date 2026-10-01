@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use gitlab::api::{AsyncQuery, UrlBase};
@@ -260,6 +261,44 @@ impl Listing {
     }
 }
 
+/// How far a run's reads are: written by the walks as their pages arrive,
+/// read by the sync worker while the fetch is in flight.
+#[derive(Debug, Default)]
+pub struct Progress {
+    fetched: AtomicU64,
+    expected: AtomicU64,
+    /// A walk came without a total, so the run has none.
+    uncounted: AtomicBool,
+}
+
+impl Progress {
+    /// Announce the rows a walk will bring, once per walk; `None` when
+    /// GitLab didn't count them.
+    pub fn expect(&self, total: Option<u64>) {
+        match total {
+            Some(total) => {
+                self.expected.fetch_add(total, Ordering::Relaxed);
+            }
+            None => self.uncounted.store(true, Ordering::Relaxed),
+        }
+    }
+
+    pub fn add(&self, rows: usize) {
+        self.fetched.fetch_add(rows as u64, Ordering::Relaxed);
+    }
+
+    pub fn fetched(&self) -> u64 {
+        self.fetched.load(Ordering::Relaxed)
+    }
+
+    /// The rows the walks so far announced; `None` if one of them didn't,
+    /// or there is nothing to expect.
+    pub fn expected(&self) -> Option<u64> {
+        let expected = self.expected.load(Ordering::Relaxed);
+        (expected > 0 && !self.uncounted.load(Ordering::Relaxed)).then_some(expected)
+    }
+}
+
 /// Daemon-facing GitLab surface. Lets tests substitute a fake without touching
 /// the real `gitlab` crate. Production code path goes through the impl on
 /// [`GitlabClient`].
@@ -296,15 +335,25 @@ pub trait GitlabApi: Send + Sync {
     async fn create_issue(&self, project_id: i64, issue: &NewIssue) -> Result<serde_json::Value>;
 
     /// The rows of a paginated REST listing, as raw JSON; paging stops once
-    /// `limit` rows arrived.
-    async fn list(&self, listing: &Listing, limit: Option<usize>)
-    -> Result<Vec<serde_json::Value>>;
+    /// `limit` rows arrived. `progress` learns the total GitLab announces
+    /// and the rows of each page as it arrives.
+    async fn list(
+        &self,
+        listing: &Listing,
+        limit: Option<usize>,
+        progress: &Progress,
+    ) -> Result<Vec<serde_json::Value>>;
 
     /// The user's timelogs with `spent_at >= since`, newest first. GitLab has
     /// no REST listing for them, so this is the one GraphQL read. A timelog
     /// whose issue or MR the user can no longer read comes with `iid` 0: it
-    /// exists, but its details are gone.
-    async fn list_timelogs(&self, since: chrono::DateTime<chrono::Utc>) -> Result<Vec<Timelog>>;
+    /// exists, but its details are gone. `progress` learns the rows of each
+    /// page; GitLab announces no total here.
+    async fn list_timelogs(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        progress: &Progress,
+    ) -> Result<Vec<Timelog>>;
 
     /// A project's avatar image as uploaded; `None` when GitLab has none to
     /// serve (no avatar, or an instance older than 16.9 without the endpoint).
@@ -558,19 +607,24 @@ impl GitlabApi for GitlabClient {
         .map_err(classify)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, progress))]
     async fn list(
         &self,
         listing: &Listing,
         limit: Option<usize>,
+        progress: &Progress,
     ) -> Result<Vec<serde_json::Value>> {
-        walk_pages(&self.inner, listing, limit).await
+        walk_pages(&self.inner, listing, limit, progress).await
     }
 
     /// Returns entries with `spent_at >= since`, newest first. Catches time
     /// logged via the web UI or other clients.
-    #[instrument(skip(self))]
-    async fn list_timelogs(&self, since: chrono::DateTime<chrono::Utc>) -> Result<Vec<Timelog>> {
+    #[instrument(skip(self, progress))]
+    async fn list_timelogs(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        progress: &Progress,
+    ) -> Result<Vec<Timelog>> {
         let mut out = Vec::new();
         let mut after: Option<String> = None;
         loop {
@@ -585,6 +639,7 @@ impl GitlabApi for GitlabClient {
             })
             .await?;
             let (page, next) = timelogs_page(&raw)?;
+            progress.add(page.len());
             out.extend(page);
             match next {
                 // A repeated cursor would loop forever.
@@ -735,6 +790,9 @@ struct Page {
     rows: Vec<serde_json::Value>,
     /// `X-Next-Page` named one.
     has_next: bool,
+    /// `X-Total`: the rows of the whole listing. GitLab leaves it out above
+    /// 10 000.
+    total: Option<u64>,
 }
 
 /// Fetch every page of `listing` GitLab announces, at most `limit` rows.
@@ -748,24 +806,31 @@ async fn walk_pages<C>(
     client: &C,
     listing: &Listing,
     limit: Option<usize>,
+    progress: &Progress,
 ) -> Result<Vec<serde_json::Value>>
 where
     C: gitlab::api::AsyncClient + Sync,
 {
+    let cap = limit.unwrap_or(usize::MAX);
     let mut rows = Vec::new();
     let mut page = 1u64;
     loop {
         let fetched =
             retry_transient("list", || async { fetch_page(client, listing, page).await }).await?;
+        if page == 1 {
+            progress.expect(fetched.total.map(|total| total.min(cap as u64)));
+        }
         let short = fetched.rows.len() < PER_PAGE;
+        let before = rows.len();
         rows.extend(fetched.rows);
-        let enough = limit.is_some_and(|l| rows.len() >= l);
-        if enough || (short && !fetched.has_next) {
+        // The rows kept: the last page can reach past `limit`.
+        progress.add(rows.len().min(cap).saturating_sub(before));
+        if rows.len() >= cap || (short && !fetched.has_next) {
             break;
         }
         page += 1;
     }
-    rows.truncate(limit.unwrap_or(usize::MAX));
+    rows.truncate(cap);
     Ok(rows)
 }
 
@@ -806,7 +871,12 @@ where
     let rows = serde_json::from_slice(rsp.body())
         .map_err(|e| Error::Gitlab(format!("page {page} of {}: {e}", listing.path())))?;
     let has_next = header(&rsp, "x-next-page").is_some_and(|v| !v.is_empty());
-    Ok(Page { rows, has_next })
+    let total = header(&rsp, "x-total").and_then(|v| v.parse().ok());
+    Ok(Page {
+        rows,
+        has_next,
+        total,
+    })
 }
 
 fn header<'a, B>(rsp: &'a http::Response<B>, name: &str) -> Option<&'a str> {
@@ -1363,6 +1433,8 @@ mod tests {
     struct PagedFake {
         answers: std::sync::Mutex<Vec<Answer>>,
         urls: std::sync::Mutex<Vec<String>>,
+        /// `X-Total` of every page of rows.
+        total: Option<u64>,
     }
 
     impl PagedFake {
@@ -1371,6 +1443,12 @@ mod tests {
                 answers: std::sync::Mutex::new(answers),
                 ..Default::default()
             }
+        }
+
+        /// Announce `total` rows, as GitLab does up to 10 000.
+        fn counting(mut self, total: u64) -> Self {
+            self.total = Some(total);
+            self
         }
 
         fn urls(&self) -> Vec<String> {
@@ -1413,10 +1491,13 @@ mod tests {
             let rsp = match answer {
                 Answer::Rows(range, next) => {
                     let rows: Vec<_> = range.map(|i| serde_json::json!({"id": i})).collect();
-                    http::Response::builder()
+                    let mut rsp = http::Response::builder()
                         .status(200)
-                        .header("x-next-page", if next { "2" } else { "" })
-                        .body(bytes::Bytes::from(serde_json::to_vec(&rows).unwrap()))
+                        .header("x-next-page", if next { "2" } else { "" });
+                    if let Some(total) = self.total {
+                        rsp = rsp.header("x-total", total.to_string());
+                    }
+                    rsp.body(bytes::Bytes::from(serde_json::to_vec(&rows).unwrap()))
                 }
                 Answer::Status(code, retry_after) => {
                     let mut rsp = http::Response::builder().status(code);
@@ -1445,7 +1526,9 @@ mod tests {
             Answer::Rows(0..99, true),
             Answer::Rows(99..158, false),
         ]);
-        let rows = walk_pages(&fake, &EVENTS, None).await.unwrap();
+        let rows = walk_pages(&fake, &EVENTS, None, &Progress::default())
+            .await
+            .unwrap();
         assert_eq!(ids(&rows), (0..158).collect::<Vec<_>>());
         assert_eq!(
             fake.urls(),
@@ -1459,7 +1542,9 @@ mod tests {
     #[tokio::test]
     async fn a_short_page_without_a_successor_ends_the_walk() {
         let fake = PagedFake::with(vec![Answer::Rows(0..17, false)]);
-        let rows = walk_pages(&fake, &EVENTS, None).await.unwrap();
+        let rows = walk_pages(&fake, &EVENTS, None, &Progress::default())
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 17);
         assert_eq!(fake.urls().len(), 1);
     }
@@ -1469,7 +1554,9 @@ mod tests {
     #[tokio::test]
     async fn an_empty_page_with_a_successor_is_followed() {
         let fake = PagedFake::with(vec![Answer::Rows(0..0, true), Answer::Rows(0..40, false)]);
-        let rows = walk_pages(&fake, &EVENTS, None).await.unwrap();
+        let rows = walk_pages(&fake, &EVENTS, None, &Progress::default())
+            .await
+            .unwrap();
         assert_eq!(ids(&rows), (0..40).collect::<Vec<_>>());
         assert_eq!(fake.urls().len(), 2);
     }
@@ -1479,7 +1566,9 @@ mod tests {
     #[tokio::test]
     async fn a_full_page_is_followed_until_an_empty_one() {
         let fake = PagedFake::with(vec![Answer::Rows(0..100, false), Answer::Rows(0..0, false)]);
-        let rows = walk_pages(&fake, &EVENTS, None).await.unwrap();
+        let rows = walk_pages(&fake, &EVENTS, None, &Progress::default())
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 100);
         assert_eq!(fake.urls().len(), 2);
     }
@@ -1491,28 +1580,89 @@ mod tests {
             Answer::Rows(100..200, true),
             Answer::Rows(200..300, true),
         ]);
-        let rows = walk_pages(&fake, &EVENTS, Some(150)).await.unwrap();
+        let rows = walk_pages(&fake, &EVENTS, Some(150), &Progress::default())
+            .await
+            .unwrap();
         assert_eq!(ids(&rows), (0..150).collect::<Vec<_>>());
         assert_eq!(fake.urls().len(), 2);
+    }
+
+    /// Counted page by page, so a walk that dies halfway still says how far
+    /// it got.
+    #[tokio::test]
+    async fn a_walk_reports_its_total_and_each_page() {
+        let fake = PagedFake::with(vec![
+            Answer::Rows(0..100, true),
+            Answer::Rows(100..200, true),
+            Answer::Status(403, None),
+        ])
+        .counting(250);
+        let progress = Progress::default();
+        assert!(walk_pages(&fake, &EVENTS, None, &progress).await.is_err());
+        assert_eq!((progress.fetched(), progress.expected()), (200, Some(250)));
+    }
+
+    #[tokio::test]
+    async fn a_capped_walk_expects_and_counts_no_more_than_its_limit() {
+        let fake = PagedFake::with(vec![
+            Answer::Rows(0..100, true),
+            Answer::Rows(100..200, true),
+        ])
+        .counting(5000);
+        let progress = Progress::default();
+        let rows = walk_pages(&fake, &EVENTS, Some(150), &progress)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 150);
+        assert_eq!((progress.fetched(), progress.expected()), (150, Some(150)));
+    }
+
+    #[tokio::test]
+    async fn a_walk_gitlab_does_not_count_has_no_total() {
+        let fake = PagedFake::with(vec![Answer::Rows(0..40, false)]);
+        let progress = Progress::default();
+        walk_pages(&fake, &EVENTS, None, &progress).await.unwrap();
+        assert_eq!((progress.fetched(), progress.expected()), (40, None));
+    }
+
+    /// A run can walk twice (a capped listing's late pass): the totals add
+    /// up, and one walk without a total leaves the run without one.
+    #[test]
+    fn progress_sums_its_walks_until_one_is_uncounted() {
+        let progress = Progress::default();
+        assert_eq!(progress.expected(), None);
+        progress.expect(Some(1000));
+        progress.add(1000);
+        progress.expect(Some(3));
+        progress.add(3);
+        assert_eq!(
+            (progress.fetched(), progress.expected()),
+            (1003, Some(1003))
+        );
+        progress.expect(None);
+        assert_eq!(progress.expected(), None);
+        // Stays so, whatever a later walk announces.
+        progress.expect(Some(2));
+        assert_eq!(progress.expected(), None);
     }
 
     #[tokio::test]
     async fn a_page_walk_classifies_gitlab_answers() {
         let fake = PagedFake::with(vec![Answer::Status(429, Some("7"))]);
         assert!(matches!(
-            walk_pages(&fake, &EVENTS, None).await,
+            walk_pages(&fake, &EVENTS, None, &Progress::default()).await,
             Err(Error::Throttled { status: 429, retry_after: Some(d), .. }) if d == Duration::from_secs(7)
         ));
 
         let fake = PagedFake::with(vec![Answer::Status(401, None)]);
         assert!(matches!(
-            walk_pages(&fake, &EVENTS, None).await,
+            walk_pages(&fake, &EVENTS, None, &Progress::default()).await,
             Err(Error::Unauthorized(_))
         ));
 
         for status in [403, 404, 400] {
             let fake = PagedFake::with(vec![Answer::Status(status, None)]);
-            let walked = walk_pages(&fake, &EVENTS, None).await;
+            let walked = walk_pages(&fake, &EVENTS, None, &Progress::default()).await;
             assert!(
                 matches!(
                     &walked,
@@ -1691,7 +1841,10 @@ mod tests {
             let client = GitlabClient::connect_with(&builder, &host, &Token::new("token"))
                 .await
                 .unwrap();
-            let rows = client.list(&EVENTS, None).await.unwrap();
+            let rows = client
+                .list(&EVENTS, None, &Progress::default())
+                .await
+                .unwrap();
             let avatar = client.project_avatar(7).await.unwrap();
             (client, rows, avatar)
         };

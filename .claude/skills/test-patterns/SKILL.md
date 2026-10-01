@@ -23,7 +23,10 @@ reconnect).
   answers only the next call (e.g. a page walk that differs from its follow-up
   delta); `fail_next(path, FakeErr)` queues one-shot failures; `gate(path)` holds the next call until the returned
   `Notify` fires (`fake.gated` signals that the call started). `serve_timelogs(..)`
-  covers the GraphQL timelog read.
+  covers the GraphQL timelog read. A read reports to the `Progress` it is handed like
+  GitLab's first page would: the rows it is about to serve as the total before its
+  gate, the rows themselves after, so a gated fetch is at `0/n` in the snapshot. A
+  call outside a sync run passes `&Progress::default()`.
 - **Writes** succeed unless `fail_next_write(FakeErr)` queued a failure; `writes()`
   logs `(op, kind, project_id, iid)`.
   `gate_writes()` holds every write until the returned gate's `release()` (sticky);

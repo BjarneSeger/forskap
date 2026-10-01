@@ -93,7 +93,7 @@ forskap time log '!42' 1h30m    # ... on merge request !42 (or: forskap time log
 forskap time history            # what you tracked recently (including queued entries)
 forskap activity --days 30      # what you did on GitLab: pushes, comments, opened and merged items
 forskap queue list              # writes that failed permanently; `retry`/`dismiss` them
-forskap sync refresh            # drop the cache and fetch again
+forskap sync refresh            # drop the cache and fetch again; a terminal sees how far that is
 forskap sync jobs               # what the background sync runs now, next, and what failed
 forskap status                  # is anything not working? daemon, login, sync, failed writes
 ```
@@ -116,7 +116,9 @@ daemon is away the watch shows the error and keeps trying.
 project) on one line per kind, and does the same for the jobs GitLab refuses for good
 (`unavailable`: a project's merge requests or boards switched off, epics without GitLab
 Premium; the daemon asks again once a day); `-a`/`--all` lists each, with GitLab's
-answer.
+answer. A running job says how far it is: `for 8s · 400/1000 (full)` is 400 of the
+1000 rows GitLab announced, in a full run rather than a delta; `400/?` where GitLab
+announced no total.
 
 `forskap status` is the first thing to run when forskap seems off. It checks that the
 daemon answers (and runs the CLI's version), that it is logged in to GitLab, that no

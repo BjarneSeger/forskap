@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use crate::config::{Config, RotatePolicy, SearchPopulation};
 use crate::error::{Error, Result};
-use crate::gitlab::{GitlabApi, Issuable, Listing, NewIssue, RotatedToken, TokenInfo};
+use crate::gitlab::{GitlabApi, Issuable, Listing, NewIssue, Progress, RotatedToken, TokenInfo};
 use crate::handlers::Session;
 use crate::secrets::Token;
 use crate::sync::model::{
@@ -580,13 +580,24 @@ impl GitlabApi for DemoGitlab {
         Ok(serde_json::to_value(row)?)
     }
 
-    async fn list(&self, listing: &Listing, limit: Option<usize>) -> Result<Vec<Value>> {
+    async fn list(
+        &self,
+        listing: &Listing,
+        limit: Option<usize>,
+        progress: &Progress,
+    ) -> Result<Vec<Value>> {
         let mut rows = self.state.lock().unwrap().list(listing);
         rows.truncate(limit.unwrap_or(usize::MAX));
+        progress.expect(Some(rows.len() as u64));
+        progress.add(rows.len());
         Ok(rows)
     }
 
-    async fn list_timelogs(&self, since: DateTime<Utc>) -> Result<Vec<Timelog>> {
+    async fn list_timelogs(
+        &self,
+        since: DateTime<Utc>,
+        progress: &Progress,
+    ) -> Result<Vec<Timelog>> {
         let since = since.timestamp().max(0) as u64;
         let state = self.state.lock().unwrap();
         let mut logs: Vec<Timelog> = state
@@ -596,6 +607,7 @@ impl GitlabApi for DemoGitlab {
             .cloned()
             .collect();
         logs.sort_by_key(|t| std::cmp::Reverse((t.spent_at, t.id)));
+        progress.add(logs.len());
         Ok(logs)
     }
 
@@ -945,7 +957,10 @@ mod tests {
     }
 
     async fn issues(demo: &DemoGitlab, listing: Listing) -> Vec<model::Issue> {
-        let rows = demo.list(&listing, None).await.unwrap();
+        let rows = demo
+            .list(&listing, None, &Progress::default())
+            .await
+            .unwrap();
         rows.into_iter()
             .map(|r| serde_json::from_value(r).unwrap())
             .collect()
@@ -1040,7 +1055,7 @@ mod tests {
             assert!(i.assignees.iter().any(|a| a.id == USER_ID));
         }
         let mrs = demo
-            .list(&Listing::AssignedMergeRequests, None)
+            .list(&Listing::AssignedMergeRequests, None, &Progress::default())
             .await
             .unwrap();
         let mrs: Vec<model::MergeRequest> = mrs
@@ -1113,6 +1128,7 @@ mod tests {
                     updated_after: None,
                 },
                 Some(3),
+                &Progress::default(),
             )
             .await
             .unwrap();
@@ -1123,7 +1139,7 @@ mod tests {
     async fn events_come_oldest_first_after_a_date() {
         let (demo, now) = demo();
         let all = demo
-            .list(&Listing::Events { after: None }, None)
+            .list(&Listing::Events { after: None }, None, &Progress::default())
             .await
             .unwrap();
         let all: Vec<Event> = all
@@ -1133,7 +1149,11 @@ mod tests {
         assert!(all.windows(2).all(|w| w[0].created_at <= w[1].created_at));
         let after = at(now - 3 * DAY).date_naive();
         let recent = demo
-            .list(&Listing::Events { after: Some(after) }, None)
+            .list(
+                &Listing::Events { after: Some(after) },
+                None,
+                &Progress::default(),
+            )
             .await
             .unwrap();
         assert!(recent.len() < all.len() && !recent.is_empty());
@@ -1151,7 +1171,7 @@ mod tests {
         assert!(!assigned.contains(&(101, 12)), "closed");
         assert!(assigned.contains(&(103, 22)), "assigned");
         let mrs = demo
-            .list(&Listing::AssignedMergeRequests, None)
+            .list(&Listing::AssignedMergeRequests, None, &Progress::default())
             .await
             .unwrap();
         assert_eq!(mrs.len(), 2);
@@ -1159,7 +1179,10 @@ mod tests {
         demo.add_spent_time(Issuable::Issue, 103, 22, "1h30m", Some("Pairing"))
             .await
             .unwrap();
-        let logs = demo.list_timelogs(at(now - HOUR)).await.unwrap();
+        let logs = demo
+            .list_timelogs(at(now - HOUR), &Progress::default())
+            .await
+            .unwrap();
         assert_eq!(logs[0].iid, 22);
         assert_eq!(logs[0].time_spent, 5400);
         assert_eq!(logs[0].summary, "Pairing");
@@ -1194,7 +1217,7 @@ mod tests {
         let authored = issues(&demo, authored).await;
         assert!(keys(&authored).contains(&(102, 11)));
         let events = demo
-            .list(&Listing::Events { after: None }, None)
+            .list(&Listing::Events { after: None }, None, &Progress::default())
             .await
             .unwrap();
         let actions: Vec<String> = events

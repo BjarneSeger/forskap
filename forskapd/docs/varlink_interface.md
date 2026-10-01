@@ -92,9 +92,15 @@ type SyncJob (
   running_since: ?int,          # unix seconds, only while running
   failures:      int,           # consecutive failed runs
   last_error:    ?string,       # why the last run failed, until a run succeeds
-  unavailable:   ?bool          # true: GitLab refuses the job for good and the daemon asks once a day
+  unavailable:   ?bool,         # true: GitLab refuses the job for good and the daemon asks once a day
                                 # (see GetSyncJobs); false otherwise. Sent on every job since forskap-api
                                 # 0.28.0: absent means an older daemon, which doesn't tell
+  full:          ?bool,         # only while running, and only for a job that also runs as a delta:
+                                # true for a full run, false for a delta
+  fetched:       ?int,          # rows the running fetch has so far (0 before its first page); only while
+                                # running. Sent since forskap-api 0.30.0
+  expected:      ?int           # rows GitLab announced for the running fetch; absent where it announced
+                                # none (see GetSyncJobs)
 )
 ```
 
@@ -517,6 +523,17 @@ landed), the due ones by priority, then the rest by `next_due`. The worker runs 
 `sync.max_in_flight` jobs at once, one per project, so several can be `running`,
 each with its own `running_since`.
 
+**Progress.** A `running` job says how far its fetch is: `fetched` counts its rows
+page by page, `expected` is the total GitLab announced (`X-Total`, at most
+`search.max_items_per_project` for a project's or a group's corpus). GitLab announces
+none for a listing above 10 000 rows or for the timelogs, and an avatar download has
+no rows: `expected` is then absent. Both are rough. A corpus run that reconciles reads
+its listing twice (the second time only what changed since it started), and the two
+totals add up; GitLab's total can also be off the rows it serves (`/events` counts
+rows it then withholds), so `fetched` can end below or above `expected`. `full` tells
+a full run from a delta for the jobs that have both: a project's issues and merge
+requests, a group's epics, `all/issues`, `all/merge_requests` and `events`.
+
 `paused_until` (unix seconds) is set while a GitLab rate limit (429) holds every
 job back; the statuses then say what runs once the pause is over.
 
@@ -595,6 +612,9 @@ for a history band and the empty scope. Everything else refills in the
 background — the `ListIssues` lists among it, so that method can reply empty right
 after a clear; `usage` alone makes no GitLab call. Replies success even when
 dormant — the cleared state then stays empty until the next successful sync.
+
+To show the refill while waiting, ask `GetSyncJobs` on a second connection: the
+daemon answers the calls of one connection one after the other.
 
 ## Session
 

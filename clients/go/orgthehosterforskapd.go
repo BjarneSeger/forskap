@@ -111,6 +111,9 @@ type SyncJob struct {
 	Failures      int64         `json:"failures"`
 	Last_error    *string       `json:"last_error,omitempty"`
 	Unavailable   *bool         `json:"unavailable,omitempty"`
+	Full          *bool         `json:"full,omitempty"`
+	Fetched       *int64        `json:"fetched,omitempty"`
+	Expected      *int64        `json:"expected,omitempty"`
 }
 
 type Epic struct {
@@ -2107,7 +2110,10 @@ type SyncJob (
   running_since: ?int,
   failures: int,
   last_error: ?string,
-  unavailable: ?bool
+  unavailable: ?bool,
+  full: ?bool,
+  fetched: ?int,
+  expected: ?int
 )
 
 type Epic (

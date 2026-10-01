@@ -2024,6 +2024,39 @@ async fn get_sync_jobs_lists_the_plan_while_dormant() {
     );
     assert_eq!((job.failures, job.last_error.as_deref()), (0, None));
     assert_eq!(job.unavailable, Some(false));
+    // Progress is a running job's.
+    assert_eq!((job.full, job.fetched, job.expected), (None, None, None));
+}
+
+/// A fetch in flight says how far it is: the rows GitLab announced, none of
+/// them here yet. The assigned list has no delta, so no `full` either.
+#[tokio::test]
+async fn get_sync_jobs_reports_a_running_jobs_progress() {
+    let fake = Arc::new(FakeGitlab::default());
+    fake.serve("issues", vec![issue_json(7, 1, "assigned")]);
+    let gate = fake.gate("issues");
+    let (h, _dir) = connected_handlers(&fake);
+    h.sync.refresh_soon(&[Job::AssignedIssues]);
+    tokio::time::timeout(Duration::from_secs(2), fake.gated.notified())
+        .await
+        .expect("the assigned issues fetch starts");
+
+    let mut call = AsyncCall::default();
+    h.get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
+        .await
+        .unwrap();
+    let reply = reply::<GetSyncJobs_Reply>(&mut call);
+    let job = reply
+        .jobs
+        .iter()
+        .find(|j| j.key == ASSIGNED_ISSUES)
+        .expect("the assigned issues");
+    assert!(matches!(job.status, SyncJobStatus::running), "{job:?}");
+    assert_eq!(
+        (job.full, job.fetched, job.expected),
+        (None, Some(0), Some(1))
+    );
+    gate.notify_one();
 }
 
 #[tokio::test]

@@ -131,8 +131,8 @@ pub fn timelog(t: model::Timelog) -> HistoryEvent {
 }
 
 /// A sync job as the worker reported it; a job that never ran has no
-/// `last_ok`. `unavailable` is on every job, so a client tells this daemon
-/// from one too old to say.
+/// `last_ok`. `unavailable` is on every job, and `fetched` on every running
+/// one, so a client tells this daemon from one too old to say.
 pub fn sync_job(j: JobInfo) -> SyncJob {
     SyncJob {
         key: j.key,
@@ -149,6 +149,9 @@ pub fn sync_job(j: JobInfo) -> SyncJob {
         failures: i64::from(j.failures),
         last_error: j.last_error,
         unavailable: Some(j.unavailable),
+        full: j.full,
+        fetched: j.fetched.map(|rows| rows as i64),
+        expected: j.expected.map(|rows| rows as i64),
     }
 }
 
@@ -272,6 +275,9 @@ mod tests {
             last_ok: 0,
             next_due: None,
             running_since: None,
+            full: None,
+            fetched: None,
+            expected: None,
             failures: 0,
             last_error: None,
             unavailable: false,
@@ -315,6 +321,33 @@ mod tests {
             sync_job(info("events", JobStatus::Running)).unavailable,
             Some(false)
         );
+    }
+
+    /// Progress is a running job's: any other job carries none.
+    #[test]
+    fn a_sync_job_carries_its_progress_only_while_it_runs() {
+        let running = sync_job(JobInfo {
+            running_since: Some(1_800_000_000),
+            full: Some(true),
+            fetched: Some(400),
+            expected: Some(1000),
+            ..info("project/9/issues", JobStatus::Running)
+        });
+        assert_eq!(
+            (running.full, running.fetched, running.expected),
+            (Some(true), Some(400), Some(1000))
+        );
+        let json = serde_json::to_value(&running).unwrap();
+        assert_eq!(
+            (&json["full"], &json["fetched"], &json["expected"]),
+            (&true.into(), &400.into(), &1000.into())
+        );
+
+        let waiting = sync_job(info("project/9/issues", JobStatus::Waiting));
+        let json = serde_json::to_value(&waiting).unwrap();
+        for key in ["full", "fetched", "expected"] {
+            assert!(json[key].is_null(), "{key} in {json}");
+        }
     }
 
     #[test]

@@ -20,7 +20,7 @@ use super::schedule::{Cadence, JobState, UNAVAILABLE_AFTER, fingerprint};
 use super::store::{Commit, RowScope, Stored, View};
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::gitlab::{GitlabApi, Issuable, Listing};
+use crate::gitlab::{GitlabApi, Issuable, Listing, Progress};
 use crate::write::{Write, WriteOp};
 
 /// View of the open issues assigned to the user.
@@ -364,6 +364,8 @@ pub struct FetchCtx {
     pub started: u64,
     pub windows: Windows,
     pub avatars: AvatarDir,
+    /// How far the run is, for the worker to report while it is in flight.
+    pub progress: Arc<Progress>,
 }
 
 impl FetchCtx {
@@ -394,7 +396,6 @@ impl Staged {
 
 /// Fetch one run of `job`.
 pub async fn fetch(job: Job, ctx: FetchCtx) -> Result<Staged> {
-    let gitlab = &*ctx.gitlab;
     match job {
         Job::AssignedIssues => {
             let listing = Listing::AssignedIssues;
@@ -430,13 +431,13 @@ pub async fn fetch(job: Job, ctx: FetchCtx) -> Result<Staged> {
             let listing = Listing::AllIssues {
                 updated_after: ctx.updated_after(),
             };
-            rows::<Issue>(gitlab, listing, ctx.full.then_some(RowScope::All)).await
+            rows::<Issue>(&ctx, listing, ctx.full.then_some(RowScope::All)).await
         }
         Job::AllMergeRequests => {
             let listing = Listing::AllMergeRequests {
                 updated_after: ctx.updated_after(),
             };
-            rows::<MergeRequest>(gitlab, listing, ctx.full.then_some(RowScope::All)).await
+            rows::<MergeRequest>(&ctx, listing, ctx.full.then_some(RowScope::All)).await
         }
         Job::RecentAuthoredIssues => {
             let listing = |updated_after| Listing::RecentAuthoredIssues { updated_after };
@@ -447,14 +448,12 @@ pub async fn fetch(job: Job, ctx: FetchCtx) -> Result<Staged> {
             recent_issues(&ctx, listing, RECENT_ASSIGNED_ISSUES).await
         }
         Job::MemberProjects => {
-            rows::<Project>(gitlab, Listing::MemberProjects, Some(RowScope::All)).await
+            rows::<Project>(&ctx, Listing::MemberProjects, Some(RowScope::All)).await
         }
-        Job::MemberGroups => {
-            rows::<Group>(gitlab, Listing::MemberGroups, Some(RowScope::All)).await
-        }
+        Job::MemberGroups => rows::<Group>(&ctx, Listing::MemberGroups, Some(RowScope::All)).await,
         Job::ProjectBoards(project_id) => {
             let fetched = fetch_rows(
-                gitlab,
+                &ctx,
                 &Listing::ProjectBoards { project_id },
                 None,
                 |b: &mut Board| b.project_id = project_id,
@@ -520,9 +519,8 @@ async fn capped_rows<R: Stored + Dated>(
     views: &'static [&'static str],
 ) -> Result<Staged> {
     let cap = ctx.windows.project_cap;
-    let gitlab = &*ctx.gitlab;
     let mut fetched: Vec<R> =
-        fetch_rows(gitlab, &listing(ctx.updated_after()), Some(cap), |_| {}).await?;
+        fetch_rows(ctx, &listing(ctx.updated_after()), Some(cap), |_| {}).await?;
     // A delta that fills the cap holds the newest `cap` items, just like a
     // full run, so it can reconcile too.
     let whole = ctx.full || fetched.len() >= cap;
@@ -540,7 +538,7 @@ async fn capped_rows<R: Stored + Dated>(
         // it before the reconcile would drop it.
         let since = ctx.started.saturating_sub(DELTA_OVERLAP_SECS);
         let late: Vec<R> = fetch_rows(
-            gitlab,
+            ctx,
             &listing(chrono::DateTime::from_timestamp(since as i64, 0)),
             Some(cap),
             |_| {},
@@ -617,11 +615,11 @@ fn drop_outdated<R: Stored + Dated>(
 /// Fetch `listing` as `R` rows; a full run (`reconcile = Some`) also drops
 /// stored rows in that scope the listing no longer returns.
 async fn rows<R: Stored>(
-    gitlab: &dyn GitlabApi,
+    ctx: &FetchCtx,
     listing: Listing,
     reconcile: Option<RowScope>,
 ) -> Result<Staged> {
-    let fetched: Vec<R> = fetch_rows(gitlab, &listing, None, |_| {}).await?;
+    let fetched: Vec<R> = fetch_rows(ctx, &listing, None, |_| {}).await?;
     Ok(Staged::new(move |c| {
         c.upsert(&fetched)?;
         if let Some(scope) = reconcile {
@@ -639,7 +637,7 @@ async fn view<R: Stored + Dated>(
     name: &'static str,
     corpus: fn(i64) -> Job,
 ) -> Result<Staged> {
-    let mut fetched: Vec<R> = fetch_rows(&*ctx.gitlab, &listing, None, |_| {}).await?;
+    let mut fetched: Vec<R> = fetch_rows(ctx, &listing, None, |_| {}).await?;
     let started = ctx.started;
     Ok(Staged::new(move |c| {
         let keys: Vec<RowKey> = fetched.iter().map(Resource::key).collect();
@@ -695,16 +693,11 @@ async fn events(ctx: &FetchCtx) -> Result<Staged> {
         .unwrap_or_default()
         .date_naive()
         .pred_opt();
-    let fetched: Vec<Event> = fetch_rows(
-        &*ctx.gitlab,
-        &Listing::Events { after },
-        None,
-        |_: &mut Event| {},
-    )
-    .await?
-    .into_iter()
-    .filter(|e| e.created_at >= window_start)
-    .collect();
+    let fetched: Vec<Event> = fetch_rows(ctx, &Listing::Events { after }, None, |_: &mut Event| {})
+        .await?
+        .into_iter()
+        .filter(|e| e.created_at >= window_start)
+        .collect();
     Ok(Staged::new(move |c| {
         c.upsert(&fetched)?;
         c.remove_where::<Event>(RowScope::Before(window_start), |_| false)?;
@@ -719,7 +712,7 @@ async fn timelogs(ctx: &FetchCtx, window: u64, prune: bool) -> Result<Staged> {
     let since_dt = chrono::DateTime::from_timestamp(since as i64, 0).unwrap_or_default();
     let (fetched, unreadable): (Vec<Timelog>, Vec<Timelog>) = ctx
         .gitlab
-        .list_timelogs(since_dt)
+        .list_timelogs(since_dt, &ctx.progress)
         .await?
         .into_iter()
         .filter(|t| t.id > 0 && t.spent_at >= since)
@@ -745,12 +738,12 @@ async fn timelogs(ctx: &FetchCtx, window: u64, prune: bool) -> Result<Staged> {
 /// response lacks. Rows that don't parse or validate are skipped: one bad
 /// row must not cost the whole listing.
 pub async fn fetch_rows<R: Resource>(
-    gitlab: &dyn GitlabApi,
+    ctx: &FetchCtx,
     listing: &Listing,
     limit: Option<usize>,
     stamp: impl Fn(&mut R),
 ) -> Result<Vec<R>> {
-    let raw = gitlab.list(listing, limit).await?;
+    let raw = ctx.gitlab.list(listing, limit, &ctx.progress).await?;
     let total = raw.len();
     let rows: Vec<R> = raw
         .into_iter()
@@ -819,6 +812,7 @@ mod tests {
                 project_cap: 2,
             },
             avatars: AvatarDir::new(avatars),
+            progress: Default::default(),
         }
     }
 

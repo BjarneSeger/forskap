@@ -1007,6 +1007,9 @@ mod tests {
             // What a daemon too old to say sends; the same as `false` for
             // anything but the epics.
             unavailable: None,
+            full: None,
+            fetched: None,
+            expected: None,
         }
     }
 

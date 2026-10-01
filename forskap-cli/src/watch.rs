@@ -13,7 +13,7 @@ use clap::ValueEnum;
 use crate::cli::{OutputFormat, WatchArgs};
 
 const HOME: &str = "\x1b[H";
-const ERASE_LINE: &str = "\x1b[K";
+pub(crate) const ERASE_LINE: &str = "\x1b[K";
 const ERASE_BELOW: &str = "\x1b[J";
 
 /// How often to redraw, if at all. Only the text view can be redrawn.
@@ -64,7 +64,7 @@ fn size() -> Option<(usize, usize)> {
 /// Append the first `cols` visible characters of `line`. Its escape
 /// sequences take no column and are all kept, also past the cut: a colour
 /// opened before it is closed by its own reset.
-fn cut(frame: &mut String, line: &str, cols: usize) {
+pub(crate) fn cut(frame: &mut String, line: &str, cols: usize) {
     let mut visible = 0;
     let mut chars = line.chars();
     while let Some(c) = chars.next() {
