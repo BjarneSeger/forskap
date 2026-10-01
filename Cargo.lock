@@ -1032,11 +1032,14 @@ version = "0.32.0"
 dependencies = [
  "async-trait",
  "dirs",
+ "quote",
  "serde",
  "serde_derive",
  "serde_json",
+ "syn 2.0.119",
  "varlink",
  "varlink_generator",
+ "varlink_parser",
 ]
 
 [[package]]

@@ -5,7 +5,13 @@ edition.workspace = true
 license = "MIT OR Apache-2.0"
 
 [build-dependencies]
+quote.workspace = true
+syn.workspace = true
 varlink_generator.workspace = true
+varlink_parser.workspace = true
+
+[dev-dependencies]
+syn.workspace = true
 
 [dependencies]
 async-trait.workspace = true

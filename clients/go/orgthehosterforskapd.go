@@ -2147,10 +2147,10 @@ type WorkItemRef (
   # its group: exactly one of the two is set.
   group_id: ?int,
   iid: int,
-  # "epic", …; null when the naming side doesn't say.
+  # "epic", …; absent when the naming side doesn't say.
   type: ?string,
   title: ?string,
-  # Absolute; null when unknown.
+  # Absolute; absent when unknown.
   web_url: ?string
 )
 
@@ -2162,9 +2162,9 @@ type WorkItem (
   iid: int,
   # "issue", "task", "incident", "test_case", "epic", …
   type: string,
-  # The project of an issue, task, …; null for an epic.
+  # The project of an issue, task, …; absent for an epic.
   project_id: ?int,
-  # The group of an epic; null for the rest.
+  # The group of an epic; absent for the rest.
   group_id: ?int,
   # Full path of that project ("team/api") or group ("team"): the stored
   # one's, else the one in web_url; empty when neither gives it.
@@ -2173,7 +2173,7 @@ type WorkItem (
   web_url: string,
   # "opened" or "closed".
   state: string,
-  # The epic an issue belongs to; null when it has none, and for an epic.
+  # The epic an issue belongs to; absent when it has none, and for an epic.
   parent: ?WorkItemRef,
   # GitLab's human-readable total spent time ("2h"); empty when none, and for
   # an epic.
@@ -2232,19 +2232,19 @@ type ActivityEvent (
   target_title: ?string,
   # 0 for events outside a project.
   project_id: int,
-  # Null when neither the project nor the item is in the store.
+  # Absent when neither the project nor the item is in the store.
   project_path: ?string,
-  # The issue or MR, a pushed branch's commits, else the project; null when
+  # The issue or MR, a pushed branch's commits, else the project; absent when
   # unknown.
   web_url: ?string,
   # Pushes only: the branch or tag.
   ref: ?string,
   # Pushes only.
   commit_count: ?int,
-  # Pushes only: the newest commit's title; null when the ref was deleted.
+  # Pushes only: the newest commit's title; absent when the ref was deleted.
   commit_title: ?string,
   # What the event did: a comment's first line (at most 200 characters, a cut
-  # one ends in …), a push's commit_title; null for every other event.
+  # one ends in …), a push's commit_title; absent for every other event.
   description: ?string
 )
 

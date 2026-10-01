@@ -69,6 +69,11 @@ versions. A client tells which version a daemon speaks by `GetStatus.api_version
 daemon that answers `GetStatus` with `MethodNotFound` is older than 0.32.0, and
 ignores an argument it doesn't know instead of refusing it.
 
+The daemon leaves an optional field without a value out of what it sends, wherever
+the field is; the Rust and Go bindings leave such an argument out too. A daemon
+before 0.32.0 sent the optional fields of its types (`WorkItem.parent`,
+`SyncJob.expected`, …) as `null` instead.
+
 From forskap-api 1.0 on, a client can rely on these:
 
 - Nothing is removed or renamed: no method, type, field, enum variant or error.
@@ -84,6 +89,8 @@ From forskap-api 1.0 on, a client can rely on these:
 And it must tolerate these:
 
 - Reply fields it doesn't know: it ignores them. The Rust and Go bindings do.
+- An optional field that is `null`: it means the same as the field being absent. The
+  Rust and Go bindings read both as `None` / `nil`.
 - `org.varlink.service.InvalidParameter` for an argument or an enum value the daemon
   doesn't know: a newer client talking to an older daemon. `parameter` names an
   unknown field, and says which value for an unknown enum value.
@@ -111,7 +118,7 @@ synced again, which the upgraded daemon does at its first start.
 An issue under an epic names it as `parent`: `group_id`, `iid`, `type` `epic`, its
 title and its link. GitLab links an issue's epic relative to the instance; the daemon
 answers with the stored epic's `web_url`, else the relative link behind the scheme and
-host of the issue's own. An epic's own `parent` is null. An issue synced by a daemon
+host of the issue's own. An epic has no `parent`. An issue synced by a daemon
 that didn't store its epic's group and number has no `parent` until its project is
 synced again, likewise at the first start.
 
@@ -330,7 +337,7 @@ is not the last one; and it re-walks the whole window every
 `search.full_interval_secs`, so an event GitLab showed late or hid at the time is
 picked up. Events carry no link of their own; `web_url`
 and `project_path` come from the stored issue, merge request and project rows and
-are null for events in projects the store doesn't know (the project row exists for
+are absent for events in projects the store doesn't know (the project row exists for
 member projects only). A comment's text is not stored. Served from the store alone;
 degrades to an empty reply on cache trouble. When the events have never been synced:
 replies with an empty array if a session exists (first sync pending),

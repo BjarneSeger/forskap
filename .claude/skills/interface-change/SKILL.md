@@ -30,7 +30,10 @@ this list top to bottom.
 `forskap-api/build.rs` runs `varlink_generator` into `$OUT_DIR` on every build;
 `lib.rs` `include!`s it. No manual step — the next `cargo build` yields the new
 `VarlinkInterface` trait, `Call_*` traits, and request/reply structs. Compile errors in
-the daemon are the to-do list.
+the daemon are the to-do list. The build script also gives every `Option` field
+`skip_serializing_if`, so an absent field is left out rather than sent as `null`; it
+fails the build if the `Option` fields it finds don't match the `.varlink` file's
+optional ones (the generator's output changed: adapt `OmitAbsent`).
 
 ## 3. Daemon handlers
 
