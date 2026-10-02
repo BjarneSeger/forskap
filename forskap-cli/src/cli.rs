@@ -516,11 +516,11 @@ pub enum SearchProviderCommand {
     #[command(hide = true)]
     Cosmic,
     /// Serve rofi's script mode: list on start, open or search what is picked
-    /// (what a `forskap:forskap integration search-provider rofi` mode runs).
+    /// (what a `forskap:forskap integration search-provider rofi --` mode runs).
     #[command(hide = true)]
     Rofi {
-        /// The picked row or the typed text; rofi passes it as is, so it may
-        /// start with a dash.
+        /// The picked row or the typed text. rofi passes it as is, so the
+        /// mode ends in `--`: text like `-h` is an option otherwise.
         #[arg(allow_hyphen_values = true)]
         entry: Option<String>,
     },

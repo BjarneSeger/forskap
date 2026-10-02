@@ -5,6 +5,9 @@
 //! the frequently opened items; typed text sent with Ctrl+Enter is searched in
 //! the daemon with the shared grammar ([`query::parse`]).
 //!
+//! rofi appends that text to the mode's command as is, so the mode ends in
+//! `--`: without it clap reads `-h` or `--color` as an option.
+//!
 //! Each row carries its result id as `info`, which rofi hands back as
 //! `ROFI_INFO`. A list without rows makes rofi quit, so a failure or an empty
 //! answer is a row too, one that can't be picked.
@@ -13,7 +16,7 @@ use anyhow::Result;
 use forskap_api::{SearchOptions, VarlinkClient, VarlinkClientInterface};
 
 use super::Provider;
-use super::query;
+use super::query::{self, Kinds, Parsed};
 use super::results::{self, Row};
 use crate::cli::SearchKind;
 use crate::client;
@@ -22,7 +25,8 @@ use crate::friendly::friendly;
 
 /// The grammar for Ctrl+Enter (rofi's default `kb-accept-custom`), as Pango
 /// markup: rofi renders the message bar with it.
-const HINT: &str = "\0message\x1fCtrl+Enter searches: i|mr|e|g|all &lt;text&gt;, #42, !42, &amp;42";
+const HINT: &str =
+    "\0message\x1fCtrl+Enter searches: &lt;text&gt;, i|mr|e|g &lt;text&gt;, #42, !42, &amp;42";
 
 /// What rofi asks of this run, from `ROFI_RETV`.
 #[derive(Debug, PartialEq, Eq)]
@@ -95,7 +99,7 @@ async fn list(provider: &Provider) -> Result<()> {
 /// their trigger word and length gate: rofi only sends it on request.
 async fn search(provider: &Provider, text: &str) -> Result<()> {
     let parsed = query::parse(text);
-    let options = wire_filter(parsed.kinds().as_slice());
+    let options = wire_filter(kinds(&parsed).as_slice());
     let found = async {
         let client = client::connect(&provider.socket).await?;
         rows(&client, &parsed.query, options).await
@@ -106,6 +110,12 @@ async fn search(provider: &Provider, text: &str) -> Result<()> {
         Err(e) => vec![notice(&format!("{e:#}"))],
     };
     print(&lines)
+}
+
+/// The kinds typed, else every kind: the projects the other launchers search
+/// for plain text are all in rofi's list already.
+fn kinds(parsed: &Parsed) -> Kinds {
+    parsed.typed.unwrap_or(Kinds::All)
 }
 
 async fn rows(client: &VarlinkClient, query: &str, options: SearchOptions) -> Result<Vec<Row>> {
@@ -202,6 +212,17 @@ mod tests {
         // Shift+Delete and custom keys aren't ours: stay open with the list.
         assert_eq!(ask(Some("3")), Ask::List);
         assert_eq!(ask(Some("10")), Ask::List);
+    }
+
+    #[test]
+    fn plain_text_searches_every_kind() {
+        assert_eq!(kinds(&query::parse("oauth")), Kinds::All);
+        assert_eq!(kinds(&query::parse("all oauth")), Kinds::All);
+        assert_eq!(
+            kinds(&query::parse("mr oauth")),
+            Kinds::Only(SearchKind::Mrs)
+        );
+        assert_eq!(kinds(&query::parse("#42")), Kinds::Only(SearchKind::Issues));
     }
 
     #[test]

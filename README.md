@@ -192,14 +192,16 @@ answer only searches that start with a word, like the `/gl` prefix, set
 rofi needs no files, only a mode that runs the provider:
 
 ```sh
-rofi -show forskap -modes "forskap:forskap integration search-provider rofi"
+rofi -show forskap -modes "forskap:forskap integration search-provider rofi --"
 ```
 
-or, in `config.rasi`, `modes: "drun,run,forskap:forskap integration search-provider rofi";`
-(and `display-forskap: "GitLab";` for the prompt). It lists every project and the
-frequently opened items, which rofi filters as you type; Ctrl+Enter searches the typed text
-instead, read as above (`i oauth`, `#42`). Avatars show with `show-icons: true`. The trigger
-word doesn't apply.
+or, in `config.rasi`, `modes: "drun,run,forskap:forskap integration search-provider rofi --";`
+(and `display-forskap: "GitLab";` for the prompt). The closing `--` keeps typed text like `-h`
+from being read as an option. It lists every project and the frequently opened items, which
+rofi filters as you type; Ctrl+Enter (or Enter, when no row matches) searches the typed text
+instead, read as above (`i oauth`, `#42`), except that plain text searches everything: the
+projects are all listed already. Avatars show with `show-icons: true`. The trigger word
+doesn't apply.
 
 # Upgrading from gitlab-trackr
 

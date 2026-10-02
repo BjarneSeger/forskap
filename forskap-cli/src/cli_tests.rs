@@ -392,6 +392,31 @@ fn groups_need_a_subcommand() {
     }
 }
 
+/// rofi appends what the user typed as is; behind the mode's `--` none of it
+/// is an option.
+#[cfg(target_os = "linux")]
+#[test]
+fn rofi_takes_any_text_behind_the_double_dash() {
+    use crate::cli::{IntegrationCommand, SearchProviderCommand};
+
+    let entry = |text: &[&str]| {
+        let mode = ["integration", "search-provider", "rofi", "--"];
+        match ok(&[&mode[..], text].concat()) {
+            Command::Integration {
+                command:
+                    IntegrationCommand::SearchProvider {
+                        command: SearchProviderCommand::Rofi { entry },
+                    },
+            } => entry,
+            _ => panic!("not the rofi command"),
+        }
+    };
+    assert_eq!(entry(&[]), None);
+    for text in ["-h", "--help", "--color", "--", "-x", "i oauth"] {
+        assert_eq!(entry(&[text]).as_deref(), Some(text));
+    }
+}
+
 /// Shell hooks already installed in rc files call these.
 #[test]
 fn installed_hook_spellings_still_parse() {
