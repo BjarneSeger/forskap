@@ -158,27 +158,33 @@ noctalia msg plugins source add forskap git https://github.com/BjarneSeger/forsk
 noctalia msg plugins enable thehoster/forskap
 ```
 
-## GNOME Shell and KRunner
+## GNOME Shell, KRunner and COSMIC
 
-`forskap integration search-provider` serves the same search to GNOME Shell's overview search and to
-KRunner (Plasma 6) over D-Bus. The session bus starts it on demand and it exits again
-when idle; picking a result opens it in the browser and counts the open like `forskap issue open`.
+`forskap integration search-provider` serves the same search to GNOME Shell's overview search, to
+KRunner (Plasma 6) over D-Bus and to COSMIC's launcher as a
+[pop-launcher](https://github.com/pop-os/launcher) plugin. The session bus starts the D-Bus
+service on demand and it exits again when idle; COSMIC's launcher runs the plugin while it is
+open. Picking a result opens it in the browser and counts the open like `forskap issue open`.
 Type `mr oauth`, `#42` or `!42` to narrow the kind, or just `oauth`. Results show the
 avatar of their project, where it has one.
 
-The deb/rpm/arch package installs the registration files. From a `cargo install`, write
-them yourself — GNOME Shell only reads providers from `$XDG_DATA_DIRS`, so this needs root
-(`sudo` does not search `~/.cargo/bin`, hence the explicit path):
+The deb/rpm/arch package installs the registration files (the plugin under
+`/etc/pop-launcher/plugins/forskap`). From a `cargo install`, write them yourself — GNOME
+Shell only reads providers from `$XDG_DATA_DIRS`, so this needs root (`sudo` does not search
+`~/.cargo/bin`, hence the explicit path):
 
 ```sh
-sudo "$(which forskap)" integration search-provider install            # /usr/local/share
-forskap integration search-provider install --prefix ~/.local/share    # KRunner only, no root
+sudo "$(which forskap)" integration search-provider install            # /usr/local/share, /etc/pop-launcher
+forskap integration search-provider install --prefix ~/.local/share    # KRunner and COSMIC only, no root
 ```
 
 Then reload the bus (`busctl --user call org.freedesktop.DBus /org/freedesktop/DBus
-org.freedesktop.DBus ReloadConfig`), log out and in for GNOME Shell, or `kquitapp6 krunner`
-for Plasma. To answer only searches that start with a word, like the `/gl` prefix, set
-`search_provider.trigger_word = "gl"` in `forskap config path` (KRunner reads it at startup).
+org.freedesktop.DBus ReloadConfig`), log out and in for GNOME Shell, `kquitapp6 krunner`
+for Plasma, or `pkill cosmic-launcher` for COSMIC (its session restarts the launcher). To
+answer only searches that start with a word, like the `/gl` prefix, set
+`search_provider.trigger_word = "gl"` in `forskap config path` (KRunner reads it at startup;
+`install` writes it into the COSMIC plugin, where `gl …` then shows GitLab results alone and
+`?` lists `gl`, so run `install` again after changing it).
 
 # Upgrading from gitlab-trackr
 

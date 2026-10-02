@@ -385,6 +385,7 @@ fn groups_need_a_subcommand() {
         assert!(parse(&["integration", "search-provider"]).is_err());
         ok(&["integration", "search-provider", "serve"]);
         ok(&["integration", "search-provider", "launch"]);
+        ok(&["integration", "search-provider", "cosmic"]);
     }
 }
 

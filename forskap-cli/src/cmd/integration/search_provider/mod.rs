@@ -1,17 +1,20 @@
-//! `forskap integration search-provider` — serve `forskap search` to GNOME Shell and
-//! KRunner.
+//! `forskap integration search-provider` — serve `forskap search` to GNOME Shell,
+//! KRunner and COSMIC's launcher.
 //!
 //! One process owns the bus name [`BUS_NAME`] and exposes two objects: the
 //! GNOME `org.gnome.Shell.SearchProvider2` interface at [`GNOME_PATH`] and
 //! the KRunner `org.kde.krunner1` interface at [`KRUNNER_PATH`]. The session
 //! bus starts it on demand through the `dbus-1/services` file that
 //! `install` writes, and it exits after [`IDLE`] without a
-//! call, so nothing runs while no launcher is open.
+//! call, so nothing runs while no launcher is open. COSMIC's launcher has no
+//! bus API: it runs us as a pop-launcher plugin over stdin/stdout ([`cosmic`])
+//! for as long as it is open.
 //!
 //! Everything comes from the daemon (`Search`, `RecordOpen`, `WhoAmI`), the
 //! same calls the noctalia plugin makes through `forskap search` / `forskap issue open`; the
 //! query grammar ([`query`]) and result ids ([`results`]) are shared with it.
 
+mod cosmic;
 mod gnome;
 mod install;
 mod krunner;
@@ -52,7 +55,18 @@ pub async fn run(command: SearchProviderCommand) -> Result<()> {
         SearchProviderCommand::Serve => serve().await,
         SearchProviderCommand::Install { prefix } => install::run(prefix),
         SearchProviderCommand::Launch => Provider::new()?.launch_search("").await,
+        SearchProviderCommand::Cosmic => cosmic::serve(Provider::new()?).await,
     }
+}
+
+/// `search_provider.trigger_word`, trimmed; blank counts as unset.
+pub(super) fn trigger_word(cfg: &config::Config) -> Option<String> {
+    cfg.search_provider
+        .trigger_word
+        .as_deref()
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
 }
 
 async fn serve() -> Result<()> {
@@ -115,11 +129,7 @@ impl Provider {
     fn new() -> Result<Self> {
         let cfg = config::load()?;
         let socket = client::socket(&cfg)?;
-        let trigger_word = cfg
-            .search_provider
-            .trigger_word
-            .map(|w| w.trim().to_string())
-            .filter(|w| !w.is_empty());
+        let trigger_word = trigger_word(&cfg);
         Ok(Self {
             socket,
             trigger_word,

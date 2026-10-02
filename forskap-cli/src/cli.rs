@@ -479,7 +479,7 @@ pub enum ConfigCommand {
 #[cfg(target_os = "linux")]
 #[derive(Subcommand)]
 pub enum IntegrationCommand {
-    /// `forskap search` for GNOME Shell and KRunner.
+    /// `forskap search` for GNOME Shell, KRunner and COSMIC.
     SearchProvider {
         #[command(subcommand)]
         command: SearchProviderCommand,
@@ -494,11 +494,15 @@ pub enum SearchProviderCommand {
     /// The session bus starts this on demand once the files from `install`
     /// are in place.
     Serve,
-    /// Write the GNOME Shell, KRunner and D-Bus activation files.
+    /// Write the GNOME Shell, KRunner, D-Bus activation and COSMIC launcher files.
     ///
     /// They go under PREFIX with this binary's path filled in. GNOME Shell
     /// only reads providers from `$XDG_DATA_DIRS`, so the default prefix needs
     /// root; KRunner and D-Bus activation also work from `~/.local/share`.
+    /// COSMIC's launcher plugin goes to `~/.local/share/pop-launcher/plugins`
+    /// for that prefix and to `/etc/pop-launcher/plugins` for any other, the
+    /// only directories it reads; a `search_provider.trigger_word` is written
+    /// into it, so run this again after changing the word.
     Install {
         /// Data directory to install into (default: /usr/local/share).
         #[arg(long, value_name = "DIR")]
@@ -507,6 +511,10 @@ pub enum SearchProviderCommand {
     /// Open your GitLab instance in the browser (the desktop entry's action).
     #[command(hide = true)]
     Launch,
+    /// Serve searches to COSMIC's launcher over stdin/stdout (what the
+    /// installed pop-launcher plugin runs).
+    #[command(hide = true)]
+    Cosmic,
 }
 
 /// `inline` is for shells whose prompt hooks run in a cooked terminal
