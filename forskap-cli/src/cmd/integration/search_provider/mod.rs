@@ -170,7 +170,7 @@ impl Provider {
         let client = client::connect(&self.socket).await?;
         let options = SearchOptions {
             limit: Some(PER_KIND_LIMIT),
-            ..wire_filter(parsed.kind.as_slice())
+            ..wire_filter(parsed.kinds().as_slice())
         };
         let reply = match client.search(parsed.query, Some(options)).call().await {
             Ok(reply) => reply,

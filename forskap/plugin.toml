@@ -1,11 +1,11 @@
 id          = "thehoster/forskap"
 name        = "Forskap"
-version     = "0.5.4"
+version     = "0.6.0"
 plugin_api  = 24 # argument-array form of noctalia.runAsync
 author      = "thehoster"
 license     = "GPL-3.0-only"
 icon        = "brand-gitlab"
-description = "Search GitLab issues, merge requests, epics, projects and groups through forskapd; frequently opened items rank first."
+description = "Open GitLab projects through forskapd; issues, merge requests, epics and groups behind a kind word, frequently opened items first."
 tags        = ["gitlab", "launcher", "search"]
 dependencies = ["forskap"]
 
