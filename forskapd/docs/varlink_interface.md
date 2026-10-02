@@ -71,39 +71,41 @@ when it starts.
 
 # Compatibility
 
+`org.thehoster.forskapd` is stable: a client built against one version of it works
+with every daemon of the same major version and a minor version at least its own.
 These rules cover `org.thehoster.forskapd` only;
-[the admin interface](#the-orgthehosterforskapdadmin-interface) has none.
+[the admin interface](#the-orgthehosterforskapdadmin-interface) is outside all of
+them.
 
-Until forskap-api 1.0 the interface still changes incompatibly between minor
-versions. A client tells which version a daemon speaks by `GetStatus.api_version`; a
-daemon that answers `GetStatus` with `MethodNotFound` is older than 0.32.0, and
-ignores an argument it doesn't know instead of refusing it. A client can use a daemon
-whose `api_version` has its own minor version before 1.0 (every interface change bumps
-the minor; a patch is a fix to a binding alone), and from 1.0 on the same major and a
-minor at least its own. Both bindings carry that rule: `forskap_api::compatible` in
-Rust, `Status.Compatible` in Go, against the version they were built from.
+The interface's version is the forskap-api crate's: every change to the interface
+bumps the minor version, a patch is a fix to a binding alone. A client tells which
+version a daemon speaks by `GetStatus.api_version`, and both bindings carry the rule
+above: `forskap_api::compatible` in Rust, `Status.Compatible` in Go, against the
+version they were built from. A daemon that answers `GetStatus` with `MethodNotFound`
+is older than 0.32.0, from before the interface was stable.
 
 The daemon leaves an optional field without a value out of what it sends, wherever
-the field is; the Rust and Go bindings leave such an argument out too. A daemon
-before 0.32.0 sent the optional fields of its types (`WorkItem.parent`, …) as `null`
-instead.
+the field is; the Rust and Go bindings leave such an argument out too.
 
-From forskap-api 1.0 on, a client can rely on these:
+Within a major version, a client can rely on these:
 
-- Nothing is removed or renamed: no method, type, field, enum variant or error.
-- A field new to a reply is optional (`?T`).
+- Nothing is removed or renamed: no method, argument, reply field, type, struct field,
+  enum variant, error or error parameter.
+- Nothing changes its type: a field, argument or error parameter keeps the same named
+  type or builtin under the same `?`, `[]` and `[string]`, so an optional one stays
+  optional and a required one required; a struct stays a struct and an enum an enum.
+- A field new to a reply, to a struct or to an error is optional (`?T`).
 - A new argument is optional, so a call that leaves it out means what it meant before.
   The methods whose arguments grow take them in one struct (`SearchOptions`,
   `WorkItemFilter`, `NewWorkItem`, `Scope`), and a new one is a new optional field of
   it: the bindings' signatures stay, and a caller that fills the struct from `Default`
   (`SearchOptions { limit: Some(5), ..Default::default() }` in Rust) or names the
   fields it sets (Go) keeps compiling.
-- An enum that appears in replies (`IssuableKind`, `HistorySource`, `NotAuthReason`)
-  gets no new variants: a new state is a new optional field. The enums only arguments
-  take (`SearchKind`, `WorkItemRole`, `WorkItemState`) may get new ones, which an
-  older daemon refuses.
-- An incompatible change is a new interface, under a new name, served next to the old
-  one.
+- An enum that a reply or an error can carry, directly or in a field of a struct it
+  carries (`IssuableKind`, `HistorySource`, `NotAuthReason`), gets no new variants: a
+  new state is a new optional field. The enums only arguments take (`SearchKind`,
+  `WorkItemRole`, `WorkItemState`) may get new ones, which an older daemon refuses.
+- New methods, types and errors may appear.
 
 And it must tolerate these:
 
@@ -114,6 +116,16 @@ And it must tolerate these:
   doesn't know: a newer client talking to an older daemon. `parameter` names an
   unknown field, and says which value for an unknown enum value.
 - `org.varlink.service.MethodNotFound` for a method the daemon doesn't have.
+
+A test of the forskap-api crate enforces the rules, and CI runs it on every change to
+the crate. Each released minor version of the definition is kept, never to be edited,
+in [`forskap-api/varlink/snapshots/`](../../forskap-api/varlink/snapshots/): the
+definition has to be the snapshot of its own version and keep the rules against every
+snapshot of its major version. A change that breaks them fails the test, and so does
+a change that comes without a new minor version.
+
+An incompatible change is a new interface under a new name, served next to the old one
+on the same socket, so that a client of the old one keeps working.
 
 # Types
 
