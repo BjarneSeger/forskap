@@ -5,7 +5,7 @@
 //! serves whatever was last synced — no fetch, effectively free.
 
 use anyhow::Result;
-use forskap_api::VarlinkClientInterface;
+use forskap_api::{Scope, VarlinkClientInterface};
 
 use crate::cli::OutputFormat;
 use crate::friendly::friendly;
@@ -14,12 +14,15 @@ use crate::{client, output, style};
 
 pub async fn run(kind: RefKind, groups: Vec<String>, format: OutputFormat) -> Result<()> {
     let client = client::connect_default().await?;
-    let filter = (!groups.is_empty()).then_some(groups);
+    let scope = (!groups.is_empty()).then_some(Scope {
+        projects: None,
+        groups: Some(groups),
+    });
 
     match kind {
         RefKind::Issue => {
             let reply = client
-                .get_assigned_work_items(filter)
+                .get_assigned_work_items(scope)
                 .call()
                 .await
                 .map_err(|e| friendly("GetAssignedWorkItems", e))?;
@@ -38,7 +41,7 @@ pub async fn run(kind: RefKind, groups: Vec<String>, format: OutputFormat) -> Re
         }
         RefKind::Mr => {
             let reply = client
-                .get_assigned_merge_requests(filter)
+                .get_assigned_merge_requests(scope)
                 .call()
                 .await
                 .map_err(|e| friendly("GetAssignedMergeRequests", e))?;

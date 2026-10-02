@@ -52,22 +52,17 @@ pub fn text_matches(needle_lower: &str, hay: &str) -> bool {
     hay.to_lowercase().contains(needle_lower)
 }
 
-/// The board-derived `graph_status` for an issue: the first of its labels that
-/// appears in the project's board lists, the issue's state when none matches,
-/// or empty when the board labels are unknown.
-pub fn graph_status_from(
+/// The board column of an issue: the first of its labels that appears in the
+/// project's board lists, the issue's state when none matches (a board's Open
+/// and Closed lists), or `None` when the board labels are unknown.
+pub fn board_column(
     board_labels: Option<&[String]>,
     labels: &[String],
     state: &str,
-) -> String {
-    match board_labels {
-        Some(board) => labels
-            .iter()
-            .find(|l| board.iter().any(|b| b == *l))
-            .cloned()
-            .unwrap_or_else(|| state.to_string()),
-        None => String::new(),
-    }
+) -> Option<String> {
+    let board = board_labels?;
+    let label = labels.iter().find(|l| board.iter().any(|b| b == *l));
+    Some(label.map_or(state, String::as_str).to_string())
 }
 
 #[cfg(test)]
@@ -103,6 +98,32 @@ mod tests {
             );
             prop_assert!(!in_group(&group, ""), "empty filter matches nothing");
         }
+    }
+
+    #[test]
+    fn the_board_column_is_a_list_label_else_the_state() {
+        let board = ["Doing".to_string(), "Review".to_string()];
+        let labels = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let column =
+            |board: Option<&[String]>, l: &[&str], state| board_column(board, &labels(l), state);
+        assert_eq!(
+            column(Some(&board), &["bug", "Review", "Doing"], "opened").as_deref(),
+            Some("Review"),
+            "the issue's first label that is a list"
+        );
+        assert_eq!(
+            column(Some(&board), &["bug"], "closed").as_deref(),
+            Some("closed")
+        );
+        assert_eq!(
+            column(Some(&[]), &["bug"], "opened").as_deref(),
+            Some("opened")
+        );
+        assert_eq!(
+            column(None, &["Doing"], "opened"),
+            None,
+            "boards never synced"
+        );
     }
 
     #[test]

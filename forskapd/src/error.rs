@@ -86,6 +86,36 @@ impl Error {
             _ => None,
         }
     }
+
+    /// What the failure leaves a client that asked for the request.
+    pub fn verdict(&self) -> Verdict {
+        match self {
+            Self::Rejected { status, .. } => Verdict::Refused(Some(*status)),
+            Self::Unauthorized(_) => Verdict::Refused(Some(401)),
+            Self::Gitlab(_) => Verdict::Refused(None),
+            Self::Transient(_) | Self::Throttled { .. } | Self::RotationLost(_) => {
+                Verdict::Unavailable
+            }
+            Self::Secrets(_)
+            | Self::NoKeychain
+            | Self::Fjall(_)
+            | Self::Db(_)
+            | Self::Json(_)
+            | Self::Io(_)
+            | Self::Varlink(_) => Verdict::Internal,
+        }
+    }
+}
+
+/// How a failed call ends for its client: the error the handlers reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// GitLab answered and won't do it; its HTTP status where there is one.
+    Refused(Option<u16>),
+    /// GitLab was out of reach or overloaded: whether it did it is unknown.
+    Unavailable,
+    /// The daemon failed on its own: its keychain or its storage.
+    Internal,
 }
 
 /// Why the daemon has no live GitLab session. Attached to
@@ -247,6 +277,42 @@ mod tests {
         }
         assert!(throttled(503).is_retryable(true));
         assert!(!throttled(503).is_retryable(false));
+    }
+
+    /// GitLab's answers are refusals with their status (none without one),
+    /// no answer or a 429/5xx an unknown outcome, the rest the daemon's own.
+    #[test]
+    fn verdicts_by_error() {
+        let throttled = |status| Error::Throttled {
+            status,
+            retry_after: None,
+            detail: String::new(),
+        };
+        let rejected = |status| Error::Rejected {
+            status,
+            detail: String::new(),
+        };
+        let json = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        for (error, verdict) in [
+            (rejected(403), Verdict::Refused(Some(403))),
+            (rejected(422), Verdict::Refused(Some(422))),
+            (Error::Unauthorized("x".into()), Verdict::Refused(Some(401))),
+            (Error::Gitlab("unreadable".into()), Verdict::Refused(None)),
+            (Error::Transient("reset".into()), Verdict::Unavailable),
+            (throttled(429), Verdict::Unavailable),
+            (throttled(503), Verdict::Unavailable),
+            (Error::RotationLost("x".into()), Verdict::Unavailable),
+            (Error::Secrets("locked".into()), Verdict::Internal),
+            (Error::NoKeychain, Verdict::Internal),
+            (Error::Db("bad key"), Verdict::Internal),
+            (Error::Json(json), Verdict::Internal),
+            (
+                Error::Io(std::io::ErrorKind::Other.into()),
+                Verdict::Internal,
+            ),
+        ] {
+            assert_eq!(error.verdict(), verdict, "{error}");
+        }
     }
 
     #[test]

@@ -6,13 +6,20 @@ use quote::ToTokens as _;
 use syn::visit_mut::{self, VisitMut};
 use varlink_parser::{IDL, VStruct, VStructOrEnum, VType, VTypeExt};
 
-const INTERFACE: &str = "varlink/org.thehoster.forskapd.varlink";
+/// The interface the crate root holds, and the admin one its `admin` module
+/// holds; each is generated into `$OUT_DIR` under its own name.
+const INTERFACES: [&str; 2] = ["org.thehoster.forskapd", "org.thehoster.forskapd.admin"];
 
 fn main() {
     let out_dir: PathBuf = env::var_os("OUT_DIR").unwrap().into();
-    let output_path = out_dir.join("org.thehoster.forskapd.rs");
+    for name in INTERFACES {
+        let idl = fs::read_to_string(format!("varlink/{name}.varlink")).unwrap();
+        fs::write(out_dir.join(format!("{name}.rs")), generate(name, &idl)).unwrap();
+    }
+}
 
-    let idl = fs::read_to_string(INTERFACE).unwrap();
+/// The Rust code for the interface `idl`, adapted as the types below say.
+fn generate(name: &str, idl: &str) -> String {
     let mut generated = Vec::new();
     varlink_generator::generate_with_options(
         &mut idl.as_bytes(),
@@ -29,17 +36,52 @@ fn main() {
     let mut file = syn::parse_file(&generated).expect("varlink_generator's output parses");
     let mut omit = OmitAbsent::default();
     omit.visit_file_mut(&mut file);
-    let declared = IDL::try_from(idl.as_str()).unwrap();
-    let optional: usize = structs(&declared).map(optional_fields).sum();
+    let mut default = DeriveDefault::default();
+    default.visit_file_mut(&mut file);
+    let declared = IDL::try_from(idl).unwrap();
+    let optional: usize = structs(&declared).iter().map(|s| optional_fields(s)).sum();
     // A field the walk didn't recognise would go out as `null` again.
     assert_eq!(
         omit.fields, optional,
-        "the interface declares {optional} optional fields, the generated structs have {} \
+        "{name} declares {optional} optional fields, the generated structs have {} \
          `Option` fields: varlink_generator's output changed, adapt `OmitAbsent`",
         omit.fields
     );
+    let defaultable = structs(&declared)
+        .iter()
+        .filter(|s| optional_fields(s) == s.elts.len())
+        .count();
+    assert_eq!(
+        default.structs, defaultable,
+        "{name} declares {defaultable} structs without a required field, {} generated \
+         structs derive `Default`: varlink_generator's output changed, adapt `DeriveDefault`",
+        default.structs
+    );
+    file.into_token_stream().to_string()
+}
 
-    fs::write(output_path, file.into_token_stream().to_string()).unwrap();
+/// Derives `Default` for every serialized struct without a required field,
+/// so a caller can write `SearchOptions { limit: Some(5),
+/// ..Default::default() }` and keeps compiling when a field is added.
+#[derive(Default)]
+struct DeriveDefault {
+    structs: usize,
+}
+
+impl VisitMut for DeriveDefault {
+    fn visit_item_struct_mut(&mut self, item: &mut syn::ItemStruct) {
+        if serialized(item) && item.fields.iter().all(|f| is_option(&f.ty)) {
+            self.structs += 1;
+            item.attrs.push(syn::parse_quote!(#[derive(Default)]));
+        }
+        visit_mut::visit_item_struct_mut(self, item);
+    }
+}
+
+fn serialized(item: &syn::ItemStruct) -> bool {
+    item.attrs.iter().any(|a| {
+        a.path().is_ident("derive") && a.to_token_stream().to_string().contains("Serialize")
+    })
 }
 
 /// Gives every `Option` field of a serialized struct the
@@ -53,10 +95,7 @@ struct OmitAbsent {
 
 impl VisitMut for OmitAbsent {
     fn visit_item_struct_mut(&mut self, item: &mut syn::ItemStruct) {
-        let serialized = item.attrs.iter().any(|a| {
-            a.path().is_ident("derive") && a.to_token_stream().to_string().contains("Serialize")
-        });
-        if let (true, syn::Fields::Named(fields)) = (serialized, &mut item.fields) {
+        if let (true, syn::Fields::Named(fields)) = (serialized(item), &mut item.fields) {
             for field in fields.named.iter_mut().filter(|f| is_option(&f.ty)) {
                 self.fields += 1;
                 let skipped = field.attrs.iter().any(|a| {
@@ -87,29 +126,36 @@ fn is_option(ty: &syn::Type) -> bool {
 }
 
 /// Every struct the interface declares: its types, its errors' parameters,
-/// its methods' arguments and replies.
-fn structs<'a>(idl: &'a IDL<'a>) -> impl Iterator<Item = &'a VStruct<'a>> {
+/// its methods' arguments and replies, and the anonymous structs inside
+/// them, each of which the generator turns into a struct of its own.
+fn structs<'a>(idl: &'a IDL<'a>) -> Vec<&'a VStruct<'a>> {
+    fn with_nested<'a>(s: &'a VStruct<'a>, all: &mut Vec<&'a VStruct<'a>>) {
+        all.push(s);
+        for field in &s.elts {
+            let mut t = &field.vtype;
+            while let VTypeExt::Array(inner) | VTypeExt::Dict(inner) | VTypeExt::Option(inner) = t {
+                t = inner;
+            }
+            if let VTypeExt::Plain(VType::Struct(s)) = t {
+                with_nested(s, all);
+            }
+        }
+    }
     let types = idl.typedefs.values().filter_map(|t| match &t.elt {
         VStructOrEnum::VStruct(s) => Some(&**s),
         VStructOrEnum::VEnum(_) => None,
     });
     let errors = idl.errors.values().map(|e| &e.parm);
     let methods = idl.methods.values().flat_map(|m| [&m.input, &m.output]);
-    types.chain(errors).chain(methods)
+    let mut all = Vec::new();
+    for s in types.chain(errors).chain(methods) {
+        with_nested(s, &mut all);
+    }
+    all
 }
 
-/// The `?` fields of `s` and of the anonymous structs inside it, each of
-/// which the generator turns into a struct of its own.
+/// The `?` fields of `s` itself.
 fn optional_fields(s: &VStruct) -> usize {
-    fn nested(t: &VTypeExt) -> usize {
-        match t {
-            VTypeExt::Plain(VType::Struct(s)) => optional_fields(s),
-            VTypeExt::Array(t) | VTypeExt::Dict(t) | VTypeExt::Option(t) => nested(t),
-            VTypeExt::Plain(_) => 0,
-        }
-    }
-    let field = |a: &varlink_parser::Argument| {
-        usize::from(matches!(a.vtype, VTypeExt::Option(_))) + nested(&a.vtype)
-    };
-    s.elts.iter().map(field).sum()
+    let optional = |a: &&varlink_parser::Argument| matches!(a.vtype, VTypeExt::Option(_));
+    s.elts.iter().filter(optional).count()
 }

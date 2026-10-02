@@ -59,9 +59,9 @@ pub struct EpicRef {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TimeStats {
-    /// Human-readable total, e.g. `"1h 30m"`; GitLab sends `null` for none.
-    #[serde(default, deserialize_with = "de::nullable")]
-    pub human_total_time_spent: String,
+    /// Seconds; 0 when none is logged, and in a row stored before schema 3.
+    #[serde(default, deserialize_with = "de::lenient")]
+    pub total_time_spent: u64,
 }
 
 /// `GET /issues`, `/projects/:id/issues`.
@@ -105,11 +105,9 @@ impl Issue {
         }
     }
 
-    /// Human-readable `total_time_spent`, empty when none was logged.
-    pub fn total_time(&self) -> &str {
-        self.time_stats
-            .as_ref()
-            .map_or("", |t| t.human_total_time_spent.as_str())
+    /// Seconds spent on it, 0 when none was logged.
+    pub fn time_spent(&self) -> u64 {
+        self.time_stats.as_ref().map_or(0, |t| t.total_time_spent)
     }
 }
 
@@ -408,7 +406,8 @@ impl Resource for Issue {
     const NAME: &'static str = "issues";
     const KEYSPACE: &'static str = "gl_issues_v1";
     /// 2: the work item type and the epic's id, number, group and title.
-    const SCHEMA: u32 = 2;
+    /// 3: the time spent in seconds.
+    const SCHEMA: u32 = 3;
     fn key(&self) -> RowKey {
         (positive(self.project_id), positive(self.iid))
     }
@@ -654,7 +653,9 @@ mod tests {
                 "id": 3, "iid": 1, "title": "Roadmap", "url": "/groups/g/-/epics/1",
                 "group_id": 4, "human_readable_end_date": null,
             },
-            "time_stats": { "human_total_time_spent": "2h", "time_estimate": 0 },
+            "time_stats": {
+                "total_time_spent": 7200, "human_total_time_spent": "2h", "time_estimate": 0,
+            },
             "labels": ["bug", 42, null, "high", {"name": "x"}, ["y"], true],
             "assignees": [{ "id": 5, "username": "me", "name": "Me" }],
             "updated_at": "2026-07-01T10:00:00.000Z",
@@ -674,7 +675,7 @@ mod tests {
                 url: "/groups/g/-/epics/1".into(),
             })
         );
-        assert_eq!(i.total_time(), "2h");
+        assert_eq!(i.time_spent(), 7200);
         assert_eq!(i.labels, ["bug", "high"], "non-string labels skipped");
         assert_eq!(i.assignees[0].username, "me");
         assert_eq!(i.updated_at, 1_782_900_000);
@@ -685,14 +686,14 @@ mod tests {
         let v = json!({
             "id": 1, "iid": 1, "project_id": 1,
             "title": null, "epic": null,
-            "time_stats": { "human_total_time_spent": null },
+            "time_stats": { "total_time_spent": null },
             "assignees": null, "labels": null, "updated_at": null,
         });
         let i: Issue = serde_json::from_value(v).unwrap();
         assert_eq!(i.title, "");
         assert_eq!(i.epic, None);
         assert_eq!(i.work_item_type(), "issue");
-        assert_eq!(i.total_time(), "");
+        assert_eq!(i.time_spent(), 0);
         assert!(i.assignees.is_empty() && i.labels.is_empty());
         assert_eq!(i.updated_at, 0);
 
@@ -772,6 +773,20 @@ mod tests {
             assert_eq!(e.work_item_id, 0, "{odd}");
             assert!(e.is_valid(), "{odd}");
         }
+    }
+
+    /// A row stored before schema 3 has the time spent as GitLab spelled it:
+    /// 0 until the refill.
+    #[test]
+    fn an_old_time_spent_reads_as_zero() {
+        let i: Issue = serde_json::from_value(json!({
+            "id": 1, "iid": 1, "project_id": 1,
+            "time_stats": { "human_total_time_spent": "2h" },
+        }))
+        .unwrap();
+        assert_eq!(i.time_spent(), 0);
+        let stored = serde_json::to_vec(&i).unwrap();
+        assert_eq!(serde_json::from_slice::<Issue>(&stored).unwrap(), i);
     }
 
     /// An issue's epic as a row stored before schema 2 has it: the link only.

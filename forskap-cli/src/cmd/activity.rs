@@ -44,15 +44,15 @@ pub async fn run(days: u32, format: OutputFormat) -> Result<()> {
 
 /// What happened, to which item, in which project.
 fn describe(e: &ActivityEvent) -> String {
-    let project = match &e.project_path {
-        Some(path) => path.clone(),
-        None if e.project_id > 0 => format!("project {}", e.project_id),
-        None => String::new(),
+    let project = match (&e.project_path, e.project_id) {
+        (Some(path), _) => path.clone(),
+        (None, Some(id)) => format!("project {id}"),
+        (None, None) => String::new(),
     };
-    let sigil = match e.target_type.as_str() {
-        "Issue" | "WorkItem" => "#",
-        "MergeRequest" => "!",
-        "Milestone" => "%",
+    let sigil = match e.target_type.as_deref() {
+        Some("Issue" | "WorkItem") => "#",
+        Some("MergeRequest") => "!",
+        Some("Milestone") => "%",
         _ => "",
     };
     let item = match e.target_iid {
@@ -89,10 +89,10 @@ mod tests {
         ActivityEvent {
             timestamp: 0,
             action: action.into(),
-            target_type: target_type.into(),
+            target_type: (!target_type.is_empty()).then(|| target_type.into()),
             target_iid,
             target_title: None,
-            project_id: 7,
+            project_id: Some(7),
             project_path: Some("team/api".into()),
             web_url: None,
             r#ref: None,
@@ -150,5 +150,8 @@ mod tests {
         wiki.project_path = None;
         wiki.target_title = Some("Home".into());
         assert_eq!(describe(&wiki), "created       project 7  Home");
+        // Outside any project.
+        wiki.project_id = None;
+        assert_eq!(describe(&wiki), "created       Home");
     }
 }

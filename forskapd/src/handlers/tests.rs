@@ -5,15 +5,19 @@ use std::time::Duration;
 
 use tokio::sync::{Notify, RwLock};
 
+use forskap_api::admin::{
+    self, CacheScope, Call_ClearCache, Call_GetSyncJobs, Call_Login, Call_Logout,
+    GetSyncJobs_Reply, SyncJobStatus, VarlinkInterface as _,
+};
 use forskap_api::{
-    AsyncCall, CacheScope, Call_ClearCache, Call_Close, Call_CreateWorkItem, Call_GetActivity,
-    Call_GetAssignedMergeRequests, Call_GetAssignedWorkItems, Call_GetHistory, Call_GetStatus,
-    Call_GetSyncJobs, Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_Search,
-    Call_UnassignSelf, Call_WhoAmI, CreateWorkItem_Reply, GetActivity_Reply,
+    AsyncCall, Call_AssignSelf, Call_Close, Call_CreateWorkItem, Call_DismissFailure,
+    Call_GetActivity, Call_GetAssignedMergeRequests, Call_GetAssignedWorkItems, Call_GetHistory,
+    Call_GetStatus, Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
+    Call_Search, Call_UnassignSelf, Call_WhoAmI, CreateWorkItem_Reply, GetActivity_Reply,
     GetAssignedMergeRequests_Reply, GetAssignedWorkItems_Reply, GetHistory_Reply, GetStatus_Reply,
-    GetSyncJobs_Reply, HistorySource, IssuableKind, ListWorkItems_Reply, MergeRequest,
-    Search_Reply, SearchKind, SearchScope, SyncJobStatus, VarlinkInterface, WhoAmI_Reply, WorkItem,
-    WorkItemRef, WorkItemRole, WorkItemState,
+    HistorySource, IssuableKind, ListWorkItems_Reply, MergeRequest, NewWorkItem, Scope,
+    Search_Reply, SearchKind, SearchOptions, VarlinkInterface, WhoAmI_Reply, WorkItem,
+    WorkItemFilter, WorkItemRef, WorkItemRole, WorkItemState,
 };
 
 use crate::config::SharedConfig;
@@ -36,6 +40,10 @@ use crate::write::{Write, WriteOp};
 
 const NOT_AUTHENTICATED: &str = "org.thehoster.forskapd.NotAuthenticated";
 const GITLAB_ERROR: &str = "org.thehoster.forskapd.GitlabError";
+const GITLAB_UNAVAILABLE: &str = "org.thehoster.forskapd.GitlabUnavailable";
+const INVALID_ARGUMENT: &str = "org.thehoster.forskapd.InvalidArgument";
+const NOT_FOUND: &str = "org.thehoster.forskapd.NotFound";
+const ADMIN_INTERNAL: &str = "org.thehoster.forskapd.admin.Internal";
 
 // ── Scaffolding ────────────────────────────────────────────────────────
 
@@ -323,8 +331,25 @@ pub(crate) fn seed_corpus(h: &Handlers) {
     mark_synced(h, &[Job::MemberProjects]);
 }
 
-fn reply<T: serde::de::DeserializeOwned>(call: &mut AsyncCall) -> T {
-    let reply = call.take_reply().expect("a reply");
+/// A call of either interface, whose reply the tests read alike.
+trait Replied {
+    fn take(&mut self) -> Option<::varlink::Reply>;
+}
+
+impl Replied for AsyncCall {
+    fn take(&mut self) -> Option<::varlink::Reply> {
+        self.take_reply()
+    }
+}
+
+impl Replied for admin::AsyncCall {
+    fn take(&mut self) -> Option<::varlink::Reply> {
+        self.take_reply()
+    }
+}
+
+fn reply<T: serde::de::DeserializeOwned>(call: &mut impl Replied) -> T {
+    let reply = call.take().expect("a reply");
     assert!(
         reply.error.is_none(),
         "expected success, got {:?}",
@@ -333,16 +358,43 @@ fn reply<T: serde::de::DeserializeOwned>(call: &mut AsyncCall) -> T {
     serde_json::from_value(reply.parameters.expect("parameters")).expect("parse reply")
 }
 
-fn reply_error(call: &mut AsyncCall) -> Option<String> {
-    call.take_reply()
-        .expect("a reply")
-        .error
-        .map(|e| e.to_string())
+fn reply_error(call: &mut impl Replied) -> Option<String> {
+    reply_error_with(call).map(|(name, _)| name)
 }
 
-async fn assigned_work_items(h: &Handlers, groups: Option<Vec<String>>) -> Vec<WorkItem> {
+/// The error a call replied and its parameters, `None` for a success.
+fn reply_error_with(call: &mut impl Replied) -> Option<(String, serde_json::Value)> {
+    let reply = call.take().expect("a reply");
+    Some((
+        reply.error?.to_string(),
+        reply.parameters.unwrap_or_default(),
+    ))
+}
+
+/// The argument an `InvalidArgument` reply names; panics on any other reply.
+fn invalid_argument(call: &mut AsyncCall) -> String {
+    match reply_error_with(call) {
+        Some((name, args)) if name == INVALID_ARGUMENT => {
+            assert!(args["message"].is_string(), "{args}");
+            args["argument"].as_str().unwrap().to_string()
+        }
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}
+
+/// The status a `GitlabError` reply carries; panics on any other reply.
+fn gitlab_status(call: &mut AsyncCall) -> Option<i64> {
+    match reply_error_with(call) {
+        Some((name, args)) if name == GITLAB_ERROR => {
+            args.get("status").map(|s| s.as_i64().unwrap())
+        }
+        other => panic!("expected GitlabError, got {other:?}"),
+    }
+}
+
+async fn assigned_work_items(h: &Handlers, scope: Option<Scope>) -> Vec<WorkItem> {
     let mut call = AsyncCall::default();
-    h.get_assigned_work_items(&mut call as &mut dyn Call_GetAssignedWorkItems, groups)
+    h.get_assigned_work_items(&mut call as &mut dyn Call_GetAssignedWorkItems, scope)
         .await
         .unwrap();
     reply::<GetAssignedWorkItems_Reply>(&mut call).work_items
@@ -355,21 +407,25 @@ async fn list_work_items(
     states: Option<Vec<WorkItemState>>,
 ) -> Vec<WorkItem> {
     let mut call = AsyncCall::default();
-    h.list_work_items(
-        &mut call as &mut dyn Call_ListWorkItems,
+    let filter = WorkItemFilter {
         role,
         updated_after,
         states,
-    )
-    .await
-    .unwrap();
+    };
+    h.list_work_items(&mut call as &mut dyn Call_ListWorkItems, Some(filter))
+        .await
+        .unwrap();
     reply::<ListWorkItems_Reply>(&mut call).work_items
 }
 
 /// The error `ListWorkItems` replies for `role`, `None` for a success.
 async fn list_work_items_error(h: &Handlers, role: Option<WorkItemRole>) -> Option<String> {
     let mut call = AsyncCall::default();
-    h.list_work_items(&mut call as &mut dyn Call_ListWorkItems, role, None, None)
+    let filter = WorkItemFilter {
+        role,
+        ..Default::default()
+    };
+    h.list_work_items(&mut call as &mut dyn Call_ListWorkItems, Some(filter))
         .await
         .unwrap();
     reply_error(&mut call)
@@ -418,9 +474,9 @@ async fn unassign(h: &Handlers, project_id: i64, iid: i64, kind: IssuableKind) -
     reply_error(&mut call)
 }
 
-async fn assigned_mrs(h: &Handlers, groups: Option<Vec<String>>) -> Vec<MergeRequest> {
+async fn assigned_mrs(h: &Handlers, scope: Option<Scope>) -> Vec<MergeRequest> {
     let mut call = AsyncCall::default();
-    h.get_assigned_merge_requests(&mut call as &mut dyn Call_GetAssignedMergeRequests, groups)
+    h.get_assigned_merge_requests(&mut call as &mut dyn Call_GetAssignedMergeRequests, scope)
         .await
         .unwrap();
     reply::<GetAssignedMergeRequests_Reply>(&mut call).merge_requests
@@ -440,9 +496,15 @@ async fn run_scoped_search(
     query: &str,
     kinds: Option<Vec<SearchKind>>,
     limit: Option<i64>,
-    scope: Option<SearchScope>,
+    scope: Option<Scope>,
 ) -> Search_Reply {
-    search_with(h, query, kinds, limit, scope, None, None).await
+    let options = SearchOptions {
+        kinds,
+        limit,
+        scope,
+        ..Default::default()
+    };
+    search_with(h, query, options).await
 }
 
 /// `Search` for the work items of `types` only.
@@ -464,28 +526,22 @@ async fn run_filtered_search(
     limit: Option<i64>,
 ) -> Search_Reply {
     let names = |list: &[&str]| Some(list.iter().map(|t| t.to_string()).collect());
-    let kinds = Some(vec![SearchKind::work_items]);
-    search_with(h, query, kinds, limit, None, names(types), names(excluded)).await
+    let options = SearchOptions {
+        kinds: Some(vec![SearchKind::work_items]),
+        limit,
+        types: names(types),
+        exclude_types: names(excluded),
+        ..Default::default()
+    };
+    search_with(h, query, options).await
 }
 
-async fn search_with(
-    h: &Handlers,
-    query: &str,
-    kinds: Option<Vec<SearchKind>>,
-    limit: Option<i64>,
-    scope: Option<SearchScope>,
-    types: Option<Vec<String>>,
-    exclude_types: Option<Vec<String>>,
-) -> Search_Reply {
+async fn search_with(h: &Handlers, query: &str, options: SearchOptions) -> Search_Reply {
     let mut call = AsyncCall::default();
     h.search(
         &mut call as &mut dyn Call_Search,
         query.to_string(),
-        kinds,
-        limit,
-        scope,
-        types,
-        exclude_types,
+        Some(options),
     )
     .await
     .unwrap();
@@ -563,17 +619,16 @@ async fn create_work_item_with(
     parent: Option<WorkItemRef>,
 ) -> AsyncCall {
     let mut call = AsyncCall::default();
-    h.create_work_item(
-        &mut call as &mut dyn Call_CreateWorkItem,
-        project_id,
-        title.to_string(),
-        description.map(str::to_string),
-        labels.map(|labels| labels.iter().map(|l| l.to_string()).collect()),
+    let item = NewWorkItem {
+        title: title.to_string(),
+        description: description.map(str::to_string),
+        labels: labels.map(|labels| labels.iter().map(|l| l.to_string()).collect()),
         assign_self,
         parent,
-    )
-    .await
-    .unwrap();
+    };
+    h.create_work_item(&mut call as &mut dyn Call_CreateWorkItem, project_id, item)
+        .await
+        .unwrap();
     call
 }
 
@@ -606,7 +661,7 @@ fn created_json(iid: i64, title: &str, assignees: &[i64]) -> serde_json::Value {
 }
 
 async fn clear_cache(h: &Handlers, scope: Option<Vec<CacheScope>>) {
-    let mut call = AsyncCall::default();
+    let mut call = admin::AsyncCall::default();
     h.clear_cache(&mut call as &mut dyn Call_ClearCache, scope)
         .await
         .unwrap();
@@ -641,13 +696,83 @@ fn looks_like_duration_accepts_valid_and_rejects_typos() {
     }
 }
 
+/// Named by the argument that is off, while dormant too.
 #[tokio::test]
-async fn close_rejects_bad_issuable_ref() {
+async fn writes_refuse_a_bad_issuable_ref() {
     let (h, _dir) = dormant_handlers();
-    assert_eq!(
-        close(&h, 0, 42, IssuableKind::work_item).await.as_deref(),
-        Some(GITLAB_ERROR)
-    );
+    for (project_id, iid, argument) in
+        [(0, 42, "project_id"), (7, -1, "iid"), (-1, 0, "project_id")]
+    {
+        let mut call = AsyncCall::default();
+        h.close(
+            &mut call as &mut dyn Call_Close,
+            project_id,
+            iid,
+            IssuableKind::work_item,
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid_argument(&mut call), argument);
+        let mut call = AsyncCall::default();
+        h.assign_self(
+            &mut call as &mut dyn Call_AssignSelf,
+            project_id,
+            iid,
+            IssuableKind::merge_request,
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid_argument(&mut call), argument);
+        let mut call = AsyncCall::default();
+        h.unassign_self(
+            &mut call as &mut dyn Call_UnassignSelf,
+            project_id,
+            iid,
+            IssuableKind::work_item,
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid_argument(&mut call), argument);
+    }
+    let mut call = AsyncCall::default();
+    h.post_time(
+        &mut call as &mut dyn Call_PostTime,
+        7,
+        42,
+        IssuableKind::work_item,
+        "soon".into(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(invalid_argument(&mut call), "duration");
+    assert!(h.queue.pending().unwrap().is_empty());
+}
+
+/// GitLab's refusal of a write comes back with its status, a dead token's
+/// too; nothing is queued.
+#[tokio::test]
+async fn a_refused_write_replies_gitlab_error_with_the_status() {
+    for (err, status) in [
+        (FakeErr::Rejected, Some(403)),
+        (FakeErr::RejectedWith(404), Some(404)),
+        (FakeErr::Unauthorized, Some(401)),
+    ] {
+        let fake = Arc::new(FakeGitlab::default());
+        fake.fail_next_write(err);
+        let (h, _dir) = connected_handlers(&fake);
+        let mut call = AsyncCall::default();
+        h.close(
+            &mut call as &mut dyn Call_Close,
+            7,
+            42,
+            IssuableKind::work_item,
+        )
+        .await
+        .unwrap();
+        assert_eq!(gitlab_status(&mut call), status, "{err:?}");
+        assert!(h.queue.pending().unwrap().is_empty(), "{err:?}");
+    }
 }
 
 // ── Writes ─────────────────────────────────────────────────────────────
@@ -673,18 +798,19 @@ async fn post_time_rejects_when_dormant_but_not_unreachable() {
 }
 
 /// A 429 is refused before GitLab does any work, so even a PostTime is safe
-/// to queue; a 5xx may already have booked the time, so it is reported.
+/// to queue; a 5xx may already have booked the time, so it is reported as an
+/// unknown outcome.
 #[tokio::test]
 async fn post_time_queues_rate_limits_but_reports_server_errors() {
-    for (status, queued) in [(429, true), (502, false)] {
+    for (status, error) in [(429, None), (502, Some(GITLAB_UNAVAILABLE))] {
         let fake = Arc::new(FakeGitlab::default());
         fake.fail_next_write(FakeErr::Throttled(status));
         let (h, _dir) = connected_handlers(&fake);
-        let error = post_time(&h, 7, 42, IssuableKind::work_item).await;
-        assert_eq!(error.is_none(), queued, "{status}");
+        let replied = post_time(&h, 7, 42, IssuableKind::work_item).await;
+        assert_eq!(replied.as_deref(), error, "{status}");
         assert_eq!(
             h.queue.pending().unwrap().len(),
-            usize::from(queued),
+            usize::from(error.is_none()),
             "{status}"
         );
     }
@@ -761,18 +887,23 @@ async fn an_applied_write_reruns_the_jobs_that_show_it() {
 async fn create_work_item_rejects_a_blank_title_or_bad_project() {
     let fake = Arc::new(FakeGitlab::default());
     let (h, _dir) = connected_handlers(&fake);
-    for (project_id, title) in [(7, ""), (7, " \t\n"), (0, "Fix it"), (-3, "Fix it")] {
+    for (project_id, title, argument) in [
+        (7, "", "item.title"),
+        (7, " \t\n", "item.title"),
+        (0, "Fix it", "project_id"),
+        (-3, "Fix it", "project_id"),
+    ] {
         let mut call = create_work_item(&h, project_id, title, None).await;
         assert_eq!(
-            reply_error(&mut call).as_deref(),
-            Some(GITLAB_ERROR),
+            invalid_argument(&mut call),
+            argument,
             "{project_id} {title:?}"
         );
     }
     // GitLab would read one label with a comma as two.
     let labels = ["bug", "auth,flow"];
     let mut call = create_work_item_with(&h, 7, "Fix it", None, Some(&labels), None, None).await;
-    assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
+    assert_eq!(invalid_argument(&mut call), "item.labels");
 
     assert!(fake.writes().is_empty(), "refused before GitLab is asked");
     assert_eq!(fake.read_calls(), 0);
@@ -780,7 +911,7 @@ async fn create_work_item_rejects_a_blank_title_or_bad_project() {
     // Refused while dormant too, as what it is: an invalid call.
     let (h, _dir) = dormant_handlers();
     let mut call = create_work_item(&h, 7, "", None).await;
-    assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
+    assert_eq!(invalid_argument(&mut call), "item.title");
 }
 
 /// Where the other writes are queued, a create fails: a replay has nothing
@@ -794,7 +925,7 @@ async fn create_work_item_is_never_queued() {
         assert!(h.queue.failures().unwrap().is_empty());
     }
 
-    // The failures every other write is queued on.
+    // The failures every other write is queued on: the outcome is unknown.
     for err in [
         FakeErr::Transient,
         FakeErr::Throttled(429),
@@ -806,7 +937,7 @@ async fn create_work_item_is_never_queued() {
         let mut call = create_work_item(&h, 7, "Fix it", None).await;
         assert_eq!(
             reply_error(&mut call).as_deref(),
-            Some(GITLAB_ERROR),
+            Some(GITLAB_UNAVAILABLE),
             "{err:?}"
         );
         assert!(h.queue.pending().unwrap().is_empty(), "{err:?}");
@@ -820,15 +951,17 @@ async fn create_work_item_is_never_queued() {
     }
 }
 
-/// A 401 included: the sync worker judges the session, not a write.
+/// A refusal with its status, an unknown outcome as such; a 401 included:
+/// the sync worker judges the session, not a write.
 #[tokio::test]
 async fn create_work_item_reports_any_gitlab_failure_without_demoting() {
-    for err in [
-        FakeErr::Transient,
-        FakeErr::Throttled(429),
-        FakeErr::Throttled(502),
-        FakeErr::Rejected,
-        FakeErr::Unauthorized,
+    for (err, replied, status) in [
+        (FakeErr::Transient, GITLAB_UNAVAILABLE, None),
+        (FakeErr::Throttled(429), GITLAB_UNAVAILABLE, None),
+        (FakeErr::Throttled(502), GITLAB_UNAVAILABLE, None),
+        (FakeErr::Rejected, GITLAB_ERROR, Some(403)),
+        (FakeErr::RejectedWith(422), GITLAB_ERROR, Some(422)),
+        (FakeErr::Unauthorized, GITLAB_ERROR, Some(401)),
     ] {
         let fake = Arc::new(FakeGitlab::default());
         fake.fail_next_write(err);
@@ -836,9 +969,11 @@ async fn create_work_item_reports_any_gitlab_failure_without_demoting() {
         seed_recent_issues(&h);
 
         let mut call = create_work_item(&h, 7, "Fix it", Some(true)).await;
+        let (name, args) = reply_error_with(&mut call).unwrap();
+        assert_eq!(name, replied, "{err:?}");
         assert_eq!(
-            reply_error(&mut call).as_deref(),
-            Some(GITLAB_ERROR),
+            args.get("status").and_then(|s| s.as_i64()),
+            status,
             "{err:?}"
         );
         assert!(
@@ -869,8 +1004,11 @@ async fn a_created_issue_is_searchable_at_once() {
 
     let mut call = create_work_item(&h, 7, "Fix the login", None).await;
     let created: CreateWorkItem_Reply = reply(&mut call);
-    assert_eq!(created.iid, 12);
-    assert_eq!(created.web_url, "https://gitlab.test/g/p7/-/issues/12");
+    assert_eq!(created.iid, Some(12));
+    assert_eq!(
+        created.web_url.as_deref(),
+        Some("https://gitlab.test/g/p7/-/issues/12")
+    );
 
     let found = run_search(&h, "login", None, None).await.work_items;
     assert_eq!(iids(&found), [12]);
@@ -898,7 +1036,7 @@ async fn a_created_issue_assigned_to_me_is_listed_at_once() {
         // Held anew: a create restarts the list the one before set off.
         let _held = fake.gate("issues");
         let mut call = create_work_item(&h, 7, title, Some(true)).await;
-        assert_eq!(reply::<CreateWorkItem_Reply>(&mut call).iid, iid);
+        assert_eq!(reply::<CreateWorkItem_Reply>(&mut call).iid, Some(iid));
     }
 
     let assigned = assigned_work_items(&h, None).await;
@@ -987,10 +1125,12 @@ async fn a_failed_parent_lookup_creates_nothing() {
     // Not served at all: a 404.
     let (h, _dir) = connected_handlers(&fake);
 
-    for _ in 0..3 {
+    for _ in 0..2 {
         let mut call = create_under(&h, parent(9, 4)).await;
-        assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
+        assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_UNAVAILABLE));
     }
+    let mut call = create_under(&h, parent(9, 4)).await;
+    assert_eq!(gitlab_status(&mut call), Some(404));
     assert_eq!(fake.epic_calls().len(), 3, "each looked up once");
     assert!(fake.created().is_empty() && fake.writes().is_empty());
     assert!(h.queue.pending().unwrap().is_empty());
@@ -1003,7 +1143,16 @@ async fn a_failed_parent_lookup_creates_nothing() {
     fake.serve_epic(unnamed);
     let (h, _dir) = connected_handlers(&fake);
     let mut call = create_under(&h, parent(9, 4)).await;
-    assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
+    assert_eq!(gitlab_status(&mut call), None, "no status to an answer");
+    assert!(fake.created().is_empty());
+    // Nor one the epic mirror can't read.
+    let fake = Arc::new(FakeGitlab::default());
+    let mut unreadable = epic_json(9, 4, "Roadmap");
+    unreadable["id"] = "9004".into();
+    fake.serve_epic(unreadable);
+    let (h, _dir) = connected_handlers(&fake);
+    let mut call = create_under(&h, parent(9, 4)).await;
+    assert_eq!(gitlab_status(&mut call), None);
     assert!(fake.created().is_empty());
 }
 
@@ -1035,18 +1184,14 @@ async fn create_work_item_refuses_a_parent_that_is_no_epic() {
         parent(-1, 4),
     ] {
         let mut call = create_under(&h, refused.clone()).await;
-        assert_eq!(
-            reply_error(&mut call).as_deref(),
-            Some(GITLAB_ERROR),
-            "{refused:?}"
-        );
+        assert_eq!(invalid_argument(&mut call), "item.parent", "{refused:?}");
     }
     assert_eq!(fake.read_calls(), 0);
     assert!(fake.writes().is_empty());
 
     let (h, _dir) = dormant_handlers();
     let mut call = create_under(&h, parent(9, 0)).await;
-    assert_eq!(reply_error(&mut call).as_deref(), Some(GITLAB_ERROR));
+    assert_eq!(invalid_argument(&mut call), "item.parent");
 }
 
 /// The issue exists: an answer the daemon can't read must not read as a
@@ -1062,13 +1207,18 @@ async fn create_work_item_replies_success_whatever_gitlab_answered() {
     let (h, _dir) = connected_handlers(&fake);
 
     let mut call = create_work_item(&h, 7, "Fix the login", None).await;
-    let unreadable: CreateWorkItem_Reply = reply(&mut call);
-    assert_eq!((unreadable.iid, unreadable.web_url.as_str()), (0, ""));
+    let unreadable = call.take_reply().unwrap();
+    assert_eq!(unreadable.error, None);
+    // Success, with nothing to say: neither field.
+    assert_eq!(unreadable.parameters, Some(serde_json::json!({})));
 
     let mut call = create_work_item(&h, 7, "Fix the login", None).await;
     let created: CreateWorkItem_Reply = reply(&mut call);
-    assert_eq!(created.iid, 12);
-    assert!(created.web_url.ends_with("/issues/12"), "{created:?}");
+    assert_eq!(created.iid, Some(12));
+    assert!(
+        created.web_url.as_deref().unwrap().ends_with("/issues/12"),
+        "{created:?}"
+    );
     assert_eq!(h.sync.store().issues.scan(RowScope::Prefix(7)).unwrap(), []);
 }
 
@@ -1175,19 +1325,36 @@ async fn get_assigned_work_items_filters_by_group_and_subgroups() {
     seed_assigned_issues(&h);
     let iids = |v: Vec<WorkItem>| v.iter().map(|i| i.iid).collect::<Vec<_>>();
     assert_eq!(
-        iids(assigned_work_items(&h, Some(vec!["team".into()])).await),
+        iids(assigned_work_items(&h, scope(&[], &["team"])).await),
         [1, 2]
     );
     assert_eq!(
-        iids(assigned_work_items(&h, Some(vec!["team/sub".into(), "team".into()])).await),
+        iids(assigned_work_items(&h, scope(&[], &["team/sub", "team"])).await),
         [1, 2],
         "overlapping groups list each issue once"
     );
     assert_eq!(
-        iids(assigned_work_items(&h, Some(vec!["tea".into()])).await),
+        iids(assigned_work_items(&h, scope(&[], &["tea"])).await),
         Vec::<i64>::new(),
         "a shared prefix is not a group"
     );
+}
+
+/// An issue passes in any listed project or any listed group, as in `Search`;
+/// a scope that lists nothing is none.
+#[tokio::test]
+async fn get_assigned_work_items_keeps_to_projects_or_groups() {
+    let (h, _dir) = dormant_handlers();
+    seed_assigned_issues(&h);
+    let iids = |v: Vec<WorkItem>| v.iter().map(|i| i.iid).collect::<Vec<_>>();
+    assert_eq!(iids(assigned_work_items(&h, scope(&[2], &[])).await), [3]);
+    assert_eq!(
+        iids(assigned_work_items(&h, scope(&[2], &["team/sub"])).await),
+        [3, 2]
+    );
+    for nothing in [scope(&[], &[]), Some(Scope::default())] {
+        assert_eq!(iids(assigned_work_items(&h, nothing).await), [3, 1, 2]);
+    }
 }
 
 #[tokio::test]
@@ -1217,10 +1384,16 @@ async fn get_assigned_work_items_overlays_open_counts_and_board_status() {
         &h,
         &[
             labeled,
+            issue(1, 2, "web", "https://gl/team/api/-/issues/2"),
             issue(2, 3, "other", "https://gl/other/x/-/issues/3"),
         ],
     );
-    seed_view(&h, ASSIGNED_ISSUES, &[(1, 1), (2, 3)], now_secs() - 60);
+    seed_view(
+        &h,
+        ASSIGNED_ISSUES,
+        &[(1, 1), (1, 2), (2, 3)],
+        now_secs() - 60,
+    );
     seed(
         &h,
         &[Board {
@@ -1239,9 +1412,15 @@ async fn get_assigned_work_items_overlays_open_counts_and_board_status() {
     let issues = assigned_work_items(&h, None).await;
     let api = issues.iter().find(|i| i.iid == 1).unwrap();
     assert_eq!(api.open_count, 1);
-    assert_eq!(api.graph_status, "Doing");
+    assert_eq!(api.board_column.as_deref(), Some("Doing"));
+    let web = issues.iter().find(|i| i.iid == 2).unwrap();
+    assert_eq!(
+        web.board_column.as_deref(),
+        Some("opened"),
+        "no list's label: the Open list"
+    );
     let other = issues.iter().find(|i| i.iid == 3).unwrap();
-    assert_eq!(other.graph_status, "", "project 2's boards never synced");
+    assert_eq!(other.board_column, None, "project 2's boards never synced");
 }
 
 /// Assigned issues are work items of their project, of their type, under
@@ -1308,12 +1487,12 @@ async fn list_work_items_serves_both_roles_once_newest_first() {
 
     let issues = list_work_items(&h, None, None, None).await;
     assert_eq!(iids(&issues), [1, 2, 3]);
-    let updated: Vec<i64> = issues.iter().map(|i| i.updated_at).collect();
-    assert_eq!(updated, [300, 200, 100]);
+    let updated: Vec<Option<i64>> = issues.iter().map(|i| i.updated_at).collect();
+    assert_eq!(updated, [Some(300), Some(200), Some(100)]);
     assert_eq!(issues[1].state, "closed", "closed ones are listed too");
-    assert_eq!(issues[2].namespace_path, "other/x");
+    assert_eq!(issues[2].namespace_path.as_deref(), Some("other/x"));
     assert_eq!(issues[2].open_count, 1);
-    assert_eq!(issues[2].graph_status, "", "its boards never synced");
+    assert_eq!(issues[2].board_column, None, "its boards never synced");
 }
 
 #[tokio::test]
@@ -1470,9 +1649,11 @@ async fn get_assigned_merge_requests_serves_newest_first_with_group_filter() {
     let all = assigned_mrs(&h, None).await;
     assert_eq!(all.iter().map(|m| m.iid).collect::<Vec<_>>(), [11, 10]);
     assert_eq!(all[0].assignees, ["me"]);
-    assert_eq!(all[0].updated_at, 200);
-    let team = assigned_mrs(&h, Some(vec!["team".into()])).await;
+    assert_eq!(all[0].updated_at, Some(200));
+    let team = assigned_mrs(&h, scope(&[], &["team"])).await;
     assert_eq!(team.iter().map(|m| m.iid).collect::<Vec<_>>(), [10]);
+    let either = assigned_mrs(&h, scope(&[2], &["team"])).await;
+    assert_eq!(either.iter().map(|m| m.iid).collect::<Vec<_>>(), [11, 10]);
 }
 
 #[tokio::test]
@@ -1508,9 +1689,9 @@ async fn search_matches_title_labels_and_paths_case_insensitively() {
     );
 
     let r = run_search(&h, "auth-serv", None, None).await;
-    assert_eq!(r.projects[0].path, "team/auth-service");
+    assert_eq!(r.projects[0].full_path, "team/auth-service");
     let r = run_search(&h, "tea", None, None).await;
-    assert_eq!(r.groups[0].path, "team");
+    assert_eq!(r.groups[0].full_path, "team");
 }
 
 #[tokio::test]
@@ -1539,9 +1720,14 @@ async fn search_finds_epics_by_title_label_and_reference() {
     );
     let found = epics(&r);
     assert_eq!(found[0].web_url, "https://gl/groups/team/-/epics/7");
-    assert_eq!(found[0].namespace_path, "team", "from the group row");
     assert_eq!(
-        found[1].namespace_path, "other",
+        found[0].namespace_path.as_deref(),
+        Some("team"),
+        "from the group row"
+    );
+    assert_eq!(
+        found[1].namespace_path.as_deref(),
+        Some("other"),
         "no row for group 6: from the link"
     );
     assert!(issue_iids(&r).is_empty() && r.groups.is_empty());
@@ -1577,7 +1763,7 @@ async fn search_serves_an_epic_as_its_groups_work_item() {
     assert_eq!(billing.r#type, "epic");
     assert_eq!((billing.project_id, billing.group_id), (None, Some(5)));
     assert_eq!(billing.parent, None);
-    assert!(billing.total_time.is_empty() && billing.project_avatar.is_empty());
+    assert_eq!((billing.time_spent, &billing.project_avatar), (None, &None));
 }
 
 /// Issues and epics are ranked together and share one limit.
@@ -1661,16 +1847,11 @@ async fn search_leaves_out_work_items_of_excluded_types() {
     assert!(found(&["epic"], &["epic"]).await.is_empty());
 
     // The other kinds don't have a type to leave out.
-    let mrs = search_with(
-        &h,
-        "oauth",
-        None,
-        None,
-        None,
-        None,
-        Some(vec!["epic".into()]),
-    )
-    .await;
+    let options = SearchOptions {
+        exclude_types: Some(vec!["epic".into()]),
+        ..Default::default()
+    };
+    let mrs = search_with(&h, "oauth", options).await;
     assert_eq!(iids(&mrs.work_items), [10]);
     assert_eq!(mrs.merge_requests.len(), 1);
 }
@@ -1743,26 +1924,56 @@ async fn record_open_counts_project_and_group_work_items_apart() {
 async fn record_open_refuses_a_malformed_reference() {
     let (h, _dir) = dormant_handlers();
     let (item, mr) = (IssuableKind::work_item, IssuableKind::merge_request);
-    for (kind, iid, project_id, group_id) in [
-        (item.clone(), 7, None, None),
-        (item.clone(), 7, Some(1), Some(5)),
-        (mr.clone(), 7, None, Some(5)),
-        (mr.clone(), 7, None, None),
-        (item.clone(), 0, Some(1), None),
-        (item.clone(), 7, Some(0), None),
-        (item.clone(), 7, Some(-1), None),
-        (item.clone(), 0, None, Some(5)),
-        (item.clone(), 7, None, Some(0)),
-        (mr.clone(), -1, Some(1), None),
+    for (kind, iid, project_id, group_id, argument) in [
+        (item.clone(), 7, None, None, "project_id"),
+        (item.clone(), 7, Some(1), Some(5), "group_id"),
+        (mr.clone(), 7, None, Some(5), "group_id"),
+        (mr.clone(), 7, None, None, "project_id"),
+        (item.clone(), 0, Some(1), None, "iid"),
+        (item.clone(), 7, Some(0), None, "project_id"),
+        (item.clone(), 7, Some(-1), None, "project_id"),
+        (item.clone(), 0, None, Some(5), "iid"),
+        (item.clone(), 7, None, Some(0), "group_id"),
+        (mr.clone(), -1, Some(1), None, "iid"),
     ] {
-        let error = record_open(&h, kind.clone(), iid, project_id, group_id).await;
+        let mut call = AsyncCall::default();
+        h.record_open(
+            &mut call as &mut dyn Call_RecordOpen,
+            kind.clone(),
+            iid,
+            project_id,
+            group_id,
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            error.as_deref(),
-            Some(GITLAB_ERROR),
+            invalid_argument(&mut call),
+            argument,
             "{kind:?} {iid} {project_id:?} {group_id:?}"
         );
     }
     assert!(h.usage.snapshot().unwrap().entries.is_empty());
+}
+
+#[tokio::test]
+async fn search_refuses_a_limit_that_is_not_positive() {
+    let (h, _dir) = dormant_handlers();
+    seed_corpus(&h);
+    for limit in [0, -1] {
+        let mut call = AsyncCall::default();
+        let options = SearchOptions {
+            limit: Some(limit),
+            ..Default::default()
+        };
+        h.search(
+            &mut call as &mut dyn Call_Search,
+            "oauth".into(),
+            Some(options),
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid_argument(&mut call), "options.limit");
+    }
 }
 
 #[tokio::test]
@@ -1805,11 +2016,11 @@ async fn search_hits_carry_their_update_time() {
     seed_corpus(&h);
 
     let r = run_search(&h, "oauth", None, None).await;
-    assert_eq!(r.work_items[0].updated_at, 100);
-    assert_eq!(r.merge_requests[0].updated_at, 50);
+    assert_eq!(r.work_items[0].updated_at, Some(100));
+    assert_eq!(r.merge_requests[0].updated_at, Some(50));
     let r = run_typed_search(&h, "i", &["epic"], None).await;
     let updated: Vec<_> = r.work_items.iter().map(|e| (e.iid, e.updated_at)).collect();
-    assert_eq!(updated, [(8, 200), (7, 100)]);
+    assert_eq!(updated, [(8, Some(200)), (7, Some(100))]);
 }
 
 /// The flag is all an archived project differs by: it matches and sorts
@@ -1834,7 +2045,7 @@ async fn projects_tell_whether_they_are_archived() {
     let archived: Vec<_> = r
         .projects
         .iter()
-        .map(|p| (p.path.as_str(), p.archived))
+        .map(|p| (p.full_path.as_str(), p.archived))
         .collect();
     assert_eq!(
         archived,
@@ -1846,17 +2057,9 @@ async fn projects_tell_whether_they_are_archived() {
 async fn search_never_synced_is_honest_about_the_session() {
     let (h, _dir) = dormant_handlers();
     let mut call = AsyncCall::default();
-    h.search(
-        &mut call as &mut dyn Call_Search,
-        "x".into(),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    h.search(&mut call as &mut dyn Call_Search, "x".into(), None)
+        .await
+        .unwrap();
     assert_eq!(reply_error(&mut call).as_deref(), Some(NOT_AUTHENTICATED));
 
     let fake = Arc::new(FakeGitlab::default());
@@ -1865,8 +2068,8 @@ async fn search_never_synced_is_honest_about_the_session() {
     assert!(r.work_items.is_empty() && r.projects.is_empty());
 }
 
-fn scope(projects: &[i64], groups: &[&str]) -> Option<SearchScope> {
-    Some(SearchScope {
+fn scope(projects: &[i64], groups: &[&str]) -> Option<Scope> {
+    Some(Scope {
         projects: Some(projects.to_vec()),
         groups: Some(groups.iter().map(|g| g.to_string()).collect()),
     })
@@ -1999,13 +2202,7 @@ async fn search_empty_scope_is_no_scope() {
     seed_scoped_corpus(&h);
     let unscoped = run_search(&h, "i", None, None).await;
     assert!(!issue_iids(&unscoped).is_empty() && !epics(&unscoped).is_empty());
-    for empty in [
-        scope(&[], &[]),
-        Some(SearchScope {
-            projects: None,
-            groups: None,
-        }),
-    ] {
+    for empty in [scope(&[], &[]), Some(Scope::default())] {
         assert_eq!(
             run_scoped_search(&h, "i", None, None, empty).await,
             unscoped
@@ -2041,8 +2238,8 @@ async fn items_carry_their_projects_path() {
     seed_assigned_mrs(&h);
 
     let r = run_search(&h, "oauth", None, None).await;
-    assert_eq!(r.work_items[0].namespace_path, "team/p");
-    assert_eq!(r.merge_requests[0].project_path, "team/p");
+    assert_eq!(r.work_items[0].namespace_path.as_deref(), Some("team/p"));
+    assert_eq!(r.merge_requests[0].project_path.as_deref(), Some("team/p"));
 
     seed(
         &h,
@@ -2053,14 +2250,23 @@ async fn items_carry_their_projects_path() {
         }],
     );
     let r = run_search(&h, "oauth", None, None).await;
-    assert_eq!(r.work_items[0].namespace_path, "team/moved");
-    assert_eq!(r.merge_requests[0].project_path, "team/moved");
-    let paths: Vec<String> = assigned_mrs(&h, None)
+    assert_eq!(
+        r.work_items[0].namespace_path.as_deref(),
+        Some("team/moved")
+    );
+    assert_eq!(
+        r.merge_requests[0].project_path.as_deref(),
+        Some("team/moved")
+    );
+    let paths: Vec<Option<String>> = assigned_mrs(&h, None)
         .await
         .into_iter()
         .map(|m| m.project_path)
         .collect();
-    assert_eq!(paths, ["other/x", "team/moved"]);
+    assert_eq!(
+        paths,
+        [Some("other/x".to_string()), Some("team/moved".to_string())]
+    );
 }
 
 /// The rows name the files, so a read works without them on disk.
@@ -2071,13 +2277,11 @@ async fn search_hits_carry_their_projects_avatar() {
     seed_avatars(&h);
 
     let r = run_search(&h, "oauth", None, None).await;
-    assert_eq!(r.work_items[0].project_avatar, avatar_path(&dir, "1-a.png"));
-    assert_eq!(
-        r.merge_requests[0].project_avatar,
-        avatar_path(&dir, "1-a.png")
-    );
+    let avatar = Some(avatar_path(&dir, "1-a.png"));
+    assert_eq!(r.work_items[0].project_avatar, avatar);
+    assert_eq!(r.merge_requests[0].project_avatar, avatar);
     let r = run_search(&h, "auth-serv", None, None).await;
-    assert_eq!(r.projects[0].avatar, avatar_path(&dir, "4-b.svg"));
+    assert_eq!(r.projects[0].avatar, Some(avatar_path(&dir, "4-b.svg")));
 }
 
 #[tokio::test]
@@ -2087,13 +2291,13 @@ async fn assigned_items_carry_their_projects_avatar() {
     seed_assigned_mrs(&h);
     seed_avatars(&h);
 
-    let avatars = |project_avatars: Vec<(i64, String)>| -> Vec<(i64, String)> {
+    let avatars = |project_avatars: Vec<(i64, Option<String>)>| -> Vec<(i64, Option<String>)> {
         let mut sorted = project_avatars;
         sorted.sort();
         sorted.dedup();
         sorted
     };
-    let expected = [(1, avatar_path(&dir, "1-a.png")), (2, String::new())];
+    let expected = [(1, Some(avatar_path(&dir, "1-a.png"))), (2, None)];
     let issues = assigned_work_items(&h, None).await;
     assert_eq!(
         avatars(
@@ -2165,17 +2369,47 @@ async fn get_history_merges_queued_and_synced_newest_first() {
     assert_eq!(post_time(&h, 7, 5, IssuableKind::merge_request).await, None);
 
     let events = history(&h, Some(7)).await;
-    let titles: Vec<&str> = events.iter().map(|e| e.title.as_str()).collect();
+    let titles: Vec<&str> = events.iter().filter_map(|e| e.title.as_deref()).collect();
     assert_eq!(
         titles,
         ["queued mr", "newer", "older"],
         "30 days back is outside"
     );
     assert_eq!(events[0].source, HistorySource::queued);
-    assert_eq!(events[0].web_url, "https://gl/g/p/-/merge_requests/5");
-    assert_eq!(events[1].duration, "30m");
+    assert_eq!(
+        events[0].web_url.as_deref(),
+        Some("https://gl/g/p/-/merge_requests/5")
+    );
+    // As it was given: the daemon doesn't know GitLab's day or week.
+    assert_eq!(
+        (events[0].time_spent, events[0].duration.as_deref()),
+        (None, Some("30m"))
+    );
+    assert_eq!(
+        (events[1].time_spent, events[1].duration.as_deref()),
+        (Some(1800), None)
+    );
     assert_eq!(events[1].kind, IssuableKind::merge_request);
-    assert_eq!(events[2].duration, "1h 30m");
+    assert_eq!(events[2].time_spent, Some(5400));
+    let json = serde_json::to_value(&events[0]).unwrap();
+    assert!(json.get("time_spent").is_none(), "{json}");
+    let json = serde_json::to_value(&events[2]).unwrap();
+    assert!(json.get("duration").is_none(), "{json}");
+}
+
+/// A queued entry whose item isn't stored has nothing to name it by, and one
+/// without a summary has none: those fields are left out.
+#[tokio::test]
+async fn a_queued_entry_leaves_out_what_the_daemon_does_not_know() {
+    let (h, _dir) = unreachable_handlers();
+    assert_eq!(post_time(&h, 8, 1, IssuableKind::work_item).await, None);
+    let events = history(&h, Some(1)).await;
+    assert_eq!(events.len(), 1);
+    let json = serde_json::to_value(&events[0]).unwrap();
+    for absent in ["title", "web_url", "summary", "time_spent"] {
+        assert!(json.get(absent).is_none(), "{absent} in {json}");
+    }
+    assert_eq!(json["duration"], "30m");
 }
 
 // ── Activity ───────────────────────────────────────────────────────────
@@ -2426,7 +2660,59 @@ async fn clear_cache_waits_for_new_board_columns() {
 
     clear_cache(&h, Some(vec![CacheScope::assigned])).await;
     let issues = assigned_work_items(&h, None).await;
-    assert_eq!(issues[0].graph_status, "Doing");
+    assert_eq!(issues[0].board_column.as_deref(), Some("Doing"));
+}
+
+// ── Dead letters ───────────────────────────────────────────────────────
+
+/// An id the dead-letter store doesn't hold is the daemon's, not GitLab's.
+#[tokio::test]
+async fn an_unknown_failure_id_is_not_found() {
+    let (h, _dir) = dormant_handlers();
+    let mut call = AsyncCall::default();
+    h.retry_failure(&mut call as &mut dyn Call_RetryFailure, 999)
+        .await
+        .unwrap();
+    assert_eq!(reply_error(&mut call).as_deref(), Some(NOT_FOUND));
+    let mut call = AsyncCall::default();
+    h.dismiss_failure(&mut call as &mut dyn Call_DismissFailure, 999)
+        .await
+        .unwrap();
+    let (name, args) = reply_error_with(&mut call).unwrap();
+    assert_eq!(name, NOT_FOUND);
+    assert_eq!(args["message"], "no failed task with id 999");
+}
+
+// ── Session ────────────────────────────────────────────────────────────
+
+/// Without a keychain both are switched off: the daemon's own refusal,
+/// before GitLab is asked.
+#[tokio::test]
+async fn login_and_logout_without_a_keychain_are_internal() {
+    let fake = Arc::new(FakeGitlab::default());
+    let (h, _dir) = connected_handlers(&fake);
+    let mut call = admin::AsyncCall::default();
+    h.login(
+        &mut call as &mut dyn Call_Login,
+        "gitlab.invalid".into(),
+        "glpat-x".into(),
+    )
+    .await
+    .unwrap();
+    let (name, args) = reply_error_with(&mut call).unwrap();
+    assert_eq!(name, ADMIN_INTERNAL);
+    assert!(
+        args["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("logging in is disabled"),
+        "{args}"
+    );
+    let mut call = admin::AsyncCall::default();
+    h.logout(&mut call as &mut dyn Call_Logout).await.unwrap();
+    assert_eq!(reply_error(&mut call).as_deref(), Some(ADMIN_INTERNAL));
+    assert!(matches!(&*h.session.read().await, ConnState::Connected(_)));
+    assert_eq!(fake.read_calls(), 0);
 }
 
 // ── WhoAmI ─────────────────────────────────────────────────────────────
@@ -2434,7 +2720,7 @@ async fn clear_cache_waits_for_new_board_columns() {
 #[tokio::test]
 async fn get_sync_jobs_lists_the_plan_while_dormant() {
     let (h, _dir) = dormant_handlers();
-    let mut call = AsyncCall::default();
+    let mut call = admin::AsyncCall::default();
     h.get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
         .await
         .unwrap();
@@ -2471,7 +2757,7 @@ async fn get_sync_jobs_reports_a_running_jobs_progress() {
         .await
         .expect("the assigned issues fetch starts");
 
-    let mut call = AsyncCall::default();
+    let mut call = admin::AsyncCall::default();
     h.get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
         .await
         .unwrap();
@@ -2496,7 +2782,7 @@ async fn get_sync_jobs_reports_a_failed_job() {
     let (h, _dir) = connected_handlers(&fake);
     h.sync.refresh_now(&[Job::AssignedIssues]).await;
 
-    let mut call = AsyncCall::default();
+    let mut call = admin::AsyncCall::default();
     h.get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
         .await
         .unwrap();
@@ -2537,7 +2823,7 @@ async fn get_sync_jobs_reports_an_unavailable_job() {
     }
     assert_eq!(fake.calls_to("projects/7/boards").len(), 3);
 
-    let mut call = AsyncCall::default();
+    let mut call = admin::AsyncCall::default();
     h.get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
         .await
         .unwrap();
@@ -2707,13 +2993,14 @@ proptest! {
             let names = |list: Option<Vec<&str>>| list.map(|t| t.into_iter().map(str::to_string).collect());
             let (types, excluded) = (names(types), names(excluded));
             let mut call = AsyncCall::default();
-            h.search(&mut call as &mut dyn Call_Search, query.clone(), kinds.clone(), limit, None, types, excluded)
+            let options = SearchOptions { kinds: kinds.clone(), limit, types, exclude_types: excluded, ..Default::default() };
+            h.search(&mut call as &mut dyn Call_Search, query.clone(), Some(options))
                 .await
                 .unwrap();
             let error = reply_error(&mut call);
 
             if matches!(limit, Some(n) if n <= 0) {
-                assert_eq!(error.as_deref(), Some(GITLAB_ERROR), "bad args are rejected eagerly");
+                assert_eq!(error.as_deref(), Some(INVALID_ARGUMENT), "bad args are rejected eagerly");
             } else {
                 assert_eq!(error, None, "valid args succeed");
             }
@@ -2777,7 +3064,7 @@ proptest! {
             .unwrap();
 
             let valid = issue_ref_error(project_id, iid).is_none() && looks_like_duration(&duration);
-            let expected = if valid { NOT_AUTHENTICATED } else { GITLAB_ERROR };
+            let expected = if valid { NOT_AUTHENTICATED } else { INVALID_ARGUMENT };
             assert_eq!(reply_error(&mut call).as_deref(), Some(expected));
             assert!(h.queue.pending().unwrap().is_empty());
         });

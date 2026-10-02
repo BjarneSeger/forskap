@@ -169,24 +169,6 @@ fn epic_ref(epic: &Epic) -> EpicRef {
     }
 }
 
-/// GitLab's spelling of a time spent: `1h 30m`, `1d 2h` (8-hour days,
-/// 5-day weeks).
-fn human(secs: u64) -> String {
-    if secs < 60 {
-        return format!("{secs}s");
-    }
-    let mut left = secs;
-    let mut parts = Vec::new();
-    for (unit, size) in [("w", 5 * 8 * HOUR), ("d", 8 * HOUR), ("h", HOUR), ("m", 60)] {
-        let n = left / size;
-        if n > 0 {
-            parts.push(format!("{n}{unit}"));
-            left -= n * size;
-        }
-    }
-    parts.join(" ")
-}
-
 /// Seconds in a GitLab duration (`1h30m`, `1.5h`, `2d`, `45`): months of 4
 /// weeks, weeks of 5 days, days of 8 hours; a bare number is hours. `None`
 /// for anything GitLab would refuse, nothing included.
@@ -258,11 +240,7 @@ impl State {
             .sum();
         let mut row = issue.row.clone();
         row.time_stats = Some(TimeStats {
-            human_total_time_spent: if spent > 0 {
-                human(spent)
-            } else {
-                String::new()
-            },
+            total_time_spent: spent,
         });
         row
     }
@@ -1040,14 +1018,6 @@ mod tests {
     }
 
     #[test]
-    fn time_spent_is_spelled_like_gitlab_spells_it() {
-        assert_eq!(human(5400), "1h 30m");
-        assert_eq!(human(9 * HOUR), "1d 1h");
-        assert_eq!(human(40 * HOUR + 60), "1w 1m");
-        assert_eq!(human(30), "30s");
-    }
-
-    #[test]
     fn every_link_is_on_the_invalid_host() {
         let state = fixture(now_secs());
         let urls = state
@@ -1162,7 +1132,7 @@ mod tests {
         let epic = featured[0].epic.clone().unwrap();
         assert_eq!((epic.id, epic.iid, epic.group_id), (3001, 1, 10));
         assert_eq!(epic.url, "/groups/acme/-/epics/1");
-        assert_eq!(featured[0].total_time(), "2h");
+        assert_eq!(featured[0].time_spent(), 2 * HOUR);
         let task = Listing::Issuable {
             kind: Issuable::Issue,
             project_id: 101,
@@ -1239,7 +1209,7 @@ mod tests {
             project_id: 103,
             iid: 22,
         };
-        assert_eq!(issues(&demo, spent).await[0].total_time(), "1h 30m");
+        assert_eq!(issues(&demo, spent).await[0].time_spent(), 5400);
 
         let new = NewIssue {
             title: "Try the dry run".into(),

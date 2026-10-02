@@ -6,7 +6,11 @@
 // generated from the interface definition shared with the Rust crates, and
 // APIVersion (version.go) from that definition's version; the Client type
 // (client.go) is a thin, hand-written convenience layer that resolves the
-// daemon socket and exposes one Go method per varlink method.
+// daemon socket and exposes one Go method per varlink method. Client is the
+// stable surface: a method whose arguments grow takes them in one struct, so
+// its signature stays when the interface adds an option. The generated call
+// helpers follow the definition argument by argument and may change signature
+// when it grows.
 //
 // Because the generated package name is derived from the interface name, callers
 // usually import it under a shorter alias:
@@ -32,7 +36,13 @@
 //		fmt.Println(is.Iid, is.Title)
 //	}
 //
-// Errors returned by the daemon surface as *GitlabError or *NotAuthenticated;
-// match them with errors.As. Optional parameters are pointers, where nil omits
-// the field on the wire.
+// Errors returned by the daemon surface as *InvalidArgument, *NotFound,
+// *GitlabError, *GitlabUnavailable, *Internal or *NotAuthenticated; match
+// them with errors.As. Optional parameters are pointers, where nil omits the
+// field on the wire.
+//
+// The daemon's second interface on the socket, org.thehoster.forskapd.admin
+// (login, logout, cache clearing, sync jobs), is not bound: it mirrors the
+// daemon's internals with no promise of stability, for the bundled forskap
+// CLI.
 package orgthehosterforskapd

@@ -4,7 +4,7 @@
 [[plugin]]
 id           = "thehoster/forskap"
 name         = "Forskap"
-version      = "0.5.3"
+version      = "0.5.4"
 author       = "thehoster"
 license      = "GPL-3.0-only"
 icon         = "brand-gitlab"

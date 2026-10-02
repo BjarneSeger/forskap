@@ -23,12 +23,17 @@ pub async fn run(days: u32, format: OutputFormat) -> Result<()> {
                 .map(|d| d.to_rfc3339())
                 .unwrap_or_else(|| e.timestamp.to_string());
             let sigil = refspec::wire_sigil(&e.kind);
+            // A queued entry has its duration as given, a synced one seconds.
+            let spent = e
+                .time_spent
+                .map(super::spent)
+                .or_else(|| e.duration.clone());
             outln!(
                 "{ts}  {:<8}  {:<6}  {:<6}  {}",
                 style::state(source(&e.source)),
                 style::reference(sigil, e.iid),
-                e.duration,
-                e.title
+                spent.unwrap_or_default(),
+                e.title.as_deref().unwrap_or_default()
             )?;
         }
         Ok(())

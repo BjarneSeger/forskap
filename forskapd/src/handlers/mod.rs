@@ -8,6 +8,8 @@
 //!
 //! - [`varlink`] — the [`VarlinkInterface`](forskap_api::VarlinkInterface)
 //!   method impls plus the write cascade.
+//! - [`admin`] — the [admin interface](forskap_api::admin)'s: the session,
+//!   the cache, the sync worker's jobs.
 //! - [`wire`] — projections of stored rows onto the wire types.
 //!
 //! This module holds the shared connection types, the helpers every submodule
@@ -17,10 +19,10 @@ use std::sync::Arc;
 
 use tokio::sync::{Notify, RwLock};
 
-use forskap_api::{IssuableKind, NotAuthReason, WorkItemRef};
+use forskap_api::{IssuableKind, NotAuthReason, VarlinkCallError, WorkItemRef};
 
 use crate::config::SharedConfig;
-use crate::error::DormancyReason;
+use crate::error::{DormancyReason, Error, Verdict};
 use crate::gitlab::{GitlabApi, GitlabClient};
 use crate::queue::RetryQueue;
 use crate::rotate::Rotation;
@@ -28,6 +30,7 @@ use crate::secrets::{Keychain, Token};
 use crate::sync::{SyncHandle, now_secs};
 use crate::usage::{UsageStats, epic_usage_key, usage_key};
 
+mod admin;
 mod varlink;
 mod wire;
 
@@ -134,42 +137,91 @@ fn dormant_args(reason: &DormancyReason) -> (Option<NotAuthReason>, Option<Strin
     (Some(reason.reason()), reason.detail())
 }
 
-/// Reject obviously-malformed issue references up front (eager pre-check), so a
-/// doomed request is never attempted or queued. Returns the error message when
-/// invalid.
-fn issue_ref_error(project_id: i64, iid: i64) -> Option<String> {
-    (project_id <= 0 || iid <= 0)
-        .then(|| format!("invalid issue/MR reference (project {project_id}, iid {iid})"))
+/// An argument value refused before anything is sent or stored: which
+/// argument, and why.
+#[derive(Debug)]
+struct Invalid {
+    argument: &'static str,
+    message: String,
 }
 
-/// The usage key `RecordOpen` counts an open under, or the message why the
-/// reference is malformed. A work item is addressed by its project or its
-/// group (an epic), never both; a merge request only by its project.
+impl Invalid {
+    fn new(argument: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            argument,
+            message: message.into(),
+        }
+    }
+
+    fn reply<C: VarlinkCallError + ?Sized>(self, call: &mut C) -> ::varlink::Result<()> {
+        call.reply_invalid_argument(self.argument.into(), self.message)
+    }
+}
+
+/// Reply to a call `e` failed by what it leaves the caller: GitLab refused,
+/// GitLab was away, or the daemon failed on its own.
+fn reply_failed<C: VarlinkCallError + ?Sized>(
+    call: &mut C,
+    e: &Error,
+    message: String,
+) -> ::varlink::Result<()> {
+    match e.verdict() {
+        Verdict::Refused(status) => call.reply_gitlab_error(message, status.map(i64::from)),
+        Verdict::Unavailable => call.reply_gitlab_unavailable(message),
+        Verdict::Internal => call.reply_internal(message),
+    }
+}
+
+/// Reject obviously-malformed issue references up front (eager pre-check), so a
+/// doomed request is never attempted or queued.
+fn issue_ref_error(project_id: i64, iid: i64) -> Option<Invalid> {
+    let argument = match (project_id, iid) {
+        (..=0, _) => "project_id",
+        (_, ..=0) => "iid",
+        _ => return None,
+    };
+    let message = format!("invalid issue/MR reference (project {project_id}, iid {iid})");
+    Some(Invalid::new(argument, message))
+}
+
+/// The usage key `RecordOpen` counts an open under, or why the reference is
+/// malformed. A work item is addressed by its project or its group (an
+/// epic), never both; a merge request only by its project.
 fn open_key(
     kind: &IssuableKind,
     iid: i64,
     project_id: Option<i64>,
     group_id: Option<i64>,
-) -> Result<String, String> {
+) -> Result<String, Invalid> {
     match (project_id, group_id) {
         (Some(project_id), None) => match issue_ref_error(project_id, iid) {
-            Some(msg) => Err(msg),
+            Some(invalid) => Err(invalid),
             None => Ok(usage_key(wire::internal_kind(kind), project_id, iid)),
         },
-        (None, Some(_)) if *kind == IssuableKind::merge_request => {
-            Err("a merge request is addressed by its project_id, not a group_id".into())
-        }
-        (None, Some(group_id)) if group_id <= 0 || iid <= 0 => Err(format!(
-            "invalid work item reference (group {group_id}, iid {iid})"
+        (None, Some(_)) if *kind == IssuableKind::merge_request => Err(Invalid::new(
+            "group_id",
+            "a merge request is addressed by its project_id, not a group_id",
+        )),
+        (None, Some(group_id)) if group_id <= 0 || iid <= 0 => Err(Invalid::new(
+            if group_id <= 0 { "group_id" } else { "iid" },
+            format!("invalid work item reference (group {group_id}, iid {iid})"),
         )),
         (None, Some(group_id)) => Ok(epic_usage_key(group_id, iid)),
-        _ => Err("give exactly one of project_id and group_id".into()),
+        // Named after the one too many, or the one missing.
+        (Some(_), Some(_)) => Err(Invalid::new(
+            "group_id",
+            "give exactly one of project_id and group_id",
+        )),
+        (None, None) => Err(Invalid::new(
+            "project_id",
+            "give exactly one of project_id and group_id",
+        )),
     }
 }
 
 /// The `(group_id, iid)` of the epic a new work item's `parent` names, or
-/// the message why it names none: only an epic can be a parent here.
-fn parent_epic(parent: &WorkItemRef) -> Result<(i64, i64), String> {
+/// why it names none: only an epic can be a parent here.
+fn parent_epic(parent: &WorkItemRef) -> Result<(i64, i64), Invalid> {
     let epic = parent
         .r#type
         .as_deref()
@@ -178,22 +230,31 @@ fn parent_epic(parent: &WorkItemRef) -> Result<(i64, i64), String> {
         (None, Some(group_id)) if epic && group_id > 0 && parent.iid > 0 => {
             Ok((group_id, parent.iid))
         }
-        _ => Err("invalid parent: name an epic by its group_id and iid".into()),
+        _ => Err(Invalid::new(
+            "item.parent",
+            "invalid parent: name an epic by its group_id and iid",
+        )),
     }
 }
 
 /// Reject a new issue GitLab would refuse or misread, before anything is
-/// sent. Returns the error message when invalid. A comma can't be part of a
-/// label: GitLab takes the labels as one comma-separated list.
-fn new_issue_error(project_id: i64, title: &str, labels: &[String]) -> Option<String> {
+/// sent. A comma can't be part of a label: GitLab takes the labels as one
+/// comma-separated list.
+fn new_issue_error(project_id: i64, title: &str, labels: &[String]) -> Option<Invalid> {
     if project_id <= 0 {
-        return Some(format!("invalid project: {project_id}"));
+        return Some(Invalid::new(
+            "project_id",
+            format!("invalid project: {project_id}"),
+        ));
     }
     if title.trim().is_empty() {
-        return Some("an issue needs a title".to_string());
+        return Some(Invalid::new("item.title", "an issue needs a title"));
     }
     let split = labels.iter().find(|l| l.contains(','));
-    split.map(|label| format!("invalid label {label:?}: a label can't contain a comma"))
+    split.map(|label| {
+        let message = format!("invalid label {label:?}: a label can't contain a comma");
+        Invalid::new("item.labels", message)
+    })
 }
 
 /// Permissive sanity check for a GitLab time-tracking duration (`30m`,

@@ -5,20 +5,44 @@ description: Checklist for changing the varlink API (adding/changing methods, ty
 
 # Changing the varlink interface
 
-Single source of truth: `forskap-api/varlink/org.thehoster.forskapd.varlink`.
-Everything else is generated from it or must be updated by hand to match. Work through
-this list top to bottom.
+Single source of truth: the two files in `forskap-api/varlink/`. Everything else is
+generated from them or must be updated by hand to match. Work through this list top to
+bottom.
+
+## 0. Pick the interface
+
+- `org.thehoster.forskapd.varlink` is the interface outside clients use: the crate
+  root, the Go binding, frozen from 1.0 on (see *Compatibility* in
+  `forskapd/docs/varlink_interface.md`).
+- `org.thehoster.forskapd.admin.varlink` is the bundled CLI's: `forskap_api::admin`,
+  no Go binding, it follows the daemon's version and promises nothing. A method goes
+  here if it mirrors daemon internals (the sync engine's jobs, the cache's bands) or
+  manages the session or the cache.
+
+The files share nothing: a type or error both need is declared in each, and an admin
+error is `org.thehoster.forskapd.admin.<Name>` on the wire. Its handlers live in
+`forskapd/src/handlers/admin.rs`, its dispatcher in `handle_admin` (`service.rs`), its
+docs in the admin part at the end of `varlink_interface.md`; the CLI reaches it through
+`client::connect_admin` / `connect_both`. Steps 1–5 apply to either file; step 6 to the
+main one only.
 
 ## 1. Edit the `.varlink` file
 
-- Interface name is `org.thehoster.forskapd`. Keep the existing style: one blank
-  line between declarations, optional params/fields as `?type`.
+- Interface names are `org.thehoster.forskapd` and `org.thehoster.forskapd.admin`.
+  Keep the existing style: one blank line between declarations, optional
+  params/fields as `?type`.
+- A method whose arguments grow takes them in one struct (`SearchOptions`,
+  `WorkItemFilter`, `NewWorkItem`, `Scope`): a new option is a new optional field
+  there, never another argument, which would change both bindings' signatures. A
+  value refused inside one is named by its path (`Invalid::new("options.limit", …)`).
+  `build.rs` derives `Default` for every struct without a required field, so Rust
+  callers write `..Default::default()`.
 - Document in the file itself: a short `#` comment on the lines before each new type,
   method and error, and before each field or enum variant whose name doesn't say it
   all (units, when it is absent or empty, since which version it is sent). Comments go
   on their own lines: that is what both generators and systemd's `varlinkctl` parse,
-  and what introspection shows. Leave the `interface` line without one: the Go
-  generator would turn it into a second package comment of the binding.
+  and what introspection shows. Leave the main file's `interface` line without one:
+  the Go generator would turn it into a second package comment of the binding.
 - Bump the version in `forskap-api/Cargo.toml` **in the same feature commit**.
   Convention (see git history): the api crate's version moves inside the commit that
   changes the interface; the workspace version moves only in separate
@@ -27,34 +51,42 @@ this list top to bottom.
 
 ## 2. Rust side regenerates itself
 
-`forskap-api/build.rs` runs `varlink_generator` into `$OUT_DIR` on every build;
-`lib.rs` `include!`s it. No manual step — the next `cargo build` yields the new
+`forskap-api/build.rs` runs `varlink_generator` on both files into `$OUT_DIR` on every
+build; `lib.rs` `include!`s the main one at the crate root and the admin one in `pub mod
+admin`. No manual step — the next `cargo build` yields the new
 `VarlinkInterface` trait, `Call_*` traits, and request/reply structs. Compile errors in
 the daemon are the to-do list. The build script also gives every `Option` field
-`skip_serializing_if`, so an absent field is left out rather than sent as `null`; it
-fails the build if the `Option` fields it finds don't match the `.varlink` file's
-optional ones (the generator's output changed: adapt `OmitAbsent`).
+`skip_serializing_if`, so an absent field is left out rather than sent as `null`, and
+derives `Default` for every struct without a required field; it fails the build if
+what it finds doesn't match the `.varlink` file's optional fields and structs (the
+generator's output changed: adapt `OmitAbsent` or `DeriveDefault`).
 
 ## 3. Daemon handlers
 
 - Implement the method in `forskapd/src/handlers/varlink.rs`
-  (`impl VarlinkInterface for Handlers`). Follow the cascade style: validate eagerly
+  (`impl VarlinkInterface for Handlers`), an admin one in `handlers/admin.rs`. Follow the cascade style: validate eagerly
   (`issue_ref_error`, `looks_like_duration` in `handlers/mod.rs`), consult cache,
   fall back to GitLab, reply.
-- Error replies: GitLab rejection → `call.reply_gitlab_error(msg)`; dormant session →
-  `call.reply_not_authenticated(reason, detail)` via `dormant_args(&e)`.
+- Error replies: a refused argument value → `Invalid::new(argument, msg).reply(call)`
+  (`InvalidArgument`); a failed `Error` → `reply_failed(call, &e, msg)`, which picks
+  `GitlabError` (with the status), `GitlabUnavailable` or `Internal` by `e.verdict()`
+  (`error.rs`); an unknown id → `call.reply_not_found(msg)`; dormant session →
+  `call.reply_not_authenticated(reason, detail)` via `dormant_args(&e)`. Never tell
+  them apart by message text.
 - **Write methods** (anything mutating GitLab) go through the shared cascade: add a
   `WriteOp` variant in `write.rs` (its `apply` arm and `idempotent()` answer), then call
   `perform_write` and `reply_write!` in `varlink.rs` like the existing writes. It tries
-  once, queues on `Unreachable` or a retryable error, and only a real GitLab rejection
-  returns `GitlabError`. A write never demotes the session — the sync worker is the
+  once, queues on `Unreachable` or a retryable error, and replies the rest by its
+  verdict: `GitlabError` for a refusal, `GitlabUnavailable` for a non-idempotent write
+  on a 5xx. A write never demotes the session — the sync worker is the
   demotion authority. Extend `Job::affected_by` so the right views re-sync after it.
   **Exception: a write that creates something** (`CreateWorkItem`) is not a `WriteOp` and
   never goes through `perform_write`/`defer`. `WriteOp`s are persisted and address an
   existing `(kind, project_id, iid)`; a create has no `iid` and no idempotency key, so
   a queued or replayed one could file its item twice. It calls GitLab once from the
-  handler, replies `NotAuthenticated` for every dormancy reason and `GitlabError` for
-  every failure, and after GitLab succeeded it must not fail any more: the created row
+  handler, replies `NotAuthenticated` for every dormancy reason and every failure by
+  its verdict (`GitlabUnavailable`: the outcome is unknown), and after GitLab
+  succeeded it must not fail any more: the created row
   goes to the sync worker (`SyncHandle::land_issue`, the only store writer) and the
   reply is sent whether or not that landed in time.
 - **Read methods** only read the sync store (`self.sync.store()`); never call GitLab.
@@ -65,12 +97,13 @@ optional ones (the generator's output changed: adapt `OmitAbsent`).
   write method, or a read of one object that is no listing (the epic lookup), goes on
   the `GitlabApi` trait in `gitlab.rs` **and** on the shared fake in `testing.rs` and
   `DemoGitlab` in `demo.rs`.
-- **New method? Add its arm to the hand-written dispatcher** `handle_forskapd` in
-  `forskapd/src/service.rs` (clone the arm of an argument-identical method) plus a
-  `dispatch_has_an_arm_for_<method>` test next to `dispatch_has_an_arm_for_search`. A
-  missing arm compiles fine and only fails at runtime as `MethodNotFound`. Every arm
-  parses its `*_Args` through `args!()`, an empty one too (`let WhoAmI_Args {} =
-  args!();`): that is what refuses an argument the method doesn't have.
+- **New method? Add its arm to the hand-written dispatcher** `handle_forskapd` (an
+  admin one: `handle_admin`) in `forskapd/src/service.rs` (clone the arm of an
+  argument-identical method) plus a `dispatch_has_an_arm_for_<method>` test next to
+  `dispatch_has_an_arm_for_search`. A missing arm compiles fine and only fails at
+  runtime as `MethodNotFound`. Every arm parses its `*_Args` through
+  `args!(method, params)`, an empty one too (`let WhoAmI_Args {} = args!(method,
+  params);`): that is what refuses an argument the method doesn't have.
 - New field on a wire type? The store holds GitLab mirrors, not wire types: add the
   field to the mirror in `sync/model.rs` (lenient `serde(default)`) and bump that
   resource's `SCHEMA`, so every job syncing it runs full once and refills old rows.

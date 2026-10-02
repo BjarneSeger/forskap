@@ -27,27 +27,29 @@ type WorkItem (
   # The group of an epic; absent for the rest.
   group_id: ?int,
   # Full path of that project ("team/api") or group ("team"): the stored
-  # one's, else the one in web_url; empty when neither gives it.
-  namespace_path: string,
+  # one's, else the one in web_url; absent when neither gives it.
+  namespace_path: ?string,
   title: string,
   web_url: string,
   # "opened" or "closed".
   state: string,
   # The epic an issue belongs to; absent when it has none, and for an epic.
   parent: ?WorkItemRef,
-  # GitLab's human-readable total spent time ("2h"); empty when none, and for
-  # an epic.
-  total_time: string,
-  # Board column the issue sits in, from its labels and the project's issue
-  # board; empty when no board or label matches, and for an epic.
-  graph_status: string,
+  # Seconds spent on it, GitLab's time_stats.total_time_spent: 0 when none is
+  # logged; absent for an epic.
+  time_spent: ?int,
+  # Board column the issue sits in: the first of its labels that is a list on
+  # the project's issue boards, else its state ("opened", "closed": a board's
+  # Open and Closed lists). Absent when the project's boards never synced, and
+  # for an epic.
+  board_column: ?string,
   # Opens recorded through RecordOpen (within usage.retention_hours).
   open_count: int,
-  # File of the project's avatar, see Project.avatar; empty when none, and for
-  # an epic.
-  project_avatar: string,
-  # Unix seconds, GitLab's updated_at as of the last sync; 0 when unknown.
-  updated_at: int
+  # File of the project's avatar, see Project.avatar; absent when none, and
+  # for an epic.
+  project_avatar: ?string,
+  # Unix seconds, GitLab's updated_at as of the last sync; absent when unknown.
+  updated_at: ?int
 )
 
 # What a write or RecordOpen targets; an issue is a work_item.
@@ -70,11 +72,18 @@ type HistoryEvent (
   kind: IssuableKind,
   project_id: int,
   iid: int,
-  # Empty on a queued event whose issuable is not in the caches.
-  title: string,
-  web_url: string,
-  duration: string,
-  summary: string
+  # Absent on a queued event whose issuable is not in the caches.
+  title: ?string,
+  # Absent like title.
+  web_url: ?string,
+  # Seconds; set on a synced entry, absent on a queued one.
+  time_spent: ?int,
+  # A queued PostTime's duration as it was given ("1h30m"); absent on a synced
+  # entry. The daemon can't turn it into seconds: GitLab's "1d" and "1w" depend
+  # on the instance's settings.
+  duration: ?string,
+  # The timelog's note; absent when it has none.
+  summary: ?string
 )
 
 # One of the user's contribution events (GitLab's GET /events).
@@ -85,13 +94,13 @@ type ActivityEvent (
   # "joined", …
   action: string,
   # "Issue", "MergeRequest", "Milestone", …; of a comment, what was commented
-  # on; empty on pushes and membership events.
-  target_type: string,
+  # on; absent on pushes and membership events.
+  target_type: ?string,
   # The target's number in its project, where it has one.
   target_iid: ?int,
   target_title: ?string,
-  # 0 for events outside a project.
-  project_id: int,
+  # Absent for events outside a project.
+  project_id: ?int,
   # Absent when neither the project nor the item is in the store.
   project_path: ?string,
   # The issue or MR, a pushed branch's commits, else the project; absent when
@@ -141,13 +150,13 @@ type MergeRequest (
   assignees: []string,
   # Opens recorded through RecordOpen (within usage.retention_hours).
   open_count: int,
-  # File of the project's avatar, see Project.avatar; empty when none.
-  project_avatar: string,
+  # File of the project's avatar, see Project.avatar; absent when none.
+  project_avatar: ?string,
   # The project's full path ("team/api"): the stored project's, else the one
-  # in web_url; empty when neither gives it.
-  project_path: string,
-  # Unix seconds, GitLab's updated_at as of the last sync; 0 when unknown.
-  updated_at: int
+  # in web_url; absent when neither gives it.
+  project_path: ?string,
+  # Unix seconds, GitLab's updated_at as of the last sync; absent when unknown.
+  updated_at: ?int
 )
 
 # A project the user is a member of.
@@ -155,11 +164,11 @@ type Project (
   id: int,
   name: string,
   # Full namespace path ("team/backend/api").
-  path: string,
+  full_path: string,
   web_url: string,
-  # Absolute path of the avatar image on the daemon's machine; empty when the
-  # project has none.
-  avatar: string,
+  # Absolute path of the avatar image on the daemon's machine; absent when
+  # the daemon has none.
+  avatar: ?string,
   # Whether the project is archived (read-only on GitLab).
   archived: bool
 )
@@ -169,58 +178,34 @@ type Group (
   id: int,
   name: string,
   # Full group path ("team/backend").
-  path: string,
+  full_path: string,
   web_url: string
 )
 
-# Where a SyncJob stands.
-type SyncJobStatus (
-  # Its fetch is in flight.
-  running,
-  # Requested ahead of the schedule; runs before anything merely due.
-  demanded,
-  # Its time has come; runs once the worker gets to it.
-  due,
-  # Not due yet; an unavailable job rests here until next_due.
-  waiting,
-  # Failed; held back until next_due.
-  backing_off
+# The call fits the interface, but an argument's value is not acceptable (a
+# number that isn't positive, a malformed duration, a blank title, …): nothing
+# was sent to GitLab or stored. argument names it, a nested value by its path
+# ("project_id", "iid", "duration", "options.limit", "item.title", …).
+error InvalidArgument (argument: string, message: string)
+
+# The daemon has no such thing: a failure id RetryFailure or DismissFailure
+# doesn't know.
+error NotFound (message: string)
+
+# GitLab answered and refused the request.
+error GitlabError (
+  message: string,
+  # The HTTP status of GitLab's answer, 401 for a token it no longer takes;
+  # absent where the daemon has none (an answer it can't read).
+  status: ?int
 )
 
-# A job of the sync worker.
-type SyncJob (
-  # Stable job id: "assigned/issues", "recent/authored/issues",
-  # "timelogs/recent", "events", "project/<id>/issues", …
-  key: string,
-  status: SyncJobStatus,
-  # Unix seconds, start of the last successful run; absent if it never ran.
-  last_ok: ?int,
-  # Unix seconds, when the schedule runs it next (the retry time while backing
-  # off); absent while running or demanded, before the first run, and for a job
-  # that is never due again (a fetched project avatar).
-  next_due: ?int,
-  # Unix seconds, only while running.
-  running_since: ?int,
-  # Consecutive failed runs.
-  failures: int,
-  # Why the last run failed, until a run succeeds.
-  last_error: ?string,
-  # True: GitLab refuses the job for good and the daemon asks once a day;
-  # false otherwise. Absent from a daemon before forskap-api 0.28.0.
-  unavailable: ?bool,
-  # Only while running, and only for a job that also runs as a delta: true for
-  # a full run, false for a delta.
-  full: ?bool,
-  # Rows the running fetch has so far (0 before its first page); only while
-  # running. Sent since forskap-api 0.30.0.
-  fetched: ?int,
-  # Rows GitLab announced for the running fetch; absent where it announced none.
-  expected: ?int
-)
+# GitLab could not be reached, or answered 429 or 5xx, and the daemon did not
+# queue the call: whether GitLab carried it out is unknown.
+error GitlabUnavailable (message: string)
 
-# GitLab rejected the request, or a local precondition failed (a malformed
-# reference or duration, an unknown failure id, …).
-error GitlabError (message: string)
+# The daemon could not do it for a reason of its own, its storage failing.
+error Internal (message: string)
 
 # Why the daemon has no GitLab session.
 type NotAuthReason (
@@ -241,12 +226,20 @@ type NotAuthReason (
 # underlying error for the reasons that have one.
 error NotAuthenticated (reason: ?NotAuthReason, detail: ?string)
 
-# Open issues assigned to the user, optionally only those in the given groups.
-method GetAssignedWorkItems(groups: ?[]string) -> (work_items: []WorkItem)
+# The projects and groups a call keeps to: an item passes if it lies in any of
+# them. Nothing listed is no filter.
+type Scope (
+  # Project IDs.
+  projects: ?[]int,
+  # Group paths ("team/backend"), subgroups included.
+  groups: ?[]string
+)
 
-# Open merge requests assigned to the user, optionally only those in the given
-# groups.
-method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)
+# Open issues assigned to the user, optionally only those in the scope.
+method GetAssignedWorkItems(scope: ?Scope) -> (work_items: []WorkItem)
+
+# Open merge requests assigned to the user, optionally only those in the scope.
+method GetAssignedMergeRequests(scope: ?Scope) -> (merge_requests: []MergeRequest)
 
 # Which of ListWorkItems' lists: the issues the user authored, or is assigned to.
 type WorkItemRole (author, assignee)
@@ -254,19 +247,42 @@ type WorkItemRole (author, assignee)
 # The states ListWorkItems filters by; WorkItem.state carries them.
 type WorkItemState (opened, closed)
 
+# Which of the user's own issues ListWorkItems lists; nothing set is all of
+# them.
+type WorkItemFilter (
+  # One of the two lists; absent: both, an issue in both listed once.
+  role: ?WorkItemRole,
+  # Unix seconds: only issues updated at or after it.
+  updated_after: ?int,
+  # Only issues in one of these states; absent or empty: both.
+  states: ?[]WorkItemState
+)
+
 # The user's own issues, closed ones included, updated recently; newest-updated
 # first.
-method ListWorkItems(role: ?WorkItemRole, updated_after: ?int, states: ?[]WorkItemState) -> (work_items: []WorkItem)
+method ListWorkItems(filter: ?WorkItemFilter) -> (work_items: []WorkItem)
 
 # The result sets of a Search.
 type SearchKind (work_items, merge_requests, projects, groups)
 
-# Projects by ID and groups by path (subgroups included) a Search keeps to.
-type SearchScope (projects: ?[]int, groups: ?[]string)
+# How a Search narrows its results; nothing set narrows nothing.
+type SearchOptions (
+  # The result sets to fill; absent or empty: all four.
+  kinds: ?[]SearchKind,
+  # Caps each result set; issues and epics share theirs. Absent: 50.
+  limit: ?int,
+  # Keeps every result set to these projects and groups.
+  scope: ?Scope,
+  # Keeps only the work items of these types ("issue", "task", "epic", …),
+  # compared case-insensitively; absent or empty: every type.
+  types: ?[]string,
+  # Leaves out the work items of these types, compared the same way.
+  exclude_types: ?[]string
+)
 
 # Searches the cached corpus; work items and merge requests rank by their
 # RecordOpen counts.
-method Search(query: string, kinds: ?[]SearchKind, limit: ?int, scope: ?SearchScope, types: ?[]string, exclude_types: ?[]string) -> (work_items: []WorkItem, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
+method Search(query: string, options: ?SearchOptions) -> (work_items: []WorkItem, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
 
 # Logs spent time on an issue or merge request; queued while GitLab is away.
 method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
@@ -281,32 +297,29 @@ method AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 # GitLab is away.
 method UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
+# The issue CreateWorkItem files.
+type NewWorkItem (
+  # Not blank.
+  title: string,
+  # GitLab Markdown.
+  description: ?string,
+  # Label names, none with a comma; GitLab creates the ones the project lacks.
+  labels: ?[]string,
+  # Assigns the issue to the user; absent: nobody is assigned.
+  assign_self: ?bool,
+  # The epic to put the issue under, by its group_id and iid (type absent or
+  # "epic", title and web_url ignored); needs GitLab Premium.
+  parent: ?WorkItemRef
+)
+
 # Creates an issue in a project, optionally under an epic. Sent to GitLab once,
-# never queued.
-method CreateWorkItem(project_id: int, title: string, description: ?string, labels: ?[]string, assign_self: ?bool, parent: ?WorkItemRef) -> (iid: int, web_url: string)
+# never queued. iid and web_url are absent where GitLab created the issue but
+# its answer didn't say them.
+method CreateWorkItem(project_id: int, item: NewWorkItem) -> (iid: ?int, web_url: ?string)
 
 # Counts an open of a project's work item or merge request, or of a group's
 # epic. Local only: works while dormant.
 method RecordOpen(kind: IssuableKind, iid: int, project_id: ?int, group_id: ?int) -> ()
-
-# What ClearCache clears.
-type CacheScope (
-  # The assigned lists, the ListWorkItems lists and the board columns.
-  assigned,
-  # The corpus: issues, MRs, epics, projects, groups, project avatars.
-  search,
-  # History inside the quick window.
-  quick,
-  # History between the retention horizon and the quick window.
-  slow,
-  # History older than history.retention_hours.
-  stale,
-  # The RecordOpen statistics, only when listed.
-  usage
-)
-
-# Clears cached state, all of it or the given scopes, and syncs it again.
-method ClearCache(scope: ?[]CacheScope) -> ()
 
 # Time logged in the last days (default 7): synced timelogs and queued PostTimes.
 method GetHistory(days: ?int) -> (events: []HistoryEvent)
@@ -326,20 +339,9 @@ method DismissFailure(id: int) -> ()
 # Drops every dead-lettered write.
 method ClearFailures() -> ()
 
-# The sync worker's jobs in the order it runs them, and until when a GitLab rate
-# limit pauses them all. Never an error.
-method GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int)
-
 # The interface version the daemon speaks, its own version and its session:
 # the account while connected, else why not. Never an error.
 method GetStatus() -> (api_version: string, daemon_version: string, connected: bool, reason: ?NotAuthReason, detail: ?string, host: ?string, username: ?string, user_id: ?int)
-
-# Connects to a GitLab host with a personal access token and stores it in the
-# keychain.
-method Login(host: string, token: string) -> ()
-
-# Drops the session and the stored credentials.
-method Logout() -> ()
 
 # The connected host and user, and when the token expires.
 method WhoAmI() -> (host: string, user_id: int, username: string, token_expires_at: ?int, token_rotates: bool)

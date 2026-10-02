@@ -17,7 +17,7 @@ use std::time::Duration;
 use clap::{Arg, Command, CommandFactory};
 use clap_complete::env::{Bash, Elvish, Fish, Powershell, Shells, Zsh};
 use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
-use forskap_api::{SearchKind, VarlinkClientInterface, WorkItem};
+use forskap_api::{SearchKind, SearchOptions, VarlinkClientInterface, WorkItem};
 
 use self::nushell::Nushell;
 use crate::cli::Cli;
@@ -374,10 +374,13 @@ async fn fetch_items(kind: RefKind, rows: &mut Vec<Item>) -> Option<()> {
             rows.extend(reply.merge_requests.into_iter().map(Item::Mr));
         }
     }
-    let kinds = vec![refspec::search_kind(kind)];
-    let excluded = refspec::excluded_types(kind);
+    let options = SearchOptions {
+        kinds: Some(vec![refspec::search_kind(kind)]),
+        exclude_types: refspec::excluded_types(kind),
+        ..Default::default()
+    };
     let reply = client
-        .search(String::new(), Some(kinds), None, None, None, excluded)
+        .search(String::new(), Some(options))
         .call()
         .await
         .ok()?;
@@ -394,12 +397,14 @@ async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
     let issues = client.get_assigned_work_items(None).call().await;
     let issues = issues.ok()?.work_items;
-    let paths = issues.iter().map(|i| (&i.namespace_path, &i.web_url));
+    let paths = issues
+        .iter()
+        .map(|i| (i.namespace_path.as_deref(), i.web_url.as_str()));
     let mrs = client.get_assigned_merge_requests(None).call().await.ok()?;
     let paths = paths.chain(
         mrs.merge_requests
             .iter()
-            .map(|m| (&m.project_path, &m.web_url)),
+            .map(|m| (m.project_path.as_deref(), m.web_url.as_str())),
     );
     rows.extend(
         paths
@@ -408,23 +413,29 @@ async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     );
 
     let query = current.trim_matches('/').to_string();
-    let kinds = vec![SearchKind::projects];
     let reply = client
-        .search(query, Some(kinds), None, None, None, None)
+        .search(query, Some(only(SearchKind::projects)))
         .call()
         .await
         .ok()?;
-    rows.extend(reply.projects.into_iter().map(|p| (p.path, Some(p.name))));
+    rows.extend(
+        reply
+            .projects
+            .into_iter()
+            .map(|p| (p.full_path, Some(p.name))),
+    );
     Some(())
 }
 
 /// The epics opened before, most used first (an empty `Search`).
 async fn fetch_epics(rows: &mut Vec<WorkItem>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
-    let kinds = vec![SearchKind::work_items];
-    let types = vec!["epic".to_string()];
+    let options = SearchOptions {
+        types: Some(vec!["epic".to_string()]),
+        ..only(SearchKind::work_items)
+    };
     let reply = client
-        .search(String::new(), Some(kinds), None, None, Some(types), None)
+        .search(String::new(), Some(options))
         .call()
         .await
         .ok()?;
@@ -432,17 +443,29 @@ async fn fetch_epics(rows: &mut Vec<WorkItem>) -> Option<()> {
     Some(())
 }
 
+/// A `Search` for one kind of result.
+fn only(kind: SearchKind) -> SearchOptions {
+    SearchOptions {
+        kinds: Some(vec![kind]),
+        ..Default::default()
+    }
+}
+
 /// The cached groups matching what is typed.
 async fn fetch_groups(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
     let query = current.trim_matches('/').to_string();
-    let kinds = vec![SearchKind::groups];
     let reply = client
-        .search(query, Some(kinds), None, None, None, None)
+        .search(query, Some(only(SearchKind::groups)))
         .call()
         .await
         .ok()?;
-    rows.extend(reply.groups.into_iter().map(|g| (g.path, Some(g.name))));
+    rows.extend(
+        reply
+            .groups
+            .into_iter()
+            .map(|g| (g.full_path, Some(g.name))),
+    );
     Some(())
 }
 

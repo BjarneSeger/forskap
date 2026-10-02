@@ -10,7 +10,7 @@ mod unassign;
 mod view;
 
 use anyhow::{Result, bail};
-use forskap_api::{SearchScope, VarlinkClient, VarlinkClientInterface};
+use forskap_api::{Scope, SearchOptions, VarlinkClient, VarlinkClientInterface};
 
 use crate::cli::{ItemCommand, TargetArgs};
 use crate::client;
@@ -49,19 +49,16 @@ pub async fn lookup(
 ) -> Result<Item> {
     // Scoped to the project: a title can contain `#iid` too, so exact-filter.
     // No epic passes a project scope, so none needs excluding.
-    let scope = SearchScope {
-        projects: Some(vec![project_id]),
-        groups: None,
+    let options = SearchOptions {
+        kinds: Some(vec![refspec::search_kind(kind)]),
+        scope: Some(Scope {
+            projects: Some(vec![project_id]),
+            groups: None,
+        }),
+        ..Default::default()
     };
     let reply = client
-        .search(
-            format!("#{iid}"),
-            Some(vec![refspec::search_kind(kind)]),
-            None,
-            Some(scope),
-            None,
-            None,
-        )
+        .search(format!("#{iid}"), Some(options))
         .call()
         .await
         .map_err(|e| friendly("Search", e))?;

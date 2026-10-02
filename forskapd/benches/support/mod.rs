@@ -275,7 +275,7 @@ pub fn mark_synced(env: &BenchEnv, jobs: &[Job]) {
 
 /// Seed the full search corpus: `n` issues, `n/2` MRs, `n/50` projects,
 /// `n/100` groups, `n/20` epics, plus synced boards for every project the issues use, so
-/// the per-hit `graph_status` lookup finds something.
+/// the per-hit `board_column` lookup finds something.
 pub fn seed_search_corpus(env: &BenchEnv, n: u64) {
     put(env, &(0..n).map(issue).collect::<Vec<_>>());
     put(env, &(0..n / 2).map(merge_request).collect::<Vec<_>>());

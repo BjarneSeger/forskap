@@ -3,7 +3,9 @@ package orgthehosterforskapd
 // This file is hand-written (NOT generated). It provides an ergonomic Client on
 // top of the generated call helpers in orgthehosterforskapd.go: it resolves
 // the daemon socket the same way forskap-cli does, opens the varlink connection, and
-// exposes one Go method per varlink method.
+// exposes one Go method per varlink method. Its signatures are the binding's
+// stable surface: a method whose arguments grow takes them in one struct, and
+// one with several results returns a struct.
 
 import (
 	"context"
@@ -41,17 +43,6 @@ const (
 	SearchMergeRequests SearchKind = "merge_requests"
 	SearchProjects      SearchKind = "projects"
 	SearchGroups        SearchKind = "groups"
-)
-
-// CacheScope values selecting what ClearCache drops: the assigned lists, the
-// search corpus, the three age bands of the time history, the open statistics.
-const (
-	ScopeAssigned CacheScope = "assigned"
-	ScopeSearch   CacheScope = "search"
-	ScopeQuick    CacheScope = "quick"
-	ScopeSlow     CacheScope = "slow"
-	ScopeStale    CacheScope = "stale"
-	ScopeUsage    CacheScope = "usage"
 )
 
 // WorkItemRole values picking one of the two lists ListWorkItems serves: the
@@ -153,33 +144,34 @@ func (c *Client) Close() error {
 }
 
 // Methods below map one-to-one onto the varlink interface. Errors returned by
-// the daemon surface as *GitlabError or *NotAuthenticated (match with errors.As);
+// the daemon surface as *InvalidArgument, *NotFound, *GitlabError,
+// *GitlabUnavailable, *Internal or *NotAuthenticated (match with errors.As);
 // optional parameters are pointers, where nil omits the field on the wire.
 
 // GetAssignedWorkItems returns the open issues assigned to the authenticated
-// user, work items of their project, optionally filtered to the given group
-// paths (nil = all groups).
-func (c *Client) GetAssignedWorkItems(ctx context.Context, groups *[]string) ([]WorkItem, error) {
-	return GetAssignedWorkItems().Call(ctx, c.conn, groups)
+// user, work items of their project, optionally only those in any of the
+// scope's projects (by ID) or groups (by path, subgroups included); nil or an
+// empty scope keeps them all.
+func (c *Client) GetAssignedWorkItems(ctx context.Context, scope *Scope) ([]WorkItem, error) {
+	return GetAssignedWorkItems().Call(ctx, c.conn, scope)
 }
 
 // GetAssignedMergeRequests returns open merge requests assigned to the
-// authenticated user, optionally filtered to the given group paths (nil = all
-// groups). Served from the daemon's search corpus, so freshness follows the
-// search sync cadence.
-func (c *Client) GetAssignedMergeRequests(ctx context.Context, groups *[]string) ([]MergeRequest, error) {
-	return GetAssignedMergeRequests().Call(ctx, c.conn, groups)
+// authenticated user, newest-updated first, optionally only those in the
+// scope as GetAssignedWorkItems keeps them.
+func (c *Client) GetAssignedMergeRequests(ctx context.Context, scope *Scope) ([]MergeRequest, error) {
+	return GetAssignedMergeRequests().Call(ctx, c.conn, scope)
 }
 
 // ListWorkItems returns the issues the authenticated user authored or is
-// assigned to, closed ones included, newest-updated first. role picks one of
-// the Role* lists (nil = both, each issue once); updatedAfter (unix seconds,
-// inclusive) keeps only issues updated since; states keeps only the given
-// State* ones (nil or empty = both). Served from what the daemon synced, which
-// reaches back its search.tracked_retention_hours (90 days by default) and is
-// refreshed daily.
-func (c *Client) ListWorkItems(ctx context.Context, role *WorkItemRole, updatedAfter *int64, states *[]WorkItemState) ([]WorkItem, error) {
-	return ListWorkItems().Call(ctx, c.conn, role, updatedAfter, states)
+// assigned to, closed ones included, newest-updated first. The filter's Role
+// picks one of the Role* lists (nil = both, each issue once); Updated_after
+// (unix seconds, inclusive) keeps only issues updated since; States keeps only
+// the given State* ones (nil or empty = both). A nil filter keeps them all.
+// Served from what the daemon synced, which reaches back its
+// search.tracked_retention_hours (90 days by default) and is refreshed daily.
+func (c *Client) ListWorkItems(ctx context.Context, filter *WorkItemFilter) ([]WorkItem, error) {
+	return ListWorkItems().Call(ctx, c.conn, filter)
 }
 
 // SearchResults groups the per-kind result sets of Search.
@@ -191,18 +183,18 @@ type SearchResults struct {
 }
 
 // Search searches the daemon's locally cached corpus (no GitLab round-trip).
-// kinds optionally restricts the reply to a subset of the Search* kinds (nil =
-// all four); limit caps each result set separately, the issues and epics
-// together (nil = daemon default of 50); scope keeps only items in any of its
-// projects (by ID) or groups (by path, subgroups included), applied before
-// limit (nil = everything); types keeps only the work items of the given types
-// and excludeTypes drops the ones of its types, both compared case-insensitively
-// ("issue", "task", "epic", …; nil or empty = no filter) and applied before
-// limit. Work items and MRs come most-opened first (see RecordOpen); an empty
-// query lists only items with recorded opens. Epics need GitLab Premium or
-// Ultimate.
-func (c *Client) Search(ctx context.Context, query string, kinds *[]SearchKind, limit *int64, scope *SearchScope, types, excludeTypes *[]string) (SearchResults, error) {
-	workItems, mrs, projects, groups, err := Search().Call(ctx, c.conn, query, kinds, limit, scope, types, excludeTypes)
+// The options narrow it (nil = none): Kinds restricts the reply to a subset of
+// the Search* kinds (nil = all four); Limit caps each result set separately,
+// the issues and epics together (nil = daemon default of 50); Scope keeps only
+// items in any of its projects (by ID) or groups (by path, subgroups
+// included), applied before Limit (nil = everything); Types keeps only the
+// work items of the given types and Exclude_types drops the ones of its types,
+// both compared case-insensitively ("issue", "task", "epic", …; nil or empty =
+// no filter) and applied before Limit. Work items and MRs come most-opened
+// first (see RecordOpen); an empty query lists only items with recorded opens.
+// Epics need GitLab Premium or Ultimate.
+func (c *Client) Search(ctx context.Context, query string, options *SearchOptions) (SearchResults, error) {
+	workItems, mrs, projects, groups, err := Search().Call(ctx, c.conn, query, options)
 	return SearchResults{workItems, mrs, projects, groups}, err
 }
 
@@ -229,20 +221,29 @@ func (c *Client) UnassignSelf(ctx context.Context, projectID, iid int64, kind Is
 	return UnassignSelf().Call(ctx, c.conn, projectID, iid, kind)
 }
 
-// CreateWorkItem creates an issue in a project and returns its number and
-// link. description (GitLab Markdown), labels and parent (an epic, named by
-// its Group_id and Iid; GitLab Premium and up) are optional; assignSelf
+// CreatedWorkItem is the issue CreateWorkItem filed.
+type CreatedWorkItem struct {
+	// IID and WebURL are its number and link, nil where GitLab created it but
+	// its answer didn't say them.
+	IID    *int64
+	WebURL *string
+}
+
+// CreateWorkItem creates the issue item describes in a project. Its Title is
+// required; Description (GitLab Markdown), Labels and Parent (an epic, named
+// by its Group_id and Iid; GitLab Premium and up) are optional; Assign_self
 // assigns the issue to the authenticated user (nil = nobody is assigned).
 //
 // Unlike the other writes it is never queued: without a live GitLab session
-// it fails with *NotAuthenticated, and any failure of the request, a network
-// error included, is a *GitlabError. Do not retry such a failure blindly:
-// GitLab may have created the issue before the answer was lost, and a second
-// call would file it again. A parent the daemon can't find fails before
-// anything is created. On success Search, ListWorkItems and (if GitLab
+// it fails with *NotAuthenticated, GitLab refusing it with *GitlabError, and
+// a network error, a 429 or a 5xx with *GitlabUnavailable. Do not retry the
+// last blindly: GitLab may have created the issue before the answer was lost,
+// and a second call would file it again. A parent the daemon can't find fails
+// before anything is created. On success Search, ListWorkItems and (if GitLab
 // assigned it) GetAssignedWorkItems show the issue at once.
-func (c *Client) CreateWorkItem(ctx context.Context, projectID int64, title string, description *string, labels *[]string, assignSelf *bool, parent *WorkItemRef) (iid int64, webURL string, err error) {
-	return CreateWorkItem().Call(ctx, c.conn, projectID, title, description, labels, assignSelf, parent)
+func (c *Client) CreateWorkItem(ctx context.Context, projectID int64, item NewWorkItem) (CreatedWorkItem, error) {
+	iid, webURL, err := CreateWorkItem().Call(ctx, c.conn, projectID, item)
+	return CreatedWorkItem{IID: iid, WebURL: webURL}, err
 }
 
 // RecordOpen counts one open of a work item or merge request in the daemon's
@@ -253,12 +254,6 @@ func (c *Client) CreateWorkItem(ctx context.Context, projectID int64, title stri
 // never contacts GitLab.
 func (c *Client) RecordOpen(ctx context.Context, kind IssuableKind, iid int64, projectID, groupID *int64) error {
 	return RecordOpen().Call(ctx, c.conn, kind, iid, projectID, groupID)
-}
-
-// ClearCache clears the daemon's cache, optionally only the given Scope* slices
-// (nil = everything but the open statistics).
-func (c *Client) ClearCache(ctx context.Context, scope *[]CacheScope) error {
-	return ClearCache().Call(ctx, c.conn, scope)
 }
 
 // GetHistory returns tracked-time history events, optionally limited to the last
@@ -277,18 +272,6 @@ func (c *Client) GetActivity(ctx context.Context, days *int64) ([]ActivityEvent,
 // GetFailures returns queued operations that have failed.
 func (c *Client) GetFailures(ctx context.Context) ([]FailedTask, error) {
 	return GetFailures().Call(ctx, c.conn)
-}
-
-// GetSyncJobs returns the daemon's planned sync jobs in the order its worker
-// runs them, and until when (unix seconds) a GitLab rate limit pauses them all
-// (nil = not paused). Status only: it succeeds while the daemon is dormant.
-// A job whose Unavailable is true is one GitLab refuses for good, asked again
-// once a day; Unavailable is nil from a daemon older than v0.28.0.
-// A running job carries Fetched, its rows so far, Expected, the total GitLab
-// announced (nil without one), and Full where it also runs as a delta; all
-// three are nil for any other job and from a daemon older than v0.30.0.
-func (c *Client) GetSyncJobs(ctx context.Context) (jobs []SyncJob, pausedUntil *int64, err error) {
-	return GetSyncJobs().Call(ctx, c.conn)
 }
 
 // Status is what GetStatus reports.
@@ -376,26 +359,24 @@ func (c *Client) ClearFailures(ctx context.Context) error {
 	return ClearFailures().Call(ctx, c.conn)
 }
 
-// Login stores credentials for a GitLab host in the daemon.
-func (c *Client) Login(ctx context.Context, host, token string) error {
-	return Login().Call(ctx, c.conn, host, token)
+// Account is the GitLab account WhoAmI reports.
+type Account struct {
+	Host     string
+	Username string
+	UserID   int64
+	// TokenExpiresAt is when the daemon's token expires, in unix seconds; nil
+	// if it never does or the daemon doesn't know yet.
+	TokenExpiresAt *int64
+	// TokenRotates tells whether the daemon replaces the token before that.
+	TokenRotates bool
 }
 
-// Logout clears stored credentials.
-func (c *Client) Logout(ctx context.Context) error {
-	return Logout().Call(ctx, c.conn)
-}
-
-// WhoAmI returns the authenticated host, GitLab login name and user id.
-func (c *Client) WhoAmI(ctx context.Context) (host, username string, userID int64, err error) {
-	host, userID, username, _, _, err = WhoAmI().Call(ctx, c.conn)
-	return host, username, userID, err
-}
-
-// TokenStatus returns when the daemon's GitLab token expires (unix seconds;
-// nil if it never does or the daemon doesn't know yet) and whether the daemon
-// rotates it before that. Wraps the varlink method `WhoAmI`.
-func (c *Client) TokenStatus(ctx context.Context) (expiresAt *int64, rotates bool, err error) {
-	_, _, _, expiresAt, rotates, err = WhoAmI().Call(ctx, c.conn)
-	return expiresAt, rotates, err
+// WhoAmI returns the account the daemon is connected as: the host, the GitLab
+// login name and user id, and its token's expiry and rotation. It fails with
+// *NotAuthenticated while the daemon has no GitLab session.
+func (c *Client) WhoAmI(ctx context.Context) (Account, error) {
+	var a Account
+	var err error
+	a.Host, a.UserID, a.Username, a.TokenExpiresAt, a.TokenRotates, err = WhoAmI().Call(ctx, c.conn)
+	return a, err
 }

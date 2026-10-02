@@ -5,4 +5,4 @@ package orgthehosterforskapd
 // APIVersion is the version of the org.thehoster.forskapd interface this
 // binding was generated from: the forskap-api crate's. Compare a daemon's with
 // Status.Compatible.
-const APIVersion = "0.32.0"
+const APIVersion = "0.33.0"

@@ -1,4 +1,4 @@
-//! Thin wrapper around the generated varlink client.
+//! Thin wrapper around the generated varlink clients.
 //!
 //! Exists so each subcommand doesn't have to repeat the socket-resolution and
 //! `AsyncConnection::with_address` dance.
@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use forskap_api::VarlinkClient;
+use forskap_api::{VarlinkClient, admin};
 use varlink::{AsyncConnection, AsyncMethodCall, ServiceInfo};
 
 use crate::config::{self, Config};
@@ -35,10 +35,7 @@ pub fn socket(cfg: &Config) -> Result<String> {
 /// The connection is single-use per command invocation; we don't pool it
 /// because the CLI exits right after the call returns.
 pub async fn connect(socket: &str) -> Result<VarlinkClient> {
-    let conn = open(socket)
-        .await
-        .with_context(|| format!("connecting to varlink socket {socket}"))?;
-    Ok(VarlinkClient::new(conn))
+    Ok(VarlinkClient::new(dial(socket).await?))
 }
 
 /// [`connect`] to the socket the config and environment name.
@@ -46,8 +43,33 @@ pub async fn connect_default() -> Result<VarlinkClient> {
     connect(&socket(&config::load()?)?).await
 }
 
-/// The bare connection, for the calls outside the forskapd interface; hand
-/// it to [`VarlinkClient::new`] for the others.
+/// [`connect_default`] for the admin interface: the session, the cache, the
+/// sync worker's jobs.
+pub async fn connect_admin() -> Result<admin::VarlinkClient> {
+    let conn = dial(&socket(&config::load()?)?).await?;
+    Ok(admin::VarlinkClient::new(conn))
+}
+
+/// Both interfaces on one connection to the socket the config and
+/// environment name.
+pub async fn connect_both() -> Result<(VarlinkClient, admin::VarlinkClient)> {
+    let conn = dial(&socket(&config::load()?)?).await?;
+    Ok((
+        VarlinkClient::new(Arc::clone(&conn)),
+        admin::VarlinkClient::new(conn),
+    ))
+}
+
+/// [`open`], its failure saying where.
+async fn dial(socket: &str) -> Result<Arc<AsyncConnection>> {
+    open(socket)
+        .await
+        .with_context(|| format!("connecting to varlink socket {socket}"))
+}
+
+/// The bare connection, for the calls outside the forskapd interfaces; hand
+/// it to [`VarlinkClient::new`] or [`admin::VarlinkClient::new`] for the
+/// others.
 pub async fn open(socket: &str) -> varlink::Result<Arc<AsyncConnection>> {
     AsyncConnection::with_address(socket).await
 }

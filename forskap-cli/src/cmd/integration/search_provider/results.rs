@@ -8,7 +8,7 @@ use forskap_api::Search_Reply;
 
 use super::query;
 use crate::cli::SearchKind;
-use crate::cmd::epic;
+use crate::cmd::{epic, time};
 use crate::item::{self, is_epic};
 use crate::refspec::RefKind;
 
@@ -37,11 +37,6 @@ impl Row {
     }
 }
 
-/// An avatar path off the wire, where empty means none.
-fn avatar(path: &str) -> Option<String> {
-    (!path.is_empty()).then(|| path.to_string())
-}
-
 /// What a result id points at once the user picks it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -63,29 +58,30 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
     let mut out = Vec::new();
     let (epics, issues): (Vec<_>, Vec<_>) = reply.work_items.iter().partition(|w| is_epic(w));
     for i in issues {
+        let spent = i.time_spent.filter(|&s| s > 0).map(time::spent);
         out.push(Row {
             id: format!("issues:{}:{}", i.project_id.unwrap_or_default(), i.iid),
             title: format!("#{} {}", i.iid, i.title),
             subtitle: join(&[
-                project_of(&i.namespace_path, &i.web_url),
+                project_of(i.namespace_path.as_deref(), &i.web_url),
                 &i.state,
-                &i.total_time,
+                spent.as_deref().unwrap_or_default(),
             ]),
             kind: SearchKind::Issues,
             score: i.open_count,
             url: i.web_url.clone(),
-            avatar: avatar(&i.project_avatar),
+            avatar: i.project_avatar.clone(),
         });
     }
     for m in &reply.merge_requests {
         out.push(Row {
             id: format!("merge_requests:{}:{}", m.project_id, m.iid),
             title: format!("!{} {}", m.iid, m.title),
-            subtitle: join(&[project_of(&m.project_path, &m.web_url), &m.state]),
+            subtitle: join(&[project_of(m.project_path.as_deref(), &m.web_url), &m.state]),
             kind: SearchKind::Mrs,
             score: m.open_count,
             url: m.web_url.clone(),
-            avatar: avatar(&m.project_avatar),
+            avatar: m.project_avatar.clone(),
         });
     }
     for e in epics {
@@ -102,18 +98,18 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
     for p in &reply.projects {
         out.push(Row {
             id: format!("url:{}", p.web_url),
-            title: p.path.clone(),
+            title: p.full_path.clone(),
             subtitle: p.name.clone(),
             kind: SearchKind::Projects,
             score: 0,
             url: p.web_url.clone(),
-            avatar: avatar(&p.avatar),
+            avatar: p.avatar.clone(),
         });
     }
     for g in &reply.groups {
         out.push(Row {
             id: format!("url:{}", g.web_url),
-            title: g.path.clone(),
+            title: g.full_path.clone(),
             subtitle: g.name.clone(),
             kind: SearchKind::Groups,
             score: 0,
@@ -125,7 +121,7 @@ pub fn rows(reply: &Search_Reply) -> Vec<Row> {
 }
 
 /// [`item::project_of`], empty when the path is unknown.
-fn project_of<'a>(project_path: &'a str, web_url: &'a str) -> &'a str {
+fn project_of<'a>(project_path: Option<&'a str>, web_url: &'a str) -> &'a str {
     item::project_of(project_path, web_url).unwrap_or_default()
 }
 
@@ -177,7 +173,7 @@ mod tests {
             title: "Accounts".into(),
             web_url: "https://gl.example.com/groups/team/-/epics/5".into(),
             open_count: 2,
-            namespace_path: "team".into(),
+            namespace_path: Some("team".into()),
             ..crate::item::testing::epic(3, 5)
         };
         Search_Reply {
@@ -190,16 +186,16 @@ mod tests {
                     r#type: "task".into(),
                     project_id: Some(7),
                     group_id: None,
-                    namespace_path: "team/api".into(),
+                    namespace_path: Some("team/api".into()),
                     title: "Fix login".into(),
                     web_url: "https://gl.example.com/team/api/-/issues/42".into(),
                     state: "opened".into(),
                     parent: None,
-                    total_time: "1h".into(),
-                    graph_status: String::new(),
+                    time_spent: Some(3600),
+                    board_column: None,
                     open_count: 3,
-                    project_avatar: "/cache/avatars/7-a.png".into(),
-                    updated_at: 1_782_900_000,
+                    project_avatar: Some("/cache/avatars/7-a.png".into()),
+                    updated_at: Some(1_782_900_000),
                 },
             ],
             merge_requests: vec![MergeRequest {
@@ -211,23 +207,23 @@ mod tests {
                 state: "merged".into(),
                 assignees: vec![],
                 open_count: 0,
-                project_avatar: "/cache/avatars/7-a.png".into(),
+                project_avatar: Some("/cache/avatars/7-a.png".into()),
                 // Unknown to the daemon: the URL names the project.
-                project_path: String::new(),
-                updated_at: 1_782_900_000,
+                project_path: None,
+                updated_at: Some(1_782_900_000),
             }],
             projects: vec![Project {
                 id: 7,
                 name: "API".into(),
-                path: "team/api".into(),
+                full_path: "team/api".into(),
                 web_url: "https://gl.example.com/team/api".into(),
-                avatar: String::new(),
+                avatar: None,
                 archived: false,
             }],
             groups: vec![Group {
                 id: 3,
                 name: "Team".into(),
-                path: "team".into(),
+                full_path: "team".into(),
                 web_url: "https://gl.example.com/groups/team".into(),
             }],
         }

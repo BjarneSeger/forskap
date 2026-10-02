@@ -1,34 +1,41 @@
 //! Projections of stored GitLab rows onto the varlink wire types.
 
+use forskap_api::admin::{SyncJob, SyncJobStatus};
 use forskap_api::{
     ActivityEvent, Group, HistoryEvent, HistorySource, IssuableKind, MergeRequest, Project,
-    SyncJob, SyncJobStatus, WorkItem, WorkItemRef, WorkItemState,
+    WorkItem, WorkItemRef, WorkItemState,
 };
 
-use crate::gitlab::{Issuable, format_duration};
-use crate::query::{graph_status_from, namespace_of};
+use crate::gitlab::Issuable;
+use crate::query::{board_column, namespace_of};
 use crate::sync::{JobInfo, JobStatus, model};
 
 /// What a wire item shows of its project.
 pub struct ProjectInfo {
     /// `path_with_namespace` of the stored project.
     pub path: Option<String>,
-    pub avatar: String,
+    /// The avatar file, `None` without one.
+    pub avatar: Option<String>,
 }
 
 /// A tracked project the user is no member of has no row, but its items
 /// carry the path in their link.
-fn project_path(stored: Option<String>, web_url: &str) -> String {
+fn project_path(stored: Option<String>, web_url: &str) -> Option<String> {
     stored
         .and_then(some)
-        .unwrap_or_else(|| namespace_of(web_url))
+        .or_else(|| some(namespace_of(web_url)))
+}
+
+/// Unix seconds as stored, `None` for the 0 of an unreadable or missing time.
+fn known(secs: u64) -> Option<i64> {
+    (secs > 0).then_some(secs as i64)
 }
 
 /// The work item type of every epic.
 pub const EPIC: &str = "epic";
 
 /// `board_labels` are the issue's project board lists, `None` when never
-/// synced (then `graph_status` stays empty). `epic_url` is the link of the
+/// synced (then `board_column` is absent). `epic_url` is the link of the
 /// stored epic the issue names as its parent, `None` without a row.
 pub fn issue(
     i: model::Issue,
@@ -38,12 +45,12 @@ pub fn issue(
     epic_url: Option<String>,
 ) -> WorkItem {
     WorkItem {
-        graph_status: graph_status_from(board_labels, &i.labels, &i.state),
+        board_column: board_column(board_labels, &i.labels, &i.state),
         parent: i
             .epic
             .as_ref()
             .and_then(|e| parent(e, epic_url, &i.web_url)),
-        total_time: i.total_time().to_string(),
+        time_spent: Some(i.time_spent() as i64),
         r#type: i.work_item_type().to_string(),
         id: i.id,
         iid: i.iid,
@@ -55,7 +62,7 @@ pub fn issue(
         open_count,
         project_avatar: project.avatar,
         web_url: i.web_url,
-        updated_at: i.updated_at as i64,
+        updated_at: known(i.updated_at),
     }
 }
 
@@ -111,15 +118,15 @@ pub fn merge_request(
         project_avatar: project.avatar,
         project_path: project_path(project.path, &m.web_url),
         web_url: m.web_url,
-        updated_at: m.updated_at as i64,
+        updated_at: known(m.updated_at),
     }
 }
 
-pub fn project(p: model::Project, avatar: String) -> Project {
+pub fn project(p: model::Project, avatar: Option<String>) -> Project {
     Project {
         id: p.id,
         name: p.name,
-        path: p.path_with_namespace,
+        full_path: p.path_with_namespace,
         web_url: p.web_url,
         avatar,
         archived: p.archived,
@@ -130,7 +137,7 @@ pub fn group(g: model::Group) -> Group {
     Group {
         id: g.id,
         name: g.name,
-        path: g.full_path,
+        full_path: g.full_path,
         web_url: g.web_url,
     }
 }
@@ -150,7 +157,7 @@ pub fn group_path(stored: Option<String>, web_url: &str) -> String {
 /// id is the epic's work item id, never its legacy one.
 pub fn epic(e: model::Epic, open_count: i64, group_path: Option<String>) -> WorkItem {
     WorkItem {
-        namespace_path: self::group_path(group_path, &e.web_url),
+        namespace_path: some(self::group_path(group_path, &e.web_url)),
         id: e.work_item_id,
         iid: e.iid,
         r#type: EPIC.into(),
@@ -160,11 +167,11 @@ pub fn epic(e: model::Epic, open_count: i64, group_path: Option<String>) -> Work
         web_url: e.web_url,
         state: e.state,
         parent: None,
-        total_time: String::new(),
-        graph_status: String::new(),
+        time_spent: None,
+        board_column: None,
         open_count,
-        project_avatar: String::new(),
-        updated_at: e.updated_at as i64,
+        project_avatar: None,
+        updated_at: known(e.updated_at),
     }
 }
 
@@ -176,10 +183,11 @@ pub fn timelog(t: model::Timelog) -> HistoryEvent {
         kind: kind(t.kind),
         project_id: t.project_id,
         iid: t.iid,
-        title: t.title,
-        web_url: t.web_url,
-        duration: format_duration(t.time_spent),
-        summary: t.summary,
+        title: some(t.title),
+        web_url: some(t.web_url),
+        time_spent: Some(t.time_spent as i64),
+        duration: None,
+        summary: some(t.summary),
     }
 }
 
@@ -210,7 +218,7 @@ pub fn sync_job(j: JobInfo) -> SyncJob {
 
 /// A contribution event. `project` is its project where that is stored,
 /// `item_url` the stored issue's or merge request's link; without the item
-/// the link is built from the project's, and without both it stays empty.
+/// the link is built from the project's, and without both it is `None`.
 pub fn activity(
     e: model::Event,
     project: Option<&model::Project>,
@@ -252,10 +260,10 @@ pub fn activity(
     ActivityEvent {
         timestamp: e.created_at as i64,
         action: e.action_name,
-        target_type,
+        target_type: some(target_type),
         target_iid: (target_iid > 0).then_some(target_iid),
         target_title: some(e.target_title),
-        project_id: e.project_id,
+        project_id: (e.project_id > 0).then_some(e.project_id),
         project_path,
         web_url,
         commit_count: is_push.then_some(push.commit_count),
@@ -266,7 +274,7 @@ pub fn activity(
 }
 
 /// `None` for the empty string.
-fn some(s: String) -> Option<String> {
+pub fn some(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
@@ -411,20 +419,36 @@ mod tests {
         };
         let info = |path: Option<&str>| ProjectInfo {
             path: path.map(str::to_string),
-            avatar: String::new(),
+            avatar: None,
         };
         let stored = merge_request(item(), 0, info(Some("team/api")));
-        assert_eq!(stored.project_path, "team/api");
+        assert_eq!(stored.project_path.as_deref(), Some("team/api"));
         let foreign = merge_request(item(), 0, info(None));
-        assert_eq!(foreign.project_path, "other/big");
+        assert_eq!(foreign.project_path.as_deref(), Some("other/big"));
         let unknown = issue(model::Issue::default(), None, 0, info(None), None);
-        assert_eq!(unknown.namespace_path, "");
+        assert_eq!(unknown.namespace_path, None);
+        let json = serde_json::to_value(&unknown).unwrap();
+        for absent in ["namespace_path", "project_avatar", "updated_at"] {
+            assert!(json.get(absent).is_none(), "{absent} in {json}");
+        }
+    }
+
+    /// Known times are sent, a row's 0 (unread or unknown) is left out.
+    #[test]
+    fn an_unknown_update_time_is_absent() {
+        let mr = |updated_at| model::MergeRequest {
+            updated_at,
+            ..Default::default()
+        };
+        assert_eq!(merge_request(mr(0), 0, no_project()).updated_at, None);
+        let known = merge_request(mr(1_782_900_000), 0, no_project());
+        assert_eq!(known.updated_at, Some(1_782_900_000));
     }
 
     fn no_project() -> ProjectInfo {
         ProjectInfo {
             path: None,
-            avatar: String::new(),
+            avatar: None,
         }
     }
 
@@ -450,7 +474,7 @@ mod tests {
         assert_eq!((task.id, task.iid), (7042, 42));
         assert_eq!(task.r#type, "task");
         assert_eq!((task.project_id, task.group_id), (Some(7), None));
-        assert_eq!(task.namespace_path, "team/api");
+        assert_eq!(task.namespace_path.as_deref(), Some("team/api"));
         assert_eq!(
             task.parent,
             Some(WorkItemRef {
@@ -480,6 +504,30 @@ mod tests {
         let plain = issue(untyped, None, 0, no_project(), None);
         assert_eq!(plain.r#type, "issue");
         assert_eq!(plain.parent, None);
+    }
+
+    /// In seconds, 0 when none is logged; a timelog's too, and only a queued
+    /// one carries a duration.
+    #[test]
+    fn time_spent_is_in_seconds() {
+        let spent = model::Issue {
+            time_stats: Some(model::TimeStats {
+                total_time_spent: 5400,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            issue(spent, None, 0, no_project(), None).time_spent,
+            Some(5400)
+        );
+        let none = issue(model::Issue::default(), None, 0, no_project(), None);
+        assert_eq!(none.time_spent, Some(0));
+
+        let logged = timelog(model::Timelog {
+            time_spent: 1800,
+            ..Default::default()
+        });
+        assert_eq!((logged.time_spent, logged.duration), (Some(1800), None));
     }
 
     #[test]
@@ -532,12 +580,11 @@ mod tests {
         assert_eq!((e.id, e.iid), (9001, 5), "never the legacy id");
         assert_eq!(e.r#type, "epic");
         assert_eq!((e.project_id, e.group_id), (None, Some(3)));
-        assert_eq!(e.namespace_path, "team");
+        assert_eq!(e.namespace_path.as_deref(), Some("team"));
         assert_eq!(e.parent, None);
         assert_eq!(e.open_count, 2);
-        assert!(
-            e.total_time.is_empty() && e.graph_status.is_empty() && e.project_avatar.is_empty()
-        );
+        assert_eq!((e.time_spent, e.project_avatar), (None, None));
+        assert_eq!(e.board_column, None);
     }
 
     #[test]
@@ -547,14 +594,15 @@ mod tests {
             ..Default::default()
         };
         let stored = epic(item(), 0, Some("team".into()));
-        assert_eq!(stored.namespace_path, "team");
+        assert_eq!(stored.namespace_path.as_deref(), Some("team"));
         let foreign = epic(item(), 0, None);
         assert_eq!(
-            foreign.namespace_path, "other/big",
+            foreign.namespace_path.as_deref(),
+            Some("other/big"),
             "without the `groups/` prefix"
         );
         let unknown = epic(model::Epic::default(), 0, Some(String::new()));
-        assert_eq!(unknown.namespace_path, "");
+        assert_eq!(unknown.namespace_path, None);
     }
 
     #[test]
@@ -582,6 +630,7 @@ mod tests {
 
         let joined = activity(event("joined", "", 0), Some(&p), None);
         assert_eq!(joined.web_url.as_deref(), Some("https://gl/team/api"));
+        assert_eq!(joined.target_type, None);
         assert_eq!(joined.target_iid, None);
         assert_eq!(joined.target_title, None);
 
@@ -596,7 +645,18 @@ mod tests {
         let unknown = activity(event("opened", "Issue", 5), None, None);
         assert_eq!(unknown.web_url, None);
         assert_eq!(unknown.project_path, None);
-        assert_eq!(unknown.project_id, 7);
+        assert_eq!(unknown.project_id, Some(7));
+
+        // A group's or the user's own event has no project.
+        let outside = model::Event {
+            project_id: 0,
+            ..event("joined", "", 0)
+        };
+        let outside = activity(outside, None, None);
+        assert_eq!(outside.project_id, None);
+        assert_eq!(outside.target_type, None);
+        let json = serde_json::to_value(&outside).unwrap();
+        assert!(json.get("project_id").is_none() && json.get("target_type").is_none());
     }
 
     #[test]
@@ -639,7 +699,7 @@ mod tests {
             noteable_iid: 12,
         };
         let comment = activity(comment, Some(&p), None);
-        assert_eq!(comment.target_type, "MergeRequest");
+        assert_eq!(comment.target_type.as_deref(), Some("MergeRequest"));
         assert_eq!(comment.target_iid, Some(12));
         assert_eq!(comment.target_title.as_deref(), Some("Add x"));
         assert_eq!(comment.description.as_deref(), Some("lgtm"));

@@ -17,7 +17,9 @@ mod open;
 mod view;
 
 use anyhow::{Result, bail};
-use forskap_api::{Group, SearchKind, VarlinkClient, VarlinkClientInterface, WorkItem};
+use forskap_api::{
+    Group, SearchKind, SearchOptions, VarlinkClient, VarlinkClientInterface, WorkItem,
+};
 
 use crate::cli::{EpicArgs, EpicCommand};
 use crate::friendly::friendly;
@@ -67,7 +69,8 @@ pub async fn resolve(client: &VarlinkClient, iid: i64, group: Option<&str>) -> R
 
 /// The group path the epic carries, else the one in its URL.
 pub fn group_of(e: &WorkItem) -> Option<&str> {
-    Some(e.namespace_path.as_str())
+    e.namespace_path
+        .as_deref()
         .filter(|p| !p.is_empty())
         .or_else(|| group_path(&e.web_url))
 }
@@ -79,15 +82,14 @@ fn group_path(web_url: &str) -> Option<&str> {
 
 /// The cached epics numbered `iid`, one per group that has one.
 async fn cached(client: &VarlinkClient, iid: i64) -> Result<Vec<WorkItem>> {
+    let options = SearchOptions {
+        kinds: Some(vec![SearchKind::work_items]),
+        limit: Some(SEARCH_LIMIT),
+        types: Some(vec!["epic".into()]),
+        ..Default::default()
+    };
     let reply = client
-        .search(
-            format!("&{iid}"),
-            Some(vec![SearchKind::work_items]),
-            Some(SEARCH_LIMIT),
-            None,
-            Some(vec!["epic".into()]),
-            None,
-        )
+        .search(format!("&{iid}"), Some(options))
         .call()
         .await
         .map_err(|e| friendly("Search", e))?;
@@ -147,15 +149,13 @@ async fn group_id(client: &VarlinkClient, group: &str) -> Result<i64> {
         return Ok(id);
     }
     let path = group.trim_matches('/');
+    let options = SearchOptions {
+        kinds: Some(vec![SearchKind::groups]),
+        limit: Some(SEARCH_LIMIT),
+        ..Default::default()
+    };
     let reply = client
-        .search(
-            path.to_string(),
-            Some(vec![SearchKind::groups]),
-            Some(SEARCH_LIMIT),
-            None,
-            None,
-            None,
-        )
+        .search(path.to_string(), Some(options))
         .call()
         .await
         .map_err(|e| friendly("Search", e))?;
@@ -164,7 +164,10 @@ async fn group_id(client: &VarlinkClient, group: &str) -> Result<i64> {
 
 /// GitLab paths are case-insensitive.
 fn by_path(path: &str, groups: &[Group]) -> Result<i64> {
-    match groups.iter().find(|g| g.path.eq_ignore_ascii_case(path)) {
+    match groups
+        .iter()
+        .find(|g| g.full_path.eq_ignore_ascii_case(path))
+    {
         Some(g) => Ok(g.id),
         None => bail!(
             "no cached group with the path {path:?} — pass the full path \
@@ -239,11 +242,11 @@ mod tests {
     fn the_carried_group_path_beats_the_url() {
         let mut e = epic(3, 5);
         assert_eq!(group_of(&e), Some("g3"));
-        e.namespace_path = "team/backend".into();
+        e.namespace_path = Some("team/backend".into());
         assert_eq!(group_of(&e), Some("team/backend"));
         e.web_url = String::new();
         assert_eq!(group_of(&e), Some("team/backend"));
-        e.namespace_path = String::new();
+        e.namespace_path = None;
         assert_eq!(group_of(&e), None);
     }
 
@@ -252,7 +255,7 @@ mod tests {
         let group = |id, path: &str| Group {
             id,
             name: String::new(),
-            path: path.to_string(),
+            full_path: path.to_string(),
             web_url: String::new(),
         };
         // The daemon matches substrings: `team` also returns `team/backend`.

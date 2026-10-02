@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use forskap_api::{GetSyncJobs_Reply, SyncJob, SyncJobStatus, VarlinkClientInterface};
+use forskap_api::admin::{GetSyncJobs_Reply, SyncJob, SyncJobStatus, VarlinkClientInterface};
 
 use crate::cli::{OutputFormat, WatchArgs};
 use crate::friendly::friendly;
@@ -27,7 +27,7 @@ pub async fn run(all: bool, format: OutputFormat, watch: WatchArgs) -> Result<()
 
 // Connects per call: a watch has to find a restarted daemon again.
 pub(super) async fn fetch() -> Result<GetSyncJobs_Reply> {
-    let client = client::connect_default().await?;
+    let client = client::connect_admin().await?;
     client
         .get_sync_jobs()
         .call()

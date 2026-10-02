@@ -7,15 +7,12 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use forskap_api::{AsyncCall, Call_Search, SearchKind, VarlinkInterface};
+use forskap_api::{AsyncCall, Call_Search, SearchKind, SearchOptions, VarlinkInterface};
 use forskapd::query::{parse_iid_query, text_matches};
 
 use support::{dormant_env, seed_search_corpus};
 
 const SIZES: [u64; 3] = [1_000, 10_000, 50_000];
-
-/// The kinds a variant searches, and the work item types it leaves out.
-type Filter = (Option<Vec<SearchKind>>, Option<Vec<String>>);
 
 fn search_handler(c: &mut Criterion) {
     let mut group = c.benchmark_group("search_handler");
@@ -26,37 +23,32 @@ fn search_handler(c: &mut Criterion) {
         seed_search_corpus(&env, n);
         group.throughput(Throughput::Elements(n));
         // The issues alone: the work items but the epics, as the CLI asks.
-        let issues = || -> Filter {
-            (
-                Some(vec![SearchKind::work_items]),
-                Some(vec!["epic".into()]),
-            )
+        let issues = || SearchOptions {
+            kinds: Some(vec![SearchKind::work_items]),
+            exclude_types: Some(vec!["epic".into()]),
+            ..Default::default()
         };
-        let variants: [(&str, &str, Filter); 4] = [
+        let variants: [(&str, &str, SearchOptions); 4] = [
             // Needle matching nothing: the pure per-entry filter cost.
             ("issues_miss", "zzz-nomatch", issues()),
             // ~1% hits: adds sort + truncate + per-hit boards.get reads.
             ("issues_hits", "flaky", issues()),
             // No kind filter: all four corpora scanned.
-            ("all_kinds", "flaky", (None, None)),
+            ("all_kinds", "flaky", SearchOptions::default()),
             // Exact-reference query: parse + iid comparison path.
             ("iid_ref", "#123", issues()),
         ];
-        for (variant, query, (kinds, excluded)) in variants {
+        for (variant, query, options) in variants {
             group.bench_with_input(BenchmarkId::new(variant, n), &n, |b, _| {
                 b.to_async(&env.rt).iter(|| {
-                    let (kinds, excluded) = (kinds.clone(), excluded.clone());
+                    let options = options.clone();
                     let h = &env.h;
                     async move {
                         let mut call = AsyncCall::default();
                         h.search(
                             &mut call as &mut dyn Call_Search,
                             query.to_string(),
-                            kinds,
-                            None,
-                            None,
-                            None,
-                            excluded,
+                            Some(options),
                         )
                         .await
                         .unwrap();

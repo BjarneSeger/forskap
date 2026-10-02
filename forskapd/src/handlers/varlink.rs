@@ -9,36 +9,31 @@ use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 
 use forskap_api::{
-    ActivityEvent, CacheScope, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
-    Call_CreateWorkItem, Call_DismissFailure, Call_GetActivity, Call_GetAssignedMergeRequests,
-    Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetStatus, Call_GetSyncJobs,
-    Call_ListWorkItems, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
-    Call_Search, Call_UnassignSelf, Call_WhoAmI, FailedTask, Group, HistoryEvent, HistorySource,
-    IssuableKind, MergeRequest, Project, SearchKind, SearchScope, VarlinkInterface, WorkItem,
-    WorkItemRef, WorkItemRole, WorkItemState,
+    ActivityEvent, Call_AssignSelf, Call_ClearFailures, Call_Close, Call_CreateWorkItem,
+    Call_DismissFailure, Call_GetActivity, Call_GetAssignedMergeRequests,
+    Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetStatus,
+    Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_RetryFailure, Call_Search,
+    Call_UnassignSelf, Call_WhoAmI, FailedTask, Group, HistoryEvent, HistorySource, IssuableKind,
+    MergeRequest, NewWorkItem, Project, Scope, SearchKind, SearchOptions, VarlinkInterface,
+    WorkItem, WorkItemFilter, WorkItemRole, WorkItemState,
 };
 
 use crate::error::{DormancyReason, Error};
-use crate::gitlab::{GitlabApi, GitlabClient, Issuable, NewIssue};
+use crate::gitlab::{GitlabApi, Issuable, NewIssue};
 use crate::query::{in_group, namespace_of, parse_epic_query, parse_iid_query, text_matches};
-use crate::secrets::{Credentials, Token};
+use crate::sync::Job;
 use crate::sync::jobs::{
     ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, RECENT_ASSIGNED_ISSUES, RECENT_AUTHORED_ISSUES,
 };
 use crate::sync::model::{self, RowKey};
 use crate::sync::store::{Identity, RowScope, Stored, SyncStore, View};
-use crate::sync::{Clear, Job};
 use crate::usage::{UsageEntry, UsageRecord};
 use crate::write::{Write, WriteOp};
 
 use super::{
-    ConnState, Handlers, Session, dormant_args, issue_ref_error, looks_like_duration,
-    new_issue_error, now_secs, open_key, parent_epic, wire,
+    Handlers, Invalid, dormant_args, issue_ref_error, looks_like_duration, new_issue_error,
+    now_secs, open_key, parent_epic, reply_failed, wire,
 };
-
-/// How long `GetSyncJobs` waits for the worker, which answers between two
-/// awaits even with a fetch in flight.
-const SYNC_JOBS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long `CreateWorkItem` waits for the worker to store the new issue before
 /// replying anyway. The worker stores it between two awaits; past this the
@@ -47,11 +42,6 @@ const LAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-kind result cap when the caller doesn't pass a `limit`.
 const DEFAULT_SEARCH_LIMIT: usize = 50;
-
-/// How long `ClearCache` waits for the foreground views (and a cleared
-/// history) to refill before replying anyway; the rest refills in the
-/// background.
-const CLEAR_REFILL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why a read has nothing to serve: its source never synced.
 enum Cold {
@@ -65,7 +55,9 @@ enum WriteOutcome {
     /// Applied, or queued for the retry worker.
     Accepted,
     NotAuthenticated(DormancyReason),
-    Rejected(Error),
+    /// Neither applied nor queued: GitLab refused it, or it may have landed
+    /// (a non-idempotent write on a 5xx).
+    Failed(Error),
 }
 
 /// Reply to a read whose source never synced — an honest `NotAuthenticated`
@@ -94,7 +86,7 @@ macro_rules! reply_write {
                 let (reason, detail) = dormant_args(&r);
                 $call.reply_not_authenticated(reason, detail)
             }
-            WriteOutcome::Rejected(e) => $call.reply_gitlab_error(e.to_string()),
+            WriteOutcome::Failed(e) => reply_failed($call, &e, e.to_string()),
         }
     };
 }
@@ -246,7 +238,7 @@ impl Handlers {
 
     /// The shared write cascade: try once while connected; queue the write
     /// when GitLab is unreachable or the failure is retryable; otherwise hand
-    /// the rejection back.
+    /// the failure back.
     async fn perform_write(&self, write: Write) -> WriteOutcome {
         let (kind, project_id, iid, op) =
             (write.kind, write.project_id, write.iid, write.op.name());
@@ -278,8 +270,8 @@ impl Handlers {
                 WriteOutcome::Accepted
             }
             Err(e) => {
-                warn!(error = %e, project_id, iid, op, "write rejected by GitLab");
-                WriteOutcome::Rejected(e)
+                warn!(error = %e, project_id, iid, op, "write failed, not queued");
+                WriteOutcome::Failed(e)
             }
         }
     }
@@ -304,7 +296,8 @@ impl Handlers {
         if let Some(epic) = self.row::<model::Epic>((group_id as u64, iid as u64)) {
             return Ok(epic.id);
         }
-        let epic: model::Epic = serde_json::from_value(gitlab.epic(group_id, iid).await?)?;
+        let epic: model::Epic = serde_json::from_value(gitlab.epic(group_id, iid).await?)
+            .map_err(|e| Error::Gitlab(format!("GitLab's answer is no epic: {e}")))?;
         match epic.id {
             id if id > 0 => Ok(id),
             _ => Err(Error::Gitlab("GitLab's answer carries no epic id".into())),
@@ -313,7 +306,7 @@ impl Handlers {
 }
 
 /// Board list labels per project, read at most once per request. `None` for
-/// a project whose boards never synced, so its `graph_status` stays empty.
+/// a project whose boards never synced, so its `board_column` is absent.
 struct BoardLabels<'a> {
     handlers: &'a Handlers,
     by_project: HashMap<i64, Option<Vec<String>>>,
@@ -353,7 +346,7 @@ impl<'a> BoardLabels<'a> {
             .as_deref()
     }
 
-    /// The work item for `i`, with its `graph_status` from the board labels
+    /// The work item for `i`, with its `board_column` from the board labels
     /// and its parent's link from `epics`.
     fn wire(
         &mut self,
@@ -417,7 +410,7 @@ impl WorkItemRow {
 /// filesystem is never asked.
 struct Projects<'a> {
     handlers: &'a Handlers,
-    avatars: HashMap<i64, String>,
+    avatars: HashMap<i64, Option<String>>,
     paths: HashMap<i64, Option<String>>,
 }
 
@@ -446,8 +439,8 @@ impl<'a> Projects<'a> {
         }
     }
 
-    /// The absolute path of the project's avatar, empty when it has none.
-    fn avatar(&mut self, project_id: i64) -> String {
+    /// The absolute path of the project's avatar, `None` without one.
+    fn avatar(&mut self, project_id: i64) -> Option<String> {
         let h = self.handlers;
         self.avatars
             .entry(project_id)
@@ -457,13 +450,10 @@ impl<'a> Projects<'a> {
                     warn!(error = %e, project_id, "avatar read failed");
                     None
                 });
-                avatar
-                    .filter(|a| !a.file.is_empty())
-                    .map(|a| {
-                        let path = h.sync.avatars().path_of(&a.file);
-                        path.to_string_lossy().into_owned()
-                    })
-                    .unwrap_or_default()
+                avatar.filter(|a| !a.file.is_empty()).map(|a| {
+                    let path = h.sync.avatars().path_of(&a.file);
+                    path.to_string_lossy().into_owned()
+                })
             })
             .clone()
     }
@@ -500,16 +490,16 @@ impl<'a> Groups<'a> {
     }
 }
 
-/// A search scope with at least one criterion: an item passes when it is in
-/// any listed project or any listed group (subgroups included).
-struct Scope {
+/// A [`Scope`] with at least one criterion: an item passes when it is in any
+/// listed project or any listed group (subgroups included).
+struct Within {
     projects: Vec<i64>,
     groups: Vec<String>,
 }
 
-impl Scope {
+impl Within {
     /// `None` when `scope` names nothing, which means no filter at all.
-    fn new(scope: Option<SearchScope>) -> Option<Self> {
+    fn new(scope: Option<Scope>) -> Option<Self> {
         let scope = scope?;
         let projects = scope.projects.unwrap_or_default();
         let groups = scope.groups.unwrap_or_default();
@@ -647,32 +637,24 @@ fn recent_source(role: &WorkItemRole) -> (Job, &'static str) {
     }
 }
 
-/// Whether `web_url` lies in any of `groups` (subgroups included). No filter
-/// matches everything.
-fn in_groups(groups: &Option<Vec<String>>, web_url: &str) -> bool {
-    match groups {
-        Some(groups) if !groups.is_empty() => {
-            let ns = namespace_of(web_url);
-            groups.iter().any(|g| in_group(&ns, g))
-        }
-        _ => true,
-    }
-}
-
 #[async_trait::async_trait]
 impl VarlinkInterface for Handlers {
     #[instrument(skip(self, call))]
     async fn get_assigned_work_items(
         &self,
         call: &mut dyn Call_GetAssignedWorkItems,
-        groups: Option<Vec<String>>,
+        scope: Option<Scope>,
     ) -> varlink::Result<()> {
         reply_if_cold!(self, call, Job::AssignedIssues, (Vec::new()));
 
+        let within = Within::new(scope);
         let me = self.synced_user();
         let mut rows: Vec<model::Issue> = self.assigned(ASSIGNED_ISSUES, Issuable::Issue);
         rows.retain(|i| {
-            still_assigned(&i.state, &i.assignees, me) && in_groups(&groups, &i.web_url)
+            still_assigned(&i.state, &i.assignees, me)
+                && within
+                    .as_ref()
+                    .is_none_or(|w| w.item(i.project_id, &i.web_url))
         });
         // Grouped by namespace; GitLab's order within each.
         rows.sort_by_cached_key(|i| namespace_of(&i.web_url));
@@ -697,15 +679,19 @@ impl VarlinkInterface for Handlers {
     async fn get_assigned_merge_requests(
         &self,
         call: &mut dyn Call_GetAssignedMergeRequests,
-        groups: Option<Vec<String>>,
+        scope: Option<Scope>,
     ) -> varlink::Result<()> {
         reply_if_cold!(self, call, Job::AssignedMergeRequests, (Vec::new()));
 
+        let within = Within::new(scope);
         let me = self.synced_user();
         let mut rows: Vec<model::MergeRequest> =
             self.assigned(ASSIGNED_MERGE_REQUESTS, Issuable::MergeRequest);
         rows.retain(|m| {
-            still_assigned(&m.state, &m.assignees, me) && in_groups(&groups, &m.web_url)
+            still_assigned(&m.state, &m.assignees, me)
+                && within
+                    .as_ref()
+                    .is_none_or(|w| w.item(m.project_id, &m.web_url))
         });
         // Newest-updated first, as the interface promises: the picker shows
         // the reply in its order.
@@ -729,10 +715,13 @@ impl VarlinkInterface for Handlers {
     async fn list_work_items(
         &self,
         call: &mut dyn Call_ListWorkItems,
-        role: Option<WorkItemRole>,
-        updated_after: Option<i64>,
-        states: Option<Vec<WorkItemState>>,
+        filter: Option<WorkItemFilter>,
     ) -> varlink::Result<()> {
+        let WorkItemFilter {
+            role,
+            updated_after,
+            states,
+        } = filter.unwrap_or_default();
         let roles = match role {
             Some(role) => vec![role],
             None => vec![WorkItemRole::author, WorkItemRole::assignee],
@@ -776,22 +765,28 @@ impl VarlinkInterface for Handlers {
         &self,
         call: &mut dyn Call_Search,
         query: String,
-        kinds: Option<Vec<SearchKind>>,
-        limit: Option<i64>,
-        scope: Option<SearchScope>,
-        types: Option<Vec<String>>,
-        exclude_types: Option<Vec<String>>,
+        options: Option<SearchOptions>,
     ) -> varlink::Result<()> {
+        let SearchOptions {
+            kinds,
+            limit,
+            scope,
+            types,
+            exclude_types,
+        } = options.unwrap_or_default();
         // An empty query is the "frequently opened" view: only work items and
         // MRs with recorded opens, ranked. Projects and groups have no open
         // counts, so they come back empty in that mode.
         let needle = query.trim().to_lowercase();
-        let scope = Scope::new(scope);
+        let scope = Within::new(scope);
         let frequent_only = needle.is_empty();
         let limit = match limit {
             None => DEFAULT_SEARCH_LIMIT,
             Some(n) if n > 0 => n as usize,
-            Some(n) => return call.reply_gitlab_error(format!("invalid limit: {n}")),
+            Some(n) => {
+                let message = format!("invalid limit: {n}");
+                return Invalid::new("options.limit", message).reply(call);
+            }
         };
         let kinds = kinds.unwrap_or_default();
         let want = |k: SearchKind| kinds.is_empty() || kinds.contains(&k);
@@ -945,73 +940,6 @@ impl VarlinkInterface for Handlers {
     }
 
     #[instrument(skip(self, call))]
-    async fn clear_cache(
-        &self,
-        call: &mut dyn Call_ClearCache,
-        scope: Option<Vec<CacheScope>>,
-    ) -> varlink::Result<()> {
-        let scopes = scope.unwrap_or_default();
-
-        let now = now_secs();
-        let (quick_start, retention_start) = {
-            let c = self.config.read().unwrap();
-            (
-                now.saturating_sub(c.refresh.quick.window().as_secs()),
-                now.saturating_sub(c.history.retention().as_secs()),
-            )
-        };
-        let timelogs = |from, until| Some(Clear::Timelogs { from, until });
-        let mut clears = Vec::new();
-        // Open statistics are user data, not a cache: only an explicit scope
-        // clears them, never the "everything" default.
-        let mut usage = false;
-        if scopes.is_empty() {
-            clears.push(Clear::Everything);
-        }
-        for scope in &scopes {
-            let clear = match scope {
-                CacheScope::assigned => Some(Clear::Assigned),
-                CacheScope::search => Some(Clear::Corpus),
-                CacheScope::quick => timelogs(quick_start, u64::MAX),
-                CacheScope::slow => timelogs(retention_start, quick_start),
-                CacheScope::stale => timelogs(0, retention_start),
-                CacheScope::usage => {
-                    usage = true;
-                    None
-                }
-            };
-            clears.extend(clear.filter(|c| !clears.contains(c)));
-        }
-        let mut refill: Vec<Job> = clears.iter().flat_map(|c| c.refill()).copied().collect();
-        refill.sort_unstable();
-        refill.dedup();
-        // Queued together, so no scheduled run slips in between.
-        let cleared: Vec<_> = clears.into_iter().map(|c| self.sync.clear(c)).collect();
-        let refilled = (!refill.is_empty()).then(|| self.sync.refresh_now(&refill));
-        for c in cleared {
-            c.await;
-        }
-
-        if usage {
-            if let Err(e) = self.usage.clear() {
-                warn!("usage stats clear failed: {e}");
-            } else {
-                info!("usage stats cleared");
-            }
-        }
-
-        // Resolves at once while dormant: the worker drops demands then.
-        if let Some(refilled) = refilled
-            && tokio::time::timeout(CLEAR_REFILL_TIMEOUT, refilled)
-                .await
-                .is_err()
-        {
-            warn!("refill still running; replying before it lands");
-        }
-        call.reply()
-    }
-
-    #[instrument(skip(self, call))]
     async fn post_time(
         &self,
         call: &mut dyn Call_PostTime,
@@ -1021,11 +949,12 @@ impl VarlinkInterface for Handlers {
         duration: String,
         summary: Option<String>,
     ) -> varlink::Result<()> {
-        if let Some(msg) = issue_ref_error(project_id, iid) {
-            return call.reply_gitlab_error(msg);
+        if let Some(invalid) = issue_ref_error(project_id, iid) {
+            return invalid.reply(call);
         }
         if !looks_like_duration(&duration) {
-            return call.reply_gitlab_error(format!("invalid duration: {duration:?}"));
+            let message = format!("invalid duration: {duration:?}");
+            return Invalid::new("duration", message).reply(call);
         }
         let write = Write {
             kind: wire::internal_kind(&kind),
@@ -1083,17 +1012,18 @@ impl VarlinkInterface for Handlers {
                             .flatten()
                             .map(|m| (m.title, m.web_url)),
                     }
-                    .unwrap_or_default();
+                    .unzip();
                     events.push(HistoryEvent {
                         timestamp: p.queued_at_secs as i64,
                         source: HistorySource::queued,
                         kind: wire::kind(kind),
                         project_id,
                         iid,
-                        title,
-                        web_url,
-                        duration,
-                        summary: summary.unwrap_or_default(),
+                        title: title.and_then(wire::some),
+                        web_url: web_url.and_then(wire::some),
+                        time_spent: None,
+                        duration: Some(duration),
+                        summary: summary.and_then(wire::some),
                     });
                 }
             }
@@ -1106,22 +1036,6 @@ impl VarlinkInterface for Handlers {
             Err(e) => warn!(error = %e, "history read failed; returning queued only"),
         }
         call.reply(events)
-    }
-
-    /// Status, not GitLab data: served whatever the session is.
-    #[instrument(skip(self, call))]
-    async fn get_sync_jobs(&self, call: &mut dyn Call_GetSyncJobs) -> varlink::Result<()> {
-        let snapshot = match tokio::time::timeout(SYNC_JOBS_TIMEOUT, self.sync.jobs()).await {
-            Ok(s) => s,
-            Err(_) => {
-                warn!("the sync worker didn't report its jobs in time; returning empty");
-                Default::default()
-            }
-        };
-        call.reply(
-            snapshot.jobs.into_iter().map(wire::sync_job).collect(),
-            snapshot.paused_until.map(|at| at as i64),
-        )
     }
 
     /// Never an error: a client asks it first, whatever the session is.
@@ -1218,10 +1132,10 @@ impl VarlinkInterface for Handlers {
                 info!(id, "re-enqueued dead-letter task");
                 call.reply()
             }
-            Ok(false) => call.reply_gitlab_error(format!("no failed task with id {id}")),
+            Ok(false) => call.reply_not_found(format!("no failed task with id {id}")),
             Err(e) => {
                 warn!(error = %e, id, "retry_failure failed");
-                call.reply_gitlab_error(e.to_string())
+                reply_failed(call, &e, e.to_string())
             }
         }
     }
@@ -1237,10 +1151,10 @@ impl VarlinkInterface for Handlers {
                 info!(id, "dismissed dead-letter task");
                 call.reply()
             }
-            Ok(false) => call.reply_gitlab_error(format!("no failed task with id {id}")),
+            Ok(false) => call.reply_not_found(format!("no failed task with id {id}")),
             Err(e) => {
                 warn!(error = %e, id, "dismiss_failure failed");
-                call.reply_gitlab_error(e.to_string())
+                reply_failed(call, &e, e.to_string())
             }
         }
     }
@@ -1249,7 +1163,7 @@ impl VarlinkInterface for Handlers {
     async fn clear_failures(&self, call: &mut dyn Call_ClearFailures) -> varlink::Result<()> {
         if let Err(e) = self.queue.clear_failures() {
             warn!(error = %e, "clear_failures failed");
-            return call.reply_gitlab_error(e.to_string());
+            return reply_failed(call, &e, e.to_string());
         }
         info!("cleared dead-letter queue");
         call.reply()
@@ -1266,7 +1180,7 @@ impl VarlinkInterface for Handlers {
     ) -> varlink::Result<()> {
         let key = match open_key(&kind, iid, project_id, group_id) {
             Ok(key) => key,
-            Err(msg) => return call.reply_gitlab_error(msg),
+            Err(invalid) => return invalid.reply(call),
         };
         // Local bookkeeping only — no GitLab, so it works while dormant.
         let retention_secs = self.config.read().unwrap().usage.retention().as_secs();
@@ -1276,7 +1190,7 @@ impl VarlinkInterface for Handlers {
             .record(&key, now, now.saturating_sub(retention_secs))
         {
             warn!(error = %e, key, "record_open failed");
-            return call.reply_gitlab_error(e.to_string());
+            return reply_failed(call, &e, e.to_string());
         }
         debug!(key, "recorded open");
         call.reply()
@@ -1290,8 +1204,8 @@ impl VarlinkInterface for Handlers {
         iid: i64,
         kind: IssuableKind,
     ) -> varlink::Result<()> {
-        if let Some(msg) = issue_ref_error(project_id, iid) {
-            return call.reply_gitlab_error(msg);
+        if let Some(invalid) = issue_ref_error(project_id, iid) {
+            return invalid.reply(call);
         }
         let write = Write {
             kind: wire::internal_kind(&kind),
@@ -1310,8 +1224,8 @@ impl VarlinkInterface for Handlers {
         iid: i64,
         kind: IssuableKind,
     ) -> varlink::Result<()> {
-        if let Some(msg) = issue_ref_error(project_id, iid) {
-            return call.reply_gitlab_error(msg);
+        if let Some(invalid) = issue_ref_error(project_id, iid) {
+            return invalid.reply(call);
         }
         let write = Write {
             kind: wire::internal_kind(&kind),
@@ -1330,8 +1244,8 @@ impl VarlinkInterface for Handlers {
         iid: i64,
         kind: IssuableKind,
     ) -> varlink::Result<()> {
-        if let Some(msg) = issue_ref_error(project_id, iid) {
-            return call.reply_gitlab_error(msg);
+        if let Some(invalid) = issue_ref_error(project_id, iid) {
+            return invalid.reply(call);
         }
         let write = Write {
             kind: wire::internal_kind(&kind),
@@ -1345,24 +1259,27 @@ impl VarlinkInterface for Handlers {
     /// Direct, never queued: a create has no target to address a replay by
     /// and no idempotency key, so repeating one that may have landed would
     /// file the issue twice.
-    #[instrument(skip(self, call, description))]
+    #[instrument(skip(self, call, item), fields(title = %item.title))]
     async fn create_work_item(
         &self,
         call: &mut dyn Call_CreateWorkItem,
         project_id: i64,
-        title: String,
-        description: Option<String>,
-        labels: Option<Vec<String>>,
-        assign_self: Option<bool>,
-        parent: Option<WorkItemRef>,
+        item: NewWorkItem,
     ) -> varlink::Result<()> {
+        let NewWorkItem {
+            title,
+            description,
+            labels,
+            assign_self,
+            parent,
+        } = item;
         let labels = labels.unwrap_or_default();
-        if let Some(msg) = new_issue_error(project_id, &title, &labels) {
-            return call.reply_gitlab_error(msg);
+        if let Some(invalid) = new_issue_error(project_id, &title, &labels) {
+            return invalid.reply(call);
         }
         let parent = match parent.as_ref().map(parent_epic).transpose() {
             Ok(parent) => parent,
-            Err(msg) => return call.reply_gitlab_error(msg),
+            Err(invalid) => return invalid.reply(call),
         };
         // Whatever keeps the session away: nothing is deferred.
         let session = match self.current_session().await {
@@ -1380,9 +1297,9 @@ impl VarlinkInterface for Handlers {
                     Ok(id) => Some(id),
                     Err(e) => {
                         warn!(error = %e, group_id, iid, "looking up the parent epic failed");
-                        return call.reply_gitlab_error(format!(
-                            "looking up the parent epic &{iid} of group {group_id}: {e}"
-                        ));
+                        let message =
+                            format!("looking up the parent epic &{iid} of group {group_id}: {e}");
+                        return reply_failed(call, &e, message);
                     }
                 }
             }
@@ -1400,7 +1317,7 @@ impl VarlinkInterface for Handlers {
             // same. The sync worker stays the one to judge the session.
             Err(e) => {
                 warn!(error = %e, project_id, "creating an issue failed");
-                return call.reply_gitlab_error(e.to_string());
+                return reply_failed(call, &e, e.to_string());
             }
         };
 
@@ -1409,7 +1326,8 @@ impl VarlinkInterface for Handlers {
         let (iid, web_url) = match serde_json::from_value::<model::Issue>(created) {
             Ok(issue) => {
                 info!(project_id, iid = issue.iid, "issue created");
-                let shown = (issue.iid, issue.web_url.clone());
+                let iid = Some(issue.iid).filter(|&iid| iid > 0);
+                let shown = (iid, wire::some(issue.web_url.clone()));
                 let by = Identity {
                     host: session.host,
                     user_id: session.user_id,
@@ -1422,66 +1340,11 @@ impl VarlinkInterface for Handlers {
             }
             Err(e) => {
                 warn!(error = %e, project_id, "issue created, but GitLab's answer is unreadable");
-                (0, String::new())
+                (None, None)
             }
         };
         self.sync.refresh_soon(&Job::showing_issues_of(project_id));
         call.reply(iid, web_url)
-    }
-
-    #[instrument(skip(self, call, token))]
-    async fn login(
-        &self,
-        call: &mut dyn Call_Login,
-        host: String,
-        token: String,
-    ) -> varlink::Result<()> {
-        // Without a keychain there is nowhere to keep the token: turned
-        // down before GitLab is asked.
-        if let Err(e) = self.keychain.require() {
-            warn!("Login refused: no keychain");
-            return call.reply_gitlab_error(format!("logging in is disabled: {e}"));
-        }
-        let token = Token::new(token);
-        let client = match GitlabClient::connect_with_retry(&host, &token).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(error = %e, host, "Login: connecting to GitLab failed");
-                return call.reply_gitlab_error(e.to_string());
-            }
-        };
-        let creds = Credentials {
-            host: host.clone(),
-            token,
-        };
-        if let Err(e) = self.keychain.store(&creds).await {
-            warn!(error = %e, "Login: keychain write failed");
-            return call.reply_gitlab_error(format!("keychain write failed: {e}"));
-        }
-        let session = Session::from_client(client);
-        info!(host, user_id = session.user_id, "logged in");
-        *self.session.write().await = ConnState::Connected(session);
-        self.queue.drain_waker().notify_one();
-        self.sync.logged_in();
-        self.rotation.reevaluate();
-        call.reply()
-    }
-
-    #[instrument(skip(self, call))]
-    async fn logout(&self, call: &mut dyn Call_Logout) -> varlink::Result<()> {
-        // Nothing to forget without a keychain: the session stays.
-        if let Err(e) = self.keychain.require() {
-            warn!("Logout refused: no keychain");
-            return call.reply_gitlab_error(format!("logging out is disabled: {e}"));
-        }
-        *self.session.write().await = ConnState::Dormant(DormancyReason::LoggedOut);
-        self.rotation.reevaluate();
-        if let Err(e) = self.keychain.delete().await {
-            warn!(error = %e, "Logout: keychain delete failed");
-            return call.reply_gitlab_error(format!("keychain delete failed: {e}"));
-        }
-        info!("logged out");
-        call.reply()
     }
 
     #[instrument(skip(self, call))]

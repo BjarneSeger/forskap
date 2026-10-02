@@ -45,7 +45,7 @@ func Example() {
 	// The issues I authored that are closed by now, newest-updated first.
 	role := forskap.RoleAuthor
 	closed := []forskap.WorkItemState{forskap.StateClosed}
-	mine, err := c.ListWorkItems(ctx, &role, nil, &closed)
+	mine, err := c.ListWorkItems(ctx, &forskap.WorkItemFilter{Role: &role, States: &closed})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func Example() {
 
 	// The epics about billing.
 	epics := []string{"epic"}
-	res, err := c.Search(ctx, "billing", nil, nil, nil, &epics, nil)
+	res, err := c.Search(ctx, "billing", &forskap.SearchOptions{Types: &epics})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -66,11 +66,44 @@ func Example() {
 	}
 
 	// Everything else about billing: tasks and the types to come included.
-	res, err = c.Search(ctx, "billing", nil, nil, nil, nil, &epics)
+	res, err = c.Search(ctx, "billing", &forskap.SearchOptions{Exclude_types: &epics})
 	if err != nil {
 		log.Fatal(err)
 	}
 	for _, w := range res.WorkItems {
 		fmt.Printf("#%d %s (%s)\n", w.Iid, w.Title, w.Type)
+	}
+}
+
+// Creating an issue is never queued, so its errors say what to do next.
+func ExampleClient_CreateWorkItem() {
+	ctx := context.Background()
+
+	c, err := forskap.Dial(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer c.Close()
+
+	labels := []string{"bug"}
+	created, err := c.CreateWorkItem(ctx, 42, forskap.NewWorkItem{Title: "Fix the login", Labels: &labels})
+	var (
+		invalid *forskap.InvalidArgument
+		refused *forskap.GitlabError
+		unknown *forskap.GitlabUnavailable
+	)
+	switch {
+	case errors.As(err, &invalid):
+		log.Fatalf("%s: %s", invalid.Argument, invalid.Message)
+	case errors.As(err, &refused):
+		log.Fatalf("GitLab refused: %s", refused.Message)
+	case errors.As(err, &unknown):
+		// GitLab may have created it before the answer was lost.
+		log.Fatalf("look for the issue before creating it again: %s", unknown.Message)
+	case err != nil:
+		log.Fatal(err)
+	}
+	if created.IID != nil && created.WebURL != nil {
+		fmt.Printf("#%d %s\n", *created.IID, *created.WebURL)
 	}
 }

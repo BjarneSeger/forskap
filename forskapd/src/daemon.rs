@@ -467,9 +467,10 @@ fn settle_hook(sync: &Arc<SyncHandle>, config: &config::SharedConfig) -> SettleH
 /// Dry runs, driven through their socket like any client drives them.
 #[cfg(test)]
 mod tests {
+    use forskap_api::admin::{self, VarlinkClientInterface as _};
     use forskap_api::{
-        ErrorKind as WireError, IssuableKind, VarlinkClient, VarlinkClientInterface, WorkItem,
-        WorkItemRef, WorkItemRole,
+        ErrorKind as WireError, IssuableKind, NewWorkItem, Scope, SearchOptions, VarlinkClient,
+        VarlinkClientInterface, WorkItem, WorkItemFilter, WorkItemRef, WorkItemRole,
     };
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
@@ -488,6 +489,8 @@ mod tests {
     /// A dry run serving in `scratch` until its stop is dropped or sent.
     struct DryRun {
         client: VarlinkClient,
+        /// The admin interface, on the same connection.
+        admin: admin::VarlinkClient,
         handlers: Arc<Handlers>,
         keychain: Keychain,
         stop: oneshot::Sender<()>,
@@ -515,7 +518,8 @@ mod tests {
                 .await
                 .unwrap();
             Self {
-                client: VarlinkClient::new(conn),
+                client: VarlinkClient::new(Arc::clone(&conn)),
+                admin: admin::VarlinkClient::new(conn),
                 handlers,
                 keychain,
                 stop,
@@ -555,15 +559,42 @@ mod tests {
         }
     }
 
+    /// The issues the user authored.
+    fn authored() -> WorkItemFilter {
+        WorkItemFilter {
+            role: Some(WorkItemRole::author),
+            ..Default::default()
+        }
+    }
+
+    /// An issue with just a title.
+    fn new_work_item(title: &str) -> NewWorkItem {
+        NewWorkItem {
+            title: title.into(),
+            description: None,
+            labels: None,
+            assign_self: None,
+            parent: None,
+        }
+    }
+
     fn keys(items: &[WorkItem]) -> Vec<(i64, i64)> {
         let key = |i: &WorkItem| (i.project_id.unwrap_or_default(), i.iid);
         items.iter().map(key).collect()
     }
 
-    fn gitlab_error(e: forskap_api::Error) -> String {
+    /// The message and status of a `GitlabError`.
+    fn gitlab_error(e: forskap_api::Error) -> (String, Option<i64>) {
         match e.kind() {
-            WireError::GitlabError(Some(args)) => args.message.clone(),
+            WireError::GitlabError(Some(args)) => (args.message.clone(), args.status),
             other => panic!("expected a GitlabError, got {other:?}"),
+        }
+    }
+
+    fn internal(e: admin::Error) -> String {
+        match e.kind() {
+            admin::ErrorKind::Internal(Some(args)) => args.message.clone(),
+            other => panic!("expected an Internal, got {other:?}"),
         }
     }
 
@@ -620,28 +651,54 @@ mod tests {
 
         let issues = run.assigned_work_items().await;
         assert_eq!(issues.len(), 6);
-        assert!(issues.iter().all(|i| !i.graph_status.is_empty()), "boards");
+        assert!(issues.iter().all(|i| i.board_column.is_some()), "boards");
         let rate_limit = issues.iter().find(|i| i.iid == 12).unwrap();
-        assert_eq!(rate_limit.graph_status, "Doing");
-        assert_eq!(rate_limit.namespace_path, "acme/backend/api");
+        assert_eq!(rate_limit.board_column.as_deref(), Some("Doing"));
+        assert_eq!(
+            rate_limit.namespace_path.as_deref(),
+            Some("acme/backend/api")
+        );
         assert!(rate_limit.web_url.starts_with("https://dry-run.invalid/"));
         let invoice = issues
             .iter()
             .find(|i| (i.project_id, i.iid) == (Some(102), 7))
             .unwrap();
-        assert_eq!(invoice.total_time, "1h");
+        assert_eq!(invoice.time_spent, Some(3600));
+
+        // A scope keeps to its projects and groups, subgroups included.
+        let scoped = async |scope: Scope| {
+            let call = client.get_assigned_work_items(Some(scope)).call().await;
+            keys(&call.unwrap().work_items)
+        };
+        let under = |path: &str| {
+            let under = |i: &&WorkItem| i.namespace_path.as_deref().unwrap().starts_with(path);
+            let found: Vec<_> = issues.iter().filter(under).cloned().collect();
+            keys(&found)
+        };
+        let api = Scope {
+            projects: Some(vec![AVATAR_PROJECT]),
+            groups: None,
+        };
+        assert_eq!(scoped(api).await, under("acme/backend/api"));
+        let backend = Scope {
+            projects: None,
+            groups: Some(vec!["acme/backend".into()]),
+        };
+        let backend = scoped(backend).await;
+        assert!(backend.len() > 1 && backend.len() < issues.len());
+        assert_eq!(backend, under("acme/backend/"));
 
         let mrs = client.get_assigned_merge_requests(None).call().await;
         let mrs = mrs.unwrap().merge_requests;
         assert_eq!(mrs.iter().map(|m| m.iid).collect::<Vec<_>>(), [31, 12, 44]);
 
-        let search = |query: &str| client.search(query.into(), None, None, None, None, None);
+        let search = |query: &str| client.search(query.into(), None);
         let found = search("billing").call().await.unwrap();
         let (epics, issues): (Vec<_>, Vec<_>) =
             found.work_items.iter().partition(|w| w.r#type == "epic");
         assert_eq!(issues.len(), 3);
         assert_eq!(found.merge_requests[0].iid, 12);
-        assert_eq!(found.projects[0].path, "acme/backend/billing");
+        assert_eq!(found.projects[0].full_path, "acme/backend/billing");
         assert_eq!(epics[0].title, "Self-service billing");
         assert_eq!((epics[0].id, epics[0].group_id), (8101, Some(10)));
         let featured = issues.iter().find(|i| i.iid == 8).unwrap();
@@ -651,18 +708,18 @@ mod tests {
             parent.web_url.as_deref(),
             Some("https://dry-run.invalid/groups/acme/-/epics/1")
         );
-        let mut tasks = client.search(
-            "webhook".into(),
-            None,
-            None,
-            None,
-            Some(vec!["task".into()]),
-            None,
-        );
+        let tasks = SearchOptions {
+            types: Some(vec!["task".into()]),
+            ..Default::default()
+        };
+        let mut tasks = client.search("webhook".into(), Some(tasks));
         let tasks = tasks.call().await.unwrap().work_items;
         assert_eq!(keys(&tasks), [(101, 16)]);
-        let no_epics = vec!["epic".to_string()];
-        let mut issues = client.search("billing".into(), None, None, None, None, Some(no_epics));
+        let no_epics = SearchOptions {
+            exclude_types: Some(vec!["epic".to_string()]),
+            ..Default::default()
+        };
+        let mut issues = client.search("billing".into(), Some(no_epics));
         let issues = issues.call().await.unwrap().work_items;
         assert_eq!(issues.len(), 3);
         assert!(issues.iter().all(|w| w.r#type == "issue"));
@@ -670,9 +727,16 @@ mod tests {
         assert!(archived.projects[0].archived);
         let api = search("API").call().await.unwrap().projects;
         let api = api.iter().find(|p| p.id == AVATAR_PROJECT).unwrap();
-        assert!(api.avatar.starts_with(scratch.path().to_str().unwrap()));
+        let avatar = api.avatar.as_deref().unwrap();
+        assert!(avatar.starts_with(scratch.path().to_str().unwrap()));
+        let others = search("acme").call().await.unwrap().projects;
+        assert!(
+            others
+                .iter()
+                .all(|p| (p.id == AVATAR_PROJECT) == p.avatar.is_some())
+        );
 
-        let mut mine = client.list_work_items(Some(WorkItemRole::author), None, None);
+        let mut mine = client.list_work_items(Some(authored()));
         let mine = mine.call().await.unwrap().work_items;
         assert_eq!(mine.len(), 7);
         assert!(keys(&mine).contains(&(103, 22)));
@@ -686,7 +750,7 @@ mod tests {
         assert_eq!(pushed.project_path.as_deref(), Some("acme/backend/api"));
         assert_eq!(pushed.r#ref.as_deref(), Some("rate-limit-token"));
 
-        let jobs = client.get_sync_jobs().call().await.unwrap().jobs;
+        let jobs = run.admin.get_sync_jobs().call().await.unwrap().jobs;
         assert!(jobs.iter().any(|j| j.key == "project/101/issues"));
         assert!(jobs.iter().any(|j| j.key == "group/10/epics"));
         assert!(jobs.iter().all(|j| j.failures == 0), "{jobs:?}");
@@ -713,11 +777,7 @@ mod tests {
             .unwrap();
         assert!(!keys(&run.assigned_work_items().await).contains(&(101, 12)));
         until("the closed issue", async || {
-            let found = client
-                .search("#12".into(), None, None, None, None, None)
-                .call()
-                .await
-                .ok()?;
+            let found = client.search("#12".into(), None).call().await.ok()?;
             let issue = found
                 .work_items
                 .into_iter()
@@ -734,35 +794,26 @@ mod tests {
             let history = client.get_history(Some(1)).call().await.ok()?.events;
             history
                 .iter()
-                .any(|e| e.summary == "Dry run" && e.duration == "45m")
+                .any(|e| e.summary.as_deref() == Some("Dry run") && e.time_spent == Some(45 * 60))
                 .then_some(())
         })
         .await;
 
         // A created issue is mine, assigned and listed.
-        let created = client
-            .create_work_item(
-                102,
-                "Try the dry run".into(),
-                None,
-                Some(vec!["demo".into()]),
-                Some(true),
-                None,
-            )
-            .call()
-            .await
-            .unwrap();
-        assert_eq!(created.iid, 11);
+        let item = NewWorkItem {
+            labels: Some(vec!["demo".into()]),
+            assign_self: Some(true),
+            ..new_work_item("Try the dry run")
+        };
+        let created = client.create_work_item(102, item).call().await.unwrap();
+        assert_eq!(created.iid, Some(11));
         assert_eq!(
-            created.web_url,
-            "https://dry-run.invalid/acme/backend/billing/-/issues/11"
+            created.web_url.as_deref(),
+            Some("https://dry-run.invalid/acme/backend/billing/-/issues/11")
         );
         until("the created issue", async || {
             let listed = keys(&run.assigned_work_items().await).contains(&(102, 11));
-            let mine = client
-                .list_work_items(Some(WorkItemRole::author), None, None)
-                .call()
-                .await;
+            let mine = client.list_work_items(Some(authored())).call().await;
             (listed && keys(&mine.ok()?.work_items).contains(&(102, 11))).then_some(())
         })
         .await;
@@ -776,19 +827,18 @@ mod tests {
             title: None,
             web_url: None,
         };
-        let mut create =
-            client.create_work_item(103, "Audit the forms".into(), None, None, None, Some(audit));
+        let item = NewWorkItem {
+            parent: Some(audit),
+            ..new_work_item("Audit the forms")
+        };
+        let mut create = client.create_work_item(103, item);
         let created = create.call().await.unwrap();
         until("the created task's parent", async || {
-            let mine = client
-                .list_work_items(Some(WorkItemRole::author), None, None)
-                .call()
-                .await
-                .ok()?;
+            let mine = client.list_work_items(Some(authored())).call().await.ok()?;
             let item = mine
                 .work_items
                 .into_iter()
-                .find(|i| i.iid == created.iid && i.project_id == Some(103))?;
+                .find(|i| Some(i.iid) == created.iid && i.project_id == Some(103))?;
             let parent = item.parent?;
             assert_eq!((parent.group_id, parent.iid), (Some(12), 1));
             parent.web_url
@@ -821,7 +871,9 @@ mod tests {
             .close(ARCHIVED_PROJECT, 2, IssuableKind::work_item)
             .call()
             .await;
-        assert!(gitlab_error(archived.unwrap_err()).contains("archived"));
+        let (refused, status) = gitlab_error(archived.unwrap_err());
+        assert!(refused.contains("archived"), "{refused}");
+        assert_eq!(status, Some(403));
 
         run.stop().await;
     }
@@ -832,17 +884,18 @@ mod tests {
         let run = DryRun::start(&scratch).await;
         let client = &run.client;
 
-        let login = client
+        let login = run
+            .admin
             .login("gitlab.com".into(), "glpat-not-a-token".into())
             .call()
             .await;
-        let refused = gitlab_error(login.unwrap_err());
+        let refused = internal(login.unwrap_err());
         assert!(
             refused.contains("logging in is disabled") && refused.contains("dry run"),
             "{refused}"
         );
-        let logout = client.logout().call().await;
-        assert!(gitlab_error(logout.unwrap_err()).contains("logging out is disabled"));
+        let logout = run.admin.logout().call().await;
+        assert!(internal(logout.unwrap_err()).contains("logging out is disabled"));
 
         let me = client.who_am_i().call().await.unwrap();
         assert_eq!(me.host, HOST, "still the demo account");
@@ -859,15 +912,11 @@ mod tests {
         })
         .await;
 
-        run.client.clear_cache(None).call().await.unwrap();
+        run.admin.clear_cache(None).call().await.unwrap();
         // The foreground views refill before the reply.
         assert_eq!(run.assigned_work_items().await.len(), 6);
         until("the search corpus", async || {
-            let found = run
-                .client
-                .search("billing".into(), None, None, None, None, None)
-                .call()
-                .await;
+            let found = run.client.search("billing".into(), None).call().await;
             (!found.ok()?.work_items.is_empty()).then_some(())
         })
         .await;

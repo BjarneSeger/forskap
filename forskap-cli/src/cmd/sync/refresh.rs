@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::Result;
 use chrono::Utc;
 use clap::ValueEnum;
-use forskap_api::{CacheScope, VarlinkClientInterface};
+use forskap_api::admin::{CacheScope, VarlinkClientInterface};
 
 use super::jobs;
 use crate::cli::RefreshScope;
@@ -41,7 +41,7 @@ pub async fn run(mut scopes: Vec<RefreshScope>) -> Result<()> {
     let scope =
         (!scopes.is_empty()).then(|| scopes.iter().flat_map(|s| wire(*s)).cloned().collect());
 
-    let client = client::connect_default().await?;
+    let client = client::connect_admin().await?;
     let mut clear = client.clear_cache(scope);
     // The follow ends with the call, and takes its line with it.
     let cleared = tokio::select! {

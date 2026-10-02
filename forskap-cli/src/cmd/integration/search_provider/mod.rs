@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use forskap_api::{ErrorKind, IssuableKind, VarlinkClientInterface};
+use forskap_api::{ErrorKind, IssuableKind, SearchOptions, VarlinkClientInterface};
 use tokio::signal::unix::{SignalKind, signal};
 use zbus::zvariant::{OwnedValue, Value};
 
@@ -158,19 +158,11 @@ impl Provider {
             });
         };
         let client = client::connect(&self.socket).await?;
-        let filter = wire_filter(parsed.kind.as_slice());
-        let reply = match client
-            .search(
-                parsed.query,
-                filter.kinds,
-                Some(PER_KIND_LIMIT),
-                None,
-                filter.types,
-                filter.exclude_types,
-            )
-            .call()
-            .await
-        {
+        let options = SearchOptions {
+            limit: Some(PER_KIND_LIMIT),
+            ..wire_filter(parsed.kind.as_slice())
+        };
+        let reply = match client.search(parsed.query, Some(options)).call().await {
             Ok(reply) => reply,
             Err(e) if matches!(e.kind(), ErrorKind::NotAuthenticated(_)) => {
                 return Ok(Hits {

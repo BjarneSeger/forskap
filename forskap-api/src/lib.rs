@@ -16,6 +16,18 @@ pub const VARLINK_INTERFACE_DESCRIPTION: &str =
 /// a client compares it with the one it was built against ([`compatible`]).
 pub const API_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// `org.thehoster.forskapd.admin`, served on the same socket: the session,
+/// the cache and the sync worker's jobs, for the bundled CLI. It mirrors the
+/// daemon's internals and follows the daemon's version, not [`API_VERSION`],
+/// with no promise of stability.
+pub mod admin {
+    include!(concat!(env!("OUT_DIR"), "/org.thehoster.forskapd.admin.rs"));
+
+    /// Raw varlink interface description of the admin interface.
+    pub const VARLINK_INTERFACE_DESCRIPTION: &str =
+        include_str!("../varlink/org.thehoster.forskapd.admin.varlink");
+}
+
 /// Whether a daemon whose `GetStatus` says `api_version` speaks an interface
 /// a client built against [`API_VERSION`] can use. Before 1.0 that takes the
 /// same minor version, as every interface change bumps it (a patch is a fix to
@@ -71,9 +83,8 @@ fn socket_in(
 mod tests {
     use std::path::PathBuf;
 
-    use super::{
-        API_VERSION, SyncJob, SyncJobStatus, WorkItemRef, compatible, compatible_with, socket_in,
-    };
+    use super::admin::{SyncJob, SyncJobStatus};
+    use super::{API_VERSION, SearchOptions, WorkItemRef, compatible, compatible_with, socket_in};
 
     #[test]
     fn a_daemon_is_compatible_by_minor_before_1_0_and_by_major_after() {
@@ -155,35 +166,45 @@ mod tests {
         }
     }
 
+    /// The serialized structs of the generated code, of both interfaces.
+    fn generated_structs() -> Vec<syn::ItemStruct> {
+        let generated = [
+            include_str!(concat!(env!("OUT_DIR"), "/org.thehoster.forskapd.rs")),
+            include_str!(concat!(env!("OUT_DIR"), "/org.thehoster.forskapd.admin.rs")),
+        ];
+        let items = generated.map(|code| syn::parse_file(code).unwrap().items);
+        let structs = items.into_iter().flatten().filter_map(|item| match item {
+            syn::Item::Struct(item) => Some(item),
+            _ => None,
+        });
+        structs
+            .filter(|s| says(&s.attrs, "derive", "Serialize"))
+            .collect()
+    }
+
+    fn says(attrs: &[syn::Attribute], name: &str, word: &str) -> bool {
+        attrs.iter().any(|a| {
+            a.path().is_ident(name)
+                && a.meta
+                    .require_list()
+                    .is_ok_and(|l| l.tokens.to_string().contains(word))
+        })
+    }
+
+    fn is_option(field: &syn::Field) -> bool {
+        let syn::Type::Path(ty) = &field.ty else {
+            return false;
+        };
+        ty.path.segments.last().is_some_and(|s| s.ident == "Option")
+    }
+
     /// Guards build.rs: a struct the generator adds can't send `null` again
     /// unnoticed.
     #[test]
     fn every_generated_option_field_is_skipped_when_absent() {
-        let generated = include_str!(concat!(env!("OUT_DIR"), "/org.thehoster.forskapd.rs"));
-        let file = syn::parse_file(generated).unwrap();
-        let says = |attrs: &[syn::Attribute], name: &str, word: &str| {
-            attrs.iter().any(|a| {
-                a.path().is_ident(name)
-                    && a.meta
-                        .require_list()
-                        .is_ok_and(|l| l.tokens.to_string().contains(word))
-            })
-        };
         let mut optional = 0;
-        for item in &file.items {
-            let syn::Item::Struct(item) = item else {
-                continue;
-            };
-            if !says(&item.attrs, "derive", "Serialize") {
-                continue;
-            }
-            for field in &item.fields {
-                let syn::Type::Path(ty) = &field.ty else {
-                    continue;
-                };
-                if ty.path.segments.last().is_none_or(|s| s.ident != "Option") {
-                    continue;
-                }
+        for item in generated_structs() {
+            for field in item.fields.iter().filter(|f| is_option(f)) {
                 optional += 1;
                 assert!(
                     says(&field.attrs, "serde", "skip_serializing_if"),
@@ -194,5 +215,29 @@ mod tests {
             }
         }
         assert!(optional > 40, "only {optional} Option fields found");
+    }
+
+    /// Guards build.rs: a struct a field can be added to without breaking a
+    /// caller's literal has a `Default` to fill the rest from.
+    #[test]
+    fn every_generated_struct_without_a_required_field_has_a_default() {
+        let mut defaulted = 0;
+        for item in generated_structs() {
+            if item.fields.iter().all(is_option) {
+                defaulted += 1;
+                assert!(
+                    says(&item.attrs, "derive", "Default"),
+                    "{} has no Default",
+                    item.ident
+                );
+            }
+        }
+        assert!(defaulted > 20, "only {defaulted} such structs found");
+        let options = SearchOptions {
+            limit: Some(5),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&options).unwrap();
+        assert_eq!(json, serde_json::json!({"limit": 5}));
     }
 }
