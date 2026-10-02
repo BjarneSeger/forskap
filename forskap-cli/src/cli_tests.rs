@@ -386,6 +386,9 @@ fn groups_need_a_subcommand() {
         ok(&["integration", "search-provider", "serve"]);
         ok(&["integration", "search-provider", "launch"]);
         ok(&["integration", "search-provider", "cosmic"]);
+        ok(&["integration", "search-provider", "rofi"]);
+        ok(&["integration", "search-provider", "rofi", "i oauth"]);
+        ok(&["integration", "search-provider", "rofi", "-x"]);
     }
 }
 

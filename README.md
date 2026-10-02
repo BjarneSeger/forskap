@@ -160,7 +160,7 @@ noctalia msg plugins source add forskap git https://github.com/BjarneSeger/forsk
 noctalia msg plugins enable thehoster/forskap
 ```
 
-## GNOME Shell, KRunner and COSMIC
+## GNOME Shell, KRunner, COSMIC and rofi
 
 `forskap integration search-provider` serves the same search to GNOME Shell's overview search, to
 KRunner (Plasma 6) over D-Bus and to COSMIC's launcher as a
@@ -188,6 +188,18 @@ answer only searches that start with a word, like the `/gl` prefix, set
 `search_provider.trigger_word = "gl"` in `forskap config path` (KRunner reads it at startup;
 `install` writes it into the COSMIC plugin, where `gl …` then shows GitLab results alone and
 `?` lists `gl`, so run `install` again after changing it).
+
+rofi needs no files, only a mode that runs the provider:
+
+```sh
+rofi -show forskap -modes "forskap:forskap integration search-provider rofi"
+```
+
+or, in `config.rasi`, `modes: "drun,run,forskap:forskap integration search-provider rofi";`
+(and `display-forskap: "GitLab";` for the prompt). It lists every project and the
+frequently opened items, which rofi filters as you type; Ctrl+Enter searches the typed text
+instead, read as above (`i oauth`, `#42`). Avatars show with `show-icons: true`. The trigger
+word doesn't apply.
 
 # Upgrading from gitlab-trackr
 

@@ -479,7 +479,7 @@ pub enum ConfigCommand {
 #[cfg(target_os = "linux")]
 #[derive(Subcommand)]
 pub enum IntegrationCommand {
-    /// `forskap search` for GNOME Shell, KRunner and COSMIC.
+    /// `forskap search` for GNOME Shell, KRunner, COSMIC and rofi.
     SearchProvider {
         #[command(subcommand)]
         command: SearchProviderCommand,
@@ -515,6 +515,15 @@ pub enum SearchProviderCommand {
     /// installed pop-launcher plugin runs).
     #[command(hide = true)]
     Cosmic,
+    /// Serve rofi's script mode: list on start, open or search what is picked
+    /// (what a `forskap:forskap integration search-provider rofi` mode runs).
+    #[command(hide = true)]
+    Rofi {
+        /// The picked row or the typed text; rofi passes it as is, so it may
+        /// start with a dash.
+        #[arg(allow_hyphen_values = true)]
+        entry: Option<String>,
+    },
 }
 
 /// `inline` is for shells whose prompt hooks run in a cooked terminal

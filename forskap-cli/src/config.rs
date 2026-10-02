@@ -37,7 +37,8 @@ pub struct Config {
     pub search_provider: SearchProvider,
 }
 
-/// Settings for `forskap integration search-provider`, the GNOME Shell / KRunner integration.
+/// Settings for `forskap integration search-provider`, the GNOME Shell / KRunner / COSMIC
+/// integration.
 #[derive(Debug, ConfiqueConfig)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct SearchProvider {
@@ -46,7 +47,7 @@ pub struct SearchProvider {
     /// list frequently opened items, while any other search returns nothing.
     /// Unset, every search is answered (queries shorter than two characters
     /// are ignored). KRunner reads the word once at startup, so restart it
-    /// after changing this.
+    /// after changing this. rofi ignores it: its mode is opened on purpose.
     pub trigger_word: Option<String>,
 }
 

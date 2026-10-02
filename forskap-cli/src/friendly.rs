@@ -87,9 +87,20 @@ pub fn friendly(op: &str, e: impl DaemonError) -> anyhow::Error {
     if let Some((reason, detail)) = e.not_authenticated() {
         return anyhow::anyhow!("{}", message_for(reason, detail));
     }
-    match e.message() {
-        Some(message) => anyhow::anyhow!("{op} failed: {message}"),
-        None => anyhow::anyhow!("{op} failed: {e}"),
+    match (e.message(), e.varlink_kind()) {
+        (Some(message), _) => anyhow::anyhow!("{op} failed: {message}"),
+        // What a daemon older than this forskap answers for what it lacks.
+        (
+            None,
+            Some(
+                varlink::ErrorKind::InvalidParameter(name)
+                | varlink::ErrorKind::MethodNotFound(name),
+            ),
+        ) => anyhow::anyhow!(
+            "{op} failed: forskapd doesn't know {name}, so it is older than this forskap; \
+             restart it (`forskap status` says how)"
+        ),
+        (None, _) => anyhow::anyhow!("{op} failed: {e}"),
     }
 }
 
@@ -212,6 +223,17 @@ mod tests {
             let error = admin::Error::from(kind);
             assert_eq!(friendly("Login", error).to_string(), shown);
         }
+    }
+
+    #[test]
+    fn an_older_daemon_reads_as_one() {
+        let refused = varlink::ErrorKind::InvalidParameter("options.match_all".into());
+        let error = forskap_api::Error::from(varlink::Error::from(refused));
+        assert_eq!(
+            friendly("Search", error).to_string(),
+            "Search failed: forskapd doesn't know options.match_all, so it is older than this \
+             forskap; restart it (`forskap status` says how)"
+        );
     }
 
     /// One the daemon didn't reply keeps the client's words.

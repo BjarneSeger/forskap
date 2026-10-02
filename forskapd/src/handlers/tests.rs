@@ -2009,6 +2009,47 @@ async fn search_ranks_frequently_opened_first() {
     );
 }
 
+#[tokio::test]
+async fn search_match_all_lists_every_row_for_an_empty_query() {
+    let (h, _dir) = dormant_handlers();
+    seed_corpus(&h);
+    seed(
+        &h,
+        &[model::Project {
+            id: 6,
+            name: "api".into(),
+            path_with_namespace: "team/api".into(),
+            web_url: "https://gl/team/api".into(),
+            ..Default::default()
+        }],
+    );
+    run_record_open(&h, 1, 10, IssuableKind::work_item).await;
+    let all = |limit| SearchOptions {
+        match_all: Some(true),
+        limit,
+        ..Default::default()
+    };
+
+    let r = search_with(&h, "", all(None)).await;
+    assert_eq!(iids(&r.work_items).len(), 4, "both issues and both epics");
+    assert_eq!(
+        r.work_items[0].iid, 10,
+        "the opened issue still ranks first"
+    );
+    assert_eq!(r.merge_requests.len(), 1);
+    let paths: Vec<_> = r.projects.iter().map(|p| p.full_path.as_str()).collect();
+    assert_eq!(paths, ["team/api", "team/auth-service"], "sorted by path");
+    assert_eq!(r.groups.len(), 1);
+
+    let r = search_with(&h, "", all(Some(1))).await;
+    assert_eq!(iids(&r.work_items), [10]);
+    assert_eq!(r.projects.len(), 1, "the limit caps each result set");
+
+    let with = search_with(&h, "oauth", all(None)).await;
+    let without = run_search(&h, "oauth", None, None).await;
+    assert_eq!(with, without, "a query that isn't empty ignores the option");
+}
+
 /// Unix seconds, as the rows store them.
 #[tokio::test]
 async fn search_hits_carry_their_update_time() {
