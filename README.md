@@ -147,11 +147,13 @@ not your daemon's data); it prints its socket's address for `FORSKAPD_SOCKET`
 ## Noctalia launcher
 
 [`forskap/`](forskap/README.md) is a
-[noctalia-shell](https://noctalia.dev) launcher provider: type `/gl <query>` to search
-issues, merge requests, epics, projects and groups through `forskap search`, and activate a result
-to open it in the browser via `forskap issue open` / `forskap mr open` / `forskap epic open` — which also counts the open, so the things you
-visit most float to the top (and `/gl` on its own lists them). Results show the avatar
-of their project. This repository doubles as a noctalia plugin source (`catalog.toml`):
+[noctalia-shell](https://noctalia.dev) launcher provider: type `/gl <query>` to find a
+project, `/gl i <query>`, `mr`, `e`, `g` or `all` to search issues, merge requests, epics,
+groups or everything through `forskap search`, and activate a result to open it in the
+browser via `forskap issue open` / `forskap mr open` / `forskap epic open` — which also counts
+the open, so the things you visit most float to the top (and `/gl` on its own lists them).
+Results show the avatar of their project. This repository doubles as a noctalia plugin
+source (`catalog.toml`):
 
 ```sh
 noctalia msg plugins source add forskap git https://github.com/BjarneSeger/forskap
@@ -165,8 +167,9 @@ KRunner (Plasma 6) over D-Bus and to COSMIC's launcher as a
 [pop-launcher](https://github.com/pop-os/launcher) plugin. The session bus starts the D-Bus
 service on demand and it exits again when idle; COSMIC's launcher runs the plugin while it is
 open. Picking a result opens it in the browser and counts the open like `forskap issue open`.
-Type `mr oauth`, `#42` or `!42` to narrow the kind, or just `oauth`. Results show the
-avatar of their project, where it has one.
+Plain text finds projects (`api`); `i oauth`, `mr oauth`, `e`, `g`, `#42` or `!42` pick
+another kind and `all oauth` searches everything. Results show the avatar of their
+project, where it has one.
 
 The deb/rpm/arch package installs the registration files (the plugin under
 `/etc/pop-launcher/plugins/forskap`). From a `cargo install`, write them yourself — GNOME

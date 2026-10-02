@@ -159,7 +159,7 @@ fn plugin_ron(trigger_word: Option<&str>) -> String {
     [
         "(\n",
         "    name: \"GitLab\",\n",
-        "    description: \"Syntax: [issue|mr|epic|project|group] <text>, #42, !42, &42\\nExample: mr oauth\",\n",
+        "    description: \"Syntax: <project>, [all|issue|mr|epic|project|group] <text>, #42, !42, &42\\nExample: i oauth\",\n",
         &format!("    bin: (path: \"{POP_LAUNCHER_SCRIPT}\"),\n"),
         "    icon: Name(\"org.thehoster.forskap\"),\n",
         &query,

@@ -1,6 +1,6 @@
 (
     name: "GitLab",
-    description: "Syntax: [issue|mr|epic|project|group] <text>, #42, !42, &42\nExample: mr oauth",
+    description: "Syntax: <project>, [all|issue|mr|epic|project|group] <text>, #42, !42, &42\nExample: i oauth",
     bin: (path: "forskap-cosmic-launcher"),
     icon: Name("org.thehoster.forskap"),
 )

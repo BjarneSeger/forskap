@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Service
 Name=GitLab
-Comment=Search tracked GitLab issues and merge requests
+Comment=Open GitLab projects, search issues and merge requests
 Icon=org.thehoster.forskap
 X-KDE-ServiceTypes=Plasma/Runner
 X-Plasma-API=DBus2

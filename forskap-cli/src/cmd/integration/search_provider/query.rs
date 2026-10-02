@@ -1,6 +1,12 @@
 //! Desktop-search query grammar, mirrored from the noctalia plugin
 //! (`forskap/launcher.luau`) so both launchers read the same shorthand.
 //!
+//! Plain text searches projects: a launcher's job is mostly "open that repo",
+//! and the issues and MRs would bury the project rows. A leading kind word
+//! (`i`, `mr`, `e`, `p`, `g`) or sigil (`#42`, `!42`, `&42`) picks another
+//! kind, `all` (or `*`) every kind; the empty query is the frequently opened
+//! view across kinds.
+//!
 //! Pure functions; the shapes are easiest to see in the tests.
 
 use std::fmt::Write as _;
@@ -18,26 +24,59 @@ pub fn icon(kind: SearchKind) -> &'static str {
     }
 }
 
-/// The kind a leading word of the shorthand stands for.
-fn kind_of(word: &str) -> Option<SearchKind> {
+/// The kinds a search asks `Search` for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kinds {
+    /// Every kind: `all oauth`, or the empty query's frequently opened view.
+    All,
+    Only(SearchKind),
+}
+
+impl Kinds {
+    /// The filter as `wire_filter` takes it: empty for every kind.
+    pub fn as_slice(&self) -> &[SearchKind] {
+        match self {
+            Kinds::All => &[],
+            Kinds::Only(kind) => std::slice::from_ref(kind),
+        }
+    }
+}
+
+/// The kinds a leading word of the shorthand stands for.
+fn kinds_of(word: &str) -> Option<Kinds> {
     Some(match word.to_ascii_lowercase().as_str() {
-        "i" | "issue" | "issues" => SearchKind::Issues,
-        "mr" | "mrs" => SearchKind::Mrs,
-        "p" | "project" | "projects" => SearchKind::Projects,
-        "g" | "group" | "groups" => SearchKind::Groups,
-        "e" | "epic" | "epics" => SearchKind::Epics,
+        "i" | "issue" | "issues" => Kinds::Only(SearchKind::Issues),
+        "mr" | "mrs" => Kinds::Only(SearchKind::Mrs),
+        "p" | "project" | "projects" => Kinds::Only(SearchKind::Projects),
+        "g" | "group" | "groups" => Kinds::Only(SearchKind::Groups),
+        "e" | "epic" | "epics" => Kinds::Only(SearchKind::Epics),
+        "all" | "*" => Kinds::All,
         _ => return None,
     })
 }
 
-/// What the user typed, split into the kind filter and the text for `Search`.
+/// What the user typed, split into the kinds they named and the text for
+/// `Search`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parsed {
-    pub kind: Option<SearchKind>,
+    /// The kind word or sigil typed, `None` when the text was plain.
+    pub typed: Option<Kinds>,
     pub query: String,
     /// The query was a bare `#42` / `!42` / `&42`: the iid match is the exact
     /// hit.
     pub exact: bool,
+}
+
+impl Parsed {
+    /// What to search: the kinds typed, else projects for text and every kind
+    /// for the empty query (the frequently opened issues, MRs and epics).
+    pub fn kinds(&self) -> Kinds {
+        self.typed.unwrap_or(if self.query.is_empty() {
+            Kinds::All
+        } else {
+            Kinds::Only(SearchKind::Projects)
+        })
+    }
 }
 
 /// Strip a configured trigger word: `Some(rest)` when `text` is the word alone
@@ -52,15 +91,18 @@ pub fn strip_trigger<'a>(text: &'a str, word: &str) -> Option<&'a str> {
     }
 }
 
-/// Split the search text into an optional kind filter and the query:
+/// Split the search text into the kinds typed and the query; [`Parsed::kinds`]
+/// fills in the default:
 ///
 /// ```text
-/// "oauth"     → None,           "oauth"
-/// "mr oauth"  → MergeRequests,  "oauth"
-/// "mr"        → MergeRequests,  ""        (frequently opened MRs)
-/// "!42"       → MergeRequests,  "#42"     (`Search` only knows the # form)
-/// "#42"       → Issues,         "#42"
-/// "&42"       → Epics,          "&42"
+/// "oauth"      → None,           "oauth"   (searched as Projects)
+/// ""           → None,           ""        (searched as All: frequently opened)
+/// "all oauth"  → All,            "oauth"
+/// "mr oauth"   → MergeRequests,  "oauth"
+/// "mr"         → MergeRequests,  ""        (frequently opened MRs)
+/// "!42"        → MergeRequests,  "#42"     (`Search` only knows the # form)
+/// "#42"        → Issues,         "#42"
+/// "&42"        → Epics,          "&42"
 /// ```
 pub fn parse(text: &str) -> Parsed {
     let text = text.trim();
@@ -68,36 +110,36 @@ pub fn parse(text: &str) -> Parsed {
         Some((w, r)) => (w, r.trim()),
         None => (text, ""),
     };
-    if let Some(kind) = kind_of(word) {
+    if let Some(kinds) = kinds_of(word) {
         return Parsed {
-            kind: Some(kind),
+            typed: Some(kinds),
             query: rest.to_string(),
             exact: false,
         };
     }
     if let Some(n) = text.strip_prefix('!').filter(|n| is_number(n)) {
         return Parsed {
-            kind: Some(SearchKind::Mrs),
+            typed: Some(Kinds::Only(SearchKind::Mrs)),
             query: format!("#{n}"),
             exact: true,
         };
     }
     if text.strip_prefix('#').is_some_and(is_number) {
         return Parsed {
-            kind: Some(SearchKind::Issues),
+            typed: Some(Kinds::Only(SearchKind::Issues)),
             query: text.to_string(),
             exact: true,
         };
     }
     if text.strip_prefix('&').is_some_and(is_number) {
         return Parsed {
-            kind: Some(SearchKind::Epics),
+            typed: Some(Kinds::Only(SearchKind::Epics)),
             query: text.to_string(),
             exact: true,
         };
     }
     Parsed {
-        kind: None,
+        typed: None,
         query: text.to_string(),
         exact: false,
     }
@@ -106,7 +148,7 @@ pub fn parse(text: &str) -> Parsed {
 /// What a desktop search asks of us, or `None` when it is not for us: with a
 /// trigger word configured, anything not starting with it; without one, a
 /// bare single character (the shells send every keystroke, and one letter
-/// would match most of the corpus).
+/// would match most of the projects).
 pub fn interpret(text: &str, trigger: Option<&str>) -> Option<Parsed> {
     match trigger {
         Some(word) => Some(parse(strip_trigger(text, word)?)),
@@ -115,7 +157,7 @@ pub fn interpret(text: &str, trigger: Option<&str>) -> Option<Parsed> {
 }
 
 fn too_short(p: &Parsed) -> bool {
-    p.kind.is_none() && p.query.chars().count() < 2
+    p.typed.is_none() && p.query.chars().count() < 2
 }
 
 fn is_number(s: &str) -> bool {
@@ -142,35 +184,59 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn p(kind: Option<SearchKind>, query: &str, exact: bool) -> Parsed {
+    fn p(typed: Option<Kinds>, query: &str, exact: bool) -> Parsed {
         Parsed {
-            kind,
+            typed,
             query: query.to_string(),
             exact,
         }
     }
 
+    fn only(kind: SearchKind) -> Option<Kinds> {
+        Some(Kinds::Only(kind))
+    }
+
     #[test]
     fn mirrors_the_luau_table() {
         assert_eq!(parse("oauth"), p(None, "oauth", false));
-        assert_eq!(parse("mr oauth"), p(Some(SearchKind::Mrs), "oauth", false));
-        assert_eq!(parse("mr"), p(Some(SearchKind::Mrs), "", false));
-        assert_eq!(parse("!42"), p(Some(SearchKind::Mrs), "#42", true));
-        assert_eq!(parse("#42"), p(Some(SearchKind::Issues), "#42", true));
-        assert_eq!(parse("&42"), p(Some(SearchKind::Epics), "&42", true));
+        assert_eq!(parse("all oauth"), p(Some(Kinds::All), "oauth", false));
+        assert_eq!(parse("* oauth"), p(Some(Kinds::All), "oauth", false));
+        assert_eq!(parse("ALL"), p(Some(Kinds::All), "", false));
+        assert_eq!(parse("mr oauth"), p(only(SearchKind::Mrs), "oauth", false));
+        assert_eq!(parse("mr"), p(only(SearchKind::Mrs), "", false));
+        assert_eq!(parse("!42"), p(only(SearchKind::Mrs), "#42", true));
+        assert_eq!(parse("#42"), p(only(SearchKind::Issues), "#42", true));
+        assert_eq!(parse("&42"), p(only(SearchKind::Epics), "&42", true));
         assert_eq!(
             parse("e roadmap"),
-            p(Some(SearchKind::Epics), "roadmap", false)
+            p(only(SearchKind::Epics), "roadmap", false)
         );
         assert_eq!(
             parse("  Issues  login  "),
-            p(Some(SearchKind::Issues), "login", false)
+            p(only(SearchKind::Issues), "login", false)
         );
         assert_eq!(
             parse("g infra"),
-            p(Some(SearchKind::Groups), "infra", false)
+            p(only(SearchKind::Groups), "infra", false)
         );
-        assert_eq!(parse("p api"), p(Some(SearchKind::Projects), "api", false));
+        assert_eq!(parse("p api"), p(only(SearchKind::Projects), "api", false));
+    }
+
+    #[test]
+    fn plain_text_searches_projects_and_the_empty_query_everything() {
+        assert_eq!(parse("oauth").kinds(), Kinds::Only(SearchKind::Projects));
+        assert_eq!(parse("team/api").kinds(), Kinds::Only(SearchKind::Projects));
+        assert_eq!(parse("").kinds(), Kinds::All);
+        assert_eq!(parse("   ").kinds(), Kinds::All);
+        // A typed kind wins over both defaults.
+        assert_eq!(parse("all oauth").kinds(), Kinds::All);
+        assert_eq!(parse("mr").kinds(), Kinds::Only(SearchKind::Mrs));
+        assert_eq!(parse("p").kinds(), Kinds::Only(SearchKind::Projects));
+        assert_eq!(Kinds::All.as_slice(), &[] as &[SearchKind]);
+        assert_eq!(
+            Kinds::Only(SearchKind::Issues).as_slice(),
+            &[SearchKind::Issues]
+        );
     }
 
     #[test]
@@ -178,6 +244,8 @@ mod tests {
         assert_eq!(parse("#abc"), p(None, "#abc", false));
         assert_eq!(parse("!"), p(None, "!", false));
         assert_eq!(parse("&amp"), p(None, "&amp", false));
+        // `*` is a kind word only as a word of its own.
+        assert_eq!(parse("*oauth"), p(None, "*oauth", false));
     }
 
     #[test]
@@ -196,11 +264,15 @@ mod tests {
         assert_eq!(interpret("oa", None), Some(p(None, "oa", false)));
         assert_eq!(
             interpret("mr", None),
-            Some(p(Some(SearchKind::Mrs), "", false))
+            Some(p(only(SearchKind::Mrs), "", false))
         );
         assert_eq!(
             interpret("i o", None),
-            Some(p(Some(SearchKind::Issues), "o", false))
+            Some(p(only(SearchKind::Issues), "o", false))
+        );
+        assert_eq!(
+            interpret("all o", None),
+            Some(p(Some(Kinds::All), "o", false))
         );
     }
 
@@ -209,11 +281,15 @@ mod tests {
         assert_eq!(interpret("oauth", Some("gl")), None);
         assert_eq!(interpret("glob", Some("gl")), None);
         // `gl` alone is the frequently-opened view, like `/gl` in noctalia.
-        assert_eq!(interpret("gl", Some("gl")), Some(p(None, "", false)));
-        assert_eq!(interpret("gl o", Some("gl")), Some(p(None, "o", false)));
+        let alone = interpret("gl", Some("gl")).unwrap();
+        assert_eq!(alone, p(None, "", false));
+        assert_eq!(alone.kinds(), Kinds::All);
+        let text = interpret("gl o", Some("gl")).unwrap();
+        assert_eq!(text, p(None, "o", false));
+        assert_eq!(text.kinds(), Kinds::Only(SearchKind::Projects));
         assert_eq!(
             interpret("gl !42", Some("gl")),
-            Some(p(Some(SearchKind::Mrs), "#42", true))
+            Some(p(only(SearchKind::Mrs), "#42", true))
         );
     }
 
@@ -230,12 +306,17 @@ mod tests {
             let parsed = parse(&text);
             prop_assert_eq!(parsed.query.trim(), parsed.query.as_str());
             if parsed.exact {
-                let sigil = if parsed.kind == Some(SearchKind::Epics) { '&' } else { '#' };
+                let sigil = if parsed.typed == Some(Kinds::Only(SearchKind::Epics)) { '&' } else { '#' };
                 prop_assert!(parsed.query.starts_with(sigil));
                 prop_assert!(matches!(
-                    parsed.kind,
-                    Some(SearchKind::Issues | SearchKind::Mrs | SearchKind::Epics)
+                    parsed.typed,
+                    Some(Kinds::Only(SearchKind::Issues | SearchKind::Mrs | SearchKind::Epics))
                 ));
+            }
+            // Only a typed kind narrows the empty query away from the
+            // frequently opened view; plain text always has a kind.
+            if parsed.typed.is_none() {
+                prop_assert_eq!(parsed.kinds() == Kinds::All, parsed.query.is_empty());
             }
             prop_assert_eq!(strip_trigger(&text, "gl").is_some(), {
                 let t = text.trim_start();

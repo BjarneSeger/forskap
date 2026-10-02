@@ -6,6 +6,12 @@
 -- (projects/groups). The daemon owns ranking; results are emitted in its
 -- order with `score = open_count`, so frequently opened issues, MRs and epics
 -- interleave across kinds instead of one kind always sitting on top.
+--
+-- Plain text searches projects: the launcher's job is mostly "open that repo",
+-- and the issues and MRs would bury the project rows. A leading kind word or
+-- sigil picks another kind, `all` every kind; `/gl` alone is the frequently
+-- opened view across kinds. The grammar is mirrored in the GNOME/KRunner
+-- provider (`forskap-cli/src/cmd/integration/search_provider/query.rs`).
 
 local CATEGORY = {
   issues = "Issues",
@@ -36,9 +42,12 @@ local function trim(s)
   return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
--- Split the text behind the prefix into an optional kind filter and the
--- query handed to `forskap search`. Pure, so the shapes are easy to eyeball:
---   "oauth"        → nil,              "oauth"
+-- Split the text behind the prefix into the kind filter (nil: every kind), the
+-- query handed to `forskap search` and whether the kind is the default rather
+-- than typed. Pure, so the shapes are easy to eyeball:
+--   "oauth"        → "projects",       "oauth"
+--   ""             → nil,              ""        (frequently opened issues/MRs/epics)
+--   "all oauth"    → nil,              "oauth"   (`*` works too)
 --   "mr oauth"     → "merge_requests", "oauth"
 --   "mr"           → "merge_requests", ""        (frequently opened MRs)
 --   "!42"          → "merge_requests", "#42"     (`forskap` only knows the # form)
@@ -47,8 +56,14 @@ end
 local function parseQuery(text)
   local t = trim(text or "")
   local word, rest = t:match("^(%S+)%s*(.*)$")
-  if word ~= nil and KIND_WORDS[word:lower()] ~= nil then
-    return KIND_WORDS[word:lower()], trim(rest)
+  if word ~= nil then
+    local lower = word:lower()
+    if lower == "all" or word == "*" then
+      return nil, trim(rest)
+    end
+    if KIND_WORDS[lower] ~= nil then
+      return KIND_WORDS[lower], trim(rest)
+    end
   end
   local mrNumber = t:match("^!(%d+)$")
   if mrNumber ~= nil then
@@ -60,7 +75,10 @@ local function parseQuery(text)
   if t:match("^&%d+$") then
     return "epics", t
   end
-  return nil, t
+  if t == "" then
+    return nil, "", true
+  end
+  return "projects", t, true
 end
 
 -- The configured path wins; otherwise `forskap` from noctalia's PATH, falling back
@@ -245,7 +263,7 @@ local function messageRow(title, glyph)
 end
 
 function onQuery(text)
-  local kind, query = parseQuery(text)
+  local kind, query, defaulted = parseQuery(text)
   local argv = { forskapPath(), "search", "--output", "json" }
   local limit = noctalia.getConfig("limit")
   if limit ~= nil then
@@ -277,7 +295,12 @@ function onQuery(text)
     end
     local results = toResults(reply)
     if #results == 0 then
-      local hint = query == "" and "Nothing opened yet — search, then open something" or "No matches"
+      local hint = "No matches"
+      if query == "" then
+        hint = "Nothing opened yet — search, then open something"
+      elseif defaulted then
+        hint = "No matching projects — i, mr, e, g pick another kind, all searches everything"
+      end
       results = messageRow(hint, "search")
     end
     launcher.setResults(text, results)

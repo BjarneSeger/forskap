@@ -1,11 +1,13 @@
 # Forskap — noctalia launcher provider
 
 A [noctalia-shell](https://noctalia.dev) plugin that puts `forskap search` behind the
-launcher prefix `/gl`. Results come from the daemon's cache (instant, works offline),
-activating an issue, merge request or epic opens it in the browser through `forskap issue open` / `forskap mr open` /
-`forskap epic open` — which also counts the open, so what you visit most ranks first. Projects and groups open via
-`xdg-open`. Issues, merge requests and projects show the avatar of their project, where
-it has one.
+launcher prefix `/gl`. Plain text finds projects, so `/gl api` opens a repository in a
+few keystrokes; a leading `i`, `mr`, `e`, `g` or `all` searches issues, merge requests,
+epics, groups or everything instead. Results come from the daemon's cache (instant,
+works offline), activating an issue, merge request or epic opens it in the browser
+through `forskap issue open` / `forskap mr open` / `forskap epic open` — which also counts
+the open, so what you visit most ranks first. Projects and groups open via `xdg-open`.
+Issues, merge requests and projects show the avatar of their project, where it has one.
 
 Requires noctalia ≥ 5.1 (plugin API 24) and a running `forskapd` with `forskap` on the
 `PATH` noctalia sees (or set the **forskap binary** setting).
@@ -55,8 +57,9 @@ Settings (**Settings → Plugins → Forskap**):
 | Input | Result |
 |---|---|
 | `/gl` | Issues/MRs/epics you have opened, most opened first |
-| `/gl oauth` | Everything matching `oauth` (issues, MRs, epics, projects, groups) |
+| `/gl api` | Projects matching `api` (name or path) |
 | `/gl mr oauth` | Merge requests only (`i`/`issue`, `mr`, `e`/`epic`, `p`/`project`, `g`/`group` also work) |
+| `/gl all oauth` | Everything matching `oauth` (issues, MRs, epics, projects, groups; `*` works too) |
 | `/gl !42` / `/gl #42` / `/gl &42` | MR / issue / epic number 42 |
 
 Ranking is the daemon's (`open_count` desc, then last opened, then updated); the

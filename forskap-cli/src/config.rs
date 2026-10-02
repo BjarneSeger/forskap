@@ -42,10 +42,11 @@ pub struct Config {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct SearchProvider {
     /// Only answer desktop searches that start with this word, e.g. `gl` makes
-    /// `gl oauth` search for "oauth" and `gl` alone list frequently opened
-    /// items, while any other search returns nothing. Unset, every search is
-    /// answered (queries shorter than two characters are ignored). KRunner
-    /// reads the word once at startup, so restart it after changing this.
+    /// `gl api` search projects for "api", `gl i api` issues, and `gl` alone
+    /// list frequently opened items, while any other search returns nothing.
+    /// Unset, every search is answered (queries shorter than two characters
+    /// are ignored). KRunner reads the word once at startup, so restart it
+    /// after changing this.
     pub trigger_word: Option<String>,
 }
 
