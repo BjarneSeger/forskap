@@ -12,6 +12,7 @@ varlink_parser.workspace = true
 
 [dev-dependencies]
 syn.workspace = true
+varlink_parser.workspace = true
 
 [dependencies]
 async-trait.workspace = true

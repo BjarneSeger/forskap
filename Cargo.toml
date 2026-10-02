@@ -29,8 +29,9 @@ gitlab = "0.1904"
 forskap-api = { path = "./forskap-api", version = "0.33.0" }
 varlink = { version = "13.0", features = ["tokio"] }
 varlink_generator = "13.0"
-# forskap-api's build script edits the generator's output with these; all
-# three come with varlink_generator already.
+# forskap-api's build script edits the generator's output with these, and its
+# compatibility test parses the definitions; all three come with
+# varlink_generator already.
 varlink_parser = "6.0"
 syn = { version = "2", features = ["full", "visit-mut"] }
 quote = "1"

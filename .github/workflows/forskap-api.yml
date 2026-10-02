@@ -1,0 +1,27 @@
+name: forskap-api
+
+# Runs the api crate's tests, among them the check that the varlink interface
+# changes only compatibly (forskap-api/src/compat.rs). Nothing else runs Rust
+# tests before a merge.
+
+on:
+  push:
+    paths:
+      - "forskap-api/**"
+      - ".github/workflows/forskap-api.yml"
+  pull_request:
+    paths:
+      - "forskap-api/**"
+      - ".github/workflows/forskap-api.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --locked --package forskap-api

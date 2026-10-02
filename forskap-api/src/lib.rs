@@ -80,6 +80,9 @@ fn socket_in(
 }
 
 #[cfg(test)]
+mod compat;
+
+#[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
