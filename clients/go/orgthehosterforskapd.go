@@ -121,24 +121,6 @@ type Group struct {
 	Web_url   string `json:"web_url"`
 }
 
-// Where a SyncJob stands.
-type SyncJobStatus string
-
-// A job of the sync worker.
-type SyncJob struct {
-	Key           string        `json:"key"`
-	Status        SyncJobStatus `json:"status"`
-	Last_ok       *int64        `json:"last_ok,omitempty"`
-	Next_due      *int64        `json:"next_due,omitempty"`
-	Running_since *int64        `json:"running_since,omitempty"`
-	Failures      int64         `json:"failures"`
-	Last_error    *string       `json:"last_error,omitempty"`
-	Unavailable   *bool         `json:"unavailable,omitempty"`
-	Full          *bool         `json:"full,omitempty"`
-	Fetched       *int64        `json:"fetched,omitempty"`
-	Expected      *int64        `json:"expected,omitempty"`
-}
-
 // Why the daemon has no GitLab session.
 type NotAuthReason string
 
@@ -183,9 +165,6 @@ type NewWorkItem struct {
 	Assign_self *bool        `json:"assign_self,omitempty"`
 	Parent      *WorkItemRef `json:"parent,omitempty"`
 }
-
-// What ClearCache clears.
-type CacheScope string
 
 // The call fits the interface, but an argument's value is not acceptable (a
 // number that isn't positive, a malformed duration, a blank title, …): nothing
@@ -238,9 +217,7 @@ func (e GitlabUnavailable) Error() string {
 	return s
 }
 
-// The daemon could not do it for a reason of its own: its keychain or its
-// storage failed, or the method is switched off (Login and Logout in a dry
-// run).
+// The daemon could not do it for a reason of its own, its storage failing.
 type Internal struct {
 	Message string `json:"message"`
 }
@@ -984,58 +961,6 @@ func (m RecordOpen_methods) Upgrade(ctx context.Context, c *varlink.Connection, 
 	}, nil
 }
 
-// Clears cached state, all of it or the given scopes, and syncs it again.
-type ClearCache_methods struct{}
-
-func ClearCache() ClearCache_methods { return ClearCache_methods{} }
-
-func (m ClearCache_methods) Call(ctx context.Context, c *varlink.Connection, scope_in_ *[]CacheScope) (err_ error) {
-	receive, err_ := m.Send(ctx, c, 0, scope_in_)
-	if err_ != nil {
-		return
-	}
-	_, err_ = receive(ctx)
-	return
-}
-
-func (m ClearCache_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, scope_in_ *[]CacheScope) (func(ctx context.Context) (uint64, error), error) {
-	var in struct {
-		Scope *[]CacheScope `json:"scope,omitempty"`
-	}
-	in.Scope = scope_in_
-	receive, err := c.Send(ctx, "org.thehoster.forskapd.ClearCache", in, flags)
-	if err != nil {
-		return nil, err
-	}
-	return func(context.Context) (flags uint64, err error) {
-		flags, err = receive(ctx, nil)
-		if err != nil {
-			err = Dispatch_Error(err)
-			return
-		}
-		return
-	}, nil
-}
-
-func (m ClearCache_methods) Upgrade(ctx context.Context, c *varlink.Connection, scope_in_ *[]CacheScope) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
-	var in struct {
-		Scope *[]CacheScope `json:"scope,omitempty"`
-	}
-	in.Scope = scope_in_
-	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.ClearCache", in)
-	if err != nil {
-		return nil, err
-	}
-	return func(context.Context) (flags uint64, conn varlink.ReadWriterContext, err error) {
-		flags, conn, err = receive(ctx, nil)
-		if err != nil {
-			err = Dispatch_Error(err)
-			return
-		}
-		return
-	}, nil
-}
-
 // Time logged in the last days (default 7): synced timelogs and queued PostTimes.
 type GetHistory_methods struct{}
 
@@ -1356,63 +1281,6 @@ func (m ClearFailures_methods) Upgrade(ctx context.Context, c *varlink.Connectio
 	}, nil
 }
 
-// The sync worker's jobs in the order it runs them, and until when a GitLab rate
-// limit pauses them all. Never an error.
-type GetSyncJobs_methods struct{}
-
-func GetSyncJobs() GetSyncJobs_methods { return GetSyncJobs_methods{} }
-
-func (m GetSyncJobs_methods) Call(ctx context.Context, c *varlink.Connection) (jobs_out_ []SyncJob, paused_until_out_ *int64, err_ error) {
-	receive, err_ := m.Send(ctx, c, 0)
-	if err_ != nil {
-		return
-	}
-	jobs_out_, paused_until_out_, _, err_ = receive(ctx)
-	return
-}
-
-func (m GetSyncJobs_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64) (func(ctx context.Context) ([]SyncJob, *int64, uint64, error), error) {
-	receive, err := c.Send(ctx, "org.thehoster.forskapd.GetSyncJobs", nil, flags)
-	if err != nil {
-		return nil, err
-	}
-	return func(context.Context) (jobs_out_ []SyncJob, paused_until_out_ *int64, flags uint64, err error) {
-		var out struct {
-			Jobs         []SyncJob `json:"jobs"`
-			Paused_until *int64    `json:"paused_until,omitempty"`
-		}
-		flags, err = receive(ctx, &out)
-		if err != nil {
-			err = Dispatch_Error(err)
-			return
-		}
-		jobs_out_ = []SyncJob(out.Jobs)
-		paused_until_out_ = out.Paused_until
-		return
-	}, nil
-}
-
-func (m GetSyncJobs_methods) Upgrade(ctx context.Context, c *varlink.Connection) (func(ctx context.Context) (jobs_out_ []SyncJob, paused_until_out_ *int64, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
-	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.GetSyncJobs", nil)
-	if err != nil {
-		return nil, err
-	}
-	return func(context.Context) (jobs_out_ []SyncJob, paused_until_out_ *int64, flags uint64, conn varlink.ReadWriterContext, err error) {
-		var out struct {
-			Jobs         []SyncJob `json:"jobs"`
-			Paused_until *int64    `json:"paused_until,omitempty"`
-		}
-		flags, conn, err = receive(ctx, &out)
-		if err != nil {
-			err = Dispatch_Error(err)
-			return
-		}
-		jobs_out_ = []SyncJob(out.Jobs)
-		paused_until_out_ = out.Paused_until
-		return
-	}, nil
-}
-
 // The interface version the daemon speaks, its own version and its session:
 // the account while connected, else why not. Never an error.
 type GetStatus_methods struct{}
@@ -1490,107 +1358,6 @@ func (m GetStatus_methods) Upgrade(ctx context.Context, c *varlink.Connection) (
 		host_out_ = out.Host
 		username_out_ = out.Username
 		user_id_out_ = out.User_id
-		return
-	}, nil
-}
-
-// Connects to a GitLab host with a personal access token and stores it in the
-// keychain.
-type Login_methods struct{}
-
-func Login() Login_methods { return Login_methods{} }
-
-func (m Login_methods) Call(ctx context.Context, c *varlink.Connection, host_in_ string, token_in_ string) (err_ error) {
-	receive, err_ := m.Send(ctx, c, 0, host_in_, token_in_)
-	if err_ != nil {
-		return
-	}
-	_, err_ = receive(ctx)
-	return
-}
-
-func (m Login_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, host_in_ string, token_in_ string) (func(ctx context.Context) (uint64, error), error) {
-	var in struct {
-		Host  string `json:"host"`
-		Token string `json:"token"`
-	}
-	in.Host = host_in_
-	in.Token = token_in_
-	receive, err := c.Send(ctx, "org.thehoster.forskapd.Login", in, flags)
-	if err != nil {
-		return nil, err
-	}
-	return func(context.Context) (flags uint64, err error) {
-		flags, err = receive(ctx, nil)
-		if err != nil {
-			err = Dispatch_Error(err)
-			return
-		}
-		return
-	}, nil
-}
-
-func (m Login_methods) Upgrade(ctx context.Context, c *varlink.Connection, host_in_ string, token_in_ string) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
-	var in struct {
-		Host  string `json:"host"`
-		Token string `json:"token"`
-	}
-	in.Host = host_in_
-	in.Token = token_in_
-	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.Login", in)
-	if err != nil {
-		return nil, err
-	}
-	return func(context.Context) (flags uint64, conn varlink.ReadWriterContext, err error) {
-		flags, conn, err = receive(ctx, nil)
-		if err != nil {
-			err = Dispatch_Error(err)
-			return
-		}
-		return
-	}, nil
-}
-
-// Drops the session and the stored credentials.
-type Logout_methods struct{}
-
-func Logout() Logout_methods { return Logout_methods{} }
-
-func (m Logout_methods) Call(ctx context.Context, c *varlink.Connection) (err_ error) {
-	receive, err_ := m.Send(ctx, c, 0)
-	if err_ != nil {
-		return
-	}
-	_, err_ = receive(ctx)
-	return
-}
-
-func (m Logout_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64) (func(ctx context.Context) (uint64, error), error) {
-	receive, err := c.Send(ctx, "org.thehoster.forskapd.Logout", nil, flags)
-	if err != nil {
-		return nil, err
-	}
-	return func(context.Context) (flags uint64, err error) {
-		flags, err = receive(ctx, nil)
-		if err != nil {
-			err = Dispatch_Error(err)
-			return
-		}
-		return
-	}, nil
-}
-
-func (m Logout_methods) Upgrade(ctx context.Context, c *varlink.Connection) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
-	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.Logout", nil)
-	if err != nil {
-		return nil, err
-	}
-	return func(context.Context) (flags uint64, conn varlink.ReadWriterContext, err error) {
-		flags, conn, err = receive(ctx, nil)
-		if err != nil {
-			err = Dispatch_Error(err)
-			return
-		}
 		return
 	}, nil
 }
@@ -1676,17 +1443,13 @@ type orgthehosterforskapdInterface interface {
 	UnassignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	CreateWorkItem(ctx context.Context, c VarlinkCall, project_id_ int64, item_ NewWorkItem) error
 	RecordOpen(ctx context.Context, c VarlinkCall, kind_ IssuableKind, iid_ int64, project_id_ *int64, group_id_ *int64) error
-	ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]CacheScope) error
 	GetHistory(ctx context.Context, c VarlinkCall, days_ *int64) error
 	GetActivity(ctx context.Context, c VarlinkCall, days_ *int64) error
 	GetFailures(ctx context.Context, c VarlinkCall) error
 	RetryFailure(ctx context.Context, c VarlinkCall, id_ int64) error
 	DismissFailure(ctx context.Context, c VarlinkCall, id_ int64) error
 	ClearFailures(ctx context.Context, c VarlinkCall) error
-	GetSyncJobs(ctx context.Context, c VarlinkCall) error
 	GetStatus(ctx context.Context, c VarlinkCall) error
-	Login(ctx context.Context, c VarlinkCall, host_ string, token_ string) error
-	Logout(ctx context.Context, c VarlinkCall) error
 	WhoAmI(ctx context.Context, c VarlinkCall) error
 }
 
@@ -1731,9 +1494,7 @@ func (c *VarlinkCall) ReplyGitlabUnavailable(ctx context.Context, message_ strin
 	return c.ReplyError(ctx, "org.thehoster.forskapd.GitlabUnavailable", &out)
 }
 
-// The daemon could not do it for a reason of its own: its keychain or its
-// storage failed, or the method is switched off (Login and Logout in a dry
-// run).
+// The daemon could not do it for a reason of its own, its storage failing.
 func (c *VarlinkCall) ReplyInternal(ctx context.Context, message_ string) error {
 	var out Internal
 	out.Message = message_
@@ -1819,10 +1580,6 @@ func (c *VarlinkCall) ReplyRecordOpen(ctx context.Context) error {
 	return c.Reply(ctx, nil)
 }
 
-func (c *VarlinkCall) ReplyClearCache(ctx context.Context) error {
-	return c.Reply(ctx, nil)
-}
-
 func (c *VarlinkCall) ReplyGetHistory(ctx context.Context, events_ []HistoryEvent) error {
 	var out struct {
 		Events []HistoryEvent `json:"events"`
@@ -1859,16 +1616,6 @@ func (c *VarlinkCall) ReplyClearFailures(ctx context.Context) error {
 	return c.Reply(ctx, nil)
 }
 
-func (c *VarlinkCall) ReplyGetSyncJobs(ctx context.Context, jobs_ []SyncJob, paused_until_ *int64) error {
-	var out struct {
-		Jobs         []SyncJob `json:"jobs"`
-		Paused_until *int64    `json:"paused_until,omitempty"`
-	}
-	out.Jobs = []SyncJob(jobs_)
-	out.Paused_until = paused_until_
-	return c.Reply(ctx, &out)
-}
-
 func (c *VarlinkCall) ReplyGetStatus(ctx context.Context, api_version_ string, daemon_version_ string, connected_ bool, reason_ *NotAuthReason, detail_ *string, host_ *string, username_ *string, user_id_ *int64) error {
 	var out struct {
 		Api_version    string         `json:"api_version"`
@@ -1889,14 +1636,6 @@ func (c *VarlinkCall) ReplyGetStatus(ctx context.Context, api_version_ string, d
 	out.Username = username_
 	out.User_id = user_id_
 	return c.Reply(ctx, &out)
-}
-
-func (c *VarlinkCall) ReplyLogin(ctx context.Context) error {
-	return c.Reply(ctx, nil)
-}
-
-func (c *VarlinkCall) ReplyLogout(ctx context.Context) error {
-	return c.Reply(ctx, nil)
 }
 
 func (c *VarlinkCall) ReplyWhoAmI(ctx context.Context, host_ string, user_id_ int64, username_ string, token_expires_at_ *int64, token_rotates_ bool) error {
@@ -1973,11 +1712,6 @@ func (s *VarlinkInterface) RecordOpen(ctx context.Context, c VarlinkCall, kind_ 
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.RecordOpen")
 }
 
-// Clears cached state, all of it or the given scopes, and syncs it again.
-func (s *VarlinkInterface) ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]CacheScope) error {
-	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.ClearCache")
-}
-
 // Time logged in the last days (default 7): synced timelogs and queued PostTimes.
 func (s *VarlinkInterface) GetHistory(ctx context.Context, c VarlinkCall, days_ *int64) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetHistory")
@@ -2008,27 +1742,10 @@ func (s *VarlinkInterface) ClearFailures(ctx context.Context, c VarlinkCall) err
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.ClearFailures")
 }
 
-// The sync worker's jobs in the order it runs them, and until when a GitLab rate
-// limit pauses them all. Never an error.
-func (s *VarlinkInterface) GetSyncJobs(ctx context.Context, c VarlinkCall) error {
-	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetSyncJobs")
-}
-
 // The interface version the daemon speaks, its own version and its session:
 // the account while connected, else why not. Never an error.
 func (s *VarlinkInterface) GetStatus(ctx context.Context, c VarlinkCall) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetStatus")
-}
-
-// Connects to a GitLab host with a personal access token and stores it in the
-// keychain.
-func (s *VarlinkInterface) Login(ctx context.Context, c VarlinkCall, host_ string, token_ string) error {
-	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.Login")
-}
-
-// Drops the session and the stored credentials.
-func (s *VarlinkInterface) Logout(ctx context.Context, c VarlinkCall) error {
-	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.Logout")
 }
 
 // The connected host and user, and when the token expires.
@@ -2155,16 +1872,6 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 		}
 		return s.orgthehosterforskapdInterface.RecordOpen(ctx, VarlinkCall{call}, in.Kind, in.Iid, in.Project_id, in.Group_id)
 
-	case "ClearCache":
-		var in struct {
-			Scope *[]CacheScope `json:"scope,omitempty"`
-		}
-		err := call.GetParameters(&in)
-		if err != nil {
-			return call.ReplyInvalidParameter(ctx, "parameters")
-		}
-		return s.orgthehosterforskapdInterface.ClearCache(ctx, VarlinkCall{call}, in.Scope)
-
 	case "GetHistory":
 		var in struct {
 			Days *int64 `json:"days,omitempty"`
@@ -2211,25 +1918,8 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 	case "ClearFailures":
 		return s.orgthehosterforskapdInterface.ClearFailures(ctx, VarlinkCall{call})
 
-	case "GetSyncJobs":
-		return s.orgthehosterforskapdInterface.GetSyncJobs(ctx, VarlinkCall{call})
-
 	case "GetStatus":
 		return s.orgthehosterforskapdInterface.GetStatus(ctx, VarlinkCall{call})
-
-	case "Login":
-		var in struct {
-			Host  string `json:"host"`
-			Token string `json:"token"`
-		}
-		err := call.GetParameters(&in)
-		if err != nil {
-			return call.ReplyInvalidParameter(ctx, "parameters")
-		}
-		return s.orgthehosterforskapdInterface.Login(ctx, VarlinkCall{call}, in.Host, in.Token)
-
-	case "Logout":
-		return s.orgthehosterforskapdInterface.Logout(ctx, VarlinkCall{call})
 
 	case "WhoAmI":
 		return s.orgthehosterforskapdInterface.WhoAmI(ctx, VarlinkCall{call})
@@ -2432,51 +2122,6 @@ type Group (
   web_url: string
 )
 
-# Where a SyncJob stands.
-type SyncJobStatus (
-  # Its fetch is in flight.
-  running,
-  # Requested ahead of the schedule; runs before anything merely due.
-  demanded,
-  # Its time has come; runs once the worker gets to it.
-  due,
-  # Not due yet; an unavailable job rests here until next_due.
-  waiting,
-  # Failed; held back until next_due.
-  backing_off
-)
-
-# A job of the sync worker.
-type SyncJob (
-  # Stable job id: "assigned/issues", "recent/authored/issues",
-  # "timelogs/recent", "events", "project/<id>/issues", …
-  key: string,
-  status: SyncJobStatus,
-  # Unix seconds, start of the last successful run; absent if it never ran.
-  last_ok: ?int,
-  # Unix seconds, when the schedule runs it next (the retry time while backing
-  # off); absent while running or demanded, before the first run, and for a job
-  # that is never due again (a fetched project avatar).
-  next_due: ?int,
-  # Unix seconds, only while running.
-  running_since: ?int,
-  # Consecutive failed runs.
-  failures: int,
-  # Why the last run failed, until a run succeeds.
-  last_error: ?string,
-  # True: GitLab refuses the job for good and the daemon asks once a day;
-  # false otherwise. Absent from a daemon before forskap-api 0.28.0.
-  unavailable: ?bool,
-  # Only while running, and only for a job that also runs as a delta: true for
-  # a full run, false for a delta.
-  full: ?bool,
-  # Rows the running fetch has so far (0 before its first page); only while
-  # running. Sent since forskap-api 0.30.0.
-  fetched: ?int,
-  # Rows GitLab announced for the running fetch; absent where it announced none.
-  expected: ?int
-)
-
 # The call fits the interface, but an argument's value is not acceptable (a
 # number that isn't positive, a malformed duration, a blank title, …): nothing
 # was sent to GitLab or stored. argument names it, a nested value by its path
@@ -2499,9 +2144,7 @@ error GitlabError (
 # queue the call: whether GitLab carried it out is unknown.
 error GitlabUnavailable (message: string)
 
-# The daemon could not do it for a reason of its own: its keychain or its
-# storage failed, or the method is switched off (Login and Logout in a dry
-# run).
+# The daemon could not do it for a reason of its own, its storage failing.
 error Internal (message: string)
 
 # Why the daemon has no GitLab session.
@@ -2618,25 +2261,6 @@ method CreateWorkItem(project_id: int, item: NewWorkItem) -> (iid: ?int, web_url
 # epic. Local only: works while dormant.
 method RecordOpen(kind: IssuableKind, iid: int, project_id: ?int, group_id: ?int) -> ()
 
-# What ClearCache clears.
-type CacheScope (
-  # The assigned lists, the ListWorkItems lists and the board columns.
-  assigned,
-  # The corpus: issues, MRs, epics, projects, groups, project avatars.
-  search,
-  # History inside the quick window.
-  quick,
-  # History between the retention horizon and the quick window.
-  slow,
-  # History older than history.retention_hours.
-  stale,
-  # The RecordOpen statistics, only when listed.
-  usage
-)
-
-# Clears cached state, all of it or the given scopes, and syncs it again.
-method ClearCache(scope: ?[]CacheScope) -> ()
-
 # Time logged in the last days (default 7): synced timelogs and queued PostTimes.
 method GetHistory(days: ?int) -> (events: []HistoryEvent)
 
@@ -2655,20 +2279,9 @@ method DismissFailure(id: int) -> ()
 # Drops every dead-lettered write.
 method ClearFailures() -> ()
 
-# The sync worker's jobs in the order it runs them, and until when a GitLab rate
-# limit pauses them all. Never an error.
-method GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int)
-
 # The interface version the daemon speaks, its own version and its session:
 # the account while connected, else why not. Never an error.
 method GetStatus() -> (api_version: string, daemon_version: string, connected: bool, reason: ?NotAuthReason, detail: ?string, host: ?string, username: ?string, user_id: ?int)
-
-# Connects to a GitLab host with a personal access token and stores it in the
-# keychain.
-method Login(host: string, token: string) -> ()
-
-# Drops the session and the stored credentials.
-method Logout() -> ()
 
 # The connected host and user, and when the token expires.
 method WhoAmI() -> (host: string, user_id: int, username: string, token_expires_at: ?int, token_rotates: bool)

@@ -467,6 +467,7 @@ fn settle_hook(sync: &Arc<SyncHandle>, config: &config::SharedConfig) -> SettleH
 /// Dry runs, driven through their socket like any client drives them.
 #[cfg(test)]
 mod tests {
+    use forskap_api::admin::{self, VarlinkClientInterface as _};
     use forskap_api::{
         ErrorKind as WireError, IssuableKind, NewWorkItem, Scope, SearchOptions, VarlinkClient,
         VarlinkClientInterface, WorkItem, WorkItemFilter, WorkItemRef, WorkItemRole,
@@ -488,6 +489,8 @@ mod tests {
     /// A dry run serving in `scratch` until its stop is dropped or sent.
     struct DryRun {
         client: VarlinkClient,
+        /// The admin interface, on the same connection.
+        admin: admin::VarlinkClient,
         handlers: Arc<Handlers>,
         keychain: Keychain,
         stop: oneshot::Sender<()>,
@@ -515,7 +518,8 @@ mod tests {
                 .await
                 .unwrap();
             Self {
-                client: VarlinkClient::new(conn),
+                client: VarlinkClient::new(Arc::clone(&conn)),
+                admin: admin::VarlinkClient::new(conn),
                 handlers,
                 keychain,
                 stop,
@@ -587,9 +591,9 @@ mod tests {
         }
     }
 
-    fn internal(e: forskap_api::Error) -> String {
+    fn internal(e: admin::Error) -> String {
         match e.kind() {
-            WireError::Internal(Some(args)) => args.message.clone(),
+            admin::ErrorKind::Internal(Some(args)) => args.message.clone(),
             other => panic!("expected an Internal, got {other:?}"),
         }
     }
@@ -746,7 +750,7 @@ mod tests {
         assert_eq!(pushed.project_path.as_deref(), Some("acme/backend/api"));
         assert_eq!(pushed.r#ref.as_deref(), Some("rate-limit-token"));
 
-        let jobs = client.get_sync_jobs().call().await.unwrap().jobs;
+        let jobs = run.admin.get_sync_jobs().call().await.unwrap().jobs;
         assert!(jobs.iter().any(|j| j.key == "project/101/issues"));
         assert!(jobs.iter().any(|j| j.key == "group/10/epics"));
         assert!(jobs.iter().all(|j| j.failures == 0), "{jobs:?}");
@@ -880,7 +884,8 @@ mod tests {
         let run = DryRun::start(&scratch).await;
         let client = &run.client;
 
-        let login = client
+        let login = run
+            .admin
             .login("gitlab.com".into(), "glpat-not-a-token".into())
             .call()
             .await;
@@ -889,7 +894,7 @@ mod tests {
             refused.contains("logging in is disabled") && refused.contains("dry run"),
             "{refused}"
         );
-        let logout = client.logout().call().await;
+        let logout = run.admin.logout().call().await;
         assert!(internal(logout.unwrap_err()).contains("logging out is disabled"));
 
         let me = client.who_am_i().call().await.unwrap();
@@ -907,7 +912,7 @@ mod tests {
         })
         .await;
 
-        run.client.clear_cache(None).call().await.unwrap();
+        run.admin.clear_cache(None).call().await.unwrap();
         // The foreground views refill before the reply.
         assert_eq!(run.assigned_work_items().await.len(), 6);
         until("the search corpus", async || {

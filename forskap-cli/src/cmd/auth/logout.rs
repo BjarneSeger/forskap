@@ -2,13 +2,13 @@
 //! connection.
 
 use anyhow::Result;
-use forskap_api::VarlinkClientInterface;
+use forskap_api::admin::VarlinkClientInterface;
 
 use crate::client;
 use crate::friendly::friendly;
 
 pub async fn run() -> Result<()> {
-    let client = client::connect_default().await?;
+    let client = client::connect_admin().await?;
     client
         .logout()
         .call()

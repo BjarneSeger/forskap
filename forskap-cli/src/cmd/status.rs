@@ -10,19 +10,24 @@
 //! without a daemon.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use forskap_api::admin::{
+    self, GetSyncJobs_Reply, SyncJob, SyncJobStatus, VarlinkClientInterface as _,
+};
 use forskap_api::{
-    API_VERSION, Error as ApiError, ErrorKind as ApiErrorKind, FailedTask, GetSyncJobs_Reply,
-    NotAuthReason, SyncJob, SyncJobStatus, VarlinkClient, VarlinkClientInterface, WhoAmI_Reply,
+    API_VERSION, ErrorKind as ApiErrorKind, FailedTask, NotAuthReason, VarlinkClient,
+    VarlinkClientInterface, WhoAmI_Reply,
 };
 use serde::Serialize;
 
 use crate::cli::{OutputFormat, WatchArgs};
 use crate::cmd::auth::status::{expiry, token_line};
 use crate::cmd::sync::jobs::{self, failure, kind, pause, span};
+use crate::friendly::DaemonError;
 use crate::{client, config, friendly, output, style, watch};
 
 /// The CLI's own version. The daemon's may differ: what has to fit is the
@@ -174,7 +179,8 @@ async fn gather(socket: &str) -> Answers {
     if matches!(answers.info, Answer::TimedOut) {
         return answers;
     }
-    let api = VarlinkClient::new(conn);
+    let api = VarlinkClient::new(Arc::clone(&conn));
+    let admin = admin::VarlinkClient::new(conn);
     answers.interface = match ask(api.get_status().call()).await {
         Some(Err(e)) if is_method_not_found(&e) => Answer::Got(None),
         other => answer(other).map(|status| Some(status.api_version)),
@@ -195,7 +201,7 @@ async fn gather(socket: &str) -> Answers {
     if matches!(answers.who, Answer::TimedOut) {
         return answers;
     }
-    answers.jobs = answer(ask(api.get_sync_jobs().call()).await);
+    answers.jobs = answer(ask(admin.get_sync_jobs().call()).await);
     if matches!(answers.jobs, Answer::TimedOut) {
         return answers;
     }
@@ -210,7 +216,7 @@ async fn ask<T, E>(call: impl Future<Output = Result<T, E>>) -> Option<Result<T,
         .ok()
 }
 
-fn answer<T>(asked: Option<Result<T, ApiError>>) -> Answer<T> {
+fn answer<T>(asked: Option<Result<T, impl DaemonError>>) -> Answer<T> {
     match asked {
         Some(Ok(reply)) => Answer::Got(reply),
         Some(Err(e)) => Answer::Failed(describe(&e)),
@@ -218,23 +224,19 @@ fn answer<T>(asked: Option<Result<T, ApiError>>) -> Answer<T> {
     }
 }
 
-fn is_method_not_found(e: &ApiError) -> bool {
+fn is_method_not_found(e: &impl DaemonError) -> bool {
     matches!(
-        e.source_varlink_kind(),
+        e.varlink_kind(),
         Some(varlink::ErrorKind::MethodNotFound(_))
     )
 }
 
 /// A failed call in a few words, rather than the generated client's dump.
-fn describe(e: &ApiError) -> String {
-    match (e.kind(), e.source_varlink_kind()) {
-        (ApiErrorKind::GitlabError(Some(args)), _) => args.message.clone(),
-        (ApiErrorKind::GitlabUnavailable(Some(args)), _) => args.message.clone(),
-        (ApiErrorKind::Internal(Some(args)), _) => args.message.clone(),
-        (ApiErrorKind::InvalidArgument(Some(args)), _) => args.message.clone(),
-        (ApiErrorKind::NotFound(Some(args)), _) => args.message.clone(),
-        (_, Some(kind)) => varlink_words(kind),
-        _ => e.to_string(),
+fn describe(e: &impl DaemonError) -> String {
+    match (e.message(), e.varlink_kind()) {
+        (Some(message), _) => message,
+        (None, Some(kind)) => varlink_words(kind),
+        (None, None) => e.to_string(),
     }
 }
 
@@ -1026,6 +1028,8 @@ fn verdict(rows: &[Row]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use forskap_api::Error as ApiError;
+
     use super::*;
 
     const NOW: i64 = 1_800_000_000;

@@ -1,0 +1,94 @@
+# What the bundled forskap CLI asks of forskapd beside org.thehoster.forskapd:
+# its session and its cache, the state of its sync. It mirrors the daemon's
+# internals and follows its version, with no promise of stability.
+interface org.thehoster.forskapd.admin
+
+# Where a SyncJob stands.
+type SyncJobStatus (
+  # Its fetch is in flight.
+  running,
+  # Requested ahead of the schedule; runs before anything merely due.
+  demanded,
+  # Its time has come; runs once the worker gets to it.
+  due,
+  # Not due yet; an unavailable job rests here until next_due.
+  waiting,
+  # Failed; held back until next_due.
+  backing_off
+)
+
+# A job of the sync worker.
+type SyncJob (
+  # Stable job id: "assigned/issues", "recent/authored/issues",
+  # "timelogs/recent", "events", "project/<id>/issues", …
+  key: string,
+  status: SyncJobStatus,
+  # Unix seconds, start of the last successful run; absent if it never ran.
+  last_ok: ?int,
+  # Unix seconds, when the schedule runs it next (the retry time while backing
+  # off); absent while running or demanded, before the first run, and for a job
+  # that is never due again (a fetched project avatar).
+  next_due: ?int,
+  # Unix seconds, only while running.
+  running_since: ?int,
+  # Consecutive failed runs.
+  failures: int,
+  # Why the last run failed, until a run succeeds.
+  last_error: ?string,
+  # True: GitLab refuses the job for good and the daemon asks once a day;
+  # false otherwise. Absent from a daemon before forskap-api 0.28.0.
+  unavailable: ?bool,
+  # Only while running, and only for a job that also runs as a delta: true for
+  # a full run, false for a delta.
+  full: ?bool,
+  # Rows the running fetch has so far (0 before its first page); only while
+  # running. Sent since forskap-api 0.30.0.
+  fetched: ?int,
+  # Rows GitLab announced for the running fetch; absent where it announced none.
+  expected: ?int
+)
+
+# GitLab answered and refused Login.
+error GitlabError (
+  message: string,
+  # The HTTP status of GitLab's answer, 401 for a token it doesn't take;
+  # absent where the daemon has none (an answer it can't read).
+  status: ?int
+)
+
+# GitLab could not be reached, or answered 429 or 5xx.
+error GitlabUnavailable (message: string)
+
+# The daemon could not do it for a reason of its own: its keychain failed, or
+# the method is switched off (Login and Logout in a dry run).
+error Internal (message: string)
+
+# What ClearCache clears.
+type CacheScope (
+  # The assigned lists, the ListWorkItems lists and the board columns.
+  assigned,
+  # The corpus: issues, MRs, epics, projects, groups, project avatars.
+  search,
+  # History inside the quick window.
+  quick,
+  # History between the retention horizon and the quick window.
+  slow,
+  # History older than history.retention_hours.
+  stale,
+  # The RecordOpen statistics, only when listed.
+  usage
+)
+
+# Clears cached state, all of it or the given scopes, and syncs it again.
+method ClearCache(scope: ?[]CacheScope) -> ()
+
+# The sync worker's jobs in the order it runs them, and until when a GitLab rate
+# limit pauses them all. Never an error.
+method GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int)
+
+# Connects to a GitLab host with a personal access token and stores it in the
+# keychain.
+method Login(host: string, token: string) -> ()
+
+# Drops the session and the stored credentials.
+method Logout() -> ()

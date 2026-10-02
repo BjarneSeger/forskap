@@ -45,17 +45,6 @@ const (
 	SearchGroups        SearchKind = "groups"
 )
 
-// CacheScope values selecting what ClearCache drops: the assigned lists, the
-// search corpus, the three age bands of the time history, the open statistics.
-const (
-	ScopeAssigned CacheScope = "assigned"
-	ScopeSearch   CacheScope = "search"
-	ScopeQuick    CacheScope = "quick"
-	ScopeSlow     CacheScope = "slow"
-	ScopeStale    CacheScope = "stale"
-	ScopeUsage    CacheScope = "usage"
-)
-
 // WorkItemRole values picking one of the two lists ListWorkItems serves: the
 // issues the authenticated user authored, or the ones assigned to them.
 const (
@@ -267,12 +256,6 @@ func (c *Client) RecordOpen(ctx context.Context, kind IssuableKind, iid int64, p
 	return RecordOpen().Call(ctx, c.conn, kind, iid, projectID, groupID)
 }
 
-// ClearCache clears the daemon's cache, optionally only the given Scope* slices
-// (nil = everything but the open statistics).
-func (c *Client) ClearCache(ctx context.Context, scope *[]CacheScope) error {
-	return ClearCache().Call(ctx, c.conn, scope)
-}
-
 // GetHistory returns tracked-time history events, optionally limited to the last
 // n days (nil = daemon default window).
 func (c *Client) GetHistory(ctx context.Context, days *int64) ([]HistoryEvent, error) {
@@ -289,18 +272,6 @@ func (c *Client) GetActivity(ctx context.Context, days *int64) ([]ActivityEvent,
 // GetFailures returns queued operations that have failed.
 func (c *Client) GetFailures(ctx context.Context) ([]FailedTask, error) {
 	return GetFailures().Call(ctx, c.conn)
-}
-
-// GetSyncJobs returns the daemon's planned sync jobs in the order its worker
-// runs them, and until when (unix seconds) a GitLab rate limit pauses them all
-// (nil = not paused). Status only: it succeeds while the daemon is dormant.
-// A job whose Unavailable is true is one GitLab refuses for good, asked again
-// once a day; Unavailable is nil from a daemon older than v0.28.0.
-// A running job carries Fetched, its rows so far, Expected, the total GitLab
-// announced (nil without one), and Full where it also runs as a delta; all
-// three are nil for any other job and from a daemon older than v0.30.0.
-func (c *Client) GetSyncJobs(ctx context.Context) (jobs []SyncJob, pausedUntil *int64, err error) {
-	return GetSyncJobs().Call(ctx, c.conn)
 }
 
 // Status is what GetStatus reports.
@@ -386,16 +357,6 @@ func (c *Client) DismissFailure(ctx context.Context, id int64) error {
 // ClearFailures discards all failed tasks.
 func (c *Client) ClearFailures(ctx context.Context) error {
 	return ClearFailures().Call(ctx, c.conn)
-}
-
-// Login stores credentials for a GitLab host in the daemon.
-func (c *Client) Login(ctx context.Context, host, token string) error {
-	return Login().Call(ctx, c.conn, host, token)
-}
-
-// Logout clears stored credentials.
-func (c *Client) Logout(ctx context.Context) error {
-	return Logout().Call(ctx, c.conn)
 }
 
 // Account is the GitLab account WhoAmI reports.

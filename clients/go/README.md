@@ -97,14 +97,14 @@ Daemon-side errors surface as typed values you match with `errors.As`; each says
 to do next, and all but `NotAuthenticated` carry a `.Message`:
 
 - `*forskap.InvalidArgument` — an argument's value the daemon refuses up front
-  (`.Argument` names it); nothing was sent or stored.
+  (`.Argument` names it, a value inside an argument struct by its path:
+  `options.limit`); nothing was sent or stored.
 - `*forskap.NotFound` — the daemon has no such thing (a failure id it doesn't know).
 - `*forskap.GitlabError` — GitLab refused the request; `.Status` is its HTTP status,
   `nil` where the daemon has none.
 - `*forskap.GitlabUnavailable` — GitLab was out of reach or answered 429/5xx and the
   daemon did not queue the call: whether it was carried out is unknown.
-- `*forskap.Internal` — the daemon failed on its own (keychain, storage), or the
-  method is switched off.
+- `*forskap.Internal` — the daemon failed on its own (its storage).
 - `*forskap.NotAuthenticated` — no valid credentials; `.Reason` is one of the
   `forskap.Reason*` constants (e.g. `forskap.ReasonLoggedOut`), `.Detail` is optional.
 
@@ -129,8 +129,8 @@ state, or
 `Close` method maps to `c.CloseIssuable` — the Go name `Close` is taken by the
 connection releaser. Enum values come from constants: `KindWorkItem` /
 `KindMergeRequest` for an `IssuableKind`, `Search*` for the kinds of `Search`,
-`Scope*` for the scopes of `ClearCache`, `RoleAuthor` / `RoleAssignee` and
-`StateOpened` / `StateClosed` for the role and the states of `ListWorkItems`.
+`RoleAuthor` / `RoleAssignee` and `StateOpened` / `StateClosed` for the role and
+the states of `ListWorkItems`.
 
 ### Work items
 
@@ -168,15 +168,7 @@ err := c.RecordOpen(ctx, forskap.KindWorkItem, epic.Iid, nil, epic.Group_id)
 ```
 
 Optional fields of a reply are pointers as well, `nil` when the daemon left them
-out. `c.GetSyncJobs` sets `SyncJob.Unavailable` on every job since `v0.28.0`: `true`
-for a job GitLab refuses for good (a project's merge requests or boards switched off,
-epics without GitLab Premium), which the daemon only asks once a day — no failure to
-report. It is `nil` from an older daemon, which doesn't tell.
-
-Since `v0.30.0` a running job says how far it is: `SyncJob.Fetched` is the rows its
-fetch has so far, `SyncJob.Expected` the total GitLab announced (`nil` where it
-announced none), and `SyncJob.Full` tells a full run from a delta for the jobs that
-have both. All three are `nil` on a job that isn't running.
+out.
 
 `c.ListWorkItems` lists your own issues across projects, closed ones included,
 newest-updated first; each carries its epic as `Parent`. It reaches back the
@@ -219,11 +211,21 @@ included) with `*forskap.GitlabError`, and a network error, a 429 or a 5xx with
 `*forskap.GitlabUnavailable`. Don't retry the last blindly — GitLab may have created
 the issue before its answer was lost, and a second call files it again.
 
+### The admin interface
+
+The daemon serves a second interface on the same socket,
+`org.thehoster.forskapd.admin`: logging in and out, clearing its cache and its sync
+worker's jobs. It mirrors the daemon's internals, follows the daemon's version and
+promises no stability, so it exists for the bundled `forskap` CLI, and this binding
+leaves it out. Use `forskap auth login`, `forskap sync refresh` and `forskap sync
+jobs` instead.
+
 ## Regenerating
 
 The generated files `orgthehosterforskapd.go` and `version.go` (`APIVersion`, from
-the version in `forskap-api/Cargo.toml`) are committed and marked `DO NOT EDIT`.
-After changing the `.varlink` interface or that version, regenerate them:
+the version in `forskap-api/Cargo.toml`) are committed and marked `DO NOT EDIT`; they
+come from `org.thehoster.forskapd.varlink` alone. After changing that interface or
+that version, regenerate them:
 
 ```sh
 cd clients/go

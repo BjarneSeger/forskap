@@ -5,16 +5,19 @@ use std::time::Duration;
 
 use tokio::sync::{Notify, RwLock};
 
+use forskap_api::admin::{
+    self, CacheScope, Call_ClearCache, Call_GetSyncJobs, Call_Login, Call_Logout,
+    GetSyncJobs_Reply, SyncJobStatus, VarlinkInterface as _,
+};
 use forskap_api::{
-    AsyncCall, CacheScope, Call_AssignSelf, Call_ClearCache, Call_Close, Call_CreateWorkItem,
-    Call_DismissFailure, Call_GetActivity, Call_GetAssignedMergeRequests,
-    Call_GetAssignedWorkItems, Call_GetHistory, Call_GetStatus, Call_GetSyncJobs,
-    Call_ListWorkItems, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
+    AsyncCall, Call_AssignSelf, Call_Close, Call_CreateWorkItem, Call_DismissFailure,
+    Call_GetActivity, Call_GetAssignedMergeRequests, Call_GetAssignedWorkItems, Call_GetHistory,
+    Call_GetStatus, Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
     Call_Search, Call_UnassignSelf, Call_WhoAmI, CreateWorkItem_Reply, GetActivity_Reply,
     GetAssignedMergeRequests_Reply, GetAssignedWorkItems_Reply, GetHistory_Reply, GetStatus_Reply,
-    GetSyncJobs_Reply, HistorySource, IssuableKind, ListWorkItems_Reply, MergeRequest, NewWorkItem,
-    Scope, Search_Reply, SearchKind, SearchOptions, SyncJobStatus, VarlinkInterface, WhoAmI_Reply,
-    WorkItem, WorkItemFilter, WorkItemRef, WorkItemRole, WorkItemState,
+    HistorySource, IssuableKind, ListWorkItems_Reply, MergeRequest, NewWorkItem, Scope,
+    Search_Reply, SearchKind, SearchOptions, VarlinkInterface, WhoAmI_Reply, WorkItem,
+    WorkItemFilter, WorkItemRef, WorkItemRole, WorkItemState,
 };
 
 use crate::config::SharedConfig;
@@ -40,7 +43,7 @@ const GITLAB_ERROR: &str = "org.thehoster.forskapd.GitlabError";
 const GITLAB_UNAVAILABLE: &str = "org.thehoster.forskapd.GitlabUnavailable";
 const INVALID_ARGUMENT: &str = "org.thehoster.forskapd.InvalidArgument";
 const NOT_FOUND: &str = "org.thehoster.forskapd.NotFound";
-const INTERNAL: &str = "org.thehoster.forskapd.Internal";
+const ADMIN_INTERNAL: &str = "org.thehoster.forskapd.admin.Internal";
 
 // ── Scaffolding ────────────────────────────────────────────────────────
 
@@ -328,8 +331,25 @@ pub(crate) fn seed_corpus(h: &Handlers) {
     mark_synced(h, &[Job::MemberProjects]);
 }
 
-fn reply<T: serde::de::DeserializeOwned>(call: &mut AsyncCall) -> T {
-    let reply = call.take_reply().expect("a reply");
+/// A call of either interface, whose reply the tests read alike.
+trait Replied {
+    fn take(&mut self) -> Option<::varlink::Reply>;
+}
+
+impl Replied for AsyncCall {
+    fn take(&mut self) -> Option<::varlink::Reply> {
+        self.take_reply()
+    }
+}
+
+impl Replied for admin::AsyncCall {
+    fn take(&mut self) -> Option<::varlink::Reply> {
+        self.take_reply()
+    }
+}
+
+fn reply<T: serde::de::DeserializeOwned>(call: &mut impl Replied) -> T {
+    let reply = call.take().expect("a reply");
     assert!(
         reply.error.is_none(),
         "expected success, got {:?}",
@@ -338,13 +358,13 @@ fn reply<T: serde::de::DeserializeOwned>(call: &mut AsyncCall) -> T {
     serde_json::from_value(reply.parameters.expect("parameters")).expect("parse reply")
 }
 
-fn reply_error(call: &mut AsyncCall) -> Option<String> {
+fn reply_error(call: &mut impl Replied) -> Option<String> {
     reply_error_with(call).map(|(name, _)| name)
 }
 
 /// The error a call replied and its parameters, `None` for a success.
-fn reply_error_with(call: &mut AsyncCall) -> Option<(String, serde_json::Value)> {
-    let reply = call.take_reply().expect("a reply");
+fn reply_error_with(call: &mut impl Replied) -> Option<(String, serde_json::Value)> {
+    let reply = call.take().expect("a reply");
     Some((
         reply.error?.to_string(),
         reply.parameters.unwrap_or_default(),
@@ -641,7 +661,7 @@ fn created_json(iid: i64, title: &str, assignees: &[i64]) -> serde_json::Value {
 }
 
 async fn clear_cache(h: &Handlers, scope: Option<Vec<CacheScope>>) {
-    let mut call = AsyncCall::default();
+    let mut call = admin::AsyncCall::default();
     h.clear_cache(&mut call as &mut dyn Call_ClearCache, scope)
         .await
         .unwrap();
@@ -2671,7 +2691,7 @@ async fn an_unknown_failure_id_is_not_found() {
 async fn login_and_logout_without_a_keychain_are_internal() {
     let fake = Arc::new(FakeGitlab::default());
     let (h, _dir) = connected_handlers(&fake);
-    let mut call = AsyncCall::default();
+    let mut call = admin::AsyncCall::default();
     h.login(
         &mut call as &mut dyn Call_Login,
         "gitlab.invalid".into(),
@@ -2680,7 +2700,7 @@ async fn login_and_logout_without_a_keychain_are_internal() {
     .await
     .unwrap();
     let (name, args) = reply_error_with(&mut call).unwrap();
-    assert_eq!(name, INTERNAL);
+    assert_eq!(name, ADMIN_INTERNAL);
     assert!(
         args["message"]
             .as_str()
@@ -2688,9 +2708,9 @@ async fn login_and_logout_without_a_keychain_are_internal() {
             .starts_with("logging in is disabled"),
         "{args}"
     );
-    let mut call = AsyncCall::default();
+    let mut call = admin::AsyncCall::default();
     h.logout(&mut call as &mut dyn Call_Logout).await.unwrap();
-    assert_eq!(reply_error(&mut call).as_deref(), Some(INTERNAL));
+    assert_eq!(reply_error(&mut call).as_deref(), Some(ADMIN_INTERNAL));
     assert!(matches!(&*h.session.read().await, ConnState::Connected(_)));
     assert_eq!(fake.read_calls(), 0);
 }
@@ -2700,7 +2720,7 @@ async fn login_and_logout_without_a_keychain_are_internal() {
 #[tokio::test]
 async fn get_sync_jobs_lists_the_plan_while_dormant() {
     let (h, _dir) = dormant_handlers();
-    let mut call = AsyncCall::default();
+    let mut call = admin::AsyncCall::default();
     h.get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
         .await
         .unwrap();
@@ -2737,7 +2757,7 @@ async fn get_sync_jobs_reports_a_running_jobs_progress() {
         .await
         .expect("the assigned issues fetch starts");
 
-    let mut call = AsyncCall::default();
+    let mut call = admin::AsyncCall::default();
     h.get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
         .await
         .unwrap();
@@ -2762,7 +2782,7 @@ async fn get_sync_jobs_reports_a_failed_job() {
     let (h, _dir) = connected_handlers(&fake);
     h.sync.refresh_now(&[Job::AssignedIssues]).await;
 
-    let mut call = AsyncCall::default();
+    let mut call = admin::AsyncCall::default();
     h.get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
         .await
         .unwrap();
@@ -2803,7 +2823,7 @@ async fn get_sync_jobs_reports_an_unavailable_job() {
     }
     assert_eq!(fake.calls_to("projects/7/boards").len(), 3);
 
-    let mut call = AsyncCall::default();
+    let mut call = admin::AsyncCall::default();
     h.get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
         .await
         .unwrap();

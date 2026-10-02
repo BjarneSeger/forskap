@@ -16,6 +16,18 @@ pub const VARLINK_INTERFACE_DESCRIPTION: &str =
 /// a client compares it with the one it was built against ([`compatible`]).
 pub const API_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// `org.thehoster.forskapd.admin`, served on the same socket: the session,
+/// the cache and the sync worker's jobs, for the bundled CLI. It mirrors the
+/// daemon's internals and follows the daemon's version, not [`API_VERSION`],
+/// with no promise of stability.
+pub mod admin {
+    include!(concat!(env!("OUT_DIR"), "/org.thehoster.forskapd.admin.rs"));
+
+    /// Raw varlink interface description of the admin interface.
+    pub const VARLINK_INTERFACE_DESCRIPTION: &str =
+        include_str!("../varlink/org.thehoster.forskapd.admin.varlink");
+}
+
 /// Whether a daemon whose `GetStatus` says `api_version` speaks an interface
 /// a client built against [`API_VERSION`] can use. Before 1.0 that takes the
 /// same minor version, as every interface change bumps it (a patch is a fix to
@@ -71,10 +83,8 @@ fn socket_in(
 mod tests {
     use std::path::PathBuf;
 
-    use super::{
-        API_VERSION, SearchOptions, SyncJob, SyncJobStatus, WorkItemRef, compatible,
-        compatible_with, socket_in,
-    };
+    use super::admin::{SyncJob, SyncJobStatus};
+    use super::{API_VERSION, SearchOptions, WorkItemRef, compatible, compatible_with, socket_in};
 
     #[test]
     fn a_daemon_is_compatible_by_minor_before_1_0_and_by_major_after() {
@@ -156,11 +166,14 @@ mod tests {
         }
     }
 
-    /// The serialized structs of the generated code.
+    /// The serialized structs of the generated code, of both interfaces.
     fn generated_structs() -> Vec<syn::ItemStruct> {
-        let generated = include_str!(concat!(env!("OUT_DIR"), "/org.thehoster.forskapd.rs"));
-        let file = syn::parse_file(generated).unwrap();
-        let structs = file.items.into_iter().filter_map(|item| match item {
+        let generated = [
+            include_str!(concat!(env!("OUT_DIR"), "/org.thehoster.forskapd.rs")),
+            include_str!(concat!(env!("OUT_DIR"), "/org.thehoster.forskapd.admin.rs")),
+        ];
+        let items = generated.map(|code| syn::parse_file(code).unwrap().items);
+        let structs = items.into_iter().flatten().filter_map(|item| match item {
             syn::Item::Struct(item) => Some(item),
             _ => None,
         });

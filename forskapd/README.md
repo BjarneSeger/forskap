@@ -132,8 +132,8 @@ Keys are grouped into TOML tables, one per concern:
 | `[auth]` `rotate` | `"scoped"` | Which tokens are replaced by a fresh one before they expire: `"scoped"` = only tokens with the `self_rotate` scope, `"always"` = also tokens that can rotate through the `api` scope, `"never"` = none. Rotating revokes the token you pasted, which breaks every other tool using it — hence the default. A token without an expiry date is never rotated. |
 | `[auth]` `rotate_before_days` | `7` | How many days before its expiry a token is rotated (floor 1). A token living less than three times as long is rotated once a third of its lifetime is left. |
 
-Credentials are configured through the `org.thehoster.forskapd.Login`
-interface or by just calling `forskap auth login`.
+Credentials are configured through `org.thehoster.forskapd.admin.Login` or by just
+calling `forskap auth login`.
 
 ### Token rotation
 
@@ -192,6 +192,7 @@ cargo run --release
 
 ## Varlink interface
 
-The interface name is `org.thehoster.forskapd`.
+The interface name is `org.thehoster.forskapd`. Beside it the daemon serves
+`org.thehoster.forskapd.admin`, for the bundled CLI and with no promise of stability.
 For more information, see [the interface docs](docs/varlink_interface.md) and
 [the library crate](../forskap-api/README.md).

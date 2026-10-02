@@ -6,13 +6,20 @@ use quote::ToTokens as _;
 use syn::visit_mut::{self, VisitMut};
 use varlink_parser::{IDL, VStruct, VStructOrEnum, VType, VTypeExt};
 
-const INTERFACE: &str = "varlink/org.thehoster.forskapd.varlink";
+/// The interface the crate root holds, and the admin one its `admin` module
+/// holds; each is generated into `$OUT_DIR` under its own name.
+const INTERFACES: [&str; 2] = ["org.thehoster.forskapd", "org.thehoster.forskapd.admin"];
 
 fn main() {
     let out_dir: PathBuf = env::var_os("OUT_DIR").unwrap().into();
-    let output_path = out_dir.join("org.thehoster.forskapd.rs");
+    for name in INTERFACES {
+        let idl = fs::read_to_string(format!("varlink/{name}.varlink")).unwrap();
+        fs::write(out_dir.join(format!("{name}.rs")), generate(name, &idl)).unwrap();
+    }
+}
 
-    let idl = fs::read_to_string(INTERFACE).unwrap();
+/// The Rust code for the interface `idl`, adapted as the types below say.
+fn generate(name: &str, idl: &str) -> String {
     let mut generated = Vec::new();
     varlink_generator::generate_with_options(
         &mut idl.as_bytes(),
@@ -31,12 +38,12 @@ fn main() {
     omit.visit_file_mut(&mut file);
     let mut default = DeriveDefault::default();
     default.visit_file_mut(&mut file);
-    let declared = IDL::try_from(idl.as_str()).unwrap();
+    let declared = IDL::try_from(idl).unwrap();
     let optional: usize = structs(&declared).iter().map(|s| optional_fields(s)).sum();
     // A field the walk didn't recognise would go out as `null` again.
     assert_eq!(
         omit.fields, optional,
-        "the interface declares {optional} optional fields, the generated structs have {} \
+        "{name} declares {optional} optional fields, the generated structs have {} \
          `Option` fields: varlink_generator's output changed, adapt `OmitAbsent`",
         omit.fields
     );
@@ -46,12 +53,11 @@ fn main() {
         .count();
     assert_eq!(
         default.structs, defaultable,
-        "the interface declares {defaultable} structs without a required field, {} generated \
+        "{name} declares {defaultable} structs without a required field, {} generated \
          structs derive `Default`: varlink_generator's output changed, adapt `DeriveDefault`",
         default.structs
     );
-
-    fs::write(output_path, file.into_token_stream().to_string()).unwrap();
+    file.into_token_stream().to_string()
 }
 
 /// Derives `Default` for every serialized struct without a required field,

@@ -8,6 +8,8 @@
 //!
 //! - [`varlink`] — the [`VarlinkInterface`](forskap_api::VarlinkInterface)
 //!   method impls plus the write cascade.
+//! - [`admin`] — the [admin interface](forskap_api::admin)'s: the session,
+//!   the cache, the sync worker's jobs.
 //! - [`wire`] — projections of stored rows onto the wire types.
 //!
 //! This module holds the shared connection types, the helpers every submodule
@@ -28,6 +30,7 @@ use crate::secrets::{Keychain, Token};
 use crate::sync::{SyncHandle, now_secs};
 use crate::usage::{UsageStats, epic_usage_key, usage_key};
 
+mod admin;
 mod varlink;
 mod wire;
 

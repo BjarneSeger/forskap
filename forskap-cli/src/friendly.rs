@@ -6,15 +6,73 @@
 //! change without a protocol bump, and an older daemon — which sends no reason
 //! — still gets a sensible generic line.
 
-use forskap_api::{Error as ApiError, ErrorKind, NotAuthReason};
+use forskap_api::{ErrorKind, NotAuthReason, admin};
+
+/// A failed call, of either interface's generated client.
+pub trait DaemonError: std::fmt::Display {
+    /// `NotAuthenticated`'s reason and detail; `None` for any other error.
+    fn not_authenticated(&self) -> Option<(Option<NotAuthReason>, Option<&str>)>;
+
+    /// The message of an error the daemon replied.
+    fn message(&self) -> Option<String>;
+
+    /// The varlink error under it: a broken connection, a reply outside the
+    /// interface (`MethodNotFound`, `InvalidParameter`).
+    fn varlink_kind(&self) -> Option<&varlink::ErrorKind>;
+}
+
+impl DaemonError for forskap_api::Error {
+    fn not_authenticated(&self) -> Option<(Option<NotAuthReason>, Option<&str>)> {
+        let ErrorKind::NotAuthenticated(args) = self.kind() else {
+            return None;
+        };
+        let args = args.as_ref();
+        let reason = args.and_then(|a| a.reason.clone());
+        Some((reason, args.and_then(|a| a.detail.as_deref())))
+    }
+
+    fn message(&self) -> Option<String> {
+        let message = match self.kind() {
+            ErrorKind::InvalidArgument(Some(args)) => &args.message,
+            ErrorKind::NotFound(Some(args)) => &args.message,
+            ErrorKind::GitlabError(Some(args)) => &args.message,
+            ErrorKind::GitlabUnavailable(Some(args)) => &args.message,
+            ErrorKind::Internal(Some(args)) => &args.message,
+            _ => return None,
+        };
+        Some(message.clone())
+    }
+
+    fn varlink_kind(&self) -> Option<&varlink::ErrorKind> {
+        self.source_varlink_kind()
+    }
+}
+
+impl DaemonError for admin::Error {
+    fn not_authenticated(&self) -> Option<(Option<NotAuthReason>, Option<&str>)> {
+        None
+    }
+
+    fn message(&self) -> Option<String> {
+        let message = match self.kind() {
+            admin::ErrorKind::GitlabError(Some(args)) => &args.message,
+            admin::ErrorKind::GitlabUnavailable(Some(args)) => &args.message,
+            admin::ErrorKind::Internal(Some(args)) => &args.message,
+            _ => return None,
+        };
+        Some(message.clone())
+    }
+
+    fn varlink_kind(&self) -> Option<&varlink::ErrorKind> {
+        self.source_varlink_kind()
+    }
+}
 
 /// Map a failed varlink call to an `anyhow::Error` with a user-facing message.
 /// `op` is the method name used in the generic (non-auth) fallback, preserving
 /// the previous `"<Method> failed: <error>"` output for every other error.
-pub fn friendly(op: &str, e: ApiError) -> anyhow::Error {
-    if let ErrorKind::NotAuthenticated(args) = e.kind() {
-        let reason = args.as_ref().and_then(|a| a.reason.clone());
-        let detail = args.as_ref().and_then(|a| a.detail.as_deref());
+pub fn friendly(op: &str, e: impl DaemonError) -> anyhow::Error {
+    if let Some((reason, detail)) = e.not_authenticated() {
         return anyhow::anyhow!("{}", message_for(reason, detail));
     }
     anyhow::anyhow!("{op} failed: {e}")

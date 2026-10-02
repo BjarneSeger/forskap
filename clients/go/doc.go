@@ -40,4 +40,9 @@
 // *GitlabError, *GitlabUnavailable, *Internal or *NotAuthenticated; match
 // them with errors.As. Optional parameters are pointers, where nil omits the
 // field on the wire.
+//
+// The daemon's second interface on the socket, org.thehoster.forskapd.admin
+// (login, logout, cache clearing, sync jobs), is not bound: it mirrors the
+// daemon's internals with no promise of stability, for the bundled forskap
+// CLI.
 package orgthehosterforskapd

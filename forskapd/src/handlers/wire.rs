@@ -1,8 +1,9 @@
 //! Projections of stored GitLab rows onto the varlink wire types.
 
+use forskap_api::admin::{SyncJob, SyncJobStatus};
 use forskap_api::{
     ActivityEvent, Group, HistoryEvent, HistorySource, IssuableKind, MergeRequest, Project,
-    SyncJob, SyncJobStatus, WorkItem, WorkItemRef, WorkItemState,
+    WorkItem, WorkItemRef, WorkItemState,
 };
 
 use crate::gitlab::Issuable;

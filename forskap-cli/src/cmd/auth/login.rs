@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use forskap_api::VarlinkClientInterface;
+use forskap_api::admin::VarlinkClientInterface as _;
 use inquire::Password;
 
 use crate::client;
@@ -43,9 +44,9 @@ pub async fn run(host: String) -> Result<()> {
         anyhow::bail!("no token entered; aborting");
     }
 
-    let client = client::connect_default().await?;
+    let (client, admin) = client::connect_both().await?;
 
-    client
+    admin
         .login(host.clone(), token)
         .call()
         .await

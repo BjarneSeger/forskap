@@ -11,6 +11,12 @@ varlinkctl introspect unix:$XDG_RUNTIME_DIR/forskapd.socket org.thehoster.forska
 This document says what the definition can't: the caching and write models, what
 each method does beyond its line, orderings, edge cases, and how to call it.
 
+The daemon serves a second interface on the same socket,
+`org.thehoster.forskapd.admin`, for the bundled CLI: logging in and out, clearing the
+cache, the sync worker's jobs. It has
+[a part of its own](#the-orgthehosterforskapdadmin-interface) at the end; everything
+before that part is about `org.thehoster.forskapd`.
+
 **Caching model**: the daemon has no TTL. A background sync worker owns freshness:
 it runs a few jobs at a time (`sync.max_in_flight`) from a persisted, jittered schedule — the assigned
 issue/MR lists and the recent timelog window every few minutes
@@ -65,6 +71,9 @@ when it starts.
 
 # Compatibility
 
+These rules cover `org.thehoster.forskapd` only;
+[the admin interface](#the-orgthehosterforskapdadmin-interface) has none.
+
 Until forskap-api 1.0 the interface still changes incompatibly between minor
 versions. A client tells which version a daemon speaks by `GetStatus.api_version`; a
 daemon that answers `GetStatus` with `MethodNotFound` is older than 0.32.0, and
@@ -76,8 +85,8 @@ Rust, `Status.Compatible` in Go, against the version they were built from.
 
 The daemon leaves an optional field without a value out of what it sends, wherever
 the field is; the Rust and Go bindings leave such an argument out too. A daemon
-before 0.32.0 sent the optional fields of its types (`WorkItem.parent`,
-`SyncJob.expected`, …) as `null` instead.
+before 0.32.0 sent the optional fields of its types (`WorkItem.parent`, …) as `null`
+instead.
 
 From forskap-api 1.0 on, a client can rely on these:
 
@@ -89,10 +98,10 @@ From forskap-api 1.0 on, a client can rely on these:
   it: the bindings' signatures stay, and a caller that fills the struct from `Default`
   (`SearchOptions { limit: Some(5), ..Default::default() }` in Rust) or names the
   fields it sets (Go) keeps compiling.
-- An enum that appears in replies (`IssuableKind`, `HistorySource`, `SyncJobStatus`,
-  `NotAuthReason`) gets no new variants: a new state is a new optional field.
-  The enums only arguments take (`SearchKind`, `WorkItemRole`, `WorkItemState`,
-  `CacheScope`) may get new ones, which an older daemon refuses.
+- An enum that appears in replies (`IssuableKind`, `HistorySource`, `NotAuthReason`)
+  gets no new variants: a new state is a new optional field. The enums only arguments
+  take (`SearchKind`, `WorkItemRole`, `WorkItemState`) may get new ones, which an
+  older daemon refuses.
 - An incompatible change is a new interface, under a new name, served next to the old
   one.
 
@@ -174,7 +183,7 @@ one. Epics are read-only here: the write methods address a project's work items 
 
 `org.varlink.service.InvalidParameter (parameter: string)` — the call's arguments
 don't fit the method: a required one is missing, an enum argument (`IssuableKind`,
-`SearchKind`, `CacheScope`, `WorkItemRole`, `WorkItemState`) carries a value the
+`SearchKind`, `WorkItemRole`, `WorkItemState`) carries a value the
 interface doesn't have, or an argument object has a field the method doesn't know,
 nested ones included (`options` of `Search`, `item` of `CreateWorkItem`). `parameter`
 says what is wrong; for an unknown field it is that field's name, `.`-joined below the
@@ -208,15 +217,14 @@ won't help until what GitLab objected to has changed.
 `GitlabUnavailable (message: string)` — GitLab could not be reached, or answered 429
 or 5xx, and the daemon did not queue the call: whether GitLab carried it out is
 unknown. `CreateWorkItem` replies it (for its parent lookup, which creates nothing,
-and for the create itself), `Login` when connecting fails that way, and the queued
-writes for a `PostTime` GitLab answered with a 5xx: it may have booked the time, so
+and for the create itself), and the queued writes for a `PostTime` GitLab answered
+with a 5xx: it may have booked the time, so
 it is not replayed. Look before calling again — a second `CreateWorkItem` after a lost
 answer files the issue twice.
 
 `Internal (message: string)` — the daemon could not do it for a reason of its own:
-the keychain failed (`Login`, `Logout`), its storage did (`RecordOpen`,
-`RetryFailure`, `DismissFailure`, `ClearFailures`), or the method is switched off
-(`Login` and `Logout` in a dry run). Not GitLab's doing; the daemon's log says more.
+its storage failed (`RecordOpen`, `RetryFailure`, `DismissFailure`,
+`ClearFailures`). Not GitLab's doing; the daemon's log says more.
 
 `NotAuthenticated (reason: ?NotAuthReason, detail: ?string)` — the daemon has no live
 GitLab session (it is *dormant*). `reason` says why; `detail` carries free text (host,
@@ -355,7 +363,7 @@ Issue `board_column` comes from the synced board columns of the issue's project 
 is absent for projects whose boards were never synced (only those of assigned issues'
 projects and of tracked member projects are). A project's switched-off features are
 left out: no issues or boards where its issues are off, no MRs where its merge requests
-are (see *Unavailable jobs* under `GetSyncJobs`).
+are (see *Unavailable jobs* under the admin interface's `GetSyncJobs`).
 When the member projects have never been synced: replies with empty arrays if a
 session exists (first sync pending), `NotAuthenticated` otherwise.
 
@@ -400,7 +408,7 @@ a token without an expiry or without the needed scope, with `rotate = "never"`, 
 once GitLab refused to rotate it.
 
 A dry run (`forskapd --dry-run`) answers with the host `dry-run.invalid` and the user
-`demo`; its `Login` and `Logout` reply `Internal`.
+`demo`.
 
 ### `GetStatus() -> (api_version: string, daemon_version: string, connected: bool, reason: ?NotAuthReason, detail: ?string, host: ?string, username: ?string, user_id: ?int)`
 
@@ -522,6 +530,92 @@ Deletes one dead-lettered task. `NotFound` when `id` is unknown.
 
 Deletes all dead-lettered tasks.
 
+## Usage statistics
+
+### `RecordOpen(kind: IssuableKind, iid: int, project_id: ?int, group_id: ?int) -> ()`
+
+Counts one open of a work item or merge request — the client's "the user just went
+there" signal (`forskap issue open`, `forskap epic open`, a launcher activation).
+Purely local bookkeeping: no GitLab round-trip, no queueing, works while dormant.
+`Search` ranks by these counts and reports them as `open_count` (also on
+`GetAssignedWorkItems` / `GetAssignedMergeRequests` rows). An entry expires
+`usage.retention_hours` (default 90 days) after its last open, and the record is
+capped at 1000 items (lowest counts dropped first); both are enforced on write.
+Cleared only by the admin interface's `ClearCache` with the scope `usage`.
+
+Exactly one of `project_id` and `group_id` names where the item lives: a project for
+an issue or merge request, a group for an epic (`kind` `work_item`). A group's work
+items are counted apart from a project's, so a group and a project sharing an ID
+don't share counters. Both or neither given, a merge request by its group, or a
+number or ID that isn't positive is an eager `InvalidArgument`.
+
+# Calling from the shell
+
+```sh
+SOCKET=unix:$XDG_RUNTIME_DIR/forskapd.socket
+
+# the interface version the daemon speaks, and its session
+varlinkctl call $SOCKET org.thehoster.forskapd.GetStatus '{}'
+
+# list assigned issues
+varlinkctl call $SOCKET org.thehoster.forskapd.GetAssignedWorkItems '{}'
+
+# the ones in the group team/backend, subgroups included
+varlinkctl call $SOCKET org.thehoster.forskapd.GetAssignedWorkItems \
+  '{"scope": {"groups": ["team/backend"]}}'
+
+# the issues I authored that were closed, updated since 2026-09-01
+varlinkctl call $SOCKET org.thehoster.forskapd.ListWorkItems \
+  '{"filter": {"role": "author", "states": ["closed"], "updated_after": 1788220800}}'
+
+# the epics about billing
+varlinkctl call $SOCKET org.thehoster.forskapd.Search \
+  '{"query": "billing", "options": {"kinds": ["work_items"], "types": ["epic"]}}'
+
+# everything about billing but the epics
+varlinkctl call $SOCKET org.thehoster.forskapd.Search \
+  '{"query": "billing", "options": {"exclude_types": ["epic"]}}'
+
+# count an open of epic &5 of group 9; oneway: the daemon runs it and answers
+# nothing, not even an error
+varlinkctl call --oneway $SOCKET org.thehoster.forskapd.RecordOpen \
+  '{"kind": "work_item", "iid": 5, "group_id": 9}'
+
+# post 1h30m to project 42, issue #7
+varlinkctl call $SOCKET org.thehoster.forskapd.PostTime \
+  '{"project_id": 42, "iid": 7, "kind": "work_item", "duration": "1h30m", "summary": "code review"}'
+
+# close merge request !3 in project 42
+varlinkctl call $SOCKET org.thehoster.forskapd.Close \
+  '{"project_id": 42, "iid": 3, "kind": "merge_request"}'
+
+# introspect the live interface
+varlinkctl introspect $SOCKET org.thehoster.forskapd
+```
+
+# The `org.thehoster.forskapd.admin` interface
+
+The daemon serves a second interface on the same socket, defined in
+[`forskap-api/varlink/org.thehoster.forskapd.admin.varlink`](../../forskap-api/varlink/org.thehoster.forskapd.admin.varlink):
+logging in and out, clearing the cache and the sync worker's jobs. It exists for the
+bundled `forskap` CLI, and it mirrors the daemon's internals — the cache's bands, the
+sync engine's job names, states and progress — which change whenever the sync does.
+So it follows the daemon's version (`GetStatus.daemon_version`), not `api_version`,
+and carries no stability promise: any daemon release may change or drop what it
+has. The [Compatibility](#compatibility) rules don't cover it. The Go binding leaves
+it out; the Rust crate has it as `forskap_api::admin`, for the CLI.
+
+```sh
+varlinkctl introspect $SOCKET org.thehoster.forskapd.admin
+```
+
+Its calls are answered like the main interface's: an argument the method doesn't know
+or can't read replies `org.varlink.service.InvalidParameter`, a `oneway` call gets no
+reply. It declares the errors its methods reply under its own name
+(`org.thehoster.forskapd.admin.GitlabError`, `…GitlabUnavailable`, `…Internal`): a
+varlink error belongs to one interface. Each means what the main interface's error of
+that name means.
+
 ## Sync status
 
 ### `GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int)`
@@ -575,25 +669,6 @@ forever would only drown the failures that matter. Two mechanisms keep them out:
   (assigned lists, events, memberships, timelogs, …) never become unavailable: a
   refusal there means something is wrong with the session.
 
-## Usage statistics
-
-### `RecordOpen(kind: IssuableKind, iid: int, project_id: ?int, group_id: ?int) -> ()`
-
-Counts one open of a work item or merge request — the client's "the user just went
-there" signal (`forskap issue open`, `forskap epic open`, a launcher activation).
-Purely local bookkeeping: no GitLab round-trip, no queueing, works while dormant.
-`Search` ranks by these counts and reports them as `open_count` (also on
-`GetAssignedWorkItems` / `GetAssignedMergeRequests` rows). An entry expires
-`usage.retention_hours` (default 90 days) after its last open, and the record is
-capped at 1000 items (lowest counts dropped first); both are enforced on write.
-Cleared only by `ClearCache` scope `usage`.
-
-Exactly one of `project_id` and `group_id` names where the item lives: a project for
-an issue or merge request, a group for an epic (`kind` `work_item`). A group's work
-items are counted apart from a project's, so a group and a project sharing an ID
-don't share counters. Both or neither given, a merge request by its group, or a
-number or ID that isn't positive is an eager `InvalidArgument`.
-
 ## Cache control
 
 ### `ClearCache(scope: ?[]CacheScope) -> ()`
@@ -634,50 +709,20 @@ PAT with the right scopes.
 
 ### `Logout() -> ()`
 
-Drops the session (subsequent calls reply `NotAuthenticated` with reason
-`logged_out`) and deletes the stored credentials from the keychain. `Internal` when
-the keychain delete fails; the session is dropped all the same.
+Drops the session (subsequent calls of the main interface reply `NotAuthenticated`
+with reason `logged_out`) and deletes the stored credentials from the keychain.
+`Internal` when the keychain delete fails; the session is dropped all the same.
 
-# Calling from the shell
+A dry run (`forskapd --dry-run`) turns both down with `Internal`, before GitLab or the
+session is touched.
+
+## Calling the admin interface from the shell
 
 ```sh
-SOCKET=unix:$XDG_RUNTIME_DIR/forskapd.socket
+# what the sync worker is doing
+varlinkctl call $SOCKET org.thehoster.forskapd.admin.GetSyncJobs '{}'
 
-# the interface version the daemon speaks, and its session
-varlinkctl call $SOCKET org.thehoster.forskapd.GetStatus '{}'
-
-# list assigned issues
-varlinkctl call $SOCKET org.thehoster.forskapd.GetAssignedWorkItems '{}'
-
-# the ones in the group team/backend, subgroups included
-varlinkctl call $SOCKET org.thehoster.forskapd.GetAssignedWorkItems \
-  '{"scope": {"groups": ["team/backend"]}}'
-
-# the issues I authored that were closed, updated since 2026-09-01
-varlinkctl call $SOCKET org.thehoster.forskapd.ListWorkItems \
-  '{"filter": {"role": "author", "states": ["closed"], "updated_after": 1788220800}}'
-
-# the epics about billing
-varlinkctl call $SOCKET org.thehoster.forskapd.Search \
-  '{"query": "billing", "options": {"kinds": ["work_items"], "types": ["epic"]}}'
-
-# everything about billing but the epics
-varlinkctl call $SOCKET org.thehoster.forskapd.Search \
-  '{"query": "billing", "options": {"exclude_types": ["epic"]}}'
-
-# count an open of epic &5 of group 9; oneway: the daemon runs it and answers
-# nothing, not even an error
-varlinkctl call --oneway $SOCKET org.thehoster.forskapd.RecordOpen \
-  '{"kind": "work_item", "iid": 5, "group_id": 9}'
-
-# post 1h30m to project 42, issue #7
-varlinkctl call $SOCKET org.thehoster.forskapd.PostTime \
-  '{"project_id": 42, "iid": 7, "kind": "work_item", "duration": "1h30m", "summary": "code review"}'
-
-# close merge request !3 in project 42
-varlinkctl call $SOCKET org.thehoster.forskapd.Close \
-  '{"project_id": 42, "iid": 3, "kind": "merge_request"}'
-
-# introspect the live interface
-varlinkctl introspect $SOCKET org.thehoster.forskapd
+# drop the history and sync it again
+varlinkctl call $SOCKET org.thehoster.forskapd.admin.ClearCache \
+  '{"scope": ["quick", "slow", "stale"]}'
 ```

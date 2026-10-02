@@ -5,14 +5,32 @@ description: Checklist for changing the varlink API (adding/changing methods, ty
 
 # Changing the varlink interface
 
-Single source of truth: `forskap-api/varlink/org.thehoster.forskapd.varlink`.
-Everything else is generated from it or must be updated by hand to match. Work through
-this list top to bottom.
+Single source of truth: the two files in `forskap-api/varlink/`. Everything else is
+generated from them or must be updated by hand to match. Work through this list top to
+bottom.
+
+## 0. Pick the interface
+
+- `org.thehoster.forskapd.varlink` is the interface outside clients use: the crate
+  root, the Go binding, frozen from 1.0 on (see *Compatibility* in
+  `forskapd/docs/varlink_interface.md`).
+- `org.thehoster.forskapd.admin.varlink` is the bundled CLI's: `forskap_api::admin`,
+  no Go binding, it follows the daemon's version and promises nothing. A method goes
+  here if it mirrors daemon internals (the sync engine's jobs, the cache's bands) or
+  manages the session or the cache.
+
+The files share nothing: a type or error both need is declared in each, and an admin
+error is `org.thehoster.forskapd.admin.<Name>` on the wire. Its handlers live in
+`forskapd/src/handlers/admin.rs`, its dispatcher in `handle_admin` (`service.rs`), its
+docs in the admin part at the end of `varlink_interface.md`; the CLI reaches it through
+`client::connect_admin` / `connect_both`. Steps 1–5 apply to either file; step 6 to the
+main one only.
 
 ## 1. Edit the `.varlink` file
 
-- Interface name is `org.thehoster.forskapd`. Keep the existing style: one blank
-  line between declarations, optional params/fields as `?type`.
+- Interface names are `org.thehoster.forskapd` and `org.thehoster.forskapd.admin`.
+  Keep the existing style: one blank line between declarations, optional
+  params/fields as `?type`.
 - A method whose arguments grow takes them in one struct (`SearchOptions`,
   `WorkItemFilter`, `NewWorkItem`, `Scope`): a new option is a new optional field
   there, never another argument, which would change both bindings' signatures. A
@@ -23,8 +41,8 @@ this list top to bottom.
   method and error, and before each field or enum variant whose name doesn't say it
   all (units, when it is absent or empty, since which version it is sent). Comments go
   on their own lines: that is what both generators and systemd's `varlinkctl` parse,
-  and what introspection shows. Leave the `interface` line without one: the Go
-  generator would turn it into a second package comment of the binding.
+  and what introspection shows. Leave the main file's `interface` line without one:
+  the Go generator would turn it into a second package comment of the binding.
 - Bump the version in `forskap-api/Cargo.toml` **in the same feature commit**.
   Convention (see git history): the api crate's version moves inside the commit that
   changes the interface; the workspace version moves only in separate
@@ -33,8 +51,9 @@ this list top to bottom.
 
 ## 2. Rust side regenerates itself
 
-`forskap-api/build.rs` runs `varlink_generator` into `$OUT_DIR` on every build;
-`lib.rs` `include!`s it. No manual step — the next `cargo build` yields the new
+`forskap-api/build.rs` runs `varlink_generator` on both files into `$OUT_DIR` on every
+build; `lib.rs` `include!`s the main one at the crate root and the admin one in `pub mod
+admin`. No manual step — the next `cargo build` yields the new
 `VarlinkInterface` trait, `Call_*` traits, and request/reply structs. Compile errors in
 the daemon are the to-do list. The build script also gives every `Option` field
 `skip_serializing_if`, so an absent field is left out rather than sent as `null`, and
@@ -45,7 +64,7 @@ generator's output changed: adapt `OmitAbsent` or `DeriveDefault`).
 ## 3. Daemon handlers
 
 - Implement the method in `forskapd/src/handlers/varlink.rs`
-  (`impl VarlinkInterface for Handlers`). Follow the cascade style: validate eagerly
+  (`impl VarlinkInterface for Handlers`), an admin one in `handlers/admin.rs`. Follow the cascade style: validate eagerly
   (`issue_ref_error`, `looks_like_duration` in `handlers/mod.rs`), consult cache,
   fall back to GitLab, reply.
 - Error replies: a refused argument value → `Invalid::new(argument, msg).reply(call)`
@@ -78,12 +97,13 @@ generator's output changed: adapt `OmitAbsent` or `DeriveDefault`).
   write method, or a read of one object that is no listing (the epic lookup), goes on
   the `GitlabApi` trait in `gitlab.rs` **and** on the shared fake in `testing.rs` and
   `DemoGitlab` in `demo.rs`.
-- **New method? Add its arm to the hand-written dispatcher** `handle_forskapd` in
-  `forskapd/src/service.rs` (clone the arm of an argument-identical method) plus a
-  `dispatch_has_an_arm_for_<method>` test next to `dispatch_has_an_arm_for_search`. A
-  missing arm compiles fine and only fails at runtime as `MethodNotFound`. Every arm
-  parses its `*_Args` through `args!()`, an empty one too (`let WhoAmI_Args {} =
-  args!();`): that is what refuses an argument the method doesn't have.
+- **New method? Add its arm to the hand-written dispatcher** `handle_forskapd` (an
+  admin one: `handle_admin`) in `forskapd/src/service.rs` (clone the arm of an
+  argument-identical method) plus a `dispatch_has_an_arm_for_<method>` test next to
+  `dispatch_has_an_arm_for_search`. A missing arm compiles fine and only fails at
+  runtime as `MethodNotFound`. Every arm parses its `*_Args` through
+  `args!(method, params)`, an empty one too (`let WhoAmI_Args {} = args!(method,
+  params);`): that is what refuses an argument the method doesn't have.
 - New field on a wire type? The store holds GitLab mirrors, not wire types: add the
   field to the mirror in `sync/model.rs` (lenient `serde(default)`) and bump that
   resource's `SCHEMA`, so every job syncing it runs full once and refills old rows.

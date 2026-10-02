@@ -1,7 +1,8 @@
 //! Varlink protocol dispatcher.
 //!
 //! Splits the framework-level `org.varlink.service.*` methods from the
-//! forskapd methods so each match stays short and self-evident.
+//! methods of `org.thehoster.forskapd` and of `org.thehoster.forskapd.admin`
+//! so each match stays short and self-evident.
 
 use std::sync::Arc;
 
@@ -10,20 +11,26 @@ use tracing::{debug, warn};
 use varlink::Reply;
 use varlink::sansio::ServerEvent;
 
+use forskap_api::admin::{
+    self, Call_ClearCache, Call_GetSyncJobs, Call_Login, Call_Logout, ClearCache_Args,
+    GetSyncJobs_Args, Login_Args, Logout_Args,
+};
 use forskap_api::{
-    AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
+    AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearFailures, Call_Close,
     Call_CreateWorkItem, Call_DismissFailure, Call_GetActivity, Call_GetAssignedMergeRequests,
-    Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetStatus, Call_GetSyncJobs,
-    Call_ListWorkItems, Call_Login, Call_Logout, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
-    Call_Search, Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, ClearFailures_Args, Close_Args,
-    CreateWorkItem_Args, DismissFailure_Args, GetActivity_Args, GetAssignedMergeRequests_Args,
-    GetAssignedWorkItems_Args, GetFailures_Args, GetHistory_Args, GetStatus_Args, GetSyncJobs_Args,
-    ListWorkItems_Args, Login_Args, Logout_Args, PostTime_Args, RecordOpen_Args, RetryFailure_Args,
-    Search_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
-    WhoAmI_Args,
+    Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetStatus,
+    Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_RetryFailure, Call_Search,
+    Call_UnassignSelf, Call_WhoAmI, ClearFailures_Args, Close_Args, CreateWorkItem_Args,
+    DismissFailure_Args, GetActivity_Args, GetAssignedMergeRequests_Args,
+    GetAssignedWorkItems_Args, GetFailures_Args, GetHistory_Args, GetStatus_Args,
+    ListWorkItems_Args, PostTime_Args, RecordOpen_Args, RetryFailure_Args, Search_Args,
+    UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _, WhoAmI_Args,
 };
 
 use crate::handlers::Handlers;
+
+const FORSKAPD: &str = "org.thehoster.forskapd";
+const ADMIN: &str = "org.thehoster.forskapd.admin";
 
 const ORG_VARLINK_SERVICE_DESCRIPTION: &str = r#"interface org.varlink.service
 
@@ -68,16 +75,9 @@ impl varlink::AsyncConnectionHandler for ServiceHandler {
                     // caller would read it as the answer to its next call.
                     let oneway = request.oneway.unwrap_or(false);
                     let method = request.method.as_ref();
-                    let reply = if let Some(reply) = handle_varlink_meta(method, &request) {
-                        Some(reply)
-                    } else if method.starts_with("org.thehoster.forskapd.") {
-                        handle_forskapd(method, request.parameters, &self.handlers).await?
-                    } else {
-                        warn!(method, "unknown varlink method");
-                        Some(Reply::error(
-                            "org.varlink.service.MethodNotFound",
-                            Some(serde_json::json!({"method": method})),
-                        ))
+                    let reply = match handle_varlink_meta(method, &request) {
+                        Some(reply) => Some(reply),
+                        None => dispatch(method, request.parameters, &self.handlers).await?,
                     };
                     if let Some(reply) = reply.filter(|_| !oneway) {
                         server.send_reply(reply)?;
@@ -99,7 +99,7 @@ fn handle_varlink_meta(method: &str, request: &varlink::Request) -> Option<Reply
             "product": "forskapd",
             "version": env!("CARGO_PKG_VERSION"),
             "url": "https://github.com/bjarneseger/forskap",
-            "interfaces": ["org.varlink.service", "org.thehoster.forskapd"]
+            "interfaces": ["org.varlink.service", FORSKAPD, ADMIN]
         })))),
         "org.varlink.service.GetInterfaceDescription" => {
             let name = request
@@ -109,7 +109,8 @@ fn handle_varlink_meta(method: &str, request: &varlink::Request) -> Option<Reply
                 .and_then(|v| v.as_str());
             let desc = match name {
                 Some("org.varlink.service") => Some(ORG_VARLINK_SERVICE_DESCRIPTION),
-                Some("org.thehoster.forskapd") => Some(VARLINK_INTERFACE_DESCRIPTION),
+                Some(FORSKAPD) => Some(VARLINK_INTERFACE_DESCRIPTION),
+                Some(ADMIN) => Some(admin::VARLINK_INTERFACE_DESCRIPTION),
                 _ => None,
             };
             Some(match desc {
@@ -122,6 +123,38 @@ fn handle_varlink_meta(method: &str, request: &varlink::Request) -> Option<Reply
         }
         _ => None,
     }
+}
+
+/// Hands a call to the interface its method is named under.
+async fn dispatch(
+    method: &str,
+    params: Option<serde_json::Value>,
+    handlers: &Handlers,
+) -> varlink::Result<Option<Reply>> {
+    if in_interface(method, ADMIN) {
+        handle_admin(method, params, handlers).await
+    } else if in_interface(method, FORSKAPD) {
+        handle_forskapd(method, params, handlers).await
+    } else {
+        warn!(method, "unknown varlink method");
+        Ok(Some(method_not_found(method)))
+    }
+}
+
+/// Whether `method` is one of `interface`'s: the interface's name, a dot and
+/// the method's own name. The admin interface's name begins with the other's.
+fn in_interface(method: &str, interface: &str) -> bool {
+    method
+        .strip_prefix(interface)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|name| !name.contains('.'))
+}
+
+fn method_not_found(method: &str) -> Reply {
+    Reply::error(
+        "org.varlink.service.MethodNotFound",
+        Some(serde_json::json!({"method": method})),
+    )
 }
 
 /// The call's arguments, or the `InvalidParameter` reply saying why they
@@ -166,81 +199,72 @@ fn field_name(path: &serde_ignored::Path) -> String {
     }
 }
 
+/// The arguments of the call of `method`, or return the `InvalidParameter`
+/// reply from the dispatcher: returning the error instead would drop the
+/// connection without a reply.
+macro_rules! args {
+    ($method:ident, $params:ident) => {
+        match parse_args($params) {
+            Ok(args) => args,
+            Err(reply) => {
+                warn!(method = $method, "invalid varlink parameters");
+                return Ok(Some(reply));
+            }
+        }
+    };
+}
+
 async fn handle_forskapd(
     method: &str,
     params: Option<serde_json::Value>,
     handlers: &Handlers,
 ) -> varlink::Result<Option<Reply>> {
     let mut call = AsyncCall::default();
-    // Returning the error instead would drop the connection without a reply.
-    macro_rules! args {
-        () => {
-            match parse_args(params) {
-                Ok(args) => args,
-                Err(reply) => {
-                    warn!(method, "invalid varlink parameters");
-                    return Ok(Some(reply));
-                }
-            }
-        };
-    }
     match method {
-        "org.thehoster.forskapd.ClearCache" => {
-            let args: ClearCache_Args = args!();
-            handlers
-                .clear_cache(&mut call as &mut dyn Call_ClearCache, args.scope)
-                .await?;
-        }
         "org.thehoster.forskapd.GetHistory" => {
-            let args: GetHistory_Args = args!();
+            let args: GetHistory_Args = args!(method, params);
             handlers
                 .get_history(&mut call as &mut dyn Call_GetHistory, args.days)
                 .await?;
         }
         "org.thehoster.forskapd.GetActivity" => {
-            let args: GetActivity_Args = args!();
+            let args: GetActivity_Args = args!(method, params);
             handlers
                 .get_activity(&mut call as &mut dyn Call_GetActivity, args.days)
                 .await?;
         }
         "org.thehoster.forskapd.GetFailures" => {
-            let GetFailures_Args {} = args!();
+            let GetFailures_Args {} = args!(method, params);
             handlers
                 .get_failures(&mut call as &mut dyn Call_GetFailures)
                 .await?;
         }
-        "org.thehoster.forskapd.GetSyncJobs" => {
-            let GetSyncJobs_Args {} = args!();
-            handlers
-                .get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
-                .await?;
-        }
         "org.thehoster.forskapd.GetStatus" => {
-            let GetStatus_Args {} = args!();
+            let GetStatus_Args {} = args!(method, params);
             handlers
                 .get_status(&mut call as &mut dyn Call_GetStatus)
                 .await?;
         }
         "org.thehoster.forskapd.RetryFailure" => {
-            let args: RetryFailure_Args = args!();
+            let args: RetryFailure_Args = args!(method, params);
             handlers
                 .retry_failure(&mut call as &mut dyn Call_RetryFailure, args.id)
                 .await?;
         }
         "org.thehoster.forskapd.DismissFailure" => {
-            let args: DismissFailure_Args = args!();
+            let args: DismissFailure_Args = args!(method, params);
             handlers
                 .dismiss_failure(&mut call as &mut dyn Call_DismissFailure, args.id)
                 .await?;
         }
         "org.thehoster.forskapd.ClearFailures" => {
-            let ClearFailures_Args {} = args!();
+            let ClearFailures_Args {} = args!(method, params);
             handlers
                 .clear_failures(&mut call as &mut dyn Call_ClearFailures)
                 .await?;
         }
         "org.thehoster.forskapd.GetAssignedWorkItems" => {
-            let args: GetAssignedWorkItems_Args = args!();
+            let args: GetAssignedWorkItems_Args = args!(method, params);
             handlers
                 .get_assigned_work_items(
                     &mut call as &mut dyn Call_GetAssignedWorkItems,
@@ -249,7 +273,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.GetAssignedMergeRequests" => {
-            let args: GetAssignedMergeRequests_Args = args!();
+            let args: GetAssignedMergeRequests_Args = args!(method, params);
             handlers
                 .get_assigned_merge_requests(
                     &mut call as &mut dyn Call_GetAssignedMergeRequests,
@@ -258,19 +282,19 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.ListWorkItems" => {
-            let args: ListWorkItems_Args = args!();
+            let args: ListWorkItems_Args = args!(method, params);
             handlers
                 .list_work_items(&mut call as &mut dyn Call_ListWorkItems, args.filter)
                 .await?;
         }
         "org.thehoster.forskapd.Search" => {
-            let args: Search_Args = args!();
+            let args: Search_Args = args!(method, params);
             handlers
                 .search(&mut call as &mut dyn Call_Search, args.query, args.options)
                 .await?;
         }
         "org.thehoster.forskapd.PostTime" => {
-            let args: PostTime_Args = args!();
+            let args: PostTime_Args = args!(method, params);
             handlers
                 .post_time(
                     &mut call as &mut dyn Call_PostTime,
@@ -283,7 +307,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.Close" => {
-            let args: Close_Args = args!();
+            let args: Close_Args = args!(method, params);
             handlers
                 .close(
                     &mut call as &mut dyn Call_Close,
@@ -294,7 +318,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.RecordOpen" => {
-            let args: RecordOpen_Args = args!();
+            let args: RecordOpen_Args = args!(method, params);
             handlers
                 .record_open(
                     &mut call as &mut dyn Call_RecordOpen,
@@ -306,7 +330,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.AssignSelf" => {
-            let args: AssignSelf_Args = args!();
+            let args: AssignSelf_Args = args!(method, params);
             handlers
                 .assign_self(
                     &mut call as &mut dyn Call_AssignSelf,
@@ -317,7 +341,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.UnassignSelf" => {
-            let args: UnassignSelf_Args = args!();
+            let args: UnassignSelf_Args = args!(method, params);
             handlers
                 .unassign_self(
                     &mut call as &mut dyn Call_UnassignSelf,
@@ -328,7 +352,7 @@ async fn handle_forskapd(
                 .await?;
         }
         "org.thehoster.forskapd.CreateWorkItem" => {
-            let args: CreateWorkItem_Args = args!();
+            let args: CreateWorkItem_Args = args!(method, params);
             handlers
                 .create_work_item(
                     &mut call as &mut dyn Call_CreateWorkItem,
@@ -337,26 +361,52 @@ async fn handle_forskapd(
                 )
                 .await?;
         }
-        "org.thehoster.forskapd.Login" => {
-            let args: Login_Args = args!();
-            handlers
-                .login(&mut call as &mut dyn Call_Login, args.host, args.token)
-                .await?;
-        }
-        "org.thehoster.forskapd.Logout" => {
-            let Logout_Args {} = args!();
-            handlers.logout(&mut call as &mut dyn Call_Logout).await?;
-        }
         "org.thehoster.forskapd.WhoAmI" => {
-            let WhoAmI_Args {} = args!();
+            let WhoAmI_Args {} = args!(method, params);
             handlers.who_am_i(&mut call as &mut dyn Call_WhoAmI).await?;
         }
         _ => {
             warn!(method, "unknown forskapd method");
-            return Ok(Some(Reply::error(
-                "org.varlink.service.MethodNotFound",
-                Some(serde_json::json!({"method": method})),
-            )));
+            return Ok(Some(method_not_found(method)));
+        }
+    }
+    Ok(call.take_reply())
+}
+
+async fn handle_admin(
+    method: &str,
+    params: Option<serde_json::Value>,
+    handlers: &Handlers,
+) -> varlink::Result<Option<Reply>> {
+    use admin::VarlinkInterface as _;
+
+    let mut call = admin::AsyncCall::default();
+    match method {
+        "org.thehoster.forskapd.admin.ClearCache" => {
+            let args: ClearCache_Args = args!(method, params);
+            handlers
+                .clear_cache(&mut call as &mut dyn Call_ClearCache, args.scope)
+                .await?;
+        }
+        "org.thehoster.forskapd.admin.GetSyncJobs" => {
+            let GetSyncJobs_Args {} = args!(method, params);
+            handlers
+                .get_sync_jobs(&mut call as &mut dyn Call_GetSyncJobs)
+                .await?;
+        }
+        "org.thehoster.forskapd.admin.Login" => {
+            let args: Login_Args = args!(method, params);
+            handlers
+                .login(&mut call as &mut dyn Call_Login, args.host, args.token)
+                .await?;
+        }
+        "org.thehoster.forskapd.admin.Logout" => {
+            let Logout_Args {} = args!(method, params);
+            handlers.logout(&mut call as &mut dyn Call_Logout).await?;
+        }
+        _ => {
+            warn!(method, "unknown forskapd admin method");
+            return Ok(Some(method_not_found(method)));
         }
     }
     Ok(call.take_reply())
@@ -455,44 +505,135 @@ mod tests {
         assert_eq!(excluded, ["issue"]);
     }
 
-    /// A oneway call runs and gets no reply, not even an error: the one
-    /// answer on the connection is the next call's.
-    #[tokio::test]
-    async fn a_oneway_call_gets_no_reply() {
+    /// The replies `calls` get on one connection, through the whole service.
+    async fn serve(
+        handlers: &Arc<Handlers>,
+        calls: &[serde_json::Value],
+    ) -> Vec<serde_json::Value> {
         use varlink::AsyncConnectionHandler as _;
 
-        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
-        let handlers = Arc::new(handlers);
-        let service = ServiceHandler::new(Arc::clone(&handlers));
+        let service = ServiceHandler::new(Arc::clone(handlers));
         let mut server = varlink::sansio::Server::new();
-        let open = serde_json::json!({"kind": "work_item", "iid": 2, "project_id": 1});
-        for call in [
-            serde_json::json!({"method": "org.thehoster.forskapd.RecordOpen", "parameters": open, "oneway": true}),
-            serde_json::json!({"method": "org.thehoster.forskapd.NoSuchMethod", "oneway": true}),
-            serde_json::json!({"method": "org.example.Other", "oneway": true}),
-            serde_json::json!({"method": "org.thehoster.forskapd.Close", "parameters": {"project_id": 1}, "oneway": true}),
-            serde_json::json!({"method": "org.thehoster.forskapd.WhoAmI", "oneway": true}),
-            serde_json::json!({"method": "org.varlink.service.GetInfo", "oneway": true}),
-            serde_json::json!({"method": "org.thehoster.forskapd.GetStatus", "oneway": false}),
-        ] {
-            let mut message = serde_json::to_vec(&call).unwrap();
+        for call in calls {
+            let mut message = serde_json::to_vec(call).unwrap();
             message.push(0);
             server.handle_input(&message).unwrap();
         }
         service.handle(&mut server, None).await.unwrap();
+        std::iter::from_fn(|| server.poll_transmit())
+            .map(|t| serde_json::from_slice(t.payload.strip_suffix(&[0]).unwrap()).unwrap())
+            .collect()
+    }
 
-        let sent: Vec<String> = std::iter::from_fn(|| server.poll_transmit())
-            .map(|t| String::from_utf8(t.payload).unwrap())
-            .collect();
+    /// A oneway call runs and gets no reply, not even an error: the one
+    /// answer on the connection is the next call's. The admin interface's
+    /// calls too.
+    #[tokio::test]
+    async fn a_oneway_call_gets_no_reply() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        let handlers = Arc::new(handlers);
+        let open = |iid| serde_json::json!({"kind": "work_item", "iid": iid, "project_id": 1});
+        let sent = serve(
+            &handlers,
+            &[
+                serde_json::json!({"method": "org.thehoster.forskapd.RecordOpen", "parameters": open(2), "oneway": true}),
+                serde_json::json!({"method": "org.thehoster.forskapd.NoSuchMethod", "oneway": true}),
+                serde_json::json!({"method": "org.example.Other", "oneway": true}),
+                serde_json::json!({"method": "org.thehoster.forskapd.Close", "parameters": {"project_id": 1}, "oneway": true}),
+                serde_json::json!({"method": "org.thehoster.forskapd.WhoAmI", "oneway": true}),
+                serde_json::json!({"method": "org.varlink.service.GetInfo", "oneway": true}),
+                serde_json::json!({"method": "org.thehoster.forskapd.admin.ClearCache", "parameters": {"scope": ["usage"]}, "oneway": true}),
+                serde_json::json!({"method": "org.thehoster.forskapd.admin.Logout", "oneway": true}),
+                serde_json::json!({"method": "org.thehoster.forskapd.admin.GetSyncJobs", "parameters": {"key": "events"}, "oneway": true}),
+                serde_json::json!({"method": "org.thehoster.forskapd.admin.NoSuchMethod", "oneway": true}),
+                serde_json::json!({"method": "org.thehoster.forskapd.RecordOpen", "parameters": open(3), "oneway": true}),
+                serde_json::json!({"method": "org.thehoster.forskapd.GetStatus", "oneway": false}),
+            ],
+        )
+        .await;
+
         assert_eq!(sent.len(), 1, "{sent:?}");
-        let reply: serde_json::Value =
-            serde_json::from_str(sent[0].trim_end_matches('\0')).unwrap();
         assert_eq!(
-            reply["parameters"]["api_version"],
+            sent[0]["parameters"]["api_version"],
             forskap_api::API_VERSION,
-            "{reply}"
+            "{sent:?}"
         );
-        assert_eq!(handlers.usage.snapshot().unwrap().entries.len(), 1);
+        // The clear ran between the two opens.
+        let entries = handlers.usage.snapshot().unwrap().entries;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+    }
+
+    /// `GetInfo` names both interfaces, and each describes itself.
+    #[tokio::test]
+    async fn the_service_offers_both_interfaces() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        let handlers = Arc::new(handlers);
+        let describe = |interface: &str| {
+            serde_json::json!({
+                "method": "org.varlink.service.GetInterfaceDescription",
+                "parameters": {"interface": interface},
+            })
+        };
+        let sent = serve(
+            &handlers,
+            &[
+                serde_json::json!({"method": "org.varlink.service.GetInfo"}),
+                describe(FORSKAPD),
+                describe(ADMIN),
+            ],
+        )
+        .await;
+        assert_eq!(
+            sent[0]["parameters"]["interfaces"],
+            serde_json::json!(["org.varlink.service", FORSKAPD, ADMIN])
+        );
+        let description = |i: usize| sent[i]["parameters"]["description"].as_str().unwrap();
+        assert_eq!(description(1), VARLINK_INTERFACE_DESCRIPTION);
+        assert_eq!(description(2), admin::VARLINK_INTERFACE_DESCRIPTION);
+        assert!(description(2).contains("interface org.thehoster.forskapd.admin\n"));
+    }
+
+    #[test]
+    fn a_method_belongs_to_the_interface_it_is_named_under() {
+        let admin = "org.thehoster.forskapd.admin.Login";
+        assert!(in_interface(admin, ADMIN));
+        assert!(!in_interface(admin, FORSKAPD));
+        let main = "org.thehoster.forskapd.WhoAmI";
+        assert!(in_interface(main, FORSKAPD));
+        assert!(!in_interface(main, ADMIN));
+        assert!(!in_interface("org.thehoster.forskapdx.WhoAmI", FORSKAPD));
+        assert!(!in_interface("org.thehoster.forskapd", FORSKAPD));
+    }
+
+    const MOVED: [&str; 4] = ["ClearCache", "GetSyncJobs", "Login", "Logout"];
+
+    /// The methods that moved to the admin interface are gone from the main
+    /// one, and the admin one has none of the main one's.
+    #[tokio::test]
+    async fn each_interface_answers_its_own_methods_only() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        let not_found = async |method: String| {
+            let reply = dispatch(&method, None, &handlers).await.unwrap();
+            let reply = reply.expect("a reply");
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("org.varlink.service.MethodNotFound"),
+                "{method}"
+            );
+            assert_eq!(reply.parameters.unwrap()["method"], method.as_str());
+        };
+        for method in MOVED {
+            not_found(format!("{FORSKAPD}.{method}")).await;
+            let declared = format!("method {method}(");
+            assert!(
+                !VARLINK_INTERFACE_DESCRIPTION.contains(&declared),
+                "{method}"
+            );
+            assert!(admin::VARLINK_INTERFACE_DESCRIPTION.contains(&declared));
+        }
+        for method in ["WhoAmI", "GetStatus", "Search", "GetFailures"] {
+            not_found(format!("{ADMIN}.{method}")).await;
+        }
     }
 
     /// The methods the work items replaced are gone, not answered.
@@ -535,9 +676,24 @@ mod tests {
                 "boards",
             ),
             (
-                "ClearCache",
+                "admin.ClearCache",
                 Some(serde_json::json!({"scope": ["everything"]})),
                 "everything",
+            ),
+            (
+                "admin.ClearCache",
+                Some(serde_json::json!({"scope": ["usage"], "wait": false})),
+                r#""wait""#,
+            ),
+            (
+                "admin.Login",
+                Some(serde_json::json!({"host": "x"})),
+                "token",
+            ),
+            (
+                "admin.Login",
+                Some(serde_json::json!({"host": "x", "token": "y", "user": "z"})),
+                r#""user""#,
             ),
             (
                 "Search",
@@ -655,7 +811,7 @@ mod tests {
                 r#""ids""#,
             ),
             (
-                "GetSyncJobs",
+                "admin.GetSyncJobs",
                 Some(serde_json::json!({"key": "events"})),
                 r#""key""#,
             ),
@@ -670,19 +826,15 @@ mod tests {
                 r#""host""#,
             ),
             (
-                "Logout",
+                "admin.Logout",
                 Some(serde_json::json!({"forget": true})),
                 r#""forget""#,
             ),
         ] {
-            let reply = handle_forskapd(
-                &format!("org.thehoster.forskapd.{method}"),
-                params,
-                &handlers,
-            )
-            .await
-            .unwrap()
-            .expect("a reply");
+            let reply = dispatch(&format!("{FORSKAPD}.{method}"), params, &handlers)
+                .await
+                .unwrap()
+                .expect("a reply");
             assert_eq!(
                 reply.error.as_deref(),
                 Some("org.varlink.service.InvalidParameter"),
@@ -700,25 +852,24 @@ mod tests {
     async fn optional_arguments_may_be_omitted() {
         let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
         for (method, error) in [
-            ("ClearCache", None),
+            ("admin.ClearCache", None),
             ("GetHistory", None),
             ("GetFailures", None),
             ("ClearFailures", None),
-            ("GetSyncJobs", None),
+            ("admin.GetSyncJobs", None),
             ("GetStatus", None),
             ("WhoAmI", Some("org.thehoster.forskapd.NotAuthenticated")),
             // The tests' disabled keychain turns it down.
-            ("Logout", Some("org.thehoster.forskapd.Internal")),
+            (
+                "admin.Logout",
+                Some("org.thehoster.forskapd.admin.Internal"),
+            ),
         ] {
             for params in [None, Some(serde_json::json!({}))] {
-                let reply = handle_forskapd(
-                    &format!("org.thehoster.forskapd.{method}"),
-                    params.clone(),
-                    &handlers,
-                )
-                .await
-                .unwrap()
-                .expect("a reply");
+                let reply = dispatch(&format!("{FORSKAPD}.{method}"), params.clone(), &handlers)
+                    .await
+                    .unwrap()
+                    .expect("a reply");
                 assert_eq!(reply.error.as_deref(), error, "{method} {params:?}");
             }
         }
@@ -745,7 +896,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_has_an_arm_for_get_sync_jobs() {
         let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
-        let reply = handle_forskapd("org.thehoster.forskapd.GetSyncJobs", None, &handlers)
+        let reply = handle_admin("org.thehoster.forskapd.admin.GetSyncJobs", None, &handlers)
             .await
             .unwrap()
             .expect("a reply");
@@ -754,6 +905,44 @@ mod tests {
             "GetSyncJobs is missing its dispatch arm: {:?}",
             reply.error
         );
+        assert!(reply.parameters.unwrap()["jobs"].is_array());
+    }
+
+    /// Dormant, it clears and replies at once, every scope or some.
+    #[tokio::test]
+    async fn dispatch_has_an_arm_for_clear_cache() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        let scoped = serde_json::json!({"scope": ["assigned", "usage"]});
+        for params in [None, Some(scoped)] {
+            let reply = handle_admin("org.thehoster.forskapd.admin.ClearCache", params, &handlers)
+                .await
+                .unwrap()
+                .expect("a reply");
+            assert!(
+                reply.error.is_none(),
+                "ClearCache is missing its dispatch arm: {:?}",
+                reply.error
+            );
+        }
+    }
+
+    /// The tests' disabled keychain turns both down, as the admin
+    /// interface's own `Internal`.
+    #[tokio::test]
+    async fn dispatch_has_an_arm_for_login_and_logout() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        let login = serde_json::json!({"host": "gitlab.invalid", "token": "glpat-x"});
+        for (method, params) in [("Login", Some(login)), ("Logout", None)] {
+            let reply = handle_admin(&format!("{ADMIN}.{method}"), params, &handlers)
+                .await
+                .unwrap()
+                .expect("a reply");
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("org.thehoster.forskapd.admin.Internal"),
+                "{method} is missing its dispatch arm"
+            );
+        }
     }
 
     /// A project's work item, a group's and a merge request.
