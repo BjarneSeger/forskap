@@ -1,10 +1,11 @@
-//! Turn the daemon's `NotAuthenticated` varlink error into a friendly,
-//! actionable message.
+//! Turn the daemon's varlink errors into messages a user reads.
 //!
-//! The daemon ships a stable machine `reason` code (plus an optional `detail`)
-//! on the error; the CLI owns the phrasing here. That split means wording can
-//! change without a protocol bump, and an older daemon — which sends no reason
-//! — still gets a sensible generic line.
+//! Every error of the interfaces carries a `message`, which is printed after
+//! the method that failed. `NotAuthenticated` is the exception: the daemon
+//! ships a stable machine `reason` code (plus an optional `detail`) on it, and
+//! the CLI owns the phrasing here. That split means wording can change without
+//! a protocol bump, and an older daemon — which sends no reason — still gets a
+//! sensible generic line.
 
 use forskap_api::{ErrorKind, NotAuthReason, admin};
 
@@ -13,7 +14,8 @@ pub trait DaemonError: std::fmt::Display {
     /// `NotAuthenticated`'s reason and detail; `None` for any other error.
     fn not_authenticated(&self) -> Option<(Option<NotAuthReason>, Option<&str>)>;
 
-    /// The message of an error the daemon replied.
+    /// The message of an error the daemon replied, with the argument it
+    /// refused or GitLab's HTTP status where it has one.
     fn message(&self) -> Option<String>;
 
     /// The varlink error under it: a broken connection, a reply outside the
@@ -32,15 +34,16 @@ impl DaemonError for forskap_api::Error {
     }
 
     fn message(&self) -> Option<String> {
-        let message = match self.kind() {
-            ErrorKind::InvalidArgument(Some(args)) => &args.message,
-            ErrorKind::NotFound(Some(args)) => &args.message,
-            ErrorKind::GitlabError(Some(args)) => &args.message,
-            ErrorKind::GitlabUnavailable(Some(args)) => &args.message,
-            ErrorKind::Internal(Some(args)) => &args.message,
+        Some(match self.kind() {
+            ErrorKind::InvalidArgument(Some(args)) => {
+                format!("{} ({})", args.message, args.argument)
+            }
+            ErrorKind::GitlabError(Some(args)) => refused(&args.message, args.status),
+            ErrorKind::NotFound(Some(args)) => args.message.clone(),
+            ErrorKind::GitlabUnavailable(Some(args)) => args.message.clone(),
+            ErrorKind::Internal(Some(args)) => args.message.clone(),
             _ => return None,
-        };
-        Some(message.clone())
+        })
     }
 
     fn varlink_kind(&self) -> Option<&varlink::ErrorKind> {
@@ -54,13 +57,12 @@ impl DaemonError for admin::Error {
     }
 
     fn message(&self) -> Option<String> {
-        let message = match self.kind() {
-            admin::ErrorKind::GitlabError(Some(args)) => &args.message,
-            admin::ErrorKind::GitlabUnavailable(Some(args)) => &args.message,
-            admin::ErrorKind::Internal(Some(args)) => &args.message,
+        Some(match self.kind() {
+            admin::ErrorKind::GitlabError(Some(args)) => refused(&args.message, args.status),
+            admin::ErrorKind::GitlabUnavailable(Some(args)) => args.message.clone(),
+            admin::ErrorKind::Internal(Some(args)) => args.message.clone(),
             _ => return None,
-        };
-        Some(message.clone())
+        })
     }
 
     fn varlink_kind(&self) -> Option<&varlink::ErrorKind> {
@@ -68,14 +70,27 @@ impl DaemonError for admin::Error {
     }
 }
 
-/// Map a failed varlink call to an `anyhow::Error` with a user-facing message.
-/// `op` is the method name used in the generic (non-auth) fallback, preserving
-/// the previous `"<Method> failed: <error>"` output for every other error.
+/// GitLab's refusal, with the HTTP status it answered where the daemon has
+/// one: the message may not say it.
+fn refused(message: &str, status: Option<i64>) -> String {
+    match status {
+        Some(status) => format!("{message} (HTTP {status})"),
+        None => message.to_string(),
+    }
+}
+
+/// Map a failed varlink call to an `anyhow::Error` with a user-facing message:
+/// `"<op> failed: <message>"`, `op` being the method's name, or for
+/// `NotAuthenticated` what it means and what to do. An error the daemon
+/// didn't reply (a broken connection) reads as the client describes it.
 pub fn friendly(op: &str, e: impl DaemonError) -> anyhow::Error {
     if let Some((reason, detail)) = e.not_authenticated() {
         return anyhow::anyhow!("{}", message_for(reason, detail));
     }
-    anyhow::anyhow!("{op} failed: {e}")
+    match e.message() {
+        Some(message) => anyhow::anyhow!("{op} failed: {message}"),
+        None => anyhow::anyhow!("{op} failed: {e}"),
+    }
 }
 
 /// The message for a dormancy `reason` code, with `detail` appended in
@@ -119,7 +134,94 @@ pub fn remedy(reason: Option<&NotAuthReason>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{NotAuthReason, message_for};
+    use forskap_api::{
+        GitlabError_Args, GitlabUnavailable_Args, Internal_Args, InvalidArgument_Args,
+        NotFound_Args,
+    };
+
+    use super::*;
+
+    /// Each error reads as its message after the method, not as the
+    /// generated client's dump; the argument or the status says more.
+    #[test]
+    fn a_daemon_error_reads_as_its_message() {
+        let message = || "it went wrong".to_string();
+        for (kind, shown) in [
+            (
+                ErrorKind::InvalidArgument(Some(InvalidArgument_Args {
+                    argument: "options.limit".into(),
+                    message: "invalid limit: 0".into(),
+                })),
+                "Search failed: invalid limit: 0 (options.limit)",
+            ),
+            (
+                ErrorKind::GitlabError(Some(GitlabError_Args {
+                    message: message(),
+                    status: Some(403),
+                })),
+                "Search failed: it went wrong (HTTP 403)",
+            ),
+            (
+                ErrorKind::GitlabError(Some(GitlabError_Args {
+                    message: message(),
+                    status: None,
+                })),
+                "Search failed: it went wrong",
+            ),
+            (
+                ErrorKind::GitlabUnavailable(Some(GitlabUnavailable_Args { message: message() })),
+                "Search failed: it went wrong",
+            ),
+            (
+                ErrorKind::Internal(Some(Internal_Args { message: message() })),
+                "Search failed: it went wrong",
+            ),
+            (
+                ErrorKind::NotFound(Some(NotFound_Args { message: message() })),
+                "Search failed: it went wrong",
+            ),
+        ] {
+            let error = forskap_api::Error::from(kind);
+            assert_eq!(friendly("Search", error).to_string(), shown);
+        }
+    }
+
+    #[test]
+    fn an_admin_error_reads_as_its_message() {
+        for (kind, shown) in [
+            (
+                admin::ErrorKind::GitlabError(Some(admin::GitlabError_Args {
+                    message: "GitLab rejected the token: invalid_token".into(),
+                    status: Some(401),
+                })),
+                "Login failed: GitLab rejected the token: invalid_token (HTTP 401)",
+            ),
+            (
+                admin::ErrorKind::GitlabUnavailable(Some(admin::GitlabUnavailable_Args {
+                    message: "network error: connection refused".into(),
+                })),
+                "Login failed: network error: connection refused",
+            ),
+            (
+                admin::ErrorKind::Internal(Some(admin::Internal_Args {
+                    message: "logging in is disabled".into(),
+                })),
+                "Login failed: logging in is disabled",
+            ),
+        ] {
+            let error = admin::Error::from(kind);
+            assert_eq!(friendly("Login", error).to_string(), shown);
+        }
+    }
+
+    /// One the daemon didn't reply keeps the client's words.
+    #[test]
+    fn a_failed_connection_reads_as_before() {
+        let closed = varlink::Error::from(varlink::ErrorKind::ConnectionClosed);
+        let error = forskap_api::Error::from(closed);
+        let shown = friendly("Search", error).to_string();
+        assert!(shown.starts_with("Search failed: "), "{shown}");
+    }
 
     #[test]
     fn maps_each_known_reason() {

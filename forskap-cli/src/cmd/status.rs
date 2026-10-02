@@ -1879,7 +1879,8 @@ healthy
         )));
     }
 
-    /// Each of the daemon's errors is told by its message.
+    /// Each of the daemon's errors is told by its message, as the other
+    /// commands print it.
     #[test]
     fn a_daemon_error_reads_as_its_message() {
         use forskap_api::{
@@ -1887,21 +1888,41 @@ healthy
             NotFound_Args,
         };
         let message = || "it went wrong".to_string();
-        for kind in [
-            ApiErrorKind::GitlabError(Some(GitlabError_Args {
-                message: message(),
-                status: Some(403),
-            })),
-            ApiErrorKind::GitlabUnavailable(Some(GitlabUnavailable_Args { message: message() })),
-            ApiErrorKind::Internal(Some(Internal_Args { message: message() })),
-            ApiErrorKind::InvalidArgument(Some(InvalidArgument_Args {
-                argument: "limit".into(),
-                message: message(),
-            })),
-            ApiErrorKind::NotFound(Some(NotFound_Args { message: message() })),
+        for (kind, described) in [
+            (
+                ApiErrorKind::GitlabError(Some(GitlabError_Args {
+                    message: message(),
+                    status: Some(403),
+                })),
+                "it went wrong (HTTP 403)",
+            ),
+            (
+                ApiErrorKind::GitlabUnavailable(Some(GitlabUnavailable_Args {
+                    message: message(),
+                })),
+                "it went wrong",
+            ),
+            (
+                ApiErrorKind::Internal(Some(Internal_Args { message: message() })),
+                "it went wrong",
+            ),
+            (
+                ApiErrorKind::InvalidArgument(Some(InvalidArgument_Args {
+                    argument: "options.limit".into(),
+                    message: message(),
+                })),
+                "it went wrong (options.limit)",
+            ),
+            (
+                ApiErrorKind::NotFound(Some(NotFound_Args { message: message() })),
+                "it went wrong",
+            ),
         ] {
-            assert_eq!(describe(&ApiError::from(kind)), "it went wrong");
+            assert_eq!(describe(&ApiError::from(kind)), described);
         }
+        let internal =
+            admin::ErrorKind::Internal(Some(admin::Internal_Args { message: message() }));
+        assert_eq!(describe(&admin::Error::from(internal)), "it went wrong");
     }
 
     #[test]

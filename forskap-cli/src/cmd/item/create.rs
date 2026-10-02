@@ -77,7 +77,7 @@ mod tests {
         let shown = format!("{:#}", failed(unavailable.into()));
         assert!(
             shown.starts_with("GitLab may have created the issue all the same")
-                && shown.contains("connection reset"),
+                && shown.ends_with(": CreateWorkItem failed: network error: connection reset"),
             "{shown}"
         );
 
@@ -86,6 +86,9 @@ mod tests {
             status: Some(403),
         }));
         let shown = format!("{:#}", failed(refused.into()));
-        assert!(shown.starts_with("CreateWorkItem failed"), "{shown}");
+        assert_eq!(
+            shown,
+            "CreateWorkItem failed: GitLab error: 403 Forbidden (HTTP 403)"
+        );
     }
 }
