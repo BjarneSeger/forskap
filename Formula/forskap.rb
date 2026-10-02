@@ -1,28 +1,75 @@
+# Rendered by .github/scripts/render-formula.sh, which the release workflow
+# runs for every stable tag: change the script, not this file.
+
+# The prebuilt macOS binaries are arm64 only. HEAD has no such requirement
+# and builds from source on an Intel Mac as well.
+class ForskapAppleSiliconRequirement < Requirement
+  fatal true
+
+  satisfy(build_env: false) { Hardware::CPU.arm? }
+
+  def display_s
+    "Apple silicon"
+  end
+
+  def message
+    <<~EOS
+      The prebuilt macOS binaries are for Apple silicon (arm64) only.
+      To build forskap from source on an Intel Mac, run:
+        brew install --HEAD bjarneseger/forskap/forskap
+    EOS
+  end
+end
+
 class Forskap < Formula
   desc "Cached GitLab CLI and daemon with time-tracking helpers"
   homepage "https://github.com/BjarneSeger/forskap"
-  # Builds the source of the release it names. At the next stable tag the
-  # release workflow replaces this file with a formula that installs the
-  # release's prebuilt binaries (.github/scripts/bump-formula.sh renders it
-  # with render-formula.sh).
-  url "https://github.com/BjarneSeger/forskap/archive/refs/tags/v0.12.0.tar.gz"
-  sha256 "973e4ca319135535c14bd832e2b2b1ad71ab69041cac5b6ce797aa716f12cf63"
   license "GPL-3.0-only"
-  head "https://github.com/BjarneSeger/forskap.git", branch: "main"
 
-  depends_on "rust" => :build
+  stable do
+    on_macos do
+      url "https://github.com/BjarneSeger/forskap/releases/download/v1.0.0/forskap_1.0.0_darwin_arm64.tar.gz"
+      sha256 "70c34fb0f31ef34f508e3b6dbfc67b98fe440fa94c70a0680cda6fdc79fd47cd"
+      depends_on ForskapAppleSiliconRequirement
+    end
+    on_linux do
+      on_arm do
+        url "https://github.com/BjarneSeger/forskap/releases/download/v1.0.0/forskap_1.0.0_linux_arm64.tar.gz"
+        sha256 "ae7e75ec0511ae86c00c1a2d6f61c2d5a3ac41d6c504dd168ac622d5f20e3715"
+      end
+      on_intel do
+        url "https://github.com/BjarneSeger/forskap/releases/download/v1.0.0/forskap_1.0.0_linux_amd64.tar.gz"
+        sha256 "73b7af1e193f41eec5fa4dcb74b7b273f382b3c5021b217415c80fb69c78ce80"
+      end
+    end
+  end
+
+  head do
+    url "https://github.com/BjarneSeger/forskap.git", branch: "main"
+
+    depends_on "rust" => :build
+  end
 
   def install
-    # The daemon crate also has a packaging-only bin (gen-config-template).
-    system "cargo", "install", "--bin", "forskapd", *std_cargo_args(path: "forskapd")
-    system "cargo", "install", *std_cargo_args(path: "forskap-cli")
+    if build.head?
+      # The daemon crate also has a packaging-only bin (gen-config-template).
+      system "cargo", "install", "--bin", "forskapd", *std_cargo_args(path: "forskapd")
+      system "cargo", "install", *std_cargo_args(path: "forskap-cli")
+      # Written by forskap-cli/build.rs; the release archives carry them.
+      completions = buildpath/"forskap-cli/completions"
+    else
+      bin.install "forskapd", "forskap"
+      completions = buildpath/"completions"
+    end
 
-    # Written by forskap-cli/build.rs, as shipped in the deb/rpm/arch packages.
-    # `COMPLETE=zsh forskap` prints the same registration minus the lines that
-    # make an autoloaded `_forskap` complete on the first Tab already.
-    bash_completion.install "forskap-cli/completions/forskap.bash" => "forskap"
-    zsh_completion.install "forskap-cli/completions/_forskap"
-    fish_completion.install "forskap-cli/completions/forskap.fish"
+    # As shipped in the deb/rpm/arch packages. `COMPLETE=zsh forskap` prints
+    # the same registration minus the lines that make an autoloaded
+    # `_forskap` complete on the first Tab already.
+    bash_completion.install completions/"forskap.bash" => "forskap"
+    zsh_completion.install completions/"_forskap"
+    fish_completion.install completions/"forskap.fish"
+    # Nushell loads every file there at startup.
+    (share/"nushell/vendor/autoload").install completions/"forskap.nu"
   end
 
   # A unit of the user who starts it, and so is its log; on Linux that
