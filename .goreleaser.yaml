@@ -139,6 +139,16 @@ nfpms:
         dst: /usr/share/krunner/dbusplugins/org.thehoster.forskap.desktop
         file_info:
           mode: 0644
+      # COSMIC's launcher: pop-launcher's system plugin dir is the same on every
+      # distro, its distribution dir is not (/usr/lib vs. Fedora's /usr/libexec).
+      - src: forskap-cli/packaging/pop-launcher/plugins/forskap/plugin.ron
+        dst: /etc/pop-launcher/plugins/forskap/plugin.ron
+        file_info:
+          mode: 0644
+      - src: forskap-cli/packaging/pop-launcher/plugins/forskap/forskap-cosmic-launcher
+        dst: /etc/pop-launcher/plugins/forskap/forskap-cosmic-launcher
+        file_info:
+          mode: 0755
       - src: forskap-cli/packaging/icons/hicolor/scalable/apps/org.thehoster.forskap.svg
         dst: /usr/share/icons/hicolor/scalable/apps/org.thehoster.forskap.svg
         file_info:

@@ -1,0 +1,3 @@
+#!/bin/sh
+# pop-launcher runs a plugin's executable without arguments.
+exec /usr/bin/forskap integration search-provider cosmic
