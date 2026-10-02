@@ -12,12 +12,13 @@ bottom.
 ## 0. Pick the interface
 
 - `org.thehoster.forskapd.varlink` is the interface outside clients use: the crate
-  root, the Go binding, frozen from 1.0 on (see *Compatibility* in
-  `forskapd/docs/varlink_interface.md`).
+  root, the Go binding, stable since 1.0 (see *Compatibility* in
+  `forskapd/docs/varlink_interface.md`). A change to it is additive only; see step 1.
 - `org.thehoster.forskapd.admin.varlink` is the bundled CLI's: `forskap_api::admin`,
-  no Go binding, it follows the daemon's version and promises nothing. A method goes
-  here if it mirrors daemon internals (the sync engine's jobs, the cache's bands) or
-  manages the session or the cache.
+  no Go binding, it follows the daemon's version and promises nothing, so it stays
+  free to change (no snapshot, no check). A method goes here if it mirrors daemon
+  internals (the sync engine's jobs, the cache's bands) or manages the session or the
+  cache.
 
 The files share nothing: a type or error both need is declared in each, and an admin
 error is `org.thehoster.forskapd.admin.<Name>` on the wire. Its handlers live in
@@ -43,11 +44,25 @@ main one only.
   on their own lines: that is what both generators and systemd's `varlinkctl` parse,
   and what introspection shows. Leave the main file's `interface` line without one:
   the Go generator would turn it into a second package comment of the binding.
-- Bump the version in `forskap-api/Cargo.toml` **in the same feature commit**.
+- Bump the version in `forskap-api/Cargo.toml` **in the same feature commit**: the
+  minor for a change to the main interface, the patch for a fix to a binding alone.
   Convention (see git history): the api crate's version moves inside the commit that
   changes the interface; the workspace version moves only in separate
   `chore: Bump version` commits. The api crate is dual-licensed MIT/Apache-2.0 —
   don't paste GPL-licensed code into it.
+- **Main interface: additive only, and a snapshot per minor version.** Copy the new
+  file to `forskap-api/varlink/snapshots/org.thehoster.forskapd-<major>.<minor>.varlink`
+  for the bumped version, in the same commit; never touch an older snapshot. Every
+  minor version needs one, a bump for the admin file alone too. The test
+  in `forskap-api/src/compat.rs` (CI: `forskap-api.yml`) fails when the file is not
+  its version's snapshot (comments, whitespace and declaration order aside) or breaks
+  any snapshot of its major version. It allows new methods, types and errors, a new
+  optional (`?T`) argument, reply field, struct field or error parameter, and a new
+  variant of an enum no reply or error can carry (not even inside a struct). It
+  refuses removing or renaming anything, any type change (`T` ↔ `?T` included), a new
+  required field anywhere, a struct turned enum or back, and a new variant of an enum
+  a reply or error carries. A change it refuses is a new interface under a new name,
+  served next to the old one.
 
 ## 2. Rust side regenerates itself
 

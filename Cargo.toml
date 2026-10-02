@@ -26,7 +26,7 @@ anyhow = "1.0"
 
 # External APIs
 gitlab = "0.1904"
-forskap-api = { path = "./forskap-api", version = "0.33.0" }
+forskap-api = { path = "./forskap-api", version = "1.0.0" }
 varlink = { version = "13.0", features = ["tokio"] }
 varlink_generator = "13.0"
 # forskap-api's build script edits the generator's output with these, and its

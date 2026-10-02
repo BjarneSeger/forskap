@@ -26,7 +26,12 @@ go get github.com/BjarneSeger/forskap/clients/go
 
 Releases are tagged `clients/go/vX.Y.Z` and carry the version of the
 [`forskap-api`](../../forskap-api/README.md) crate they were generated from, so a
-version names one state of the interface. Append `@v0.33.0` to pin one.
+version names one state of the interface. Append `@v1.0.0` to pin one.
+
+The interface is stable: within a major version a daemon serves every method, type
+and error an earlier binding uses, with the same types, and only adds to them (see
+[Compatibility](../../forskapd/docs/varlink_interface.md#compatibility)). A v1
+binding works with every 1.x daemon whose minor version is at least its own.
 
 The generated package is named after the interface, so import it under an alias:
 
@@ -86,8 +91,8 @@ case !status.Compatible():
 ```
 
 `forskap.APIVersion` is the interface version the binding was generated from.
-`Compatible` holds while the minor versions match (from 1.0 on: the same major and a
-daemon minor at least the binding's); a patch apart is a fix to a binding alone.
+`Compatible` holds for a daemon of the same major version and a minor version at least
+the binding's; a patch apart is a fix to a binding alone.
 `GetStatus` also says whether the daemon has a GitLab session, and never fails for
 want of one.
 
