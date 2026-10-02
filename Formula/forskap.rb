@@ -29,17 +29,17 @@ class Forskap < Formula
   stable do
     on_macos do
       url "https://github.com/BjarneSeger/forskap/releases/download/v1.0.0/forskap_1.0.0_darwin_arm64.tar.gz"
-      sha256 "70c34fb0f31ef34f508e3b6dbfc67b98fe440fa94c70a0680cda6fdc79fd47cd"
+      sha256 "da7f4afdf5f5ec880e2f3a50d35819a503af9a53a8f36a411bca3a8377a35f49"
       depends_on ForskapAppleSiliconRequirement
     end
     on_linux do
       on_arm do
         url "https://github.com/BjarneSeger/forskap/releases/download/v1.0.0/forskap_1.0.0_linux_arm64.tar.gz"
-        sha256 "ae7e75ec0511ae86c00c1a2d6f61c2d5a3ac41d6c504dd168ac622d5f20e3715"
+        sha256 "2430ebfbf3fbace04e81f046fe27b51e6c9c173647227a0b55ad4412ecaeb4cf"
       end
       on_intel do
         url "https://github.com/BjarneSeger/forskap/releases/download/v1.0.0/forskap_1.0.0_linux_amd64.tar.gz"
-        sha256 "73b7af1e193f41eec5fa4dcb74b7b273f382b3c5021b217415c80fb69c78ce80"
+        sha256 "049e0d761c5cf09ea479c3c44ae0818c7315bf3b5408fc69b49e17e3c8282e18"
       end
     end
   end
