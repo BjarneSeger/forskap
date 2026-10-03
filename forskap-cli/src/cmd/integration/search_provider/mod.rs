@@ -1,5 +1,5 @@
 //! `forskap integration search-provider` — serve `forskap search` to GNOME Shell,
-//! KRunner and COSMIC's launcher.
+//! KRunner, COSMIC's launcher and rofi.
 //!
 //! One process owns the bus name [`BUS_NAME`] and exposes two objects: the
 //! GNOME `org.gnome.Shell.SearchProvider2` interface at [`GNOME_PATH`] and
@@ -8,7 +8,8 @@
 //! `install` writes, and it exits after [`IDLE`] without a
 //! call, so nothing runs while no launcher is open. COSMIC's launcher has no
 //! bus API: it runs us as a pop-launcher plugin over stdin/stdout ([`cosmic`])
-//! for as long as it is open.
+//! for as long as it is open. rofi runs us once per step of its script mode
+//! and filters the list itself ([`rofi`]).
 //!
 //! Everything comes from the daemon (`Search`, `RecordOpen`, `WhoAmI`), the
 //! same calls the noctalia plugin makes through `forskap search` / `forskap issue open`; the
@@ -20,6 +21,7 @@ mod install;
 mod krunner;
 mod query;
 mod results;
+mod rofi;
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -56,6 +58,7 @@ pub async fn run(command: SearchProviderCommand) -> Result<()> {
         SearchProviderCommand::Install { prefix } => install::run(prefix),
         SearchProviderCommand::Launch => Provider::new()?.launch_search("").await,
         SearchProviderCommand::Cosmic => cosmic::serve(Provider::new()?).await,
+        SearchProviderCommand::Rofi { entry } => rofi::serve(Provider::new()?, entry).await,
     }
 }
 

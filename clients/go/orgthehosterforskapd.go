@@ -155,6 +155,7 @@ type SearchOptions struct {
 	Scope         *Scope        `json:"scope,omitempty"`
 	Types         *[]string     `json:"types,omitempty"`
 	Exclude_types *[]string     `json:"exclude_types,omitempty"`
+	Match_all     *bool         `json:"match_all,omitempty"`
 }
 
 // The issue CreateWorkItem files.
@@ -2217,7 +2218,10 @@ type SearchOptions (
   # compared case-insensitively; absent or empty: every type.
   types: ?[]string,
   # Leaves out the work items of these types, compared the same way.
-  exclude_types: ?[]string
+  exclude_types: ?[]string,
+  # With an empty query, every row matches instead of only the frequently
+  # opened ones; absent: false. A query that isn't empty ignores it. Since 1.1.
+  match_all: ?bool
 )
 
 # Searches the cached corpus; work items and merge requests rank by their

@@ -773,13 +773,15 @@ impl VarlinkInterface for Handlers {
             scope,
             types,
             exclude_types,
+            match_all,
         } = options.unwrap_or_default();
         // An empty query is the "frequently opened" view: only work items and
         // MRs with recorded opens, ranked. Projects and groups have no open
-        // counts, so they come back empty in that mode.
+        // counts, so they come back empty in that mode. `match_all` turns the
+        // view off: the empty needle then matches every row.
         let needle = query.trim().to_lowercase();
         let scope = Within::new(scope);
-        let frequent_only = needle.is_empty();
+        let frequent_only = needle.is_empty() && !match_all.unwrap_or(false);
         let limit = match limit {
             None => DEFAULT_SEARCH_LIMIT,
             Some(n) if n > 0 => n as usize,

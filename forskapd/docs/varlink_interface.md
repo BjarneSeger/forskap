@@ -356,6 +356,12 @@ and groups are sorted by path. An empty or whitespace-only `query` selects the
 ranked the same way; projects and groups are empty in that mode. The statistics are read once per call and a read failure degrades to the
 plain recency order.
 
+`match_all` (since 1.1) turns that view off: an empty query then matches every row,
+in the same order and under the same `kinds`, `scope`, types and `limit`, so
+`{"kinds": ["projects"], "match_all": true}` with a large `limit` lists every cached
+project. A query that isn't empty ignores it. A 1.0 daemon doesn't know the field and
+replies `org.varlink.service.InvalidParameter`.
+
 What the corpus contains depends on the `[search]` daemon config. The default
 `population = "tracked"` holds the issues and MRs of the member projects you are
 active in: where you have assigned issues/MRs, pushed, opened or commented on an issue
