@@ -18,6 +18,7 @@ use super::jobs;
 use crate::cli::RefreshScope;
 use crate::client;
 use crate::friendly::friendly;
+use crate::style;
 use crate::watch::{self, ERASE_LINE};
 
 /// How often the sync is asked how far it is. The first look comes after
@@ -51,14 +52,14 @@ pub async fn run(mut scopes: Vec<RefreshScope>) -> Result<()> {
     cleared.map_err(|e| friendly("ClearCache", e))?;
 
     if scopes.is_empty() {
-        outln!("cache cleared")?;
+        outln!("{}", style::success("cache cleared"))?;
     } else {
         let names: Vec<_> = scopes
             .iter()
             .filter_map(|s| s.to_possible_value())
             .map(|v| v.get_name().to_string())
             .collect();
-        outln!("cleared: {}", names.join(", "))?;
+        outln!("{} {}", style::success("cleared:"), names.join(", "))?;
     }
     Ok(())
 }

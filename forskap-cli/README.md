@@ -103,11 +103,13 @@ so `forskap status >/dev/null || …` in a script or prompt fires only when
 something is broken.
 
 ### Colour
-On a terminal the text output colours the state words (`opened`, `merged`, a
-sync job's `running`, a check's `warning`, …), the headings and the item
-numbers (`#42`, `!7`, `&5`).
-Pipes, scripts and launchers get plain text, and `--output json` is never
-coloured. `--color always` or `--color never` overrules that on any command;
+On a terminal the text output colours by role: state words (`opened`, `merged`, a
+sync job's `running`, a check's `warning`, …), headings and titles, item numbers
+(`#42`, `!7`, `&5`), project and group paths, the verb of a confirmation
+(`logged`, `closed`, `wrote`), an activity's verb, warnings (a rate-limit pause, a
+token about to expire); URLs, timestamps, labels and hints are dimmed.
+Only the escape codes are added: pipes, scripts and launchers get the same text
+plain, and `--output json` is never coloured. `--color always` or `--color never` overrules that on any command;
 `NO_COLOR` turns it off and `CLICOLOR_FORCE` on.
 
 ## Config

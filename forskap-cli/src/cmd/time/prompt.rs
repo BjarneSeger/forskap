@@ -130,7 +130,8 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
     state::save(&st).context("saving state")?;
 
     outln!(
-        "logged {duration} on {} ({})",
+        "{} {duration} on {} ({})",
+        style::success("logged"),
         style::reference(refspec::sigil(kind), picked.iid()),
         picked.title()
     )?;

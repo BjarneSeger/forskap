@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::config;
+use crate::{config, style};
 
 /// Where the package installs to; gnome-shell reads providers only from
 /// `$XDG_DATA_DIRS`, whose default is `/usr/local/share:/usr/share`.
@@ -84,7 +84,7 @@ pub fn run(prefix: Option<PathBuf>) -> Result<()> {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         fs::write(&dst, body.replace(PACKAGED_BIN, exe))
             .with_context(|| format!("writing {}", dst.display()))?;
-        outln!("wrote {}", dst.display())?;
+        outln!("{} {}", style::success("wrote"), dst.display())?;
     }
 
     let plugin_dir = pop_launcher_plugin_dir(&prefix, dirs::home_dir().as_deref());
@@ -93,18 +93,18 @@ pub fn run(prefix: Option<PathBuf>) -> Result<()> {
     let ron = plugin_dir.join("plugin.ron");
     fs::write(&ron, plugin_ron(trigger_word.as_deref()))
         .with_context(|| format!("writing {}", ron.display()))?;
-    outln!("wrote {}", ron.display())?;
+    outln!("{} {}", style::success("wrote"), ron.display())?;
     let script = plugin_dir.join(POP_LAUNCHER_SCRIPT);
     fs::write(&script, POP_LAUNCHER_SCRIPT_BODY.replace(PACKAGED_BIN, exe))
         .with_context(|| format!("writing {}", script.display()))?;
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
         .with_context(|| format!("making {} executable", script.display()))?;
-    outln!("wrote {}", script.display())?;
+    outln!("{} {}", style::success("wrote"), script.display())?;
 
     for rel in LEGACY_FILES {
         let old = prefix.join(rel);
         match fs::remove_file(&old) {
-            Ok(()) => outln!("removed {}", old.display())?,
+            Ok(()) => outln!("{} {}", style::success("removed"), old.display())?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e).with_context(|| format!("removing {}", old.display())),
         }
@@ -112,7 +112,7 @@ pub fn run(prefix: Option<PathBuf>) -> Result<()> {
 
     let data_dirs = xdg_data_dirs();
     if !data_dirs.iter().any(|d| same_dir(d, &prefix)) {
-        outln!(
+        let note = format!(
             "note: GNOME Shell loads search providers only from $XDG_DATA_DIRS ({}), \
              not from {}; KRunner and D-Bus activation work from there.",
             data_dirs
@@ -121,13 +121,17 @@ pub fn run(prefix: Option<PathBuf>) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(":"),
             prefix.display()
-        )?;
+        );
+        outln!("{}", style::muted(&note))?;
     }
     outln!(
-        "Reload the bus with `busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
-         org.freedesktop.DBus ReloadConfig`; GNOME Shell picks the provider up at the next \
-         login, KRunner after `kquitapp6 krunner`, COSMIC's launcher after \
-         `pkill cosmic-launcher` (its session restarts it)."
+        "{}",
+        style::muted(
+            "Reload the bus with `busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+             org.freedesktop.DBus ReloadConfig`; GNOME Shell picks the provider up at the next \
+             login, KRunner after `kquitapp6 krunner`, COSMIC's launcher after \
+             `pkill cosmic-launcher` (its session restarts it)."
+        )
     )?;
     Ok(())
 }

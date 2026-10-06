@@ -106,8 +106,9 @@ or numeric ID. `forskap issue create <title> -p <project>` files a new issue
 and unlike the other writes it is not queued while GitLab is unreachable: it fails,
 so nothing is created behind your back later. `forskap epic` has `view` and `open`; epics belong to a group, so an
 ambiguous number takes `-g`. Commands that print data take `-o json` or `-o yaml`.
-On a terminal the text output colours state words, headings and item numbers;
-`--color always|never` overrules that, and `NO_COLOR` is honoured.
+On a terminal the text output colours state words, headings, item numbers, paths
+and confirmations and dims URLs, timestamps and hints; `--color always|never`
+overrules that, and `NO_COLOR` is honoured.
 `forskap sync jobs`, `forskap queue list` and `forskap status` take `-w`/`--watch [SECS]`
 to redraw their text view every SECS seconds (2 by default) until Ctrl-C; while the
 daemon is away the watch shows the error and keeps trying.

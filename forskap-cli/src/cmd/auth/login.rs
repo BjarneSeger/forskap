@@ -58,10 +58,8 @@ pub async fn run(host: String) -> Result<()> {
         .await
         .map_err(|e| friendly("WhoAmI", e))?;
     outln!(
-        "Logged in to {} as @{} (#{}).",
-        me.host,
-        me.username,
-        me.user_id
+        "{}",
+        super::status::logged_in(&me.host, &me.username, me.user_id)
     )?;
     Ok(())
 }

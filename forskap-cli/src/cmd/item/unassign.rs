@@ -19,8 +19,10 @@ pub async fn run(kind: RefKind, target: TargetArgs) -> Result<()> {
         .map_err(|e| friendly("UnassignSelf", e))?;
 
     outln!(
-        "unassigned from {} (project {project_id})",
-        style::reference(refspec::sigil(kind), iid)
+        "{} {} {}",
+        style::success("unassigned from"),
+        style::reference(refspec::sigil(kind), iid),
+        style::muted(&format!("(project {project_id})"))
     )?;
     Ok(())
 }

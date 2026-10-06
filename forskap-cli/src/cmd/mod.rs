@@ -14,3 +14,13 @@ pub mod search;
 pub mod status;
 pub mod sync;
 pub mod time;
+
+use anyhow::Result;
+
+/// A labelled line of a view, left out while its value is empty.
+pub fn field(name: &str, value: &str) -> Result<()> {
+    if !value.is_empty() {
+        outln!("  {:<11} {value}", crate::style::muted(&format!("{name}:")))?;
+    }
+    Ok(())
+}

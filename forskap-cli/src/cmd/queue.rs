@@ -71,7 +71,7 @@ async fn fetch() -> Result<Vec<FailedTask>> {
 
 fn render(failures: &[FailedTask]) -> String {
     if failures.is_empty() {
-        return "no failed writes\n".to_string();
+        return format!("{}\n", style::muted("no failed writes"));
     }
     let mut out = String::new();
     for f in failures {
@@ -85,19 +85,18 @@ fn render(failures: &[FailedTask]) -> String {
         };
         let sigil = refspec::wire_sigil(&f.kind);
         out.push_str(&format!(
-            "[{}] {} {}{}  —  {}  ({})\n",
-            f.id,
+            "{} {} {}{}  —  {}  {}\n",
+            style::muted(&format!("[{}]", f.id)),
             f.op,
             style::reference(sigil, f.iid),
             detail,
             style::error(&f.error),
-            when
+            style::muted(&format!("({when})"))
         ));
     }
-    out.push_str(
-        "\nretry with `forskap queue retry <id>`, drop with `forskap queue dismiss <id>`, \
-         or `forskap queue clear`\n",
-    );
+    let hint = "retry with `forskap queue retry <id>`, drop with `forskap queue dismiss <id>`, \
+                or `forskap queue clear`";
+    out.push_str(&format!("\n{}\n", style::muted(hint)));
     out
 }
 
@@ -133,7 +132,8 @@ mod tests {
         let text = render(&[failure]);
         assert!(
             text.starts_with(
-                "[3] post_time \x1b[36m!42\x1b[0m (1h)  —  \x1b[31m403 Forbidden\x1b[0m  (2027"
+                "\x1b[2m[3]\x1b[0m post_time \x1b[36m!42\x1b[0m (1h)  —  \x1b[31m403 Forbidden\x1b[0m  \
+                 \x1b[2m(2027-01-15T08:00:00+00:00)\x1b[0m\n\n\x1b[2mretry"
             ),
             "{text}"
         );

@@ -25,7 +25,7 @@ use forskap_api::{
 use serde::Serialize;
 
 use crate::cli::{OutputFormat, WatchArgs};
-use crate::cmd::auth::status::{expiry, token_line};
+use crate::cmd::auth::status::{EXPIRY_WARN_SECS, expiry, token_line};
 use crate::cmd::sync::jobs::{self, failure, kind, pause, span};
 use crate::friendly::DaemonError;
 use crate::{client, config, friendly, output, style, watch};
@@ -47,10 +47,6 @@ const HANG_SECS: i64 = 15 * 60;
 /// minutes, so a sync worker that works starts something well within this;
 /// it only warns when nothing at all started meanwhile (see [`sync`]).
 const OVERDUE_SECS: i64 = 30 * 60;
-
-/// A token this close to its expiry, and not rotated, needs replacing soon.
-/// A week: GitLab's own expiry mail gives as much notice.
-const EXPIRY_WARN_SECS: i64 = 7 * 86_400;
 
 /// How many failing jobs are named; `forskap sync jobs` has them all.
 const FAILING_NAMED: usize = 3;
@@ -986,21 +982,21 @@ fn render(report: &Report) -> String {
     let indent = " ".repeat(w0 + 2 + w1 + 2);
     let mut out = String::new();
     for row in &rows {
+        let name = style::strong(row.name);
         let level = style::state(row.level.word());
-        out.push_str(&format!(
-            "{:<w0$}  {level:<w1$}  {}\n",
-            row.name, row.summary
-        ));
+        out.push_str(&format!("{name:<w0$}  {level:<w1$}  {}\n", row.summary));
         for detail in row.details {
-            out.push_str(&format!("{indent}{detail}\n"));
+            out.push_str(&format!("{indent}{}\n", style::muted(detail)));
         }
     }
-    out.push_str(&format!("\n{}\n", verdict(&rows)));
+    let (state, tail) = verdict(&rows);
+    out.push_str(&format!("\n{}{tail}\n", style::state(state)));
     out
 }
 
-/// `healthy`, `healthy: 1 warning`, `unhealthy: 1 error, 3 skipped`.
-fn verdict(rows: &[Row]) -> String {
+/// `healthy`, `healthy: 1 warning`, `unhealthy: 1 error, 3 skipped`, as the
+/// state and what follows it.
+fn verdict(rows: &[Row]) -> (&'static str, String) {
     let count = |level| rows.iter().filter(|r| r.level == level).count();
     let parts: Vec<String> = [
         (Level::Error, "errors"),
@@ -1020,9 +1016,9 @@ fn verdict(rows: &[Row]) -> String {
         "healthy"
     };
     if parts.is_empty() {
-        state.to_string()
+        (state, String::new())
     } else {
-        format!("{state}: {}", parts.join(", "))
+        (state, format!(": {}", parts.join(", ")))
     }
 }
 
@@ -2049,7 +2045,10 @@ unhealthy: 1 error, 3 skipped
             ),
             "{text}"
         );
-        assert_eq!(verdict(&report(&healthy()).checks.rows()), "healthy");
+        assert_eq!(
+            verdict(&report(&healthy()).checks.rows()),
+            ("healthy", String::new())
+        );
         // All `ok`: the columns stay where a warning would put them.
         let text = render(&report(&healthy()));
         assert!(text.starts_with("daemon   ok       forskapd"), "{text}");
@@ -2070,11 +2069,19 @@ unhealthy: 1 error, 3 skipped
         let text = render(&report(&answers));
         let lines: Vec<&str> = text.lines().collect();
         assert!(
-            lines[0].starts_with("daemon   \x1b[32mok     \x1b[0m  forskapd"),
+            lines[0].starts_with("\x1b[1mdaemon \x1b[0m  \x1b[32mok     \x1b[0m  forskapd"),
             "{text}"
         );
         assert!(
-            lines[3].starts_with("sync     \x1b[31merror  \x1b[0m  no answer"),
+            lines[2].starts_with("                  \x1b[2mThe token expires on"),
+            "{text}"
+        );
+        assert!(
+            lines[3].starts_with("\x1b[1msync   \x1b[0m  \x1b[31merror  \x1b[0m  no answer"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("\n\x1b[31munhealthy\x1b[0m: 1 error\n"),
             "{text}"
         );
     }
