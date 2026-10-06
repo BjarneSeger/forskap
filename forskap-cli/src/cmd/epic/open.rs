@@ -29,9 +29,10 @@ pub async fn run(target: EpicArgs, no_browser: bool) -> Result<()> {
         }
     }
     outln!(
-        "opened {} {}",
+        "{} {} {}",
+        style::success("opened"),
         style::reference('&', epic.iid),
-        epic.web_url
+        style::muted(&epic.web_url)
     )?;
     Ok(())
 }

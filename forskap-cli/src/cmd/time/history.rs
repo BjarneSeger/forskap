@@ -29,7 +29,8 @@ pub async fn run(days: u32, format: OutputFormat) -> Result<()> {
                 .map(super::spent)
                 .or_else(|| e.duration.clone());
             outln!(
-                "{ts}  {:<8}  {:<6}  {:<6}  {}",
+                "{}  {:<8}  {:<6}  {:<6}  {}",
+                style::muted(&ts),
                 style::state(source(&e.source)),
                 style::reference(sigil, e.iid),
                 spent.unwrap_or_default(),

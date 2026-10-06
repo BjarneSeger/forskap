@@ -19,8 +19,10 @@ pub async fn run(kind: RefKind, target: TargetArgs) -> Result<()> {
         .map_err(|e| friendly("Close", e))?;
 
     outln!(
-        "closed {} (project {project_id})",
-        style::reference(refspec::sigil(kind), iid)
+        "{} {} {}",
+        style::success("closed"),
+        style::reference(refspec::sigil(kind), iid),
+        style::muted(&format!("(project {project_id})"))
     )?;
     Ok(())
 }

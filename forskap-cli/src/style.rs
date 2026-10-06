@@ -72,6 +72,10 @@ pub struct Painted<'a> {
 
 impl fmt::Display for Painted<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Nothing to colour: an absent suffix or value writes no escapes.
+        if self.text.is_empty() {
+            return f.pad("");
+        }
         write!(f, "{}", self.style)?;
         f.pad(&self.text)?;
         write!(f, "{:#}", self.style)
@@ -94,13 +98,19 @@ pub fn heading(text: &str) -> Painted<'_> {
     paint(Style::new().bold(), text)
 }
 
+/// What a line is about: an item's title in a view, the host and the user
+/// `forskap auth status` names.
+pub fn strong(text: &str) -> Painted<'_> {
+    paint(Style::new().bold(), text)
+}
+
 /// A state word: of an issue, merge request or epic, of a sync job, the
-/// origin of a time entry, or the level of a `forskap status` check. Words
-/// outside the palette stay plain.
+/// origin of a time entry, the level of a `forskap status` check or its
+/// verdict. Words outside the palette stay plain.
 pub fn state(word: &str) -> Painted<'_> {
     let style = match word {
-        "opened" | "running" | "ok" => fg(AnsiColor::Green),
-        "closed" | "backing off" | "error" => fg(AnsiColor::Red),
+        "opened" | "running" | "ok" | "healthy" => fg(AnsiColor::Green),
+        "closed" | "backing off" | "error" | "unhealthy" => fg(AnsiColor::Red),
         "merged" | "demanded" => fg(AnsiColor::Magenta),
         "locked" | "due" | "queued" | "warning" => fg(AnsiColor::Yellow),
         "waiting" | "skipped" | "unavailable" => Style::new().dimmed(),
@@ -109,9 +119,39 @@ pub fn state(word: &str) -> Painted<'_> {
     paint(style, word)
 }
 
+/// The verb of an activity event, as GitLab names it: what the user did.
+/// Verbs outside the palette stay plain.
+pub fn action(verb: &str) -> Painted<'_> {
+    let style = match verb {
+        "opened" | "reopened" | "created" | "joined" => fg(AnsiColor::Green),
+        "closed" | "deleted" | "destroyed" | "left" | "expired" => fg(AnsiColor::Red),
+        "merged" | "accepted" | "approved" => fg(AnsiColor::Magenta),
+        "pushed to" | "pushed new" => fg(AnsiColor::Blue),
+        _ => Style::new(),
+    };
+    paint(style, verb)
+}
+
 /// An item as GitLab writes it: `#42`, `!7`, `&5`.
 pub fn reference(sigil: impl fmt::Display, iid: i64) -> Painted<'static> {
     paint(fg(AnsiColor::Cyan), format!("{sigil}{iid}"))
+}
+
+/// Where an item lives: a project or group path, or `project 7` where only
+/// the id is known.
+pub fn path(text: &str) -> Painted<'_> {
+    paint(fg(AnsiColor::Blue), text)
+}
+
+/// The verb of a confirmation: what a write or a command just did.
+pub fn success(text: &str) -> Painted<'_> {
+    paint(fg(AnsiColor::Green), text)
+}
+
+/// Something to act on before long: a rate-limit pause, a token about to
+/// expire.
+pub fn warning(text: &str) -> Painted<'_> {
+    paint(fg(AnsiColor::Yellow), text)
 }
 
 /// Why a sync job or a queued write failed.
@@ -119,8 +159,9 @@ pub fn error(text: &str) -> Painted<'_> {
     paint(fg(AnsiColor::Red), text)
 }
 
-/// A remark that is no failure: why GitLab refuses a sync job for good.
-pub fn note(text: &str) -> Painted<'_> {
+/// Secondary text: a timestamp, a URL, a field's label, a hint, an empty
+/// result, a remark that is no failure.
+pub fn muted(text: &str) -> Painted<'_> {
     paint(Style::new().dimmed(), text)
 }
 
@@ -161,10 +202,15 @@ mod tests {
     #[test]
     fn off_leaves_the_text_as_it_is() {
         assert_eq!(heading("Issues:").to_string(), "Issues:");
+        assert_eq!(strong("Fix login").to_string(), "Fix login");
         assert_eq!(state("opened").to_string(), "opened");
+        assert_eq!(action("pushed to").to_string(), "pushed to");
         assert_eq!(reference('#', 42).to_string(), "#42");
+        assert_eq!(path("team/api").to_string(), "team/api");
+        assert_eq!(success("logged").to_string(), "logged");
+        assert_eq!(warning("paused").to_string(), "paused");
         assert_eq!(error("403").to_string(), "403");
-        assert_eq!(note("refused").to_string(), "refused");
+        assert_eq!(muted("refused").to_string(), "refused");
     }
 
     #[test]
@@ -183,11 +229,54 @@ mod tests {
             state("unavailable").to_string(),
             "\x1b[2munavailable\x1b[0m"
         );
-        assert_eq!(note("refused").to_string(), "\x1b[2mrefused\x1b[0m");
+        // The verdict of `forskap status`.
+        assert_eq!(state("healthy").to_string(), "\x1b[32mhealthy\x1b[0m");
+        assert_eq!(state("unhealthy").to_string(), "\x1b[31munhealthy\x1b[0m");
+        assert_eq!(muted("refused").to_string(), "\x1b[2mrefused\x1b[0m");
         assert_eq!(reference('!', 7).to_string(), "\x1b[36m!7\x1b[0m");
         assert_eq!(error("403").to_string(), "\x1b[31m403\x1b[0m");
+        assert_eq!(strong("Fix login").to_string(), "\x1b[1mFix login\x1b[0m");
+        assert_eq!(path("team/api").to_string(), "\x1b[34mteam/api\x1b[0m");
+        assert_eq!(success("logged").to_string(), "\x1b[32mlogged\x1b[0m");
+        assert_eq!(warning("paused").to_string(), "\x1b[33mpaused\x1b[0m");
         // A word outside the palette gets no escapes at all.
         assert_eq!(state("In review").to_string(), "In review");
+        assert_eq!(state("gitlab").to_string(), "gitlab");
+    }
+
+    #[test]
+    fn actions_take_the_colour_of_what_they_did() {
+        force(true);
+        for (verb, code) in [
+            ("opened", "32"),
+            ("reopened", "32"),
+            ("created", "32"),
+            ("joined", "32"),
+            ("closed", "31"),
+            ("deleted", "31"),
+            ("destroyed", "31"),
+            ("left", "31"),
+            ("expired", "31"),
+            ("merged", "35"),
+            ("accepted", "35"),
+            ("approved", "35"),
+            ("pushed to", "34"),
+            ("pushed new", "34"),
+        ] {
+            assert_eq!(
+                action(verb).to_string(),
+                format!("\x1b[{code}m{verb}\x1b[0m")
+            );
+        }
+        assert_eq!(action("commented on").to_string(), "commented on");
+        assert_eq!(action("updated").to_string(), "updated");
+    }
+
+    #[test]
+    fn empty_text_gets_no_escapes() {
+        force(true);
+        assert_eq!(muted("").to_string(), "");
+        assert_eq!(format!("{:<4}|", path("")), "    |");
     }
 
     #[test]
@@ -201,5 +290,10 @@ mod tests {
             format!("{:<6}|", reference('#', 42)),
             "\x1b[36m#42   \x1b[0m|"
         );
+        assert_eq!(
+            format!("{:<12}|", action("pushed to")),
+            "\x1b[34mpushed to   \x1b[0m|"
+        );
+        assert_eq!(format!("{:<7}|", muted("url:")), "\x1b[2murl:   \x1b[0m|");
     }
 }

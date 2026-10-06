@@ -44,7 +44,9 @@ pub async fn run(args: CreateArgs) -> Result<()> {
 
     output::emit(args.output.output, &reply, |created| {
         match (created.iid, &created.web_url) {
-            (Some(iid), Some(url)) => outln!("{} {url}", style::reference('#', iid)),
+            (Some(iid), Some(url)) => {
+                outln!("{} {}", style::reference('#', iid), style::muted(url))
+            }
             (Some(iid), None) => outln!("{}", style::reference('#', iid)),
             (None, Some(url)) => outln!("{url}"),
             (None, None) => outln!("created, but GitLab's answer doesn't say which issue it is"),

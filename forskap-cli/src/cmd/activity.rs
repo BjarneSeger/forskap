@@ -20,7 +20,8 @@ pub async fn run(days: u32, format: OutputFormat) -> Result<()> {
 
     output::emit(format, &reply.events, |events| {
         if events.is_empty() {
-            return outln!("no activity in the last {days} days");
+            let none = format!("no activity in the last {days} days");
+            return outln!("{}", style::muted(&none));
         }
         // One heading per day, in local time.
         let mut day = None;
@@ -36,7 +37,8 @@ pub async fn run(days: u32, format: OutputFormat) -> Result<()> {
                 outln!("{}", style::heading(&date))?;
                 day = Some(at.date_naive());
             }
-            outln!("  {}  {}", at.format("%H:%M"), describe(e))?;
+            let time = at.format("%H:%M").to_string();
+            outln!("  {}  {}", style::muted(&time), describe(e))?;
         }
         Ok(())
     })
@@ -55,9 +57,10 @@ fn describe(e: &ActivityEvent) -> String {
         Some("Milestone") => "%",
         _ => "",
     };
+    let place = style::path(&project);
     let item = match e.target_iid {
-        Some(iid) if !sigil.is_empty() => format!("{project}{}", style::reference(sigil, iid)),
-        _ => project,
+        Some(iid) if !sigil.is_empty() => format!("{place}{}", style::reference(sigil, iid)),
+        _ => place.to_string(),
     };
     let detail = match (&e.r#ref, &e.commit_title) {
         (Some(git_ref), Some(title)) => match e.commit_count {
@@ -71,7 +74,7 @@ fn describe(e: &ActivityEvent) -> String {
             (title, text) => title.clone().or(text.clone()).unwrap_or_default(),
         },
     };
-    let mut line = format!("{:<12}", e.action);
+    let mut line = format!("{:<12}", style::action(&e.action));
     for part in [item, detail] {
         if !part.is_empty() {
             line.push_str("  ");
@@ -141,7 +144,11 @@ mod tests {
         style::force(true);
         assert_eq!(
             describe(&closed),
-            "closed        team/api\x1b[36m#3\x1b[0m  Fix the login"
+            "\x1b[31mclosed      \x1b[0m  \x1b[34mteam/api\x1b[0m\x1b[36m#3\x1b[0m  Fix the login"
+        );
+        assert_eq!(
+            describe(&push),
+            "\x1b[34mpushed to   \x1b[0m  \x1b[34mteam/api\x1b[0m  main"
         );
         style::force(false);
 

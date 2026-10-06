@@ -53,11 +53,11 @@ pub async fn run(
         {
             return outln!(
                 "{}",
-                if frequent_only {
+                style::muted(if frequent_only {
                     "no frequently opened items yet (see `forskap issue open`)"
                 } else {
                     "no matches"
-                }
+                })
             );
         }
         if !issues.is_empty() {
@@ -68,8 +68,8 @@ pub async fn run(
                     style::reference('#', i.iid),
                     style::state(&i.state),
                     i.title,
-                    i.web_url,
-                    opened(i.open_count)
+                    style::muted(&i.web_url),
+                    style::muted(&opened(i.open_count))
                 )?;
             }
         }
@@ -81,8 +81,8 @@ pub async fn run(
                     style::reference('!', m.iid),
                     style::state(&m.state),
                     m.title,
-                    m.web_url,
-                    opened(m.open_count)
+                    style::muted(&m.web_url),
+                    style::muted(&opened(m.open_count))
                 )?;
             }
         }
@@ -94,21 +94,29 @@ pub async fn run(
                     style::reference('&', e.iid),
                     style::state(&e.state),
                     e.title,
-                    e.web_url,
-                    opened(e.open_count)
+                    style::muted(&e.web_url),
+                    style::muted(&opened(e.open_count))
                 )?;
             }
         }
         if !reply.projects.is_empty() {
             outln!("{}", style::heading("Projects:"))?;
             for p in &reply.projects {
-                outln!("  {}  {}", p.full_path, p.web_url)?;
+                outln!(
+                    "  {}  {}",
+                    style::path(&p.full_path),
+                    style::muted(&p.web_url)
+                )?;
             }
         }
         if !reply.groups.is_empty() {
             outln!("{}", style::heading("Groups:"))?;
             for g in &reply.groups {
-                outln!("  {}  {}", g.full_path, g.web_url)?;
+                outln!(
+                    "  {}  {}",
+                    style::path(&g.full_path),
+                    style::muted(&g.web_url)
+                )?;
             }
         }
         Ok(())

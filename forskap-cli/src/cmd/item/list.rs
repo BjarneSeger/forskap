@@ -33,7 +33,7 @@ pub async fn run(kind: RefKind, groups: Vec<String>, format: OutputFormat) -> Re
                         style::reference(refspec::sigil(kind), i.iid),
                         style::state(&i.state),
                         i.title,
-                        i.web_url
+                        style::muted(&i.web_url)
                     )?;
                 }
                 Ok(())
@@ -52,7 +52,7 @@ pub async fn run(kind: RefKind, groups: Vec<String>, format: OutputFormat) -> Re
                         style::reference(refspec::sigil(kind), m.iid),
                         style::state(&m.state),
                         m.title,
-                        m.web_url
+                        style::muted(&m.web_url)
                     )?;
                 }
                 Ok(())

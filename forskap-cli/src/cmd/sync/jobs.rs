@@ -171,11 +171,11 @@ fn rows(jobs: &[SyncJob], now: i64, all: bool) -> Vec<Row<'_>> {
 /// The jobs as an aligned table, a job's last error on a line of its own.
 fn render(jobs: &[SyncJob], paused_until: Option<i64>, now: i64, all: bool) -> String {
     if jobs.is_empty() {
-        return "no sync jobs planned\n".to_string();
+        return format!("{}\n", style::muted("no sync jobs planned"));
     }
     let mut out = String::new();
     if let Some(pause) = pause(paused_until, now) {
-        out.push_str(&format!("{pause}\n\n"));
+        out.push_str(&format!("{}\n\n", style::warning(&pause)));
     }
     let rows = rows(jobs, now, all);
     let header = ["JOB", "STATUS", "LAST SYNC", "NEXT"].map(str::to_string);
@@ -186,6 +186,7 @@ fn render(jobs: &[SyncJob], paused_until: Option<i64>, now: i64, all: bool) -> S
     let (w0, w1, w2) = (width(0), width(1), width(2));
     let line = |[job, status, last, next]: &[String; 4]| {
         let status = style::state(status);
+        let (last, next) = (style::muted(last), style::muted(next));
         format!("{job:<w0$}  {status:<w1$}  {last:<w2$}  {next}\n")
     };
     let [job, status, last, next] = &header;
@@ -200,11 +201,11 @@ fn render(jobs: &[SyncJob], paused_until: Option<i64>, now: i64, all: bool) -> S
             }
             Some(Below::Refused(error)) => {
                 let why = refused(error);
-                out.push_str(&format!("    {}\n", style::note(&why)));
+                out.push_str(&format!("    {}\n", style::muted(&why)));
             }
             Some(Below::RefusedAll) => {
                 let why = "refused by GitLab; `--all` lists each";
-                out.push_str(&format!("    {}\n", style::note(why)));
+                out.push_str(&format!("    {}\n", style::muted(why)));
             }
             None => {}
         }
@@ -673,9 +674,15 @@ project/7/avatar  waiting      1d 1h ago  -
         assert_eq!(
             render(&jobs, None, NOW, false),
             "\x1b[1mJOB               STATUS       LAST SYNC  NEXT\x1b[0m\n\
-             events            \x1b[32mrunning    \x1b[0m  never      now\n\
-             project/9/boards  \x1b[31mbacking off\x1b[0m  never      -\n\
+             events            \x1b[32mrunning    \x1b[0m  \x1b[2mnever    \x1b[0m  \x1b[2mnow\x1b[0m\n\
+             project/9/boards  \x1b[31mbacking off\x1b[0m  \x1b[2mnever    \x1b[0m  \x1b[2m-\x1b[0m\n\
              \x20   \x1b[31mfailed once: 403 Forbidden\x1b[0m\n"
+        );
+        // A rate-limit pause is a warning.
+        let paused = render(&jobs, Some(NOW + 240), NOW, false);
+        assert!(
+            paused.starts_with("\x1b[33mpaused by a GitLab rate limit for another 4m\x1b[0m\n\n"),
+            "{paused}"
         );
     }
 

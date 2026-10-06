@@ -6,7 +6,11 @@ use forskap_api::VarlinkClientInterface;
 
 use crate::cli::OutputFormat;
 use crate::friendly::friendly;
-use crate::{client, output};
+use crate::{client, output, style};
+
+/// A token this close to its expiry, and not rotated, needs replacing soon.
+/// A week: GitLab's own expiry mail gives as much notice.
+pub const EXPIRY_WARN_SECS: i64 = 7 * 86_400;
 
 pub async fn run(format: OutputFormat) -> Result<()> {
     let client = client::connect_default().await?;
@@ -26,18 +30,36 @@ pub async fn run(format: OutputFormat) -> Result<()> {
             "token_rotates": me.token_rotates,
         }),
         |_| {
-            outln!(
-                "Logged in to {} as @{} (#{}).",
-                me.host,
-                me.username,
-                me.user_id
-            )?;
+            outln!("{}", logged_in(&me.host, &me.username, me.user_id))?;
             outln!(
                 "{}",
-                token_line(me.token_expires_at, me.token_rotates, Utc::now())
+                token_line_styled(me.token_expires_at, me.token_rotates, Utc::now())
             )
         },
     )
+}
+
+/// `Logged in to gitlab.example.com as @ada (#7).`
+pub fn logged_in(host: &str, username: &str, user_id: i64) -> String {
+    format!(
+        "Logged in to {} as {} {}.",
+        style::strong(host),
+        style::strong(&format!("@{username}")),
+        style::muted(&format!("(#{user_id})"))
+    )
+}
+
+/// [`token_line`] coloured by its urgency: red once the token expired, yellow
+/// while it expires inside the week `forskap status` warns in and nothing
+/// rotates it, plain otherwise.
+pub fn token_line_styled(expires_at: Option<i64>, rotates: bool, now: DateTime<Utc>) -> String {
+    let line = token_line(expires_at, rotates, now);
+    let left = expires_at.map(|secs| secs - now.timestamp());
+    match left {
+        Some(left) if left <= 0 => style::error(&line).to_string(),
+        Some(left) if !rotates && left < EXPIRY_WARN_SECS => style::warning(&line).to_string(),
+        _ => line,
+    }
 }
 
 /// The token's expiry and rotation in one sentence.
@@ -110,5 +132,30 @@ mod tests {
         ] {
             assert_eq!(token_line(expires_at, rotates, now), line);
         }
+    }
+
+    #[test]
+    fn token_line_colours_by_urgency() {
+        style::force(true);
+        let now = at("2026-12-24T09:00:00Z");
+        let expires = |s: &str| Some(at(s).timestamp());
+        let styled = |expires_at, rotates| token_line_styled(expires_at, rotates, now);
+        assert!(
+            styled(expires("2026-12-24T00:00:00Z"), true).starts_with("\x1b[31mThe token expired")
+        );
+        assert!(
+            styled(expires("2026-12-30T00:00:00Z"), false).starts_with("\x1b[33mThe token expires")
+        );
+        // Rotated before then, or far off: nothing to act on.
+        assert_eq!(
+            styled(expires("2026-12-30T00:00:00Z"), true),
+            "The token expires on 2026-12-30 (in 5 days); the daemon rotates it before that."
+        );
+        assert!(styled(expires("2027-03-01T00:00:00Z"), false).starts_with("The token expires"));
+        assert_eq!(styled(None, false), "The token has no known expiry date.");
+        assert_eq!(
+            logged_in("gitlab.example.com", "ada", 7),
+            "Logged in to \x1b[1mgitlab.example.com\x1b[0m as \x1b[1m@ada\x1b[0m \x1b[2m(#7)\x1b[0m."
+        );
     }
 }

@@ -31,8 +31,10 @@ pub async fn run(kind: RefKind, target: TargetArgs, no_browser: bool) -> Result<
         }
     }
     outln!(
-        "opened {} {web_url}",
-        style::reference(refspec::sigil(kind), iid)
+        "{} {} {}",
+        style::success("opened"),
+        style::reference(refspec::sigil(kind), iid),
+        style::muted(web_url)
     )?;
     Ok(())
 }
