@@ -11,10 +11,11 @@ use forskap_api::admin::{
 };
 use forskap_api::{
     AsyncCall, Call_AssignSelf, Call_Close, Call_CreateWorkItem, Call_DismissFailure,
-    Call_GetActivity, Call_GetAssignedMergeRequests, Call_GetAssignedWorkItems, Call_GetHistory,
-    Call_GetStatus, Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
-    Call_Search, Call_UnassignSelf, Call_WhoAmI, CreateWorkItem_Reply, GetActivity_Reply,
-    GetAssignedMergeRequests_Reply, GetAssignedWorkItems_Reply, GetHistory_Reply, GetStatus_Reply,
+    Call_GetActivity, Call_GetAssignedMergeRequests, Call_GetAssignedWorkItems,
+    Call_GetDescriptionTemplates, Call_GetHistory, Call_GetStatus, Call_ListWorkItems,
+    Call_PostTime, Call_RecordOpen, Call_RetryFailure, Call_Search, Call_UnassignSelf, Call_WhoAmI,
+    CreateWorkItem_Reply, GetActivity_Reply, GetAssignedMergeRequests_Reply,
+    GetAssignedWorkItems_Reply, GetDescriptionTemplates_Reply, GetHistory_Reply, GetStatus_Reply,
     HistorySource, IssuableKind, ListWorkItems_Reply, MergeRequest, NewWorkItem, Scope,
     Search_Reply, SearchKind, SearchOptions, VarlinkInterface, WhoAmI_Reply, WorkItem,
     WorkItemFilter, WorkItemRef, WorkItemRole, WorkItemState,
@@ -2550,6 +2551,95 @@ async fn get_activity_never_reads_through() {
     let (h, _dir) = connected_handlers(&fake);
     assert!(activity(&h, None).await.is_empty());
     assert_eq!(fake.read_calls(), 0);
+}
+
+// ── GetDescriptionTemplates ───────────────────────────────────────────────
+
+async fn templates(
+    h: &Handlers,
+    project_id: i64,
+    kind: Option<IssuableKind>,
+) -> Vec<(IssuableKind, String)> {
+    let mut call = AsyncCall::default();
+    h.get_description_templates(
+        &mut call as &mut dyn Call_GetDescriptionTemplates,
+        project_id,
+        kind,
+    )
+    .await
+    .unwrap();
+    reply::<GetDescriptionTemplates_Reply>(&mut call)
+        .templates
+        .into_iter()
+        .map(|t| (t.kind, t.name))
+        .collect()
+}
+
+#[tokio::test]
+async fn get_description_templates_serves_the_synced_kinds_by_name() {
+    let fake = Arc::new(FakeGitlab::default());
+    let (h, _dir) = connected_handlers(&fake);
+    let template = |project_id, kind, name: &str| model::DescriptionTemplate {
+        project_id,
+        kind,
+        name: name.into(),
+        content: format!("## {name}\n"),
+    };
+    seed(
+        &h,
+        &[
+            template(7, Issuable::Issue, "Feature request"),
+            template(7, Issuable::Issue, "Bug"),
+            template(7, Issuable::MergeRequest, "Release"),
+            template(8, Issuable::Issue, "Bug"),
+        ],
+    );
+    let work_item = || IssuableKind::work_item;
+    let merge_request = || IssuableKind::merge_request;
+    // Not synced yet: nothing, and GitLab isn't asked.
+    assert!(templates(&h, 7, None).await.is_empty());
+    // One kind synced serves that kind; the other is still empty.
+    mark_synced(&h, &[Job::ProjectTemplates(7, Issuable::Issue)]);
+    assert_eq!(
+        templates(&h, 7, None).await,
+        [
+            (work_item(), "Bug".to_string()),
+            (work_item(), "Feature request".to_string()),
+        ]
+    );
+    assert!(templates(&h, 7, Some(merge_request())).await.is_empty());
+    mark_synced(&h, &[Job::ProjectTemplates(7, Issuable::MergeRequest)]);
+    assert_eq!(
+        templates(&h, 7, None).await,
+        [
+            (work_item(), "Bug".to_string()),
+            (work_item(), "Feature request".to_string()),
+            (merge_request(), "Release".to_string()),
+        ]
+    );
+    assert_eq!(
+        templates(&h, 7, Some(merge_request())).await,
+        [(merge_request(), "Release".to_string())]
+    );
+    assert_eq!(templates(&h, 7, Some(work_item())).await.len(), 2);
+    assert!(templates(&h, 8, None).await.is_empty(), "never synced");
+    assert_eq!(fake.read_calls(), 0);
+
+    let mut call = AsyncCall::default();
+    h.get_description_templates(&mut call as &mut dyn Call_GetDescriptionTemplates, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(reply_error(&mut call).as_deref(), Some(INVALID_ARGUMENT));
+}
+
+#[tokio::test]
+async fn get_description_templates_never_reads_through() {
+    let (h, _dir) = dormant_handlers();
+    let mut call = AsyncCall::default();
+    h.get_description_templates(&mut call as &mut dyn Call_GetDescriptionTemplates, 7, None)
+        .await
+        .unwrap();
+    assert_eq!(reply_error(&mut call).as_deref(), Some(NOT_AUTHENTICATED));
 }
 
 // ── ClearCache ─────────────────────────────────────────────────────────

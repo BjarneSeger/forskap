@@ -17,7 +17,7 @@
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::config::{Config, RotatePolicy, SearchPopulation};
 use crate::error::{Error, Result};
@@ -25,8 +25,8 @@ use crate::gitlab::{GitlabApi, Issuable, Listing, NewIssue, Progress, RotatedTok
 use crate::handlers::Session;
 use crate::secrets::Token;
 use crate::sync::model::{
-    Board, BoardList, Epic, EpicRef, Event, Group, Issue, LabelRef, MergeRequest, NoteRef, Project,
-    PushData, TimeStats, Timelog, UserRef,
+    Board, BoardList, DescriptionTemplate, Epic, EpicRef, Event, Group, Issue, LabelRef,
+    MergeRequest, NoteRef, Project, PushData, TimeStats, Timelog, UserRef,
 };
 use crate::sync::now_secs;
 
@@ -86,6 +86,7 @@ struct State {
     merge_requests: Vec<MergeRequest>,
     epics: Vec<Epic>,
     boards: Vec<Board>,
+    description_templates: Vec<DescriptionTemplate>,
     events: Vec<Event>,
     timelogs: Vec<Timelog>,
     /// The next id of a timelog or event made by a write.
@@ -315,6 +316,13 @@ impl State {
             Listing::ProjectBoards { project_id } => {
                 rows(self.boards.iter().filter(|b| b.project_id == *project_id))
             }
+            // Names only, as GitLab lists them.
+            Listing::ProjectTemplates { project_id, kind } => self
+                .description_templates
+                .iter()
+                .filter(|t| t.project_id == *project_id && t.kind == *kind)
+                .map(|t| json!({"key": t.name, "name": t.name}))
+                .collect(),
             // Oldest first; `after` is a date, compared exclusively.
             Listing::Events { after } => {
                 let mut events: Vec<&Event> = self
@@ -581,6 +589,20 @@ impl GitlabApi for DemoGitlab {
             .iter()
             .find(|e| e.group_id == group_id && e.iid == iid);
         Ok(serde_json::to_value(epic.ok_or_else(not_found)?)?)
+    }
+
+    async fn description_template(
+        &self,
+        project_id: i64,
+        kind: Issuable,
+        key: &str,
+    ) -> Result<Option<Value>> {
+        let state = self.state.lock().unwrap();
+        let template = state
+            .description_templates
+            .iter()
+            .find(|t| t.project_id == project_id && t.kind == kind && t.name == key);
+        Ok(template.map(|t| json!({"name": t.name, "content": t.content})))
     }
 
     async fn list(
@@ -879,6 +901,35 @@ fn fixture(now: u64) -> State {
         board(503, 103, &[Some("Doing"), Some("Review")]),
     ];
 
+    // Only the API project has `.gitlab/issue_templates/` (one name with a
+    // space, as GitLab allows) and `.gitlab/merge_request_templates/`.
+    let template = |project_id: i64, kind, name: &str, content: &str| DescriptionTemplate {
+        project_id,
+        kind,
+        name: name.into(),
+        content: content.into(),
+    };
+    let description_templates = vec![
+        template(
+            101,
+            Issuable::Issue,
+            "Bug",
+            "## Summary\n\n## Steps to reproduce\n\n1. \n\n## Expected behaviour\n\n## Actual behaviour\n",
+        ),
+        template(
+            101,
+            Issuable::Issue,
+            "Feature request",
+            "## Problem\n\n## Proposal\n\n## Out of scope\n",
+        ),
+        template(
+            101,
+            Issuable::MergeRequest,
+            "Release",
+            "## What\n\n## Checklist\n\n- [ ] Changelog entry\n- [ ] Rollback plan\n",
+        ),
+    ];
+
     let events = EVENTS
         .iter()
         .enumerate()
@@ -955,6 +1006,7 @@ fn fixture(now: u64) -> State {
         merge_requests,
         epics,
         boards,
+        description_templates,
         events,
         timelogs,
         // Above every fixture id: new timelogs and events follow it.
@@ -1049,6 +1101,7 @@ mod tests {
         assert!(state.groups.iter().all(Resource::is_valid));
         assert!(state.epics.iter().all(Resource::is_valid));
         assert!(state.boards.iter().all(Resource::is_valid));
+        assert!(state.description_templates.iter().all(Resource::is_valid));
         assert!(state.events.iter().all(Resource::is_valid));
         assert!(state.timelogs.iter().all(Resource::is_valid));
         assert!(state.timelogs.iter().all(|t| !t.title.is_empty()));
@@ -1278,6 +1331,43 @@ mod tests {
         let epic: model::Epic = serde_json::from_value(demo.epic(12, 1).await.unwrap()).unwrap();
         assert_eq!((epic.id, epic.work_item_id), (3002, 8102));
         assert_eq!(epic.title, "Accessibility audit");
+    }
+
+    #[tokio::test]
+    async fn the_api_project_has_description_templates_of_both_kinds() {
+        let (demo, _) = demo();
+        let demo = &demo;
+        let keys = |project_id, kind| async move {
+            let listed = demo
+                .list(
+                    &Listing::ProjectTemplates { project_id, kind },
+                    None,
+                    &Progress::default(),
+                )
+                .await
+                .unwrap();
+            let keys: Vec<String> = listed
+                .iter()
+                .filter_map(|t| t["key"].as_str().map(str::to_string))
+                .collect();
+            keys
+        };
+        assert_eq!(keys(101, Issuable::Issue).await, ["Bug", "Feature request"]);
+        assert_eq!(keys(101, Issuable::MergeRequest).await, ["Release"]);
+        assert!(keys(102, Issuable::Issue).await.is_empty());
+        let bug = demo
+            .description_template(101, Issuable::Issue, "Bug")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(bug["content"].as_str().unwrap().starts_with("## Summary"));
+        // A name is of its kind.
+        assert!(
+            demo.description_template(101, Issuable::MergeRequest, "Bug")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

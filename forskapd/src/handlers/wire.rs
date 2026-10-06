@@ -2,8 +2,8 @@
 
 use forskap_api::admin::{SyncJob, SyncJobStatus};
 use forskap_api::{
-    ActivityEvent, Group, HistoryEvent, HistorySource, IssuableKind, MergeRequest, Project,
-    WorkItem, WorkItemRef, WorkItemState,
+    ActivityEvent, DescriptionTemplate, Group, HistoryEvent, HistorySource, IssuableKind,
+    MergeRequest, Project, WorkItem, WorkItemRef, WorkItemState,
 };
 
 use crate::gitlab::Issuable;
@@ -176,6 +176,14 @@ pub fn epic(e: model::Epic, open_count: i64, group_path: Option<String>) -> Work
 }
 
 /// A synced timelog as a history event.
+pub fn description_template(t: model::DescriptionTemplate) -> DescriptionTemplate {
+    DescriptionTemplate {
+        kind: kind(t.kind),
+        name: t.name,
+        content: t.content,
+    }
+}
+
 pub fn timelog(t: model::Timelog) -> HistoryEvent {
     HistoryEvent {
         timestamp: t.spent_at as i64,

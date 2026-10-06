@@ -18,7 +18,8 @@ use clap::{Arg, Command, CommandFactory};
 use clap_complete::env::{Bash, Elvish, Fish, Powershell, Shells, Zsh};
 use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
 use forskap_api::{
-    Scope, Search_Reply, SearchKind, SearchOptions, VarlinkClient, VarlinkClientInterface, WorkItem,
+    IssuableKind, Scope, Search_Reply, SearchKind, SearchOptions, VarlinkClient,
+    VarlinkClientInterface, WorkItem,
 };
 
 use self::nushell::Nushell;
@@ -86,6 +87,7 @@ pub fn command() -> Command {
             create.mut_args(|arg| match arg.get_id().as_str() {
                 "project" => completing(arg, projects),
                 "group" => completing(arg, groups),
+                "template" => completing(arg, templates),
                 _ => arg,
             })
         })
@@ -235,6 +237,25 @@ fn unquoted(word: &str) -> String {
         .and_then(|w| w.strip_suffix('\''))
         .or_else(|| word.strip_prefix('"').and_then(|w| w.strip_suffix('"')));
     inner.unwrap_or(word).to_string()
+}
+
+/// `forskap issue create --template <NAME>`: the cached templates of the
+/// project named on the line; none without one.
+fn templates(current: &str) -> Vec<Candidate> {
+    let Some(project) = option_value(&line(), "project", 'p') else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    within_budget(fetch_templates(&project, &mut names));
+    let prefix = current.to_ascii_lowercase();
+    names
+        .into_iter()
+        .filter(|name| name.to_ascii_lowercase().starts_with(&prefix))
+        .map(|name| Candidate {
+            value: name,
+            help: String::new(),
+        })
+        .collect()
 }
 
 /// `-p/--project <PROJECT>`.
@@ -573,6 +594,19 @@ async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
             .into_iter()
             .map(|p| (p.full_path, Some(p.name))),
     );
+    Some(())
+}
+
+/// The names of the project's cached issue templates.
+async fn fetch_templates(project: &str, names: &mut Vec<String>) -> Option<()> {
+    let client = client::connect_default().await.ok()?;
+    let project_id = project::by_arg(&client, project).await.ok()?;
+    let reply = client
+        .get_description_templates(project_id, Some(IssuableKind::work_item))
+        .call()
+        .await
+        .ok()?;
+    names.extend(reply.templates.into_iter().map(|t| t.name));
     Some(())
 }
 

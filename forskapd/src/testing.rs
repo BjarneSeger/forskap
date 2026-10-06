@@ -6,9 +6,10 @@
 //! path can be gated to hold its next call until released. Every call is
 //! recorded for assertions. Writes succeed unless a failure is queued, and
 //! can all be held behind one gate to observe them in flight; creating an
-//! issue is one of them, answered with a served row. The token, avatar and
-//! epic calls fail like reads, by their path ([`TOKEN_PATH`],
-//! [`ROTATE_PATH`], `projects/<id>/avatar`, [`epic_path`]).
+//! issue is one of them, answered with a served row. The token, avatar,
+//! epic and description template calls fail like reads, by their path
+//! ([`TOKEN_PATH`], [`ROTATE_PATH`], `projects/<id>/avatar`, [`epic_path`],
+//! [`template_path`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -34,6 +35,15 @@ pub const RECENT_ASSIGNED_PATH: &str = "issues?assigned";
 /// The path [`FakeGitlab::fail_next`] fails the lookup of an epic by.
 pub fn epic_path(group_id: i64, iid: i64) -> String {
     format!("groups/{group_id}/epics/{iid}")
+}
+
+/// The path [`FakeGitlab::fail_next`] fails the read of a description
+/// template by.
+pub fn template_path(project_id: i64, kind: Issuable, key: &str) -> String {
+    format!(
+        "projects/{project_id}/templates/{}/{key}",
+        kind.path_segment()
+    )
 }
 
 /// The path a read is served, failed, gated and counted by: the listing's
@@ -115,6 +125,11 @@ pub struct FakeGitlab {
     epics: Mutex<HashMap<(i64, i64), Value>>,
     /// The group and number of every epic lookup.
     epic_calls: Mutex<Vec<(i64, i64)>>,
+    /// The content of the description templates the read finds, by project,
+    /// kind and key.
+    description_templates: Mutex<HashMap<(i64, Issuable, String), String>>,
+    /// The project, kind and key of every description template read.
+    template_calls: Mutex<Vec<(i64, Issuable, String)>>,
     write_failures: Mutex<VecDeque<FakeErr>>,
     writes: Mutex<Vec<WriteCall>>,
     /// Holds every write while set; see [`FakeGitlab::gate_writes`].
@@ -209,6 +224,21 @@ impl FakeGitlab {
         self.epic_calls.lock().unwrap().clone()
     }
 
+    /// Let the description template read find `content` under `key` among
+    /// the project's templates of `kind`; any other template is a 404
+    /// (`None`).
+    pub fn serve_template(&self, project_id: i64, kind: Issuable, key: &str, content: &str) {
+        self.description_templates
+            .lock()
+            .unwrap()
+            .insert((project_id, kind, key.to_string()), content.to_string());
+    }
+
+    /// The project, kind and key of every description template read so far.
+    pub fn template_calls(&self) -> Vec<(i64, Issuable, String)> {
+        self.template_calls.lock().unwrap().clone()
+    }
+
     pub fn serve_token(&self, info: TokenInfo) {
         *self.token.lock().unwrap() = Some(info);
     }
@@ -287,13 +317,14 @@ impl FakeGitlab {
         self.timelog_calls.lock().unwrap().clone()
     }
 
-    /// Every read so far: listings, timelog queries, avatar downloads and
-    /// epic lookups.
+    /// Every read so far: listings, timelog queries, avatar downloads, epic
+    /// lookups and issue template reads.
     pub fn read_calls(&self) -> usize {
         self.calls.lock().unwrap().len()
             + self.timelog_calls.lock().unwrap().len()
             + self.avatar_calls.lock().unwrap().len()
             + self.epic_calls.lock().unwrap().len()
+            + self.template_calls.lock().unwrap().len()
     }
 
     pub fn writes(&self) -> Vec<WriteCall> {
@@ -403,6 +434,24 @@ impl GitlabApi for FakeGitlab {
         }
         let served = self.epics.lock().unwrap().get(&(group_id, iid)).cloned();
         served.ok_or_else(|| FakeErr::RejectedWith(404).error())
+    }
+
+    async fn description_template(
+        &self,
+        project_id: i64,
+        kind: Issuable,
+        key: &str,
+    ) -> Result<Option<Value>> {
+        self.template_calls
+            .lock()
+            .unwrap()
+            .push((project_id, kind, key.to_string()));
+        if let Some(err) = self.next_failure(&template_path(project_id, kind, key)) {
+            return Err(err.error());
+        }
+        let served = self.description_templates.lock().unwrap();
+        let content = served.get(&(project_id, kind, key.to_string())).cloned();
+        Ok(content.map(|content| serde_json::json!({"name": key, "content": content})))
     }
 
     async fn add_spent_time(

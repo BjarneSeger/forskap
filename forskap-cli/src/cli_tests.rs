@@ -31,7 +31,8 @@ fn tree_is_well_formed() {
 fn every_number_and_project_argument_completes() {
     fn check(cmd: &clap::Command, path: &str, seen: &mut usize) {
         for arg in cmd.get_arguments() {
-            if ["iid", "reference", "project", "group"].contains(&arg.get_id().as_str()) {
+            if ["iid", "reference", "project", "group", "template"].contains(&arg.get_id().as_str())
+            {
                 assert!(
                     arg.get::<ArgValueCompleter>().is_some(),
                     "`{path}` has no completer for `{}`",
@@ -50,9 +51,9 @@ fn every_number_and_project_argument_completes() {
     let mut seen = 0;
     check(&cmd, "forskap", &mut seen);
     // Number and project of five verbs in two groups and of `time log`,
-    // number and group of the two epic verbs, project of `search`, project
-    // and epic group of `issue create`.
-    assert_eq!(seen, 2 * 5 * 2 + 2 + 2 * 2 + 1 + 2);
+    // number and group of the two epic verbs, project of `search`, project,
+    // epic group and template of `issue create`.
+    assert_eq!(seen, 2 * 5 * 2 + 2 + 2 * 2 + 1 + 3);
 
     // Attaching them must not reorder the positionals.
     let log = cmd.find_subcommand("time").unwrap();
@@ -96,11 +97,12 @@ fn issue_create_takes_title_words_and_a_project() {
     assert_eq!(args.title, ["Fix", "the", "login"]);
     assert_eq!(args.project, "team/api");
     assert_eq!(
-        (args.description, args.epic, args.group),
-        (None, None, None)
+        (args.description, args.template, args.epic, args.group),
+        (None, None, None, None)
     );
     assert!(args.labels.is_empty());
     assert!(!args.no_assign, "assigned unless asked not to");
+    assert!(!args.no_edit, "edited on a terminal unless asked not to");
 
     let Command::Issue {
         command: IssueCommand::Create(args),
@@ -145,6 +147,40 @@ fn issue_create_takes_title_words_and_a_project() {
         let args = ["issue", "create", "x", "-p", "1", "--epic", bad];
         assert!(parse(&args).is_err(), "{bad:?}");
     }
+}
+
+#[test]
+fn issue_create_starts_from_a_template_or_takes_the_text_as_is() {
+    let Command::Issue {
+        command: IssueCommand::Create(args),
+    } = ok(&[
+        "issue",
+        "create",
+        "x",
+        "-p",
+        "1",
+        "--template",
+        "Bug",
+        "--no-edit",
+    ])
+    else {
+        panic!("not `issue create`");
+    };
+    assert_eq!(args.template.as_deref(), Some("Bug"));
+    assert!(args.no_edit);
+    // Text given is final: there is nothing for a template to start.
+    let both = [
+        "issue",
+        "create",
+        "x",
+        "-p",
+        "1",
+        "--template",
+        "Bug",
+        "--description",
+        "y",
+    ];
+    assert!(parse(&both).is_err());
 }
 
 #[test]

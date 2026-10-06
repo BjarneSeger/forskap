@@ -269,9 +269,14 @@ pub enum IssueCommand {
     Item(ItemCommand),
     /// Create an issue.
     ///
-    /// It is assigned to you unless `--no-assign` is given. The daemon sends
-    /// it to GitLab right away and, unlike the other writes, never queues it:
-    /// while GitLab is unreachable this fails, and nothing is created later.
+    /// It is assigned to you unless `--no-assign` is given. On a terminal
+    /// with `$VISUAL` or `$EDITOR` set, the description is written in that
+    /// editor, starting from one of the project's issue templates if it has
+    /// any; `--description` gives the text as is, `--no-edit` skips the
+    /// editor. The daemon sends the
+    /// issue to GitLab right away and, unlike the other writes, never queues
+    /// it: while GitLab is unreachable this fails, and nothing is created
+    /// later.
     Create(CreateArgs),
 }
 
@@ -284,9 +289,19 @@ pub struct CreateArgs {
     /// (`group/project`).
     #[arg(short = 'p', long, value_name = "PROJECT")]
     pub project: String,
-    /// Description, in GitLab's Markdown.
+    /// Description, in GitLab's Markdown, as is: no template, no editor.
     #[arg(long, value_name = "TEXT")]
     pub description: Option<String>,
+    /// Issue template of the project to start the description from, by its
+    /// name in GitLab's template picker (`.gitlab/issue_templates/<NAME>.md`),
+    /// as cached by the daemon.
+    #[arg(long, value_name = "NAME", conflicts_with = "description")]
+    pub template: Option<String>,
+    /// Don't open the editor or ask for a template, and don't mention it
+    /// when none is set: the template's text (`--template`), or no
+    /// description, is sent as is.
+    #[arg(long)]
+    pub no_edit: bool,
     /// Label to set. Repeat the flag for several.
     #[arg(long = "label", value_name = "LABEL")]
     pub labels: Vec<String>,

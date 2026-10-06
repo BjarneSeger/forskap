@@ -26,11 +26,12 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::avatars::Avatar;
 use super::jobs::{ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, ISSUE_VIEWS, Job};
-use super::model::{Board, Epic, Event, Issue, MergeRequest, Project, RowKey};
+use super::model::{Board, DescriptionTemplate, Epic, Event, Issue, MergeRequest, Project, RowKey};
 use super::schedule::{fingerprint, text_hash};
 use super::store::{Commit, RowScope, SyncStore};
 use crate::config::{Config, SearchPopulation};
 use crate::error::Result;
+use crate::gitlab::Issuable;
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Plan {
@@ -123,8 +124,12 @@ pub fn plan(store: &SyncStore, population: SearchPopulation, tracked_since: u64)
         .map(|p| p.id)
         .collect();
     let switched_off = |job: &Job| match *job {
-        Job::ProjectIssues(p) | Job::ProjectBoards(p) => no_issues.contains(&p),
-        Job::ProjectMergeRequests(p) => no_merge_requests.contains(&p),
+        Job::ProjectIssues(p)
+        | Job::ProjectBoards(p)
+        | Job::ProjectTemplates(p, Issuable::Issue) => no_issues.contains(&p),
+        Job::ProjectMergeRequests(p) | Job::ProjectTemplates(p, Issuable::MergeRequest) => {
+            no_merge_requests.contains(&p)
+        }
         _ => false,
     };
     let mut jobs = BTreeSet::from(BASE);
@@ -137,10 +142,15 @@ pub fn plan(store: &SyncStore, population: SearchPopulation, tracked_since: u64)
         }
     };
     jobs.extend(avatars.keys().map(|&p| Job::ProjectAvatar(p)));
-    // Board columns are read for the assigned issues and the corpus. A
+    // Board columns are read for the assigned issues and the corpus, and
+    // an issue or a merge request is created where one is worked on. A
     // tracked project the user isn't a member of may be gone or closed.
     for &p in assigned_issues.iter().chain(tracked.intersection(&members)) {
         plan_unless_off(&mut jobs, Job::ProjectBoards(p));
+        plan_unless_off(&mut jobs, Job::ProjectTemplates(p, Issuable::Issue));
+    }
+    for &p in assigned_mrs.iter().chain(tracked.intersection(&members)) {
+        plan_unless_off(&mut jobs, Job::ProjectTemplates(p, Issuable::MergeRequest));
     }
     let unlisted = events
         .iter()
@@ -258,7 +268,7 @@ fn viewed(store: &SyncStore, names: &[&str]) -> Result<HashSet<RowKey>> {
 
 /// Stage the removal of rows no job in `plan` keeps fresh any more: issues
 /// and MRs of unplanned projects (unless a view lists them),
-/// epics of unplanned groups, boards of untracked projects and avatars of projects that lost theirs or
+/// epics of unplanned groups, boards and issue templates of untracked projects and avatars of projects that lost theirs or
 /// left the memberships (their files go with the worker's sweep). Returns
 /// how many.
 pub fn collect_garbage(commit: &mut Commit<'_>, store: &SyncStore, plan: &Plan) -> Result<usize> {
@@ -280,6 +290,10 @@ pub fn collect_garbage(commit: &mut Commit<'_>, store: &SyncStore, plan: &Plan) 
     })?;
     removed += commit.remove_where::<Board>(RowScope::All, |k| {
         plan.jobs.contains(&Job::ProjectBoards(k.0 as i64))
+    })?;
+    removed += commit.remove_where::<DescriptionTemplate>(RowScope::All, |k| {
+        let (project_id, kind) = DescriptionTemplate::owner(k);
+        plan.jobs.contains(&Job::ProjectTemplates(project_id, kind))
     })?;
     removed += commit.remove_where::<Avatar>(RowScope::All, |k| {
         plan.jobs.contains(&Job::ProjectAvatar(k.0 as i64))
@@ -466,6 +480,20 @@ mod tests {
             })
             .collect();
         assert_eq!(boards, BTreeSet::from([3, 5]));
+        // The issue templates go with them: an issue is created where one
+        // is worked on. Merge request templates follow the assigned merge
+        // requests instead: project 5 has only an assigned issue.
+        let templates = |kind| -> BTreeSet<i64> {
+            plan.jobs
+                .iter()
+                .filter_map(|j| match j {
+                    Job::ProjectTemplates(p, k) if *k == kind => Some(*p),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(templates(Issuable::Issue), boards);
+        assert_eq!(templates(Issuable::MergeRequest), BTreeSet::from([3]));
     }
 
     #[test]
@@ -861,11 +889,15 @@ mod tests {
     }
 
     /// The per-project jobs `plan` holds for project `p`, by kind.
-    fn per_project(plan: &Plan, p: i64) -> [bool; 3] {
+    fn per_project(plan: &Plan, p: i64) -> [bool; 5] {
         [
             plan.jobs.contains(&Job::ProjectIssues(p)),
             plan.jobs.contains(&Job::ProjectMergeRequests(p)),
             plan.jobs.contains(&Job::ProjectBoards(p)),
+            plan.jobs
+                .contains(&Job::ProjectTemplates(p, Issuable::Issue)),
+            plan.jobs
+                .contains(&Job::ProjectTemplates(p, Issuable::MergeRequest)),
         ]
     }
 
@@ -898,30 +930,50 @@ mod tests {
 
         for population in [SearchPopulation::Tracked, SearchPopulation::Member] {
             let plan = plan(&s, population, 100).unwrap();
-            // [issues, merge requests, boards]
-            assert_eq!(per_project(&plan, 1), [true, false, true], "{population:?}");
+            // [issues, merge requests, boards, issue templates, MR templates]
             assert_eq!(
-                per_project(&plan, 2),
-                [false, true, false],
+                per_project(&plan, 1),
+                [true, false, true, true, false],
                 "{population:?}"
             );
-            assert_eq!(per_project(&plan, 3), [true, true, true], "{population:?}");
-            assert_eq!(per_project(&plan, 4), [true, false, true], "{population:?}");
-            assert_eq!(per_project(&plan, 5), [true, true, true], "{population:?}");
+            assert_eq!(
+                per_project(&plan, 2),
+                [false, true, false, false, true],
+                "{population:?}"
+            );
+            assert_eq!(
+                per_project(&plan, 3),
+                [true, true, true, true, true],
+                "{population:?}"
+            );
+            assert_eq!(
+                per_project(&plan, 4),
+                [true, false, true, true, false],
+                "{population:?}"
+            );
+            assert_eq!(
+                per_project(&plan, 5),
+                [true, true, true, true, true],
+                "{population:?}"
+            );
             assert_eq!(
                 per_project(&plan, 6),
-                [false, true, false],
+                [false, true, false, false, true],
                 "{population:?}"
             );
             assert_eq!(
                 plan.switched_off,
                 BTreeSet::from([
                     Job::ProjectMergeRequests(1),
+                    Job::ProjectTemplates(1, Issuable::MergeRequest),
                     Job::ProjectIssues(2),
                     Job::ProjectBoards(2),
+                    Job::ProjectTemplates(2, Issuable::Issue),
                     Job::ProjectMergeRequests(4),
+                    Job::ProjectTemplates(4, Issuable::MergeRequest),
                     Job::ProjectIssues(6),
                     Job::ProjectBoards(6),
+                    Job::ProjectTemplates(6, Issuable::Issue),
                 ]),
                 "{population:?}"
             );
@@ -952,7 +1004,11 @@ mod tests {
         // The assignment tracks it, so it is in the corpus too.
         assert_eq!(
             plan.switched_off,
-            BTreeSet::from([Job::ProjectBoards(2), Job::ProjectIssues(2)])
+            BTreeSet::from([
+                Job::ProjectBoards(2),
+                Job::ProjectIssues(2),
+                Job::ProjectTemplates(2, Issuable::Issue),
+            ])
         );
     }
 
@@ -972,27 +1028,40 @@ mod tests {
             ..Default::default()
         }])
         .unwrap();
+        c.upsert(&[DescriptionTemplate {
+            project_id: 2,
+            kind: Issuable::Issue,
+            name: "Bug".into(),
+            content: String::new(),
+        }])
+        .unwrap();
         c.set_view(RECENT_AUTHORED_ISSUES, &listing(&[(2, 2)]))
             .unwrap();
         c.commit().unwrap();
         let on = plan(&s, SearchPopulation::Tracked, 100).unwrap();
-        assert_eq!(per_project(&on, 2), [true, true, true]);
+        assert_eq!(per_project(&on, 2), [true, true, true, true, true]);
 
         let mut c = s.begin();
         c.upsert(&[without(2, "issues")]).unwrap();
         c.commit().unwrap();
         let off = plan(&s, SearchPopulation::Tracked, 100).unwrap();
-        assert_eq!(per_project(&off, 2), [false, true, false]);
+        assert_eq!(per_project(&off, 2), [false, true, false, false, true]);
         let mut c = s.begin();
         let removed = collect_garbage(&mut c, &s, &off).unwrap();
         c.commit().unwrap();
-        assert_eq!(removed, 2, "issue #1 and the board");
+        assert_eq!(removed, 3, "issue #1, the board and the template");
         assert_eq!(
             s.issues.keys(RowScope::All).unwrap(),
             [(2, 2)],
             "a view still lists #2"
         );
         assert!(s.boards.keys(RowScope::All).unwrap().is_empty());
+        assert!(
+            s.description_templates
+                .keys(RowScope::All)
+                .unwrap()
+                .is_empty()
+        );
 
         let mut c = s.begin();
         c.upsert(&[Project {

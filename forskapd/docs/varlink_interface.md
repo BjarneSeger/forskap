@@ -24,9 +24,9 @@ issue/MR lists and the recent timelog window every few minutes
 `updated_after` deltas every `search.partial_interval_secs` (default 30 min) with a
 full resync that also reconciles deletions every `search.full_interval_secs`
 (default weekly; the epics of the groups above those projects go the same way),
-and the full timelog history, board columns, project/group memberships and the
-issues you authored or were assigned (open or closed, updated within
-`search.tracked_retention_hours`) daily (`refresh.slow.interval_secs`). Read
+and the full timelog history, board columns, description templates, project/group
+memberships and the issues you authored or were assigned (open or closed, updated
+within `search.tracked_retention_hours`) daily (`refresh.slow.interval_secs`). Read
 methods serve whatever was last synced from the local store
 (`$XDG_DATA_HOME/forskapd/db/`). Reads never trigger a GitLab round-trip.
 
@@ -412,6 +412,28 @@ degrades to an empty reply on cache trouble. When the events have never been syn
 replies with an empty array if a session exists (first sync pending),
 `NotAuthenticated` otherwise.
 
+### `GetDescriptionTemplates(project_id: int, kind: ?IssuableKind) -> (templates: []DescriptionTemplate)`
+
+The description templates of a project (the files under `.gitlab/issue_templates/`
+and `.gitlab/merge_request_templates/` on its default branch, as GitLab's "Choose a
+template" offers them when an issue or a merge request is created there), sorted by
+kind — `work_item` first — and name, content included; `kind` keeps one kind. An
+issue template serves every work item type GitLab creates in the project (issues,
+tasks, incidents, …), hence `work_item`. A `project_id` that isn't positive replies
+`InvalidArgument`. The sync fetches each kind by its own job: the issue templates for
+the projects whose board columns it fetches — the projects of the assigned issues and
+the tracked member projects, unless the project's issues are switched off — and the
+merge request templates likewise for the projects of the assigned merge requests and
+the tracked member projects, unless merge requests (or the repository) are switched
+off; both on the slow cadence (`refresh.slow.interval_secs`, daily): GitLab's listing
+names no change, so every run reads the kind's whole set (`GET
+/projects/:id/templates/issues` or `…/merge_requests`, then one `GET …/:name` per
+template). Served from the store alone, so a kind whose job never ran — because there
+is none for the project, or not yet — reads as empty, exactly as a kind the project
+has no templates of; where no kind asked for has synced and there is no session,
+`NotAuthenticated`. A create without a template works regardless: `CreateWorkItem`
+takes the description as given.
+
 ### `WhoAmI() -> (host: string, user_id: int, username: string, token_expires_at: ?int, token_rotates: bool)`
 
 The connected GitLab host and the authenticated user's ID and login name (`username`:
@@ -668,12 +690,13 @@ forever would only drown the failures that matter. Two mechanisms keep them out:
 
 - *Not planned.* A member project whose issues are switched off
   (`issues_access_level` `disabled`, or `issues_enabled` false on an older instance)
-  gets no issues and no board job — boards belong to the issues — and one whose merge
-  requests or repository are switched off gets no merge request job. What the project
+  gets no issues, no board and no issue template job — they belong to the issues — and one whose merge
+  requests or repository are switched off gets no merge request and no merge request
+  template job. What the project
   doesn't say plans as usual; the next member-projects sync after a change in the
   project's settings adds or drops the jobs (and their rows).
 - *Refused three times in a row.* A per-project or per-group listing (`project/<id>/issues`,
-  `…/merge_requests`, `…/boards`, `…/avatar`, `group/<id>/epics`) that GitLab answers
+  `…/merge_requests`, `…/boards`, `…/issue_templates`, `…/merge_request_templates`, `…/avatar`, `group/<id>/epics`) that GitLab answers
   `403` or `404` three times in a row is `unavailable: true`: it rests about a day
   between attempts and reports `waiting` with that `next_due`, its `failures` and (until
   a daemon restart) its `last_error` kept, and the daemon logs its refusals at debug
@@ -682,7 +705,7 @@ forever would only drown the failures that matter. Two mechanisms keep them out:
   neither count nor start the count over — they say nothing about the listing; any
   other rejection (`400`, `422`, …) starts it over and backs off as a failure. A
   success, `Login` (it clears every backoff) or a `ClearCache` resetting the job
-  (`assigned` for the boards, `search` for the rest, or everything) makes it available
+  (`assigned` for the boards and the templates, `search` for the rest, or everything) makes it available
   again; the count is persisted, so a restart doesn't. The account-wide listings
   (assigned lists, events, memberships, timelogs, …) never become unavailable: a
   refusal there means something is wrong with the session.
@@ -696,7 +719,7 @@ clears everything synced. Otherwise each scope selects a slice:
 
 | scope      | clears                                                       |
 |------------|--------------------------------------------------------------|
-| `assigned` | the assigned issue/MR lists, the `ListWorkItems` lists and the board columns |
+| `assigned` | the assigned issue/MR lists, the `ListWorkItems` lists, the board columns and the description templates |
 | `search` | the corpus: issues, MRs, epics, projects, groups, project avatars |
 | `quick`  | history inside the quick window (last `refresh.quick.window_hours`) |
 | `slow`   | history between the retention horizon and the quick window     |

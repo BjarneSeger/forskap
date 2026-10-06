@@ -23,7 +23,17 @@ use crate::sync::model::Timelog;
 /// because every record written before MR support was an issue, which lets
 /// them deserialize via `#[serde(default)]`.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 pub enum Issuable {
     #[default]
@@ -160,6 +170,10 @@ pub enum Listing {
     },
     /// A project's boards, lists embedded.
     ProjectBoards { project_id: i64 },
+    /// A project's description templates of one kind (its issue or merge
+    /// request templates), names only: the content is one
+    /// [`GitlabApi::description_template`] each.
+    ProjectTemplates { project_id: i64, kind: Issuable },
     /// The user's own contribution events created after `after` (a date;
     /// GitLab compares exclusively). Oldest first: a new event lands behind
     /// the walk instead of shifting every later page.
@@ -188,6 +202,9 @@ impl Listing {
             Self::MemberGroups => "groups".into(),
             Self::GroupEpics { group_id, .. } => format!("groups/{group_id}/epics"),
             Self::ProjectBoards { project_id } => format!("projects/{project_id}/boards"),
+            Self::ProjectTemplates { project_id, kind } => {
+                format!("projects/{project_id}/templates/{}", kind.path_segment())
+            }
             Self::Events { .. } => "events".into(),
             Self::Issuable {
                 kind, project_id, ..
@@ -249,7 +266,7 @@ impl Listing {
                 p.extend(after(updated_after));
                 p
             }
-            Self::ProjectBoards { .. } => Vec::new(),
+            Self::ProjectBoards { .. } | Self::ProjectTemplates { .. } => Vec::new(),
             Self::Events { after } => {
                 let mut p = vec![("sort", "asc".into())];
                 p.extend(after.map(|d| ("after", d.format("%Y-%m-%d").to_string())));
@@ -338,6 +355,17 @@ pub trait GitlabApi: Send + Sync {
     /// The epic `iid` of the group as GitLab answered (`GET
     /// /groups/:id/epics/:iid`), for its legacy id.
     async fn epic(&self, group_id: i64, iid: i64) -> Result<serde_json::Value>;
+
+    /// The description template `key` of the project for `kind` as GitLab
+    /// answers it (`GET /projects/:id/templates/issues/:key` or
+    /// `…/templates/merge_requests/:key`: `name` and `content`); `None` for
+    /// one the project doesn't have (any more).
+    async fn description_template(
+        &self,
+        project_id: i64,
+        kind: Issuable,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>>;
 
     /// The rows of a paginated REST listing, as raw JSON; paging stops once
     /// `limit` rows arrived. `progress` learns the total GitLab announces
@@ -617,6 +645,28 @@ impl GitlabApi for GitlabClient {
         let endpoint = EpicEndpoint { group_id, iid };
         retry_transient("fetch epic", || async {
             endpoint.query_async(&self.inner).await.map_err(classify)
+        })
+        .await
+    }
+
+    #[instrument(skip(self))]
+    async fn description_template(
+        &self,
+        project_id: i64,
+        kind: Issuable,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let endpoint = DescriptionTemplateEndpoint {
+            project_id,
+            kind,
+            key,
+        };
+        retry_transient("fetch description template", || async {
+            match endpoint.query_async(&self.inner).await {
+                Ok(template) => Ok(Some(template)),
+                Err(e) if status_of(&e) == Some(404) => Ok(None),
+                Err(e) => Err(classify(e)),
+            }
         })
         .await
     }
@@ -1074,6 +1124,26 @@ impl gitlab::api::Endpoint for EpicEndpoint {
 
     fn endpoint(&self) -> Cow<'static, str> {
         format!("groups/{}/epics/{}", self.group_id, self.iid).into()
+    }
+}
+
+/// `GET /projects/:id/templates/issues/:key`, or `merge_requests`.
+struct DescriptionTemplateEndpoint<'a> {
+    project_id: i64,
+    kind: Issuable,
+    key: &'a str,
+}
+
+impl gitlab::api::Endpoint for DescriptionTemplateEndpoint<'_> {
+    fn method(&self) -> http::Method {
+        http::Method::GET
+    }
+
+    fn endpoint(&self) -> Cow<'static, str> {
+        // The key is the file name, spaces and all: one path segment.
+        let key = gitlab::api::common::path_escaped(self.key);
+        let kind = self.kind.path_segment();
+        format!("projects/{}/templates/{kind}/{key}", self.project_id).into()
     }
 }
 
@@ -2027,6 +2097,22 @@ mod tests {
                 "projects/7/merge_requests",
                 "iids[]=3",
             ),
+            (
+                Listing::ProjectTemplates {
+                    project_id: 7,
+                    kind: Issuable::Issue,
+                },
+                "projects/7/templates/issues",
+                "",
+            ),
+            (
+                Listing::ProjectTemplates {
+                    project_id: 7,
+                    kind: Issuable::MergeRequest,
+                },
+                "projects/7/templates/merge_requests",
+                "",
+            ),
         ];
         for (listing, path, query) in cases {
             assert_eq!(listing.path(), path, "{listing:?}");
@@ -2194,6 +2280,31 @@ mod tests {
         };
         assert_eq!(epic.endpoint(), "groups/3/epics/5");
         assert_eq!(epic.method(), http::Method::GET);
+    }
+
+    #[test]
+    fn the_template_endpoint_renders_the_kind_and_escapes_the_name() {
+        use gitlab::api::Endpoint;
+
+        let template = DescriptionTemplateEndpoint {
+            project_id: 7,
+            kind: Issuable::Issue,
+            key: "Feature request",
+        };
+        assert_eq!(
+            template.endpoint(),
+            "projects/7/templates/issues/Feature%20request"
+        );
+        assert_eq!(template.method(), http::Method::GET);
+        let template = DescriptionTemplateEndpoint {
+            project_id: 7,
+            kind: Issuable::MergeRequest,
+            key: "Release",
+        };
+        assert_eq!(
+            template.endpoint(),
+            "projects/7/templates/merge_requests/Release"
+        );
     }
 
     #[test]

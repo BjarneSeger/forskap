@@ -36,6 +36,7 @@ mod client;
 mod cmd;
 mod complete;
 mod config;
+mod editor;
 mod friendly;
 mod item;
 mod migrate;

@@ -14,7 +14,8 @@ use tracing::{info, warn};
 
 use super::avatars::{self, Avatar, AvatarDir};
 use super::model::{
-    Board, Epic, Event, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog,
+    Board, DescriptionTemplate, Epic, Event, Group, Issue, MergeRequest, Project, Resource, RowKey,
+    Timelog,
 };
 use super::schedule::{Cadence, JobState, UNAVAILABLE_AFTER, fingerprint};
 use super::store::{Commit, RowScope, Stored, View};
@@ -94,6 +95,9 @@ pub enum Job {
     AllTimelogs,
     /// A member project's avatar, as a file for the launchers.
     ProjectAvatar(i64),
+    /// A project's description templates of one kind, for creating an issue
+    /// or a merge request there.
+    ProjectTemplates(i64, Issuable),
 }
 
 impl Job {
@@ -116,6 +120,12 @@ impl Job {
             Self::RecentAssignedIssues => RECENT_ASSIGNED_ISSUES.into(),
             Self::AllTimelogs => "timelogs/all".into(),
             Self::ProjectAvatar(p) => format!("project/{p}/avatar"),
+            // Not `…/templates/issues`: a cache clear tells the jobs it
+            // resets by the key's last segment.
+            Self::ProjectTemplates(p, Issuable::Issue) => format!("project/{p}/issue_templates"),
+            Self::ProjectTemplates(p, Issuable::MergeRequest) => {
+                format!("project/{p}/merge_request_templates")
+            }
         }
     }
 
@@ -124,7 +134,8 @@ impl Job {
         match self {
             Self::AssignedIssues | Self::AssignedMergeRequests | Self::RecentTimelogs => 0,
             Self::Events => 1,
-            Self::AllTimelogs => 3,
+            // Wanted only when the user creates an issue.
+            Self::AllTimelogs | Self::ProjectTemplates(..) => 3,
             // Decoration: never ahead of data.
             Self::ProjectAvatar(_) => 4,
             _ => 2,
@@ -139,7 +150,8 @@ impl Job {
             Self::ProjectBoards(p)
             | Self::ProjectIssues(p)
             | Self::ProjectMergeRequests(p)
-            | Self::ProjectAvatar(p) => Lane::Project(p),
+            | Self::ProjectAvatar(p)
+            | Self::ProjectTemplates(p, _) => Lane::Project(p),
             Self::GroupEpics(g) => Lane::Group(g),
             // A full `all/*` run reconciles every row, so a list landing
             // mid-fetch would lose what it just stored. And two lists store
@@ -194,7 +206,8 @@ impl Job {
             Self::ProjectIssues(_)
             | Self::ProjectMergeRequests(_)
             | Self::ProjectBoards(_)
-            | Self::ProjectAvatar(_) => Some(UNAVAILABLE_AFTER),
+            | Self::ProjectAvatar(_)
+            | Self::ProjectTemplates(..) => Some(UNAVAILABLE_AFTER),
             _ => None,
         }
     }
@@ -232,8 +245,9 @@ impl Job {
             }
             // Memberships rarely change, and a large one pages for a while.
             // The recent issue lists are a look back, where a day of lag
-            // is fine.
+            // is fine. The templates say nothing of when they changed.
             Self::ProjectBoards(_)
+            | Self::ProjectTemplates(..)
             | Self::AllTimelogs
             | Self::MemberProjects
             | Self::MemberGroups
@@ -282,6 +296,7 @@ impl Job {
             Self::MemberGroups => Group::SCHEMA,
             Self::GroupEpics(_) => Epic::SCHEMA,
             Self::ProjectAvatar(_) => Avatar::SCHEMA,
+            Self::ProjectTemplates(..) => DescriptionTemplate::SCHEMA,
         });
         match self {
             Self::ProjectIssues(_) | Self::ProjectMergeRequests(_) | Self::GroupEpics(_) => {
@@ -470,7 +485,55 @@ pub async fn fetch(job: Job, ctx: FetchCtx) -> Result<Staged> {
         Job::RecentTimelogs => timelogs(&ctx, ctx.windows.quick, false).await,
         Job::AllTimelogs => timelogs(&ctx, ctx.windows.retention, true).await,
         Job::ProjectAvatar(project_id) => avatar(&ctx, project_id).await,
+        Job::ProjectTemplates(project_id, kind) => templates(&ctx, project_id, kind).await,
     }
+}
+
+/// A project's description templates of one kind, content included: GitLab
+/// lists the names alone, so the content is one GET each, and a template
+/// gone between the two is left out. Every run fetches the whole set (the
+/// listing says nothing of changes) and reconciles the kind's rows of the
+/// project to it.
+async fn templates(ctx: &FetchCtx, project_id: i64, kind: Issuable) -> Result<Staged> {
+    let listing = Listing::ProjectTemplates { project_id, kind };
+    let listed = ctx.gitlab.list(&listing, None, &ctx.progress).await?;
+    let mut fetched: Vec<DescriptionTemplate> = Vec::with_capacity(listed.len());
+    for entry in &listed {
+        let Some(key) = entry["key"].as_str().filter(|k| !k.is_empty()) else {
+            warn!(
+                project_id,
+                ?kind,
+                "skipping a description template without a key"
+            );
+            continue;
+        };
+        let Some(raw) = ctx
+            .gitlab
+            .description_template(project_id, kind, key)
+            .await?
+        else {
+            continue;
+        };
+        match serde_json::from_value::<DescriptionTemplate>(raw) {
+            Ok(mut template) => {
+                template.project_id = project_id;
+                template.kind = kind;
+                if template.name.is_empty() {
+                    template.name = key.to_string();
+                }
+                fetched.push(template);
+            }
+            Err(e) => {
+                warn!(project_id, ?kind, key, error = %e, "skipping a malformed description template")
+            }
+        }
+    }
+    let scope = RowScope::Prefix(DescriptionTemplate::prefix(project_id, kind));
+    Ok(Staged::new(move |c| {
+        c.upsert(&fetched)?;
+        c.reconcile(scope, &fetched)?;
+        Ok(fetched.len())
+    }))
 }
 
 /// A project's avatar as a local file, named by its bytes: the job runs
@@ -770,7 +833,7 @@ mod tests {
     use crate::sync::store::SyncStore;
     use crate::testing::{
         FakeErr, FakeGitlab, PNG, RECENT_ASSIGNED_PATH, RECENT_AUTHORED_PATH, epic_json,
-        event_json, issue_json,
+        event_json, issue_json, template_path,
     };
     use serde_json::json;
 
@@ -1063,6 +1126,8 @@ mod tests {
             Job::ProjectIssues(7),
             Job::ProjectMergeRequests(7),
             Job::ProjectAvatar(7),
+            Job::ProjectTemplates(7, Issuable::Issue),
+            Job::ProjectTemplates(7, Issuable::MergeRequest),
         ];
         assert!(project.iter().all(|j| j.lane() == Lane::Project(7)));
         assert_ne!(Job::ProjectIssues(8).lane(), Lane::Project(7));
@@ -1096,6 +1161,8 @@ mod tests {
             Job::ProjectMergeRequests(7),
             Job::ProjectBoards(7),
             Job::ProjectAvatar(7),
+            Job::ProjectTemplates(7, Issuable::Issue),
+            Job::ProjectTemplates(7, Issuable::MergeRequest),
         ];
         for job in per_project {
             assert_eq!(job.unavailable_after(), Some(3), "{job:?}");
@@ -1353,6 +1420,95 @@ mod tests {
         let boards = s.boards.scan(RowScope::Prefix(7)).unwrap();
         assert_eq!(boards.len(), 1);
         assert_eq!(boards[0].labels().collect::<Vec<_>>(), ["Doing"]);
+    }
+
+    #[tokio::test]
+    async fn issue_templates_come_with_their_content_and_replace_the_old_set() {
+        let (s, _d) = store();
+        let fake = Arc::new(FakeGitlab::default());
+        fake.serve(
+            "projects/7/templates/issues",
+            vec![
+                json!({"key": "Bug", "name": "Bug"}),
+                json!({"key": "Gone", "name": "Gone"}),
+            ],
+        );
+        fake.serve_template(7, Issuable::Issue, "Bug", "## Steps\n");
+        let issues = RowScope::Prefix(DescriptionTemplate::prefix(7, Issuable::Issue));
+        run(
+            &s,
+            Job::ProjectTemplates(7, Issuable::Issue),
+            ctx(&fake, true, 0),
+        )
+        .await;
+        let templates = s.description_templates.scan(issues).unwrap();
+        assert_eq!(templates.len(), 1, "gone between the listing and its GET");
+        assert_eq!(
+            (templates[0].name.as_str(), templates[0].content.as_str()),
+            ("Bug", "## Steps\n")
+        );
+        assert_eq!(
+            fake.template_calls(),
+            [
+                (7, Issuable::Issue, "Bug".to_string()),
+                (7, Issuable::Issue, "Gone".to_string())
+            ]
+        );
+
+        // The other kind has its own rows: neither run touches the other's.
+        fake.serve(
+            "projects/7/templates/merge_requests",
+            vec![json!({"key": "Release", "name": "Release"})],
+        );
+        fake.serve_template(7, Issuable::MergeRequest, "Release", "## Checklist\n");
+        run(
+            &s,
+            Job::ProjectTemplates(7, Issuable::MergeRequest),
+            ctx(&fake, true, 0),
+        )
+        .await;
+        let all = s.description_templates.scan(RowScope::All).unwrap();
+        let kinds: Vec<(Issuable, &str)> = all.iter().map(|t| (t.kind, t.name.as_str())).collect();
+        assert_eq!(
+            kinds,
+            [
+                (Issuable::Issue, "Bug"),
+                (Issuable::MergeRequest, "Release")
+            ]
+        );
+
+        // The next run's set replaces the stored one.
+        fake.serve(
+            "projects/7/templates/issues",
+            vec![json!({"key": "Feature request", "name": "Feature request"})],
+        );
+        fake.serve_template(7, Issuable::Issue, "Feature request", "## Why\n");
+        run(
+            &s,
+            Job::ProjectTemplates(7, Issuable::Issue),
+            ctx(&fake, true, NOW - 3600),
+        )
+        .await;
+        let templates = s.description_templates.scan(issues).unwrap();
+        let names: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Feature request"]);
+        assert_eq!(
+            s.description_templates.scan(RowScope::All).unwrap().len(),
+            2
+        );
+
+        // A refused GET fails the run; the rows stand.
+        fake.fail_next(
+            &template_path(7, Issuable::Issue, "Feature request"),
+            FakeErr::Rejected,
+        );
+        let failed = fetch(
+            Job::ProjectTemplates(7, Issuable::Issue),
+            ctx(&fake, true, NOW),
+        )
+        .await;
+        assert!(failed.is_err());
+        assert_eq!(s.description_templates.scan(issues).unwrap().len(), 1);
     }
 
     #[tokio::test]

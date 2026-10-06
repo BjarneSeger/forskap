@@ -8,6 +8,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use super::schedule::text_hash;
 use crate::gitlab::Issuable;
 
 /// Storage key of a row. Both halves are big-endian encoded, so the first
@@ -387,6 +388,26 @@ pub struct LabelRef {
     pub name: String,
 }
 
+/// `GET /projects/:id/templates/issues/:key` or `…/merge_requests/:key`: one
+/// description template of a project (a file under
+/// `.gitlab/issue_templates/` or `.gitlab/merge_request_templates/` on its
+/// default branch), content included.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DescriptionTemplate {
+    /// Not in GitLab's JSON; stamped by the sync job that fetched it.
+    #[serde(default)]
+    pub project_id: i64,
+    /// Not in GitLab's JSON either: issue templates serve every work item
+    /// type, merge request templates the merge requests.
+    #[serde(default)]
+    pub kind: Issuable,
+    /// The file name without its `.md`.
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub name: String,
+    #[serde(default, deserialize_with = "de::nullable")]
+    pub content: String,
+}
+
 impl Board {
     /// Label names of the board's lists, in list order.
     pub fn labels(&self) -> impl Iterator<Item = &str> {
@@ -501,6 +522,43 @@ impl Resource for Board {
     }
     fn is_valid(&self) -> bool {
         self.id > 0 && self.project_id > 0
+    }
+}
+
+impl DescriptionTemplate {
+    /// The scan prefix of a project's templates of one kind: the two kinds
+    /// are fetched by two jobs, and each reconciles its own rows.
+    pub fn prefix(project_id: i64, kind: Issuable) -> u64 {
+        let kind = match kind {
+            Issuable::Issue => 0,
+            Issuable::MergeRequest => 1,
+        };
+        positive(project_id) * 2 + kind
+    }
+
+    /// The project and kind a key's prefix stands for.
+    pub fn owner(key: RowKey) -> (i64, Issuable) {
+        let kind = match key.0 % 2 {
+            0 => Issuable::Issue,
+            _ => Issuable::MergeRequest,
+        };
+        ((key.0 / 2) as i64, kind)
+    }
+}
+
+impl Resource for DescriptionTemplate {
+    const NAME: &'static str = "description templates";
+    const KEYSPACE: &'static str = "gl_description_templates_v1";
+    const SCHEMA: u32 = 1;
+    /// GitLab gives a template no id: the name's hash stands in.
+    fn key(&self) -> RowKey {
+        (
+            Self::prefix(self.project_id, self.kind),
+            text_hash(&self.name),
+        )
+    }
+    fn is_valid(&self) -> bool {
+        self.project_id > 0 && !self.name.is_empty()
     }
 }
 

@@ -40,7 +40,10 @@ use super::jobs::{
     self, ASSIGNED_ISSUES, ASSIGNED_MERGE_REQUESTS, FetchCtx, Job, Lane, RECENT_ASSIGNED_ISSUES,
     RECENT_AUTHORED_ISSUES, Staged, Windows,
 };
-use super::model::{Board, Epic, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog};
+use super::model::{
+    Board, DescriptionTemplate, Epic, Group, Issue, MergeRequest, Project, Resource, RowKey,
+    Timelog,
+};
 use super::now_secs;
 use super::planner::{self, Plan};
 use super::schedule::{
@@ -67,8 +70,8 @@ const NOTED_WRITE_TTL_SECS: u64 = 86_400;
 pub enum Clear {
     /// Every synced row, view and job state.
     Everything,
-    /// The assigned issue/MR views, the recent issue views and the board
-    /// labels.
+    /// The assigned issue/MR views, the recent issue views, the board
+    /// labels and the description templates.
     Assigned,
     /// Issues, MRs, epics, projects, groups and the project avatars.
     Corpus,
@@ -86,6 +89,7 @@ impl Clear {
                     || key == ASSIGNED_MERGE_REQUESTS
                     || key.starts_with("recent/")
                     || key.ends_with("/boards")
+                    || key.ends_with("_templates")
             }
             Self::Corpus => {
                 key.starts_with("member/")
@@ -1397,6 +1401,7 @@ impl Worker {
                     c.remove_view(RECENT_AUTHORED_ISSUES);
                     c.remove_view(RECENT_ASSIGNED_ISSUES);
                     c.remove_where::<Board>(RowScope::All, |_| false)?;
+                    c.remove_where::<DescriptionTemplate>(RowScope::All, |_| false)?;
                 }
                 Clear::Corpus => {
                     c.remove_where::<Issue>(RowScope::All, |_| false)?;
@@ -1812,6 +1817,8 @@ mod tests {
             Job::ProjectIssues(7),
             Job::ProjectMergeRequests(7),
             Job::ProjectBoards(7),
+            Job::ProjectTemplates(7, crate::gitlab::Issuable::Issue),
+            Job::ProjectTemplates(7, crate::gitlab::Issuable::MergeRequest),
         ]);
         mark_synced(store, &jobs);
     }
