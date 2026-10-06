@@ -11,17 +11,20 @@
 //! [`BUDGET`], and every failure — no daemon, a broken config, a socket unit
 //! whose daemon doesn't come up — just means fewer candidates.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::time::Duration;
 
 use clap::{Arg, Command, CommandFactory};
 use clap_complete::env::{Bash, Elvish, Fish, Powershell, Shells, Zsh};
 use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
-use forskap_api::{SearchKind, SearchOptions, VarlinkClientInterface, WorkItem};
+use forskap_api::{
+    Scope, Search_Reply, SearchKind, SearchOptions, VarlinkClient, VarlinkClientInterface, WorkItem,
+};
 
 use self::nushell::Nushell;
 use crate::cli::Cli;
 use crate::cmd::epic::group_of;
+use crate::cmd::project;
 use crate::item::{self, Item, project_of};
 use crate::refspec::{self, RefKind};
 use crate::state::{LastEpic, LastIssue};
@@ -32,6 +35,10 @@ mod nushell;
 /// For everything one completion asks the daemon. Cache reads answer in a few
 /// milliseconds; this only bounds the cases where nothing answers.
 const BUDGET: Duration = Duration::from_millis(300);
+
+/// How many numbers to offer once a project or group is named on the line:
+/// every cached one of it then, not just the frequently opened ones.
+const SCOPED_LIMIT: i64 = 200;
 
 /// The subcommands of `forskap issue` / `forskap mr` that take a number.
 const TARGET_VERBS: [&str; 5] = ["view", "open", "close", "assign", "unassign"];
@@ -141,24 +148,93 @@ struct Candidate {
 
 /// `forskap issue|mr <verb> <IID>`.
 fn numbers(kind: RefKind, current: &str) -> Vec<Candidate> {
-    candidates(&known(kind), "", current, "project")
+    let project = option_value(&line(), "project", 'p');
+    candidates(&known(kind, project.as_deref()), "", current, "project")
 }
 
 /// `forskap epic <verb> <IID>`.
 fn epics(current: &str) -> Vec<Candidate> {
+    let group = option_value(&line(), "group", 'g');
     let mut rows = Vec::new();
-    within_budget(fetch_epics(&mut rows));
+    within_budget(fetch_epics(group.as_deref(), &mut rows));
     let last = state::load().ok().and_then(|st| st.last_epic);
-    candidates(&ranked_epics(last, &rows), "", current, "group")
+    candidates(
+        &ranked_epics(last, &rows, group.is_none()),
+        "",
+        current,
+        "group",
+    )
 }
 
 /// `forskap time log <REF>`.
 fn references(current: &str) -> Vec<Candidate> {
-    // A completer sees only the word at the cursor; whether `--mr` is on the
-    // line shows in our own arguments, which are that line.
-    let mr = std::env::args_os().any(|arg| arg == "--mr");
+    let line = line();
+    let mr = line.iter().any(|arg| arg == "--mr");
+    let project = option_value(&line, "project", 'p');
     let (kind, sigil, digits) = reference(current, mr);
-    candidates(&known(kind), sigil, digits, "project")
+    candidates(&known(kind, project.as_deref()), sigil, digits, "project")
+}
+
+/// The command line being completed. A completer sees only the word at the
+/// cursor, but the shells pass the whole line as our arguments behind a
+/// `--` (bash and zsh with the words after the cursor too; fish and nushell
+/// cut at it).
+fn line() -> Vec<OsString> {
+    std::env::args_os()
+        .skip_while(|arg| arg != "--")
+        .skip(1)
+        .collect()
+}
+
+/// The value given to `--long` or `-s` among `words`, in any spelling clap
+/// takes: `--long v`, `--long=v`, `-s v`, `-sv`, `-s=v` — and `--long = v`,
+/// which is how bash hands over `--long=v`. The quotes bash, zsh and nushell
+/// leave on a word are stripped. A `--` ends the options; a value that is
+/// missing or empty is none.
+fn option_value(words: &[OsString], long: &str, short: char) -> Option<String> {
+    let long_flag = format!("--{long}");
+    let short_flag = format!("-{short}");
+    let mut words = words.iter().filter_map(|word| word.to_str());
+    while let Some(word) = words.next() {
+        if word == "--" {
+            return None;
+        }
+        // The value attached to the flag, if the word is the flag at all.
+        let attached = if let Some(rest) = word.strip_prefix(&long_flag) {
+            match rest.strip_prefix('=') {
+                Some(value) => Some(value),
+                None if rest.is_empty() => None,
+                // `--longer`: another option.
+                None => continue,
+            }
+        } else if let Some(rest) = word.strip_prefix(&short_flag) {
+            match rest.strip_prefix('=') {
+                Some(value) => Some(value),
+                None if rest.is_empty() => None,
+                None => Some(rest),
+            }
+        } else {
+            continue;
+        };
+        let value = match attached {
+            Some(value) => value,
+            None => match words.next()? {
+                "=" => words.next()?,
+                next => next,
+            },
+        };
+        return Some(unquoted(value)).filter(|value| !value.is_empty());
+    }
+    None
+}
+
+/// A word without the matching quotes around it.
+fn unquoted(word: &str) -> String {
+    let inner = word
+        .strip_prefix('\'')
+        .and_then(|w| w.strip_suffix('\''))
+        .or_else(|| word.strip_prefix('"').and_then(|w| w.strip_suffix('"')));
+    inner.unwrap_or(word).to_string()
 }
 
 /// `-p/--project <PROJECT>`.
@@ -213,17 +289,20 @@ impl From<&Item> for Known {
     }
 }
 
-/// Everything known of `kind`, most likely first.
-fn known(kind: RefKind) -> Vec<Known> {
+/// Everything known of `kind`, most likely first — of one project where
+/// `--project` names it on the line.
+fn known(kind: RefKind, project: Option<&str>) -> Vec<Known> {
     let mut rows = Vec::new();
-    within_budget(fetch_items(kind, &mut rows));
+    within_budget(fetch_items(kind, project, &mut rows));
     let last = state::load().ok().and_then(|st| st.last_issue);
-    ranked(kind, last.as_ref(), &rows)
+    ranked(kind, last.as_ref(), &rows, project.is_none())
 }
 
 /// Order `rows` (the assigned ones, then the opened ones by use) behind the
-/// item time was last logged on, each item once.
-fn ranked(kind: RefKind, last: Option<&LastIssue>, rows: &[Item]) -> Vec<Known> {
+/// item time was last logged on, each item once. `anywhere`: the rows are
+/// not kept to one project, so that item is offered even if it isn't among
+/// them.
+fn ranked(kind: RefKind, last: Option<&LastIssue>, rows: &[Item], anywhere: bool) -> Vec<Known> {
     let mut known: Vec<Known> = Vec::with_capacity(rows.len() + 1);
     for row in rows {
         if !known
@@ -234,13 +313,19 @@ fn ranked(kind: RefKind, last: Option<&LastIssue>, rows: &[Item]) -> Vec<Known> 
         }
     }
     if let Some(last) = last.filter(|last| last.kind == kind) {
-        put_first(&mut known, last.project_id, last.issue_iid, "project");
+        put_first(
+            &mut known,
+            last.project_id,
+            last.issue_iid,
+            anywhere.then_some("project"),
+        );
     }
     known
 }
 
 /// The epics opened before, most used first, behind the one opened last.
-fn ranked_epics(last: Option<LastEpic>, rows: &[WorkItem]) -> Vec<Known> {
+/// `anywhere` as for [`ranked`], with groups for projects.
+fn ranked_epics(last: Option<LastEpic>, rows: &[WorkItem], anywhere: bool) -> Vec<Known> {
     let mut known: Vec<Known> = rows
         .iter()
         .map(|e| Known {
@@ -253,22 +338,30 @@ fn ranked_epics(last: Option<LastEpic>, rows: &[WorkItem]) -> Vec<Known> {
         })
         .collect();
     if let Some(last) = last {
-        put_first(&mut known, last.group_id, last.iid, "group");
+        put_first(
+            &mut known,
+            last.group_id,
+            last.iid,
+            anywhere.then_some("group"),
+        );
     }
     known
 }
 
-/// Move the number used last to the front. `scope` names what `project_id`
-/// is of when the number isn't cached (any more): still the likeliest one.
-fn put_first(known: &mut Vec<Known>, project_id: i64, iid: i64, scope: &str) {
+/// Move the number used last to the front. When it isn't cached (any more)
+/// it is still the likeliest one, so it is offered all the same if `scope`
+/// names what `project_id` is of; with `None` the rows are kept to a project
+/// or group it may not be in, and a number outside them is no help.
+fn put_first(known: &mut Vec<Known>, project_id: i64, iid: i64, scope: Option<&str>) {
     let is_last = |k: &Known| (k.project_id, k.iid) == (project_id, iid);
-    let first = match known.iter().position(is_last) {
-        Some(at) => known.remove(at),
-        None => Known {
+    let first = match (known.iter().position(is_last), scope) {
+        (Some(at), _) => known.remove(at),
+        (None, Some(scope)) => Known {
             iid,
             project_id,
             help: format!("{scope} {project_id}"),
         },
+        (None, None) => return,
     };
     known.insert(0, first);
 }
@@ -361,34 +454,90 @@ fn within_budget(lookup: impl Future<Output = Option<()>>) {
 }
 
 /// The assigned items of `kind`, then the ones opened before, most used
-/// first (an empty `Search` lists just those).
-async fn fetch_items(kind: RefKind, rows: &mut Vec<Item>) -> Option<()> {
+/// first (an empty `Search` lists just those) — or, in the one `project`,
+/// the assigned ones and then every cached one, so naming it browses it.
+async fn fetch_items(kind: RefKind, project: Option<&str>, rows: &mut Vec<Item>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
+    let scope = match project {
+        // A path the cache doesn't know offers nothing: the command fails
+        // with it as well, and numbers of other projects aren't what was
+        // asked for.
+        Some(project) => Some(Scope {
+            projects: Some(vec![project::by_arg(&client, project).await.ok()?]),
+            groups: None,
+        }),
+        None => None,
+    };
     match kind {
         RefKind::Issue => {
-            let reply = client.get_assigned_work_items(None).call().await.ok()?;
+            let reply = client
+                .get_assigned_work_items(scope.clone())
+                .call()
+                .await
+                .ok()?;
             rows.extend(reply.work_items.into_iter().map(Item::Issue));
         }
         RefKind::Mr => {
-            let reply = client.get_assigned_merge_requests(None).call().await.ok()?;
+            let reply = client
+                .get_assigned_merge_requests(scope.clone())
+                .call()
+                .await
+                .ok()?;
             rows.extend(reply.merge_requests.into_iter().map(Item::Mr));
         }
     }
+    let all = scope.is_some();
     let options = SearchOptions {
         kinds: Some(vec![refspec::search_kind(kind)]),
         exclude_types: refspec::excluded_types(kind),
-        ..Default::default()
+        ..scoped(scope, all)
     };
-    let reply = client
-        .search(String::new(), Some(options))
-        .call()
-        .await
-        .ok()?;
+    let reply = search_all_or_frequent(&client, options).await?;
     match kind {
         RefKind::Issue => rows.extend(item::issues(reply.work_items)),
         RefKind::Mr => rows.extend(reply.merge_requests.into_iter().map(Item::Mr)),
     }
     Some(())
+}
+
+/// The options of an empty `Search` in `scope`: every cached row (`all`,
+/// once a project or group is named on the line) or the frequently opened
+/// ones.
+fn scoped(scope: Option<Scope>, all: bool) -> SearchOptions {
+    SearchOptions {
+        scope,
+        match_all: all.then_some(true),
+        limit: all.then_some(SCOPED_LIMIT),
+        ..Default::default()
+    }
+}
+
+/// An empty `Search`. A daemon older than `match_all` refuses the option;
+/// its frequently opened rows are then what there is.
+async fn search_all_or_frequent(
+    client: &VarlinkClient,
+    options: SearchOptions,
+) -> Option<Search_Reply> {
+    match client
+        .search(String::new(), Some(options.clone()))
+        .call()
+        .await
+    {
+        Ok(reply) => Some(reply),
+        Err(_) if options.match_all.is_some() => {
+            let frequent = SearchOptions {
+                match_all: None,
+                limit: None,
+                ..options
+            };
+            client
+                .search(String::new(), Some(frequent))
+                .call()
+                .await
+                .ok()
+        }
+        Err(_) => None,
+    }
 }
 
 /// The projects of the assigned items, then the cached projects matching
@@ -427,19 +576,35 @@ async fn fetch_projects(current: &str, rows: &mut Vec<PathRow>) -> Option<()> {
     Some(())
 }
 
-/// The epics opened before, most used first (an empty `Search`).
-async fn fetch_epics(rows: &mut Vec<WorkItem>) -> Option<()> {
+/// The epics opened before, most used first (an empty `Search`) — or every
+/// cached one of the `group`, named by its path or numeric ID.
+async fn fetch_epics(group: Option<&str>, rows: &mut Vec<WorkItem>) -> Option<()> {
     let client = client::connect_default().await.ok()?;
+    let id = group.and_then(|g| g.parse::<i64>().ok());
+    let path = group.filter(|_| id.is_none()).map(|g| g.trim_matches('/'));
+    // The daemon scopes by path, subgroups included; an ID is matched here,
+    // and so is the path, exactly: `-g team` doesn't mean `team/backend`.
+    let scope = path.map(|path| Scope {
+        projects: None,
+        groups: Some(vec![path.to_string()]),
+    });
     let options = SearchOptions {
+        kinds: Some(vec![SearchKind::work_items]),
         types: Some(vec!["epic".to_string()]),
-        ..only(SearchKind::work_items)
+        ..scoped(scope, group.is_some())
     };
-    let reply = client
-        .search(String::new(), Some(options))
-        .call()
-        .await
-        .ok()?;
-    rows.extend(reply.work_items.into_iter().filter(item::is_epic));
+    let reply = search_all_or_frequent(&client, options).await?;
+    rows.extend(
+        reply
+            .work_items
+            .into_iter()
+            .filter(item::is_epic)
+            .filter(|e| match (id, path) {
+                (Some(id), _) => e.group_id == Some(id),
+                (None, Some(path)) => group_of(e).is_some_and(|g| g.eq_ignore_ascii_case(path)),
+                (None, None) => true,
+            }),
+    );
     Some(())
 }
 
@@ -498,7 +663,7 @@ mod tests {
 
     #[test]
     fn ranked_lists_each_item_once_in_order() {
-        let known = ranked(RefKind::Issue, None, &rows());
+        let known = ranked(RefKind::Issue, None, &rows(), true);
         let iids: Vec<i64> = known.iter().map(|k| k.iid).collect();
         assert_eq!(iids, [42, 7, 421]);
         assert_eq!(known[0].help, "Fix login (team/api)");
@@ -508,7 +673,7 @@ mod tests {
     #[test]
     fn ranked_puts_the_last_logged_item_first() {
         let first = |last: &LastIssue| {
-            let known = ranked(RefKind::Issue, Some(last), &rows());
+            let known = ranked(RefKind::Issue, Some(last), &rows(), true);
             (known[0].iid, known[0].help.clone(), known.len())
         };
         assert_eq!(
@@ -525,8 +690,72 @@ mod tests {
     }
 
     #[test]
+    fn a_project_on_the_line_keeps_the_last_logged_item_to_its_rows() {
+        // The rows are those of team/web; the last logged item is among them.
+        let rows = [item(RefKind::Issue, 2, "team/web", 7, "Dark mode")];
+        let known = ranked(
+            RefKind::Issue,
+            Some(&last(RefKind::Issue, 2, 7)),
+            &rows,
+            false,
+        );
+        assert_eq!(values(&candidates(&known, "", "", "project")), ["7"]);
+        // Logged on elsewhere, or not cached: nothing is made up.
+        let known = ranked(
+            RefKind::Issue,
+            Some(&last(RefKind::Issue, 1, 42)),
+            &rows,
+            false,
+        );
+        assert_eq!(values(&candidates(&known, "", "", "project")), ["7"]);
+        let known = ranked_epics(
+            Some(LastEpic {
+                group_id: 9,
+                iid: 7,
+            }),
+            &[],
+            false,
+        );
+        assert!(known.is_empty());
+    }
+
+    #[test]
+    fn option_value_reads_every_spelling_clap_takes() {
+        let words = |line: &str| -> Vec<OsString> { line.split(' ').map(OsString::from).collect() };
+        let project = |line: &str| option_value(&words(line), "project", 'p');
+        for line in [
+            "forskap issue view --project team/api 4",
+            "forskap issue view --project=team/api 4",
+            "forskap issue view --project = team/api 4",
+            "forskap issue view -p team/api 4",
+            "forskap issue view -pteam/api 4",
+            "forskap issue view -p=team/api 4",
+            "forskap issue view 4 --project team/api",
+            "forskap issue view --project 'team/api' 4",
+            "forskap issue view --project \"team/api\" 4",
+        ] {
+            assert_eq!(project(line).as_deref(), Some("team/api"), "{line}");
+        }
+        for line in [
+            "forskap issue view 4",
+            "forskap issue view --project",
+            "forskap issue view --project=",
+            "forskap issue view --project ''",
+            "forskap issue view --projects team/api 4",
+            "forskap issue view -- --project team/api",
+            "forskap issue view --mr 4",
+        ] {
+            assert_eq!(project(line), None, "{line}");
+        }
+        assert_eq!(
+            option_value(&words("forskap epic view 5 -g team/backend"), "group", 'g').as_deref(),
+            Some("team/backend")
+        );
+    }
+
+    #[test]
     fn candidates_filter_on_the_typed_digits() {
-        let known = ranked(RefKind::Issue, None, &rows());
+        let known = ranked(RefKind::Issue, None, &rows(), true);
         assert_eq!(
             values(&candidates(&known, "", "", "project")),
             ["42", "7", "421"]
@@ -552,7 +781,7 @@ mod tests {
             item(RefKind::Mr, 3, "team/docs", 3, "Typo"),
             item(RefKind::Mr, 3, "team/docs", 30, "Index"),
         ];
-        let known = ranked(RefKind::Mr, None, &rows);
+        let known = ranked(RefKind::Mr, None, &rows, true);
         assert_eq!(
             candidates(&known, "!", "3", "project"),
             [
@@ -583,7 +812,7 @@ mod tests {
         ];
         let last = |group_id, iid| Some(LastEpic { group_id, iid });
 
-        let known = ranked_epics(last(4, 12), &rows);
+        let known = ranked_epics(last(4, 12), &rows, true);
         assert_eq!(
             candidates(&known, "", "", "group"),
             [
@@ -598,7 +827,7 @@ mod tests {
             ]
         );
         // Not in the cache: offered all the same.
-        let known = ranked_epics(last(9, 7), &rows);
+        let known = ranked_epics(last(9, 7), &rows, true);
         assert_eq!(known[0].help, "group 9");
         assert_eq!(
             values(&candidates(&known, "", "", "group")),
