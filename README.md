@@ -102,9 +102,13 @@ forskap status                  # is anything not working? daemon, login, sync, 
 `unassign`) and take the number shown in GitLab. The project is looked up in the
 cache; when a number exists in several projects, name one with `-p`, as full path
 or numeric ID. `forskap issue create <title> -p <project>` files a new issue
-(`--description`, `--label`, `--epic`, `--no-assign`); it always names its project,
-and unlike the other writes it is not queued while GitLab is unreachable: it fails,
-so nothing is created behind your back later. `forskap epic` has `view` and `open`; epics belong to a group, so an
+(`--label`, `--epic`, `--no-assign`); it always names its project, and unlike the
+other writes it is not queued while GitLab is unreachable: it fails, so nothing is
+created behind your back later. On a terminal with `$VISUAL` or `$EDITOR` set, its
+description is written in that editor, starting from one of the project's issue
+templates (`.gitlab/issue_templates/`, cached by the daemon) if it has any:
+`--template <name>` names one up front, `--no-edit` skips the editor,
+`--description <text>` gives the text as is. `forskap epic` has `view` and `open`; epics belong to a group, so an
 ambiguous number takes `-g`. Commands that print data take `-o json` or `-o yaml`.
 On a terminal the text output colours state words, headings, item numbers, paths
 and confirmations and dims URLs, timestamps and hints; `--color always|never`
