@@ -15,7 +15,8 @@ use tracing::warn;
 
 use super::avatars::Avatar;
 use super::model::{
-    Board, Epic, Event, Group, Issue, MergeRequest, Project, Resource, RowKey, Timelog,
+    Board, DescriptionTemplate, Epic, Event, Group, Issue, MergeRequest, Project, Resource, RowKey,
+    Timelog,
 };
 use super::schedule::{JobState, fingerprint};
 use crate::error::Result;
@@ -139,6 +140,7 @@ stored!(
     Group => groups,
     Epic => epics,
     Board => boards,
+    DescriptionTemplate => description_templates,
     Event => events,
     Timelog => timelogs,
     NotedWrite => noted,
@@ -200,6 +202,7 @@ pub struct SyncStore {
     pub groups: Table<Group>,
     pub epics: Table<Epic>,
     pub boards: Table<Board>,
+    pub description_templates: Table<DescriptionTemplate>,
     pub events: Table<Event>,
     pub timelogs: Table<Timelog>,
     pub noted: Table<NotedWrite>,
@@ -221,6 +224,7 @@ impl SyncStore {
             groups: Table::open(db)?,
             epics: Table::open(db)?,
             boards: Table::open(db)?,
+            description_templates: Table::open(db)?,
             events: Table::open(db)?,
             timelogs: Table::open(db)?,
             noted: Table::open(db)?,
@@ -375,6 +379,7 @@ impl Commit<'_> {
         self.remove_where::<Group>(RowScope::All, |_| false)?;
         self.remove_where::<Epic>(RowScope::All, |_| false)?;
         self.remove_where::<Board>(RowScope::All, |_| false)?;
+        self.remove_where::<DescriptionTemplate>(RowScope::All, |_| false)?;
         self.remove_where::<Event>(RowScope::All, |_| false)?;
         self.remove_where::<Timelog>(RowScope::All, |_| false)?;
         self.remove_where::<NotedWrite>(RowScope::All, |_| false)?;

@@ -155,8 +155,9 @@ impl QuickRefreshConfig {
 #[derive(Debug, ConfiqueConfig)]
 pub struct SlowRefreshConfig {
     /// Seconds between slow syncs of the full timelog history (the whole
-    /// `history.retention_hours`), the board columns, your project and
-    /// group memberships, and the issues you authored or were assigned,
+    /// `history.retention_hours`), the board columns, the description templates,
+    /// your project and group memberships, and the issues you authored or
+    /// were assigned,
     /// open or closed (the last `search.tracked_retention_hours` of them).
     /// Once a day by default.
     #[config(default = 86400)]

@@ -167,6 +167,15 @@ type NewWorkItem struct {
 	Parent      *WorkItemRef `json:"parent,omitempty"`
 }
 
+// A description template of a project: a file under .gitlab/issue_templates or
+// .gitlab/merge_request_templates on its default branch, as GitLab's "Choose a
+// template" offers it.
+type DescriptionTemplate struct {
+	Kind    IssuableKind `json:"kind"`
+	Name    string       `json:"name"`
+	Content string       `json:"content"`
+}
+
 // The call fits the interface, but an argument's value is not acceptable (a
 // number that isn't positive, a malformed duration, a blank title, …): nothing
 // was sent to GitLab or stored. argument names it, a nested value by its path
@@ -1082,6 +1091,74 @@ func (m GetActivity_methods) Upgrade(ctx context.Context, c *varlink.Connection,
 	}, nil
 }
 
+// The description templates of a project, by kind and name; kind keeps one
+// kind. Served from the cache: empty for a project whose templates haven't
+// synced (not a member project, or not yet), as for one that has none.
+type GetDescriptionTemplates_methods struct{}
+
+func GetDescriptionTemplates() GetDescriptionTemplates_methods {
+	return GetDescriptionTemplates_methods{}
+}
+
+func (m GetDescriptionTemplates_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, kind_in_ *IssuableKind) (templates_out_ []DescriptionTemplate, err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, project_id_in_, kind_in_)
+	if err_ != nil {
+		return
+	}
+	templates_out_, _, err_ = receive(ctx)
+	return
+}
+
+func (m GetDescriptionTemplates_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, kind_in_ *IssuableKind) (func(ctx context.Context) ([]DescriptionTemplate, uint64, error), error) {
+	var in struct {
+		Project_id int64         `json:"project_id"`
+		Kind       *IssuableKind `json:"kind,omitempty"`
+	}
+	in.Project_id = project_id_in_
+	in.Kind = kind_in_
+	receive, err := c.Send(ctx, "org.thehoster.forskapd.GetDescriptionTemplates", in, flags)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (templates_out_ []DescriptionTemplate, flags uint64, err error) {
+		var out struct {
+			Templates []DescriptionTemplate `json:"templates"`
+		}
+		flags, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		templates_out_ = []DescriptionTemplate(out.Templates)
+		return
+	}, nil
+}
+
+func (m GetDescriptionTemplates_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, kind_in_ *IssuableKind) (func(ctx context.Context) (templates_out_ []DescriptionTemplate, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+	var in struct {
+		Project_id int64         `json:"project_id"`
+		Kind       *IssuableKind `json:"kind,omitempty"`
+	}
+	in.Project_id = project_id_in_
+	in.Kind = kind_in_
+	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.GetDescriptionTemplates", in)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (templates_out_ []DescriptionTemplate, flags uint64, conn varlink.ReadWriterContext, err error) {
+		var out struct {
+			Templates []DescriptionTemplate `json:"templates"`
+		}
+		flags, conn, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		templates_out_ = []DescriptionTemplate(out.Templates)
+		return
+	}, nil
+}
+
 // The dead-lettered writes.
 type GetFailures_methods struct{}
 
@@ -1446,6 +1523,7 @@ type orgthehosterforskapdInterface interface {
 	RecordOpen(ctx context.Context, c VarlinkCall, kind_ IssuableKind, iid_ int64, project_id_ *int64, group_id_ *int64) error
 	GetHistory(ctx context.Context, c VarlinkCall, days_ *int64) error
 	GetActivity(ctx context.Context, c VarlinkCall, days_ *int64) error
+	GetDescriptionTemplates(ctx context.Context, c VarlinkCall, project_id_ int64, kind_ *IssuableKind) error
 	GetFailures(ctx context.Context, c VarlinkCall) error
 	RetryFailure(ctx context.Context, c VarlinkCall, id_ int64) error
 	DismissFailure(ctx context.Context, c VarlinkCall, id_ int64) error
@@ -1597,6 +1675,14 @@ func (c *VarlinkCall) ReplyGetActivity(ctx context.Context, events_ []ActivityEv
 	return c.Reply(ctx, &out)
 }
 
+func (c *VarlinkCall) ReplyGetDescriptionTemplates(ctx context.Context, templates_ []DescriptionTemplate) error {
+	var out struct {
+		Templates []DescriptionTemplate `json:"templates"`
+	}
+	out.Templates = []DescriptionTemplate(templates_)
+	return c.Reply(ctx, &out)
+}
+
 func (c *VarlinkCall) ReplyGetFailures(ctx context.Context, failures_ []FailedTask) error {
 	var out struct {
 		Failures []FailedTask `json:"failures"`
@@ -1721,6 +1807,13 @@ func (s *VarlinkInterface) GetHistory(ctx context.Context, c VarlinkCall, days_ 
 // The user's contribution events of the last days (default 7), newest first.
 func (s *VarlinkInterface) GetActivity(ctx context.Context, c VarlinkCall, days_ *int64) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetActivity")
+}
+
+// The description templates of a project, by kind and name; kind keeps one
+// kind. Served from the cache: empty for a project whose templates haven't
+// synced (not a member project, or not yet), as for one that has none.
+func (s *VarlinkInterface) GetDescriptionTemplates(ctx context.Context, c VarlinkCall, project_id_ int64, kind_ *IssuableKind) error {
+	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetDescriptionTemplates")
 }
 
 // The dead-lettered writes.
@@ -1892,6 +1985,17 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
 		return s.orgthehosterforskapdInterface.GetActivity(ctx, VarlinkCall{call}, in.Days)
+
+	case "GetDescriptionTemplates":
+		var in struct {
+			Project_id int64         `json:"project_id"`
+			Kind       *IssuableKind `json:"kind,omitempty"`
+		}
+		err := call.GetParameters(&in)
+		if err != nil {
+			return call.ReplyInvalidParameter(ctx, "parameters")
+		}
+		return s.orgthehosterforskapdInterface.GetDescriptionTemplates(ctx, VarlinkCall{call}, in.Project_id, in.Kind)
 
 	case "GetFailures":
 		return s.orgthehosterforskapdInterface.GetFailures(ctx, VarlinkCall{call})
@@ -2270,6 +2374,24 @@ method GetHistory(days: ?int) -> (events: []HistoryEvent)
 
 # The user's contribution events of the last days (default 7), newest first.
 method GetActivity(days: ?int) -> (events: []ActivityEvent)
+
+# A description template of a project: a file under .gitlab/issue_templates or
+# .gitlab/merge_request_templates on its default branch, as GitLab's "Choose a
+# template" offers it.
+type DescriptionTemplate (
+  # What it describes: work_item for GitLab's issue templates, which every
+  # work item type shares.
+  kind: IssuableKind,
+  # The file name without ".md".
+  name: string,
+  # GitLab Markdown.
+  content: string
+)
+
+# The description templates of a project, by kind and name; kind keeps one
+# kind. Served from the cache: empty for a project whose templates haven't
+# synced (not a member project, or not yet), as for one that has none.
+method GetDescriptionTemplates(project_id: int, kind: ?IssuableKind) -> (templates: []DescriptionTemplate)
 
 # The dead-lettered writes.
 method GetFailures() -> (failures: []FailedTask)

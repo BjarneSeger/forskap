@@ -11,11 +11,11 @@ use tracing::{debug, info, instrument, warn};
 use forskap_api::{
     ActivityEvent, Call_AssignSelf, Call_ClearFailures, Call_Close, Call_CreateWorkItem,
     Call_DismissFailure, Call_GetActivity, Call_GetAssignedMergeRequests,
-    Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetStatus,
-    Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_RetryFailure, Call_Search,
-    Call_UnassignSelf, Call_WhoAmI, FailedTask, Group, HistoryEvent, HistorySource, IssuableKind,
-    MergeRequest, NewWorkItem, Project, Scope, SearchKind, SearchOptions, VarlinkInterface,
-    WorkItem, WorkItemFilter, WorkItemRole, WorkItemState,
+    Call_GetAssignedWorkItems, Call_GetDescriptionTemplates, Call_GetFailures, Call_GetHistory,
+    Call_GetStatus, Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
+    Call_Search, Call_UnassignSelf, Call_WhoAmI, FailedTask, Group, HistoryEvent, HistorySource,
+    IssuableKind, MergeRequest, NewWorkItem, Project, Scope, SearchKind, SearchOptions,
+    VarlinkInterface, WorkItem, WorkItemFilter, WorkItemRole, WorkItemState,
 };
 
 use crate::error::{DormancyReason, Error};
@@ -1095,6 +1095,58 @@ impl VarlinkInterface for Handlers {
         let events: Vec<ActivityEvent> = rows.into_iter().rev().map(|e| places.wire(e)).collect();
         debug!(count = events.len(), "serving activity");
         call.reply(events)
+    }
+
+    #[instrument(skip(self, call))]
+    async fn get_description_templates(
+        &self,
+        call: &mut dyn Call_GetDescriptionTemplates,
+        project_id: i64,
+        kind: Option<IssuableKind>,
+    ) -> varlink::Result<()> {
+        if project_id <= 0 {
+            let invalid = Invalid::new("project_id", format!("invalid project: {project_id}"));
+            return invalid.reply(call);
+        }
+        let kinds: Vec<Issuable> = match &kind {
+            Some(kind) => vec![wire::internal_kind(kind)],
+            None => vec![Issuable::Issue, Issuable::MergeRequest],
+        };
+        // Each kind has its own job; cold only while none asked for synced.
+        let synced = |k: &Issuable| self.sync.has_synced(Job::ProjectTemplates(project_id, *k));
+        if !kinds.iter().any(synced) {
+            reply_if_cold!(
+                self,
+                call,
+                Job::ProjectTemplates(project_id, kinds[0]),
+                (Vec::new())
+            );
+        }
+
+        // A kind whose job never ran has no rows worth reading.
+        let mut rows: Vec<model::DescriptionTemplate> = kinds
+            .iter()
+            .filter(|kind| synced(kind))
+            .flat_map(|&kind| {
+                let prefix = model::DescriptionTemplate::prefix(project_id, kind);
+                self.store()
+                    .description_templates
+                    .scan(RowScope::Prefix(prefix))
+                    .unwrap_or_else(|e| {
+                        warn!(error = %e, project_id, ?kind, "template read failed; returning empty");
+                        Vec::new()
+                    })
+            })
+            .collect();
+        // Stored under the hash of their name; offered as GitLab's picker
+        // sorts them, the issue templates first.
+        rows.sort_by(|a, b| (a.kind, &a.name).cmp(&(b.kind, &b.name)));
+        debug!(
+            project_id,
+            count = rows.len(),
+            "serving description templates"
+        );
+        call.reply(rows.into_iter().map(wire::description_template).collect())
     }
 
     #[instrument(skip(self, call))]

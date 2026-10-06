@@ -18,13 +18,14 @@ use forskap_api::admin::{
 use forskap_api::{
     AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearFailures, Call_Close,
     Call_CreateWorkItem, Call_DismissFailure, Call_GetActivity, Call_GetAssignedMergeRequests,
-    Call_GetAssignedWorkItems, Call_GetFailures, Call_GetHistory, Call_GetStatus,
-    Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_RetryFailure, Call_Search,
-    Call_UnassignSelf, Call_WhoAmI, ClearFailures_Args, Close_Args, CreateWorkItem_Args,
-    DismissFailure_Args, GetActivity_Args, GetAssignedMergeRequests_Args,
-    GetAssignedWorkItems_Args, GetFailures_Args, GetHistory_Args, GetStatus_Args,
-    ListWorkItems_Args, PostTime_Args, RecordOpen_Args, RetryFailure_Args, Search_Args,
-    UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _, WhoAmI_Args,
+    Call_GetAssignedWorkItems, Call_GetDescriptionTemplates, Call_GetFailures, Call_GetHistory,
+    Call_GetStatus, Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
+    Call_Search, Call_UnassignSelf, Call_WhoAmI, ClearFailures_Args, Close_Args,
+    CreateWorkItem_Args, DismissFailure_Args, GetActivity_Args, GetAssignedMergeRequests_Args,
+    GetAssignedWorkItems_Args, GetDescriptionTemplates_Args, GetFailures_Args, GetHistory_Args,
+    GetStatus_Args, ListWorkItems_Args, PostTime_Args, RecordOpen_Args, RetryFailure_Args,
+    Search_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
+    WhoAmI_Args,
 };
 
 use crate::handlers::Handlers;
@@ -231,6 +232,16 @@ async fn handle_forskapd(
             let args: GetActivity_Args = args!(method, params);
             handlers
                 .get_activity(&mut call as &mut dyn Call_GetActivity, args.days)
+                .await?;
+        }
+        "org.thehoster.forskapd.GetDescriptionTemplates" => {
+            let args: GetDescriptionTemplates_Args = args!(method, params);
+            handlers
+                .get_description_templates(
+                    &mut call as &mut dyn Call_GetDescriptionTemplates,
+                    args.project_id,
+                    args.kind,
+                )
                 .await?;
         }
         "org.thehoster.forskapd.GetFailures" => {
@@ -716,6 +727,17 @@ mod tests {
                 "merged",
             ),
             ("Search", None, "query"),
+            ("GetDescriptionTemplates", None, "project_id"),
+            (
+                "GetDescriptionTemplates",
+                Some(serde_json::json!({"project_id": 1, "kind": "epic"})),
+                "epic",
+            ),
+            (
+                "GetDescriptionTemplates",
+                Some(serde_json::json!({"project_id": 1, "type": "issues"})),
+                "type",
+            ),
             (
                 "CreateWorkItem",
                 Some(serde_json::json!({"project_id": 1})),
@@ -991,6 +1013,27 @@ mod tests {
                 "GetAssignedWorkItems is missing its dispatch arm in handle_forskapd"
             );
         }
+    }
+
+    /// Dormant and never synced: the arm answers `NotAuthenticated`, not
+    /// `MethodNotFound`.
+    #[tokio::test]
+    async fn dispatch_has_an_arm_for_get_work_item_templates() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        let params = Some(serde_json::json!({"project_id": 7}));
+        let reply = handle_forskapd(
+            "org.thehoster.forskapd.GetDescriptionTemplates",
+            params,
+            &handlers,
+        )
+        .await
+        .unwrap()
+        .expect("a reply");
+        assert_eq!(
+            reply.error.as_deref(),
+            Some("org.thehoster.forskapd.NotAuthenticated"),
+            "GetDescriptionTemplates is missing its dispatch arm in handle_forskapd"
+        );
     }
 
     /// Dormant and never synced: the arm answers `NotAuthenticated`, not

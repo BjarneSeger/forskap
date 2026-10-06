@@ -269,6 +269,13 @@ func (c *Client) GetActivity(ctx context.Context, days *int64) ([]ActivityEvent,
 	return GetActivity().Call(ctx, c.conn, days)
 }
 
+// GetDescriptionTemplates returns the cached description templates of a
+// project, sorted by kind and name, or those of one kind; empty for a
+// project whose templates never synced as for one that has none.
+func (c *Client) GetDescriptionTemplates(ctx context.Context, projectID int64, kind *IssuableKind) ([]DescriptionTemplate, error) {
+	return GetDescriptionTemplates().Call(ctx, c.conn, projectID, kind)
+}
+
 // GetFailures returns queued operations that have failed.
 func (c *Client) GetFailures(ctx context.Context) ([]FailedTask, error) {
 	return GetFailures().Call(ctx, c.conn)

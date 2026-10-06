@@ -207,6 +207,13 @@ created, err := c.CreateWorkItem(ctx, projectID, forskap.NewWorkItem{
 })
 ```
 
+`c.GetDescriptionTemplates` returns a project's description templates (the files
+under `.gitlab/issue_templates/` and `.gitlab/merge_request_templates/`, synced daily
+with the board columns), sorted by kind and name with their Markdown content — or
+those of one `IssuableKind` — for a client that lets the user pick one before
+`CreateWorkItem`. Empty for a project whose templates never synced — not a member
+project, or not yet — as for one that has none.
+
 `c.WhoAmI` returns the `Account` the daemon is connected as, its token's expiry and
 rotation included.
 
