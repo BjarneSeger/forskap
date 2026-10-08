@@ -356,11 +356,30 @@ mod tests {
         assert!(platform::locked(&dbus(DBusError::Dismissed)));
         let refused = ServiceError::IsLocked("collection is locked".into());
         assert!(platform::locked(&dbus(DBusError::Service(refused))));
-        // A stale session after the service restarted is a failed call:
-        // the client is dropped and the next call opens a new one.
-        let stale = ServiceError::NoSession("no such session".into());
-        assert!(!platform::locked(&dbus(DBusError::Service(stale))));
+        // A session the service doesn't know is a failed call, not a lock.
+        let gone = ServiceError::NoSession("The session does not exist".into());
+        assert!(!platform::locked(&dbus(DBusError::Service(gone))));
         assert!(!platform::locked(&dbus(DBusError::Deleted)));
+    }
+
+    /// The keyring service was replaced under the daemon's client — it
+    /// crashed, or the login started its own: every call on that client
+    /// fails though the service answers. A call on such a client is tried
+    /// once more on a new one; a failure on a client just made is final,
+    /// and a locked keyring is no failure of the client at all.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_failure_on_a_client_from_before_is_tried_once_more_on_a_new_one() {
+        use oo7::dbus::{Error as DBusError, ServiceError};
+
+        let gone = || {
+            let gone = ServiceError::NoSession("The session does not exist".into());
+            oo7::Error::DBus(DBusError::Service(gone))
+        };
+        assert!(platform::stale(true, &gone()));
+        assert!(!platform::stale(false, &gone()), "a new client had its try");
+        let locked = oo7::Error::DBus(DBusError::Dismissed);
+        assert!(!platform::stale(true, &locked));
     }
 
     #[tokio::test]
@@ -400,6 +419,8 @@ mod tests {
 #[cfg(not(target_os = "macos"))]
 mod platform {
     use std::collections::HashMap;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
 
     use oo7::Keyring;
@@ -411,9 +432,9 @@ mod platform {
     /// The daemon's one Secret Service client. Every `Keyring::new` is a new
     /// D-Bus connection whose first call is OpenSession, and gnome-keyring 50
     /// can abort on exactly that (upstream #190) — one client per daemon life
-    /// keeps that to the start. Cleared after a failed call so the next one
-    /// reconnects, e.g. to a daemon that was replaced after a crash; a locked
-    /// keyring is no failed call, and keeps it.
+    /// keeps that to the start. Dropped after a failed call, which is tried
+    /// once more on a new one where the client was from before (see
+    /// [`stale`]); a locked keyring is no failed call, and keeps it.
     static KEYRING: Mutex<Option<Arc<Keyring>>> = Mutex::const_new(None);
 
     fn attributes(service: &'static str) -> HashMap<&'static str, &'static str> {
@@ -424,16 +445,23 @@ mod platform {
         Error::Secrets(e.to_string())
     }
 
-    async fn open() -> Result<Arc<Keyring>> {
+    /// The client, and whether it is one from an earlier call.
+    async fn open() -> Result<(Arc<Keyring>, bool)> {
         let mut slot = KEYRING.lock().await;
-        if slot.is_none() {
-            *slot = Some(Arc::new(Keyring::new().await.map_err(secrets)?));
+        if let Some(kr) = slot.as_ref() {
+            return Ok((Arc::clone(kr), true));
         }
-        Ok(Arc::clone(slot.as_ref().expect("filled above")))
+        let kr = Arc::new(Keyring::new().await.map_err(secrets)?);
+        *slot = Some(Arc::clone(&kr));
+        Ok((kr, false))
     }
 
-    async fn forget() {
-        *KEYRING.lock().await = None;
+    /// Drop `kr` from the slot, unless a newer client took its place.
+    async fn forget(kr: &Arc<Keyring>) {
+        let mut slot = KEYRING.lock().await;
+        if slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, kr)) {
+            *slot = None;
+        }
     }
 
     /// Whether `e` says the keyring is locked: the unlock prompt was
@@ -446,37 +474,62 @@ mod platform {
         )
     }
 
-    /// Run `op` on the keyring once it is open, asking the user to unlock it
-    /// where `unlock` allows.
-    async fn with_keyring<T>(
+    /// Whether a call that failed with `e` is worth one more try on a new
+    /// client: it ran on one from an earlier call (`cached`), whose session
+    /// belongs to a keyring service that may have been replaced since — a
+    /// crash, a login that starts its own — and then fails every call
+    /// ("The session does not exist") though the service is fine. Not a
+    /// locked keyring, which a new client finds just as locked.
+    pub(super) fn stale(cached: bool, e: &oo7::Error) -> bool {
+        cached && !locked(e)
+    }
+
+    /// One run of a keychain operation on a client. Boxed, and handed the
+    /// client whole: an operation may run twice (see [`stale`]), and a
+    /// closure borrowing its client can't promise the daemon's tasks a
+    /// `Send` future for every such run.
+    type Run<T> = Pin<Box<dyn Future<Output = oo7::Result<T>> + Send>>;
+
+    /// `op` on `kr` once it is open, asking the user to unlock it where
+    /// `unlock` allows; `None` where it stays locked.
+    async fn attempt<T>(
+        kr: &Arc<Keyring>,
         unlock: Unlock,
-        op: impl AsyncFnOnce(&Keyring) -> oo7::Result<T>,
-    ) -> Result<T> {
-        let kr = open().await?;
-        let result = async {
-            let open = match unlock {
-                Unlock::Ask => {
-                    kr.unlock().await?;
+        op: &impl Fn(Arc<Keyring>) -> Run<T>,
+    ) -> oo7::Result<Option<T>> {
+        let open = match unlock {
+            Unlock::Ask => {
+                kr.unlock().await?;
+                true
+            }
+            // Dropping the wait leaves the prompt to the user: once they
+            // answer it, the next look finds the keyring open.
+            Unlock::AskFor(limit) => match tokio::time::timeout(limit, kr.unlock()).await {
+                Ok(asked) => {
+                    asked?;
                     true
                 }
-                // Dropping the wait leaves the prompt to the user: once they
-                // answer it, the next look finds the keyring open.
-                Unlock::AskFor(limit) => match tokio::time::timeout(limit, kr.unlock()).await {
-                    Ok(asked) => {
-                        asked?;
-                        true
-                    }
-                    Err(_) => false,
-                },
-                // A property read: no prompt, whatever it says.
-                Unlock::Never => !kr.is_locked().await?,
-            };
-            if !open {
-                return Ok(None);
-            }
-            op(&kr).await.map(Some)
+                Err(_) => false,
+            },
+            // A property read: no prompt, whatever it says.
+            Unlock::Never => !kr.is_locked().await?,
+        };
+        if !open {
+            return Ok(None);
         }
-        .await;
+        op(Arc::clone(kr)).await.map(Some)
+    }
+
+    /// Run `op` on the keyring once it is open, asking the user to unlock it
+    /// where `unlock` allows.
+    async fn with_keyring<T>(unlock: Unlock, op: impl Fn(Arc<Keyring>) -> Run<T>) -> Result<T> {
+        let (mut kr, cached) = open().await?;
+        let mut result = attempt(&kr, unlock, &op).await;
+        if result.as_ref().is_err_and(|e| stale(cached, e)) {
+            forget(&kr).await;
+            (kr, _) = open().await?;
+            result = attempt(&kr, unlock, &op).await;
+        }
         match result {
             Ok(Some(value)) => Ok(value),
             Ok(None) => Err(Error::KeychainLocked),
@@ -484,19 +537,21 @@ mod platform {
             // new one, and its OpenSession, per look at a locked keyring.
             Err(e) if locked(&e) => Err(Error::KeychainLocked),
             Err(e) => {
-                forget().await;
+                forget(&kr).await;
                 Err(secrets(e))
             }
         }
     }
 
     pub async fn load(service: &'static str, unlock: Unlock) -> Result<Option<Credentials>> {
-        let secret = with_keyring(unlock, async |kr| {
-            let items = kr.search_items(&attributes(service)).await?;
-            match items.first() {
-                Some(item) => item.secret().await.map(Some),
-                None => Ok(None),
-            }
+        let secret = with_keyring(unlock, |kr| {
+            Box::pin(async move {
+                let items = kr.search_items(&attributes(service)).await?;
+                match items.first() {
+                    Some(item) => item.secret().await.map(Some),
+                    None => Ok(None),
+                }
+            })
         })
         .await?;
         secret.map(|s| decode(&s)).transpose()
@@ -504,15 +559,21 @@ mod platform {
 
     pub async fn store(creds: &Credentials, unlock: Unlock) -> Result<()> {
         let payload = encode(creds)?;
-        with_keyring(unlock, async |kr| {
-            kr.create_item("forskapd credentials", &attributes(SERVICE), payload, true)
-                .await
-                .map(drop)
+        with_keyring(unlock, |kr| {
+            let secret = payload.clone();
+            Box::pin(async move {
+                kr.create_item("forskapd credentials", &attributes(SERVICE), secret, true)
+                    .await
+                    .map(drop)
+            })
         })
         .await
     }
 
     pub async fn delete(service: &'static str, unlock: Unlock) -> Result<()> {
-        with_keyring(unlock, async |kr| kr.delete(&attributes(service)).await).await
+        with_keyring(unlock, |kr| {
+            Box::pin(async move { kr.delete(&attributes(service)).await })
+        })
+        .await
     }
 }
