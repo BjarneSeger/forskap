@@ -60,9 +60,11 @@ archive() {
 
 stable() {
   echo "  stable do"
-  # Homebrew reads the version from a GitHub release URL, but not from the
-  # archive name alone: from a file:// URL it would read `64` (arm64).
-  if [[ "$base" != https://github.com/*/releases/download/v"$version" ]]; then
+  # Homebrew reads the version from a GitHub release URL, and from the
+  # archive's name where it has a pre-release suffix (1.2.0-rc.1): a `version`
+  # beside either fails the audit as redundant. From the name of a plain
+  # version it would read `64` (arm64).
+  if [[ "$base" != https://github.com/*/releases/download/v"$version" && "$version" != *-* ]]; then
     echo "    version \"$version\""
   fi
   if [[ -n "$sha_darwin_arm64" ]]; then
