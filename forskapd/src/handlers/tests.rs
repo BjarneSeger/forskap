@@ -3099,7 +3099,7 @@ async fn who_am_i_reports_the_token_once_it_is_known() {
         expires_at: Some(expires),
     };
     let client: Arc<dyn crate::gitlab::GitlabApi> = fake.clone();
-    h.rotation.publish(&client, &info);
+    h.rotation.publish(&client, &info, 0.0);
 
     let me = who_am_i(&h).await;
     let midnight = expires.and_time(chrono::NaiveTime::MIN).and_utc();
