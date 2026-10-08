@@ -4,7 +4,7 @@ members = ["forskap-api","forskapd","forskap-cli"]
 
 [workspace.package]
 edition = "2024"
-version = "1.2.0-rc.1"
+version = "1.2.0"
 license = "GPL-3.0-only"
 
 [workspace.dependencies]

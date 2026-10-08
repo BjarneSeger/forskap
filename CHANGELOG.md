@@ -7,6 +7,8 @@ described on the [releases page](https://github.com/BjarneSeger/forskap/releases
 
 ## Unreleased
 
+## 1.2.0 - 2026-10-08
+
 ### Added
 
 - `forskap issue create` opens `$VISUAL` or `$EDITOR` on the description, after
