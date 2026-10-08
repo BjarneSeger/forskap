@@ -255,8 +255,8 @@ fn render(jobs: &[SyncJob], paused_until: Option<i64>, now: i64, all: bool) -> S
     out
 }
 
-/// Why GitLab refuses a job, as far as the daemon still knows: its last
-/// error is gone after a restart.
+/// Why GitLab refuses a job, as far as the daemon knows: an older one
+/// forgets the error at a restart.
 fn refused(error: Option<&str>) -> String {
     match error {
         Some(error) => format!("refused by GitLab: {error}"),
@@ -310,8 +310,8 @@ pub fn pause(paused_until: Option<i64>, now: i64) -> Option<String> {
     ))
 }
 
-/// How a job has been failing: `failed 2 times: 403 Forbidden`. The error
-/// is gone after a daemon restart, the count is not.
+/// How a job has been failing: `failed 2 times: 403 Forbidden`. An older
+/// daemon forgets the error at a restart, the count it keeps.
 pub fn failure(failures: i64, error: Option<&str>) -> String {
     let times = match failures {
         0 => None,

@@ -193,7 +193,9 @@ pub struct JobInfo {
     pub expected: Option<u64>,
     /// Consecutive failures.
     pub failures: u32,
-    /// Why the last run failed, until a run succeeds. Kept in memory only.
+    /// Why the last run failed, until a run succeeds. Stored with the state
+    /// of a job that backs off or rests, so it outlives a restart; a failure
+    /// that holds the job back no further (a rate limit) is in memory only.
     pub last_error: Option<String>,
     /// GitLab refused it for good (see [`Job::unavailable`]): it rests a day
     /// at a time, and its status is no `BackingOff`.
@@ -306,7 +308,14 @@ impl SyncHandle {
             fetches: JoinSet::new(),
             launched: None,
             lost: None,
-            errors: HashMap::new(),
+            errors: store
+                .job_errors()
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "reading the sync jobs' last errors failed");
+                    Vec::new()
+                })
+                .into_iter()
+                .collect(),
             landings: Vec::new(),
             asked: Vec::new(),
             replan: true,
@@ -536,8 +545,9 @@ struct Worker {
     /// The client whose session a failed fetch already gave up, so its
     /// siblings' failures don't do it again.
     lost: Option<Arc<dyn GitlabApi>>,
-    /// Why each job's last run failed, by state key. Not persisted: the
-    /// persisted [`JobState`] stays `Copy`.
+    /// Why each job's last run failed, by state key. Stored beside the
+    /// [`JobState`] of a job held back for it (see [`Self::rest`]), not in
+    /// it: that stays `Copy`.
     errors: HashMap<String, String>,
     /// Created issues waiting to be stored: [`Self::handle`] can run before
     /// the session's account was checked against the store.
@@ -1439,7 +1449,11 @@ impl Worker {
         };
         let persisted = (|| -> Result<()> {
             let mut c = self.store.begin();
-            c.set_job(key, &next)?;
+            // With why, so the job still says it after a restart.
+            match self.errors.get(key) {
+                Some(error) => c.set_failed_job(key, &next, error)?,
+                None => c.set_job(key, &next)?,
+            }
             c.commit()
         })();
         if let Err(e) = persisted {
@@ -2805,7 +2819,9 @@ mod tests {
         assert!(line.unavailable, "{line:?}");
         assert_eq!(line.status, JobStatus::Waiting);
         assert_eq!(line.next_due, Some(before.retry_at));
-        assert_eq!(line.last_error, None, "kept in memory only");
+        // A day of rest without a reason helps nobody: it is stored too.
+        let refused = line.last_error.as_deref().unwrap_or_default();
+        assert!(refused.contains("403"), "{line:?}");
         assert!(
             again.calls_to("projects/7/boards").is_empty(),
             "still resting"
@@ -2815,6 +2831,38 @@ mod tests {
         assert_eq!(state(&second, job).rejections, 4);
         assert_eq!(logs.count("WARN", &job.key()), warned, "{}", logs.text());
         assert!(info(&second, job).await.unavailable);
+    }
+
+    /// A job backing off says why also after a restart, until it runs
+    /// through: the error is stored with the backoff it explains.
+    #[tokio::test]
+    async fn a_failed_jobs_reason_outlives_a_restart() {
+        let (store, _dir) = open_store();
+        let fake = Arc::new(FakeGitlab::default());
+        fake.fail_next("merge_requests", FakeErr::Throttled(503));
+        let job = Job::AssignedMergeRequests;
+        let first = start_on(Arc::clone(&store), connected(&fake, 1));
+        let failed = failed(&first, job).await;
+        let before = failed.jobs.iter().find(|j| j.key == job.key()).unwrap();
+        let why = before.last_error.clone().unwrap();
+        assert!(why.contains("503"), "{why}");
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Dormant, so the job can't run and lose its error that way.
+        let dormant = ConnState::Dormant(DormancyReason::NoCredentials);
+        let second = start_on(Arc::clone(&store), dormant);
+        let restarted = info(&second, job).await;
+        assert_eq!(restarted.status, JobStatus::BackingOff);
+        assert_eq!((restarted.failures, restarted.last_error), (1, Some(why)));
+        drop(second);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A run that succeeds takes the stored error with it.
+        let third = start_on(store, connected(&fake, 1));
+        rerun(&third, job).await;
+        assert_eq!(info(&third, job).await.last_error, None);
+        assert!(third.store.job_errors().unwrap().is_empty());
     }
 
     /// GitLab refusing an account-wide listing means something is wrong

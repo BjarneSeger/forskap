@@ -704,8 +704,9 @@ daemon that didn't hear from its worker in time replies no jobs and no `connecte
 
 Status, not GitLab data: never errors and is served while dormant. A dormant
 daemon runs nothing, so its jobs stay `due`, held by `session`, until one exists;
-it drops what was demanded. `last_error` is kept in memory only — after a daemon
-restart a job can be `backing_off` without one.
+it drops what was demanded. `last_error` is stored with the state of a job that
+backs off or rests for it, so it is still there after a daemon restart; a failure
+that holds the job back no further (a rate limit) is kept in memory only.
 
 **Unavailable jobs.** Some listings GitLab refuses for good, and failing them
 forever would only drown the failures that matter. Two mechanisms keep them out:
@@ -720,8 +721,8 @@ forever would only drown the failures that matter. Two mechanisms keep them out:
 - *Refused three times in a row.* A per-project or per-group listing (`project/<id>/issues`,
   `…/merge_requests`, `…/boards`, `…/issue_templates`, `…/merge_request_templates`, `…/avatar`, `group/<id>/epics`) that GitLab answers
   `403` or `404` three times in a row is `unavailable: true`: it rests about a day
-  between attempts and reports `waiting` with that `next_due`, its `failures` and (until
-  a daemon restart) its `last_error` kept, and the daemon logs its refusals at debug
+  between attempts and reports `waiting` with that `next_due`, its `failures` and its
+  `last_error` kept, and the daemon logs its refusals at debug
   level only. An epics listing is unavailable at its first rejection of any status (an
   instance without GitLab Premium has none). Network errors, `429`, `5xx` and `401`
   neither count nor start the count over — they say nothing about the listing; any
