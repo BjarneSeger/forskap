@@ -26,11 +26,11 @@ use tracing::{info, warn};
 use crate::args::Args;
 use crate::config::{self, SharedConfig};
 use crate::demo::{self, DemoGitlab};
-use crate::error::{DormancyReason, Result};
+use crate::error::{DormancyReason, Error, Result};
 use crate::gitlab::GitlabClient;
 use crate::handlers::{ConnState, Handlers, Session, SessionSlot};
 use crate::queue::{RetryQueue, SettleHook};
-use crate::secrets::Keychain;
+use crate::secrets::{Keychain, Unlock};
 use crate::service::ServiceHandler;
 use crate::sync::store::SyncStore;
 use crate::sync::{AvatarDir, Job, JobStatus, SyncHandle, now_secs};
@@ -178,6 +178,12 @@ impl Environment {
     }
 }
 
+/// How long the start waits for an answer to the keyring's unlock prompt.
+/// A daemon started before the desktop session (a lingering user's, at boot)
+/// finds the keyring locked with nowhere to show a prompt, and one started
+/// into a session mustn't keep its socket back for a dialog nobody looks at.
+const BOOT_UNLOCK_WAIT: Duration = Duration::from_secs(5);
+
 /// The session the daemon starts with.
 ///
 /// Credentials come only from the OS keychain (set via `forskap auth login`). The
@@ -185,10 +191,15 @@ impl Environment {
 /// (serving, but returning `NotAuthenticated`). The dormancy reason is kept
 /// in the session slot so the CLI can report a specific cause.
 async fn connect(keychain: &Keychain) -> ConnState {
-    match keychain.load().await {
+    match keychain.load(Unlock::AskFor(BOOT_UNLOCK_WAIT)).await {
+        // The reconnect supervisor looks again, without asking.
+        Err(Error::KeychainLocked) => {
+            info!("the keychain is locked; starting dormant and connecting once it is unlocked");
+            ConnState::Dormant(DormancyReason::KeychainLocked { host: None })
+        }
         Err(e) => {
             warn!(error = %e, "keychain read failed; starting dormant");
-            ConnState::Dormant(DormancyReason::KeychainError(e.to_string()))
+            ConnState::Dormant(DormancyReason::from_keychain_error(&e))
         }
         Ok(None) => {
             info!("no credentials available; daemon starting dormant (run `forskap auth login`)");

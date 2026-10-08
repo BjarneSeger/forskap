@@ -247,15 +247,20 @@ daemons that send neither stay compatible — clients fall back to a generic
 | reason           | meaning                                                            |
 |------------------|--------------------------------------------------------------------|
 | `no_credentials` | no credentials stored (never logged in)                            |
-| `keychain_error` | reading the OS keychain failed (`detail` = the error)              |
+| `keychain_error` | reading the OS keychain failed (`detail` = the error), or it is locked (`detail` says so) |
 | `unreachable`    | credentials exist but GitLab could not be reached (`detail` set)   |
 | `token_rejected` | credentials exist but GitLab rejected the token (`detail` set)     |
 | `logged_out`     | the user explicitly logged out this session                        |
 
 The daemon auto-recovers from `unreachable` in the background (unless disabled via
-`[reconnect]` config); the other reasons need the user. A token GitLab rejects while
-the keychain holds a newer one (rotated by another machine sharing the keychain) is
-reported as `unreachable` for the moment it takes to reconnect with that one.
+`[reconnect]` config); the other reasons need the user, with one exception. A locked
+keychain — a daemon started before the desktop session finds the keyring locked — is
+a `keychain_error` the daemon recovers from as well: it looks again with the same
+back-off, without ever asking for an unlock, and at once when a call finds the session
+waiting for it; meanwhile writes are queued as during an outage. A token GitLab
+rejects while the keychain holds a newer one (rotated by another machine sharing the
+keychain) is reported as `unreachable` for the moment it takes to reconnect with that
+one.
 
 # Methods
 

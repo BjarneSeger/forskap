@@ -129,7 +129,12 @@ is `Ok`; "did not fire" → `.is_err()`.
   `run.stop()` asserts `keychain.refused() == 0` and the socket's removal. A test
   that must see the temp dir go drops the runtime first, as `main` does.
 - Handler and bench scaffolding holds `Keychain::disabled()`: no test reaches the OS
-  keychain.
+  keychain. For what the daemon does around a locked one, `Keychain::Fake` wraps a
+  `FakeKeychain::locked(creds)`: every call fails with `Error::KeychainLocked` until
+  `unlock()`, and `asked()` counts the calls that came with leave to prompt (anything
+  but `Unlock::Never`) — a background task must leave it at 0.
+  `locked_handlers(&fake)` (handler tests, `pub(crate)`) are `Handlers` started
+  dormant on it.
 
 ## Queue and reconnect tests
 

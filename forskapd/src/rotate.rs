@@ -25,7 +25,7 @@ use crate::config::{AuthConfig, RotatePolicy, SharedConfig, next_backoff};
 use crate::error::{DormancyReason, Error, Result};
 use crate::gitlab::{GitlabApi, GitlabClient, TokenInfo};
 use crate::handlers::{ConnState, Handlers, Session, SessionSlot};
-use crate::secrets::{Credentials, Token};
+use crate::secrets::{Credentials, Token, Unlock};
 
 /// Widest spread of the rotation point between machines.
 const SPREAD_MAX: TimeDelta = TimeDelta::hours(24);
@@ -211,16 +211,18 @@ impl Env for Live {
         Utc::now()
     }
 
+    // A rotation runs in the background: it never asks for an unlock, and a
+    // locked keychain postpones it like an unreadable one.
     async fn load(&self) -> Result<Option<Credentials>> {
-        self.0.keychain.load().await
+        self.0.keychain.load(Unlock::Never).await
     }
 
     async fn store(&self, creds: &Credentials) -> Result<()> {
-        self.0.keychain.store(creds).await
+        self.0.keychain.store(creds, Unlock::Never).await
     }
 
     async fn forget(&self) -> Result<()> {
-        self.0.keychain.delete().await
+        self.0.keychain.delete(Unlock::Never).await
     }
 
     async fn connect(&self, host: &str, token: &Token) -> Result<Session> {
@@ -573,7 +575,8 @@ impl<E: Env> Supervisor<E> {
 }
 
 /// Whether the slot still is the rotated session's to replace: it holds that
-/// session, or what a failure of its revoked token left. A login or logout
+/// session, or what a failure of its revoked token left — an outage of its
+/// host, also one the keychain was then found locked in. A login or logout
 /// since is not.
 fn replaceable(state: &ConnState, rotated: &Session) -> bool {
     match state {
@@ -581,6 +584,9 @@ fn replaceable(state: &ConnState, rotated: &Session) -> bool {
         ConnState::Dormant(
             DormancyReason::Unreachable { host, .. } | DormancyReason::TokenRejected { host, .. },
         ) => *host == rotated.host,
+        ConnState::Dormant(DormancyReason::KeychainLocked { host }) => {
+            host.as_deref() == Some(rotated.host.as_str())
+        }
         ConnState::Dormant(_) => false,
     }
 }
@@ -762,6 +768,23 @@ mod tests {
         fn swapped(&self) {
             self.swapped.fetch_add(1, SeqCst);
         }
+    }
+
+    /// A slot waiting for a locked keychain stays the rotation's only where
+    /// the outage of its own host was found locked: taking any other for a
+    /// login or logout would drop the rotated token from the keychain.
+    #[test]
+    fn a_locked_keychain_leaves_the_slot_the_rotations_to_replace() {
+        let rotated = session_on(&Arc::new(FakeGitlab::default()), "old");
+        let locked = |host: Option<&str>| {
+            ConnState::Dormant(DormancyReason::KeychainLocked {
+                host: host.map(str::to_string),
+            })
+        };
+        assert!(replaceable(&locked(Some(HOST)), &rotated));
+        assert!(!replaceable(&locked(Some("other.test")), &rotated));
+        // Locked since the daemon's start: no session of this run rotated.
+        assert!(!replaceable(&locked(None), &rotated));
     }
 
     fn session_on(fake: &Arc<FakeGitlab>, token: &str) -> Session {

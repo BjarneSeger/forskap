@@ -102,3 +102,25 @@ dbus-run-session -- bash -c '
 ```
 
 Afterwards `stat ~/.local/share/keyrings/login.keyring` must show an unchanged mtime.
+
+### Locked at the daemon's start
+
+What a daemon started before the desktop session meets (a lingering user's, at
+boot): no keyring daemon yet, no display for its unlock prompt, and a login that
+unlocks the keyring later. In the same private session, started with
+`env -u DISPLAY -u WAYLAND_DISPLAY dbus-run-session -- …` (with a display,
+gcr-prompter raises a real dialog for the scratch keyring):
+
+1. Create the keyring and store the item as above, then kill that keyring daemon
+   by the pid that owns `org.freedesktop.secrets` on the private bus, never by
+   name (the real one matches too):
+   `gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.GetConnectionUnixProcessID org.freedesktop.secrets`
+2. Start `forskapd`: its read D-Bus-activates a locked `gnome-keyring-daemon`, the
+   prompter fails with `cannot open display`, and the daemon starts dormant
+   ("the keychain is locked"). The session's stderr must show that one prompt
+   attempt and no further one, however long the daemon waits.
+3. Unlock like `pam_gnome_keyring`, over the control socket:
+   `python3 .claude/skills/verify/pam-unlock.py $XDG_RUNTIME_DIR/keyring/control test-pw`
+   (`gnome-keyring-daemon --unlock` would start a second daemon instead).
+4. The next `forskap` call nudges the reconnect supervisor; with credentials for
+   `localhost:8930` the session reads `unreachable` a moment later.

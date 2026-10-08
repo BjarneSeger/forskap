@@ -23,6 +23,12 @@
 //! user and would just spin. The exception is a token rejected while the
 //! keychain holds another one (rotated by a machine sharing the keychain): the
 //! sync worker hands that to the supervisor too ([`commit_token_replaced`]).
+//!
+//! A locked keychain is transient too. A daemon that starts before the desktop
+//! session (a lingering user's, at boot) finds the keyring locked and nobody to
+//! ask; the login unlocks it moments later. The supervisor looks again with a
+//! back-off, never asking for an unlock ([`Unlock::Never`]), and connects once
+//! the credentials can be read.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -33,17 +39,16 @@ use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::config::{SharedConfig, next_backoff};
-use crate::error::DormancyReason;
+use crate::error::{DormancyReason, Error};
 use crate::gitlab::{GitlabApi, GitlabClient};
 use crate::handlers::{ConnState, Handlers, Session, SessionSlot};
-use crate::secrets::{Credentials, Keychain};
+use crate::secrets::{Credentials, Keychain, Unlock};
 use crate::sync::Job;
 
 /// How long a reconnect waits for its probing sync job.
 const RECOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long the sync worker waits for the keychain on a 401; a locked
-/// keyring may sit on a prompt.
+/// How long the sync worker waits for the keychain on a 401.
 const KEYCHAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Asked by the sync worker on a 401: whether the keychain holds another
@@ -56,7 +61,8 @@ pub fn keychain_probe(keychain: Keychain) -> KeychainProbe {
     Arc::new(move |session| {
         let keychain = keychain.clone();
         Box::pin(async move {
-            match tokio::time::timeout(KEYCHAIN_PROBE_TIMEOUT, keychain.load()).await {
+            let look = keychain.load(Unlock::Never);
+            match tokio::time::timeout(KEYCHAIN_PROBE_TIMEOUT, look).await {
                 Ok(loaded) => holds_another_token(loaded, &session),
                 Err(_) => {
                     warn!("keychain read timed out; not looking for a newer token");
@@ -93,8 +99,9 @@ fn holds_another_token(
 enum Attempt {
     /// A live session was established.
     Connected(Session),
-    /// Transient/network failure — keep retrying (carries a detail for logging).
-    Transient(String),
+    /// Transient/network failure — keep retrying. Carries the `Unreachable`
+    /// it makes, for the log and for a slot that blamed the keychain so far.
+    Transient(DormancyReason),
     /// Permanent failure — commit this dormancy reason and stop (e.g. the token
     /// was rejected). Don't hammer auth.
     Permanent(DormancyReason),
@@ -123,15 +130,23 @@ enum Engaged {
     /// re-demoted the session. Re-engaging at once would spin against a partial
     /// outage, so the supervisor backs off first.
     Flapping,
+    /// The keychain is locked: look again after a back-off, or as soon as a
+    /// client asks for the session.
+    Locked,
 }
 
 /// The supervisor loop, factored out of [`spawn`] so it can be unit-tested with
 /// an injected `engage` step.
 ///
-/// Two waits guard the two failure shapes:
+/// Three waits guard the three shapes:
 /// * A `Flapping` engagement (reconnect succeeded but its first sync re-failed) sleeps
 ///   an exponential back-off before re-engaging, so a partial outage — the cheap
 ///   `connect` probe reachable while the heavier fetches are not — can't storm.
+/// * A `Locked` engagement waits out a back-off of its own, quietly: a look at a
+///   locked keychain is one property read, and it stays locked for as long as the
+///   user is away. A signal cuts the wait short without stepping the back-off — the
+///   handlers fire it when a client finds the session waiting for the keychain,
+///   which is when the user is back.
 /// * A `Stable` engagement parks until the next runtime demotion signal *or* a
 ///   periodic re-check tick. The tick re-arms an already-dormant slot that no
 ///   signal can reach (keychain recovered, token fixed out-of-band, or
@@ -148,13 +163,24 @@ where
     F: Future<Output = Engaged>,
 {
     let mut flap_delay: Option<Duration> = None;
+    let mut locked_delay: Option<Duration> = None;
     loop {
-        match engage().await {
+        let engaged = engage().await;
+        let (base, max) = {
+            let c = config.read().unwrap();
+            (c.reconnect.base_delay(), c.reconnect.max_delay())
+        };
+        match engaged {
+            Engaged::Locked => {
+                flap_delay = None;
+                let d = locked_delay.unwrap_or(base);
+                tokio::select! {
+                    _ = signal.notified() => {}
+                    _ = tokio::time::sleep(d) => locked_delay = Some(next_backoff(d, max)),
+                }
+            }
             Engaged::Flapping => {
-                let (base, max) = {
-                    let c = config.read().unwrap();
-                    (c.reconnect.base_delay(), c.reconnect.max_delay())
-                };
+                locked_delay = None;
                 let d = flap_delay.unwrap_or(base);
                 warn!(
                     delay_secs = d.as_secs(),
@@ -167,11 +193,11 @@ where
             }
             Engaged::Stable => {
                 flap_delay = None;
-                // Re-read `max_delay` each park so a hot reload retunes the tick.
-                let tick = config.read().unwrap().reconnect.max_delay();
+                locked_delay = None;
+                // `max_delay` is re-read each park so a hot reload retunes the tick.
                 tokio::select! {
                     _ = signal.notified() => {}
-                    _ = tokio::time::sleep(tick) => {}
+                    _ = tokio::time::sleep(max) => {}
                 }
             }
         }
@@ -185,6 +211,9 @@ where
 /// re-demoted the session (so the supervisor backs off), or [`Engaged::Stable`]
 /// otherwise. A no-op returning `Stable` when the slot isn't retryable, so a
 /// connected session costs only the guard check.
+///
+/// A slot waiting for a locked keychain returns [`Engaged::Locked`] for as long
+/// as it stays locked, and goes on to connect the moment it isn't.
 ///
 /// The keychain is read once *per engagement*, not per retry, and only after the
 /// `enabled` guard — a disabled daemon never touches it. Re-reading on every retry
@@ -203,12 +232,22 @@ async fn engage_once(handlers: Arc<Handlers>) -> Engaged {
     if !handlers.config.read().unwrap().reconnect.enabled {
         return Engaged::Stable;
     }
-    let loaded = handlers.keychain.load().await;
+    let was_locked = matches!(
+        &*handlers.session.read().await,
+        ConnState::Dormant(DormancyReason::KeychainLocked { .. })
+    );
+    // Never asking: the user gets no prompt for something they didn't start.
+    let loaded = handlers.keychain.load(Unlock::Never).await;
     let creds = match resolve_credentials(loaded, &handlers.session).await {
-        Some(c) => c,
-        None => return Engaged::Stable,
+        Resolved::Credentials(c) => c,
+        Resolved::Locked => return Engaged::Locked,
+        Resolved::Stop => return Engaged::Stable,
     };
-    info!("GitLab unreachable; starting background auto-reconnect");
+    if was_locked {
+        info!("the keychain is unlocked; connecting to GitLab");
+    } else {
+        info!("GitLab unreachable; starting background auto-reconnect");
+    }
     let committed = reconnect_loop(
         Arc::clone(&handlers.session),
         Arc::clone(&handlers.config),
@@ -235,24 +274,38 @@ async fn engage_once(handlers: Arc<Handlers>) -> Engaged {
     Engaged::Stable
 }
 
+/// What a keychain read leaves a reconnect engagement with.
+enum Resolved {
+    Credentials(Credentials),
+    /// The keychain is locked: the credentials are there, just not now.
+    Locked,
+    /// Nothing to connect with, and looking again won't change it.
+    Stop,
+}
+
 /// Resolve the credentials for a reconnect attempt. Loading the keychain fails
-/// with either "no credentials" (logged out / cleared) or a read error; both
-/// mean the current `Dormant(Unreachable)` is no longer the true reason, so we
+/// with "no credentials" (logged out / cleared), a read error, or a locked
+/// keychain; each means the slot's reason is no longer the true one, so we
 /// commit the honest one (via the same CAS as `commit_dormant`, so a racing
-/// `forskap auth login` is never clobbered) and return `None` to stop the task.
+/// `forskap auth login` is never clobbered). The first two stop the task; a
+/// locked keychain keeps it looking.
 async fn resolve_credentials(
     loaded: crate::error::Result<Option<Credentials>>,
     session: &SessionSlot,
-) -> Option<Credentials> {
+) -> Resolved {
     match loaded {
-        Ok(Some(c)) => Some(c),
+        Ok(Some(c)) => Resolved::Credentials(c),
         Ok(None) => {
             commit_dormant(session, DormancyReason::NoCredentials).await;
-            None
+            Resolved::Stop
+        }
+        Err(Error::KeychainLocked) => {
+            commit_locked(session).await;
+            Resolved::Locked
         }
         Err(e) => {
-            commit_dormant(session, DormancyReason::KeychainError(e.to_string())).await;
-            None
+            commit_dormant(session, DormancyReason::from_keychain_error(&e)).await;
+            Resolved::Stop
         }
     }
 }
@@ -265,7 +318,7 @@ async fn connect_once(creds: &Credentials) -> Attempt {
     match GitlabClient::connect(&creds.host, &creds.token).await {
         Ok(client) => Attempt::Connected(Session::from_client(client)),
         Err(e) => match DormancyReason::from_connect_error(&creds.host, &e) {
-            r if r.is_auto_retryable() => Attempt::Transient(e.to_string()),
+            r if r.is_auto_retryable() => Attempt::Transient(r),
             r => Attempt::Permanent(r),
         },
     }
@@ -309,8 +362,11 @@ where
                 commit_dormant(&session, reason).await;
                 return false;
             }
-            Attempt::Transient(detail) => {
+            Attempt::Transient(reason) => {
+                // The keychain opened; from here on GitLab is what's missing.
+                commit_unlocked_unreachable(&session, &reason).await;
                 let d = delay.unwrap_or(base);
+                let detail = reason.detail().unwrap_or_default();
                 warn!(error = %detail, delay_secs = d.as_secs(), "reconnect attempt failed; retrying");
                 tokio::time::sleep(d).await;
                 delay = Some(next_backoff(d, max));
@@ -349,6 +405,33 @@ async fn commit_dormant(session: &SessionSlot, reason: DormancyReason) {
     if matches!(&*slot, ConnState::Dormant(r) if r.is_auto_retryable()) {
         warn!(reason = ?reason, "reconnect: giving up");
         *slot = ConnState::Dormant(reason);
+    }
+}
+
+/// The keychain turned out locked during an outage: say so, keeping the
+/// outage's host for the token rotation's claim on the slot (see
+/// `rotate::replaceable`). The same CAS as `commit_dormant`; a slot already
+/// waiting for the keychain stays as it is, quietly.
+async fn commit_locked(session: &SessionSlot) {
+    let mut slot = session.write().await;
+    let host = match &*slot {
+        ConnState::Dormant(DormancyReason::Unreachable { host, .. }) => host.clone(),
+        _ => return,
+    };
+    info!("the keychain is locked; reconnecting once it is unlocked");
+    *slot = ConnState::Dormant(DormancyReason::KeychainLocked { host: Some(host) });
+}
+
+/// The keychain opened, but GitLab can't be reached with what it holds: the
+/// slot stops blaming the keychain and takes `unreachable`. Only a slot still
+/// waiting for the keychain changes; an outage keeps the detail it began with.
+async fn commit_unlocked_unreachable(session: &SessionSlot, unreachable: &DormancyReason) {
+    let mut slot = session.write().await;
+    if matches!(
+        &*slot,
+        ConnState::Dormant(DormancyReason::KeychainLocked { .. })
+    ) {
+        *slot = ConnState::Dormant(unreachable.clone());
     }
 }
 
@@ -439,12 +522,18 @@ mod tests {
     use crate::secrets::Token;
     use crate::testing::FakeGitlab;
 
-    fn unreachable_slot() -> SessionSlot {
-        let reason = DormancyReason::Unreachable {
+    /// GitLab out of reach, for the reason `detail`.
+    fn refused(detail: &str) -> DormancyReason {
+        DormancyReason::Unreachable {
             host: "gitlab.example.com".into(),
-            detail: "connection refused".into(),
-        };
-        Arc::new(RwLock::new(ConnState::Dormant(reason)))
+            detail: detail.into(),
+        }
+    }
+
+    fn unreachable_slot() -> SessionSlot {
+        Arc::new(RwLock::new(ConnState::Dormant(refused(
+            "connection refused",
+        ))))
     }
 
     /// Defaults with the back-off zeroed so retry tests don't actually sleep.
@@ -510,7 +599,7 @@ mod tests {
     async fn missing_credentials_commits_no_credentials_and_stops() {
         let session = unreachable_slot();
         let creds = resolve_credentials(Ok(None), &session).await;
-        assert!(creds.is_none());
+        assert!(matches!(creds, Resolved::Stop));
         assert!(matches!(
             &*session.read().await,
             ConnState::Dormant(DormancyReason::NoCredentials)
@@ -521,8 +610,8 @@ mod tests {
     async fn keychain_error_commits_keychain_error_and_stops() {
         let session = unreachable_slot();
         let creds =
-            resolve_credentials(Err(Error::Secrets("keyring locked".into())), &session).await;
-        assert!(creds.is_none());
+            resolve_credentials(Err(Error::Secrets("no secret service".into())), &session).await;
+        assert!(matches!(creds, Resolved::Stop));
         assert!(matches!(
             &*session.read().await,
             ConnState::Dormant(DormancyReason::KeychainError(_))
@@ -540,11 +629,199 @@ mod tests {
             &session,
         )
         .await;
-        assert!(creds.is_some());
+        assert!(matches!(creds, Resolved::Credentials(_)));
         assert!(matches!(
             &*session.read().await,
             ConnState::Dormant(r) if r.is_auto_retryable()
         ));
+    }
+
+    fn locked_slot(host: Option<&str>) -> SessionSlot {
+        let host = host.map(str::to_string);
+        let reason = DormancyReason::KeychainLocked { host };
+        Arc::new(RwLock::new(ConnState::Dormant(reason)))
+    }
+
+    fn stored(token: &str) -> Credentials {
+        Credentials {
+            host: "gitlab.example.com".into(),
+            token: Token::new(token),
+        }
+    }
+
+    /// What used to end the reconnect for good: a keyring locked during an
+    /// outage. It keeps the supervisor looking, and remembers whose outage.
+    #[tokio::test]
+    async fn a_locked_keychain_commits_locked_and_keeps_looking() {
+        let session = unreachable_slot();
+        let found = resolve_credentials(Err(Error::KeychainLocked), &session).await;
+        assert!(matches!(found, Resolved::Locked));
+        assert!(matches!(
+            &*session.read().await,
+            ConnState::Dormant(DormancyReason::KeychainLocked { host: Some(h) })
+                if h == "gitlab.example.com"
+        ));
+        assert!(slot_is_retryable(&session).await);
+
+        // Locked since the start: still locked, nothing changes.
+        let session = locked_slot(None);
+        let found = resolve_credentials(Err(Error::KeychainLocked), &session).await;
+        assert!(matches!(found, Resolved::Locked));
+        assert!(matches!(
+            &*session.read().await,
+            ConnState::Dormant(DormancyReason::KeychainLocked { host: None })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_locked_keychain_never_overrides_a_login_or_logout() {
+        let logged_out: SessionSlot =
+            Arc::new(RwLock::new(ConnState::Dormant(DormancyReason::LoggedOut)));
+        commit_locked(&logged_out).await;
+        assert!(matches!(
+            &*logged_out.read().await,
+            ConnState::Dormant(DormancyReason::LoggedOut)
+        ));
+
+        let logged_in: SessionSlot =
+            Arc::new(RwLock::new(ConnState::Connected(connected_session())));
+        commit_locked(&logged_in).await;
+        commit_unlocked_unreachable(&logged_in, &refused("connection refused")).await;
+        assert!(matches!(&*logged_in.read().await, ConnState::Connected(_)));
+    }
+
+    #[tokio::test]
+    async fn an_unlocked_keychain_that_cannot_reach_gitlab_reads_unreachable() {
+        let session = locked_slot(None);
+        let calls = AtomicUsize::new(0);
+        let committed = reconnect_loop(session.clone(), instant_config(), || {
+            let n = calls.fetch_add(1, SeqCst);
+            let seen = session.clone();
+            async move {
+                if n == 0 {
+                    return Attempt::Transient(refused("connection refused"));
+                }
+                // The keychain is no longer what the daemon waits for, and
+                // the outage keeps the detail it began with.
+                assert!(matches!(
+                    &*seen.read().await,
+                    ConnState::Dormant(DormancyReason::Unreachable { host, detail })
+                        if host == "gitlab.example.com" && detail == "connection refused"
+                ));
+                if n == 1 {
+                    Attempt::Transient(refused("timed out"))
+                } else {
+                    Attempt::Connected(connected_session())
+                }
+            }
+        })
+        .await;
+        assert!(committed);
+        assert_eq!(calls.load(SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn the_probe_looks_without_asking_for_an_unlock() {
+        let fake = crate::secrets::FakeKeychain::locked(Some(stored("newer")));
+        let probe = keychain_probe(Keychain::Fake(Arc::clone(&fake)));
+        let session = Session {
+            token: Token::new("old"),
+            ..connected_session()
+        };
+        assert!(!probe(session.clone()).await, "locked: nothing to find");
+        fake.unlock();
+        assert!(probe(session).await);
+        assert_eq!(fake.asked(), 0, "a 401 never raises an unlock prompt");
+    }
+
+    #[tokio::test]
+    async fn an_engagement_waits_for_the_keychain_without_asking() {
+        let fake = crate::secrets::FakeKeychain::locked(None);
+        let (h, _dir) = crate::handlers::tests::locked_handlers(&fake);
+        let h = Arc::new(h);
+
+        assert_eq!(engage_once(Arc::clone(&h)).await, Engaged::Locked);
+        assert_eq!(engage_once(Arc::clone(&h)).await, Engaged::Locked);
+        assert!(matches!(
+            &*h.session.read().await,
+            ConnState::Dormant(DormancyReason::KeychainLocked { host: None })
+        ));
+
+        // Unlocked and empty: nothing to connect with, which only a login ends.
+        fake.unlock();
+        assert_eq!(engage_once(Arc::clone(&h)).await, Engaged::Stable);
+        assert!(matches!(
+            &*h.session.read().await,
+            ConnState::Dormant(DormancyReason::NoCredentials)
+        ));
+        assert_eq!(fake.asked(), 0);
+    }
+
+    /// The config of a supervisor whose back-off runs from `base` to `max`.
+    fn paced(base: u64, max: u64) -> SharedConfig {
+        let mut c = crate::config::defaults();
+        c.reconnect.base_delay_secs = base;
+        c.reconnect.max_delay_secs = max;
+        Arc::new(std::sync::RwLock::new(c))
+    }
+
+    #[tokio::test]
+    async fn the_supervisor_looks_again_after_a_backoff_while_locked() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let looks = AtomicUsize::new(0);
+        // Nothing signals: only the back-off (zeroed) brings the next look.
+        let handle = tokio::spawn(async move {
+            supervise(paced(0, 3600), Arc::new(Notify::new()), move || {
+                let n = looks.fetch_add(1, SeqCst);
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(());
+                    // Unlocked at the fourth look; then it parks.
+                    if n < 3 {
+                        Engaged::Locked
+                    } else {
+                        Engaged::Stable
+                    }
+                }
+            })
+            .await;
+        });
+        for look in 1..=4 {
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("look {look} never came"));
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_nudge_cuts_the_wait_for_an_unlock_short() {
+        let signal = Arc::new(Notify::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let sig = Arc::clone(&signal);
+        let handle = tokio::spawn(async move {
+            supervise(paced(3600, 3600), sig, move || {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(());
+                    Engaged::Locked
+                }
+            })
+            .await;
+        });
+        rx.recv().await.expect("the first look");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "the next look waits for its back-off"
+        );
+        // A client asked for the session: the user is back.
+        signal.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a nudge brings the next look at once");
+        handle.abort();
     }
 
     #[tokio::test]
@@ -555,7 +832,7 @@ mod tests {
             let n = calls.fetch_add(1, SeqCst);
             async move {
                 if n < 2 {
-                    Attempt::Transient("connection refused".into())
+                    Attempt::Transient(refused("connection refused"))
                 } else {
                     Attempt::Connected(connected_session())
                 }

@@ -237,20 +237,22 @@ impl Handlers {
     }
 
     /// The shared write cascade: try once while connected; queue the write
-    /// when GitLab is unreachable or the failure is retryable; otherwise hand
-    /// the failure back.
+    /// when the session is away but comes back by itself (GitLab unreachable,
+    /// the keychain locked) or the failure is retryable; otherwise hand the
+    /// failure back.
     async fn perform_write(&self, write: Write) -> WriteOutcome {
         let (kind, project_id, iid, op) =
             (write.kind, write.project_id, write.iid, write.op.name());
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
-            Err(DormancyReason::Unreachable { .. }) => {
+            Err(r) if r.is_auto_retryable() => {
                 info!(
                     project_id,
                     iid,
                     ?kind,
                     op,
-                    "GitLab unreachable, queuing write for retry"
+                    reason = ?r.reason(),
+                    "no GitLab session for now, queuing write for retry"
                 );
                 self.defer(write).await;
                 return WriteOutcome::Accepted;

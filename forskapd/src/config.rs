@@ -267,16 +267,19 @@ impl QueueConfig {
 ///
 /// When the daemon is dormant because GitLab was *unreachable* (the stored
 /// credentials are known-good), a background task retries the connection with
-/// exponential backoff using these values. Unlike the queue there is nothing to
-/// dead-letter, so retries continue indefinitely — the delay is merely capped —
-/// until the connection succeeds or the session state changes. The cap is kept
+/// exponential backoff using these values. A daemon waiting for a locked
+/// keychain looks at it again on the same schedule. Unlike the queue there is
+/// nothing to dead-letter, so retries continue indefinitely — the delay is
+/// merely capped — until the connection succeeds or the session state changes. The cap is kept
 /// short (a minute) so recovery is noticed promptly, versus the queue's 30-min
 /// cap tuned for long-lived write retries.
 #[derive(Debug, Clone, Copy, ConfiqueConfig)]
 pub struct ReconnectConfig {
     /// Whether the daemon auto-reconnects after an unreachable-GitLab dormancy
-    /// (whether GitLab was down at boot or the connection dropped mid-run). When
-    /// `false`, recovery is manual (`forskap auth login` or a restart) — the session still
+    /// (whether GitLab was down at boot or the connection dropped mid-run), and
+    /// connects by itself once a keychain it found locked is unlocked (a daemon
+    /// started before the desktop session). When `false`, recovery is manual
+    /// (`forskap auth login` or a restart) — the session still
     /// honestly reports `unreachable`, it just isn't retried. Re-read on every
     /// retry, so disabling it via a hot config reload stops an in-flight reconnect
     /// on the next iteration. The supervisor task is long-lived (parked between

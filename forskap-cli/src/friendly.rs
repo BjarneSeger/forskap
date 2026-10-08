@@ -139,7 +139,12 @@ pub fn remedy(reason: Option<&NotAuthReason>) -> &'static str {
             "It retries automatically unless auto-reconnect is disabled; if so, \
              restart it once GitLab is reachable."
         }
-        Some(NotAuthReason::keychain_error) => "Run `forskap auth login` to store them again.",
+        // The daemon waits for a locked keychain and says so in the detail;
+        // any other failure to read it takes a new login.
+        Some(NotAuthReason::keychain_error) => {
+            "If it is locked, unlock it and the daemon connects by itself; otherwise run \
+             `forskap auth login` to store them again."
+        }
     }
 }
 
@@ -274,8 +279,9 @@ mod tests {
             ),
             (
                 NotAuthReason::keychain_error,
-                "Couldn't read your saved credentials from the keychain. \
-                 Run `forskap auth login` to store them again.",
+                "Couldn't read your saved credentials from the keychain. If it is locked, \
+                 unlock it and the daemon connects by itself; otherwise run \
+                 `forskap auth login` to store them again.",
             ),
             (
                 NotAuthReason::logged_out,

@@ -95,6 +95,17 @@ fn unreachable_handlers() -> (Handlers, tempfile::TempDir) {
     }))
 }
 
+/// Started with `keychain` locked, and holding it. `pub(crate)` for the
+/// reconnect supervisor's tests.
+pub(crate) fn locked_handlers(
+    keychain: &Arc<crate::secrets::FakeKeychain>,
+) -> (Handlers, tempfile::TempDir) {
+    let locked = DormancyReason::KeychainLocked { host: None };
+    let (mut h, dir) = handlers_with(ConnState::Dormant(locked));
+    h.keychain = crate::secrets::Keychain::Fake(Arc::clone(keychain));
+    (h, dir)
+}
+
 fn connected_handlers(fake: &Arc<FakeGitlab>) -> (Handlers, tempfile::TempDir) {
     handlers_with(ConnState::Connected(Session {
         gitlab: Arc::clone(fake) as Arc<dyn crate::gitlab::GitlabApi>,
@@ -783,6 +794,40 @@ async fn post_time_queues_through_an_unreachable_outage() {
     let (h, _dir) = unreachable_handlers();
     assert_eq!(post_time(&h, 7, 42, IssuableKind::work_item).await, None);
     assert_eq!(h.queue.pending().unwrap().len(), 1, "drains on reconnect");
+}
+
+/// The keychain opens by itself (a login to the desktop session), so a
+/// write made before that waits for it like for an outage's end.
+#[tokio::test]
+async fn a_write_is_queued_while_the_keychain_is_locked() {
+    let (h, _dir) = locked_handlers(&crate::secrets::FakeKeychain::locked(None));
+    assert_eq!(post_time(&h, 7, 42, IssuableKind::work_item).await, None);
+    assert_eq!(h.queue.pending().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_call_that_finds_the_keychain_locked_wakes_the_supervisor() {
+    let (h, _dir) = locked_handlers(&crate::secrets::FakeKeychain::locked(None));
+    let mut call = AsyncCall::default();
+    h.who_am_i(&mut call as &mut dyn Call_WhoAmI).await.unwrap();
+    let (name, params) = reply_error_with(&mut call).unwrap();
+    assert_eq!(name, NOT_AUTHENTICATED);
+    assert_eq!(params["reason"], "keychain_error");
+    assert!(params["detail"].as_str().unwrap().contains("locked"));
+    tokio::time::timeout(Duration::from_millis(200), h.reconnect_signal.notified())
+        .await
+        .expect("the supervisor looks at the keychain again at once");
+
+    // No other dormancy is the supervisor's to end on a client's call.
+    let (h, _dir) = dormant_handlers();
+    let mut call = AsyncCall::default();
+    h.who_am_i(&mut call as &mut dyn Call_WhoAmI).await.unwrap();
+    assert_eq!(reply_error(&mut call).as_deref(), Some(NOT_AUTHENTICATED));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), h.reconnect_signal.notified())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
