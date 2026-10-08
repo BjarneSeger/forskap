@@ -114,9 +114,10 @@ async fn fetch() -> Result<Listed> {
         true => client.get_status().call().await.ok(),
         false => None,
     };
-    let no_session = status
-        .filter(|s| !s.connected)
-        .map(|s| friendly::message_for(s.reason, s.detail.as_deref()));
+    let no_session = status.filter(|s| !s.connected).map(|s| {
+        let retrying = s.dormancy.as_ref().map(|d| d.retrying);
+        friendly::message_for(s.reason, s.detail.as_deref(), retrying)
+    });
     let listing = Listing {
         queued,
         paused_until,
