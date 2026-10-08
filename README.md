@@ -32,6 +32,16 @@ prebuilt binaries (macOS on Apple silicon, Linux amd64 and arm64) and the shell
 completions. Intel Macs are not supported by the formula: it refuses to install there
 and points to `brew install --HEAD`, which builds `main` from source.
 
+What each release brings is in the [changelog](CHANGELOG.md). Releases after 1.1.0 are
+immutable and attested, so the [GitHub CLI](https://cli.github.com) can check a
+download: that it is the file of that release, and that this repository's release
+workflow built it.
+
+```sh
+gh release verify-asset <tag> <file> --repo BjarneSeger/forskap
+gh attestation verify <file> --repo BjarneSeger/forskap
+```
+
 ## 2. Start the daemon
 
 The daemon is a systemd user unit — enable and start it:
