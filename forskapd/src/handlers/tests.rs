@@ -3,7 +3,7 @@ use super::*;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 
 use forskap_api::admin::{
     self, CacheScope, Call_ClearCache, Call_GetSyncJobs, Call_Login, Call_Logout, ClearCache_Reply,
@@ -56,9 +56,13 @@ fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
     let db = fjall::Database::builder(dir.path().join("db"))
         .open()
         .unwrap();
-    let session: SessionSlot = Arc::new(RwLock::new(state));
     let config: SharedConfig = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
-    let reconnect_signal = Arc::new(Notify::new());
+    let reconnect_signal = Arc::new(crate::reconnect::Reconnect::default());
+    // As the daemon's start does for a session it begins without.
+    if matches!(state, ConnState::Dormant(_)) {
+        reconnect_signal.lost();
+    }
+    let session: SessionSlot = Arc::new(RwLock::new(state));
     let sync = SyncHandle::spawn_on_demand(
         Arc::new(SyncStore::open(&db).unwrap()),
         crate::sync::AvatarDir::new(dir.path().join("avatars")),
@@ -74,7 +78,7 @@ fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
             usage: Arc::new(crate::usage::UsageStats::open(&db).unwrap()),
             queue,
             config,
-            reconnect_signal,
+            reconnect: reconnect_signal,
             rotation: Default::default(),
             // No test reaches the OS keychain.
             keychain: crate::secrets::Keychain::disabled(),
@@ -815,7 +819,7 @@ async fn a_call_that_finds_the_keychain_locked_wakes_the_supervisor() {
     assert_eq!(name, NOT_AUTHENTICATED);
     assert_eq!(params["reason"], "keychain_error");
     assert!(params["detail"].as_str().unwrap().contains("locked"));
-    tokio::time::timeout(Duration::from_millis(200), h.reconnect_signal.notified())
+    tokio::time::timeout(Duration::from_millis(200), h.reconnect.notified())
         .await
         .expect("the supervisor looks at the keychain again at once");
 
@@ -825,7 +829,7 @@ async fn a_call_that_finds_the_keychain_locked_wakes_the_supervisor() {
     h.who_am_i(&mut call as &mut dyn Call_WhoAmI).await.unwrap();
     assert_eq!(reply_error(&mut call).as_deref(), Some(NOT_AUTHENTICATED));
     assert!(
-        tokio::time::timeout(Duration::from_millis(50), h.reconnect_signal.notified())
+        tokio::time::timeout(Duration::from_millis(50), h.reconnect.notified())
             .await
             .is_err()
     );
@@ -886,7 +890,7 @@ async fn post_time_transient_queues_without_demoting() {
     assert_eq!(h.queue.pending().unwrap().len(), 1);
     assert!(matches!(&*h.session.read().await, ConnState::Connected(_)));
     assert!(
-        tokio::time::timeout(Duration::from_millis(50), h.reconnect_signal.notified())
+        tokio::time::timeout(Duration::from_millis(50), h.reconnect.notified())
             .await
             .is_err()
     );
@@ -1028,7 +1032,7 @@ async fn create_work_item_reports_any_gitlab_failure_without_demoting() {
             "{err:?}"
         );
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), h.reconnect_signal.notified())
+            tokio::time::timeout(Duration::from_millis(50), h.reconnect.notified())
                 .await
                 .is_err(),
             "{err:?}"

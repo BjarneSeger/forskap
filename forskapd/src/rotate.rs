@@ -233,6 +233,7 @@ impl Env for Live {
 
     fn swapped(&self) {
         // The account is the same one: nothing to clear, no backoff to lift.
+        self.0.reconnect.connected();
         self.0.queue.drain_waker().notify_one();
         self.0.sync.wake();
     }
@@ -1038,8 +1039,8 @@ mod tests {
         rig.supervisor.engage().await;
 
         let old: Arc<dyn GitlabApi> = rig.fake.clone();
-        crate::reconnect::commit_token_rejected(&rig.session, &old, "401".into()).await;
-        let signal = Notify::new();
+        let signal = crate::reconnect::Reconnect::default();
+        crate::reconnect::commit_token_rejected(&rig.session, &signal, &old, "401".into()).await;
         crate::reconnect::commit_token_replaced(&rig.session, &signal, &old).await;
         crate::reconnect::commit_unreachable(&rig.session, &signal, &old, "stale".into()).await;
 

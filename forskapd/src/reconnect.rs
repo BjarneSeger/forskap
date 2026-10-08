@@ -14,7 +14,7 @@
 //! moment it flips the slot back to `Connected`, the queue worker's defer loop
 //! and the sync worker resume on their own; we additionally nudge
 //! the queue and wake the sync worker so recovery is instant. Between
-//! engagements it parks on [`Handlers::reconnect_signal`], woken by the next
+//! engagements it parks on [`Handlers::reconnect`], woken by the next
 //! runtime demotion or a periodic re-check tick; a reconnect whose first sync
 //! immediately re-fails backs off before retrying (see [`supervise`]).
 //!
@@ -32,10 +32,11 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::Notify;
+use tokio::sync::futures::Notified;
 use tracing::{info, warn};
 
 use crate::config::{SharedConfig, next_backoff};
@@ -43,7 +44,81 @@ use crate::error::{DormancyReason, Error};
 use crate::gitlab::{GitlabApi, GitlabClient};
 use crate::handlers::{ConnState, Handlers, Session, SessionSlot};
 use crate::secrets::{Credentials, Keychain, Unlock};
-use crate::sync::Job;
+use crate::sync::{Job, now_secs};
+
+/// What the supervisor shares with the rest of the daemon: its wakeup, and
+/// how the daemon stands without a session (for `GetStatus`). The session
+/// slot says *why* there is none; this says since when, and what the
+/// supervisor does about it.
+#[derive(Default)]
+pub struct Reconnect {
+    signal: Notify,
+    standing: Mutex<Standing>,
+}
+
+/// How the daemon stands without a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Standing {
+    /// Unix seconds since when there is none; `None` while there is one.
+    pub since: Option<u64>,
+    /// Attempts to get one since then.
+    pub attempts: u32,
+    /// Why the latest of them failed. The slot keeps why the session was
+    /// lost, this follows the attempts.
+    pub last_error: Option<String>,
+    /// Unix seconds of the supervisor's next attempt or look; `None` when it
+    /// plans none (it takes the user, or auto-reconnect is off).
+    pub retry_at: Option<u64>,
+}
+
+impl Reconnect {
+    /// Wake the supervisor.
+    pub fn notify_one(&self) {
+        self.signal.notify_one();
+    }
+
+    pub fn notified(&self) -> Notified<'_> {
+        self.signal.notified()
+    }
+
+    /// How the dormancy stands right now.
+    pub fn standing(&self) -> Standing {
+        self.standing.lock().unwrap().clone()
+    }
+
+    /// The daemon is without a session from now on, or still is for another
+    /// reason: what was tried so far belongs to the reason before. Called by
+    /// whoever writes `Dormant` into the slot where it held a session, and
+    /// by a logout.
+    pub fn lost(&self) {
+        let mut standing = self.standing.lock().unwrap();
+        *standing = Standing {
+            since: standing.since.or(Some(now_secs())),
+            ..Standing::default()
+        };
+    }
+
+    /// The daemon has a session again. Called by whoever writes `Connected`.
+    pub fn connected(&self) {
+        *self.standing.lock().unwrap() = Standing::default();
+    }
+
+    /// An attempt failed for `error`; the next comes in `retry_in`, or none
+    /// does.
+    fn attempted(&self, error: Option<String>, retry_in: Option<Duration>) {
+        let mut standing = self.standing.lock().unwrap();
+        standing.attempts = standing.attempts.saturating_add(1);
+        standing.last_error = error;
+        standing.retry_at = retry_in.map(|d| now_secs() + d.as_secs());
+    }
+
+    /// The supervisor waits `retry_in` before it looks again, or plans
+    /// nothing.
+    fn waits(&self, retry_in: Option<Duration>) {
+        let mut standing = self.standing.lock().unwrap();
+        standing.retry_at = retry_in.map(|d| now_secs() + d.as_secs());
+    }
+}
 
 /// How long a reconnect waits for its probing sync job.
 const RECOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -108,13 +183,13 @@ enum Attempt {
 }
 
 /// Spawn the background reconnect supervisor. It lives for the whole daemon run:
-/// a connected start pays only a task parked on [`Handlers::reconnect_signal`],
+/// a connected start pays only a task parked on [`Handlers::reconnect`],
 /// and it (re-)engages the retry loop whenever the session is dormant for an
 /// auto-retryable reason — at boot, or after a runtime [`commit_unreachable`].
 pub fn spawn(handlers: Arc<Handlers>) {
-    let signal = Arc::clone(&handlers.reconnect_signal);
+    let reconnect = Arc::clone(&handlers.reconnect);
     let config = Arc::clone(&handlers.config);
-    tokio::spawn(supervise(config, signal, move || {
+    tokio::spawn(supervise(config, reconnect, move || {
         engage_once(Arc::clone(&handlers))
     }));
 }
@@ -157,7 +232,7 @@ enum Engaged {
 /// and `engage` re-reads the slot at its top, so a permit stored between `engage`
 /// returning and the park below is consumed on the next iteration — the same
 /// guarantee the queue worker relies on for its drain waker.
-async fn supervise<E, F>(config: SharedConfig, signal: Arc<Notify>, mut engage: E)
+async fn supervise<E, F>(config: SharedConfig, signal: Arc<Reconnect>, mut engage: E)
 where
     E: FnMut() -> F,
     F: Future<Output = Engaged>,
@@ -174,6 +249,7 @@ where
             Engaged::Locked => {
                 flap_delay = None;
                 let d = locked_delay.unwrap_or(base);
+                signal.waits(Some(d));
                 tokio::select! {
                     _ = signal.notified() => {}
                     _ = tokio::time::sleep(d) => locked_delay = Some(next_backoff(d, max)),
@@ -186,6 +262,7 @@ where
                     delay_secs = d.as_secs(),
                     "reconnected but the first sync re-failed; backing off before retrying"
                 );
+                signal.waits(Some(d));
                 tokio::time::sleep(d).await;
                 flap_delay = Some(next_backoff(d, max));
                 // Loop straight back into `engage`: the slot is still dormant and
@@ -194,6 +271,8 @@ where
             Engaged::Stable => {
                 flap_delay = None;
                 locked_delay = None;
+                // Nothing is planned: the tick only looks whether that changed.
+                signal.waits(None);
                 // `max_delay` is re-read each park so a hot reload retunes the tick.
                 tokio::select! {
                     _ = signal.notified() => {}
@@ -251,6 +330,7 @@ async fn engage_once(handlers: Arc<Handlers>) -> Engaged {
     let committed = reconnect_loop(
         Arc::clone(&handlers.session),
         Arc::clone(&handlers.config),
+        &handlers.reconnect,
         || connect_once(&creds),
     )
     .await;
@@ -327,7 +407,12 @@ async fn connect_once(creds: &Credentials) -> Attempt {
 /// Retry `connect` with exponential back-off while the session stays dormant for
 /// an auto-retryable reason. Returns `true` iff it committed a fresh `Connected`
 /// session (the caller then runs the recovery side effects).
-async fn reconnect_loop<C, F>(session: SessionSlot, config: SharedConfig, mut connect: C) -> bool
+async fn reconnect_loop<C, F>(
+    session: SessionSlot,
+    config: SharedConfig,
+    standing: &Reconnect,
+    mut connect: C,
+) -> bool
 where
     C: FnMut() -> F,
     F: Future<Output = Attempt>,
@@ -356,9 +441,14 @@ where
 
         match connect().await {
             Attempt::Connected(new_session) => {
-                return commit_connected(&session, new_session).await;
+                let committed = commit_connected(&session, new_session).await;
+                if committed {
+                    standing.connected();
+                }
+                return committed;
             }
             Attempt::Permanent(reason) => {
+                standing.attempted(reason.detail(), None);
                 commit_dormant(&session, reason).await;
                 return false;
             }
@@ -367,6 +457,7 @@ where
                 commit_unlocked_unreachable(&session, &reason).await;
                 let d = delay.unwrap_or(base);
                 let detail = reason.detail().unwrap_or_default();
+                standing.attempted(Some(detail.clone()), Some(d));
                 warn!(error = %detail, delay_secs = d.as_secs(), "reconnect attempt failed; retrying");
                 tokio::time::sleep(d).await;
                 delay = Some(next_backoff(d, max));
@@ -452,7 +543,7 @@ async fn commit_unlocked_unreachable(session: &SessionSlot, unreachable: &Dorman
 /// means a real disconnect happened".
 pub(crate) async fn commit_unreachable(
     session: &SessionSlot,
-    signal: &Notify,
+    signal: &Reconnect,
     failed_client: &Arc<dyn GitlabApi>,
     detail: String,
 ) {
@@ -464,6 +555,7 @@ pub(crate) async fn commit_unreachable(
         let host = s.host.clone();
         warn!(host = %host, error = %detail, "GitLab unreachable at runtime; going dormant and auto-reconnecting");
         *slot = ConnState::Dormant(DormancyReason::Unreachable { host, detail });
+        signal.lost();
         signal.notify_one();
     }
 }
@@ -473,6 +565,7 @@ pub(crate) async fn commit_unreachable(
 /// identity CAS as [`commit_unreachable`].
 pub(crate) async fn commit_token_rejected(
     session: &SessionSlot,
+    standing: &Reconnect,
     failed_client: &Arc<dyn GitlabApi>,
     detail: String,
 ) {
@@ -484,6 +577,7 @@ pub(crate) async fn commit_token_rejected(
         let host = s.host.clone();
         warn!(host = %host, error = %detail, "GitLab rejected the token; run `forskap auth login`");
         *slot = ConnState::Dormant(DormancyReason::TokenRejected { host, detail });
+        standing.lost();
     }
 }
 
@@ -492,7 +586,7 @@ pub(crate) async fn commit_token_rejected(
 /// same identity CAS as [`commit_unreachable`].
 pub(crate) async fn commit_token_replaced(
     session: &SessionSlot,
-    signal: &Notify,
+    signal: &Reconnect,
     failed_client: &Arc<dyn GitlabApi>,
 ) {
     let mut slot = session.write().await;
@@ -506,6 +600,7 @@ pub(crate) async fn commit_token_replaced(
             host,
             detail: "token rejected; reconnecting with the newer one from the keychain".into(),
         });
+        signal.lost();
         signal.notify_one();
     }
 }
@@ -562,9 +657,12 @@ mod tests {
                 detail: "401".into(),
             },
         )));
-        let committed = reconnect_loop(session.clone(), instant_config(), || async {
-            panic!("connect must not run when the slot is not auto-retryable")
-        })
+        let committed = reconnect_loop(
+            session.clone(),
+            instant_config(),
+            &Reconnect::default(),
+            || async { panic!("connect must not run when the slot is not auto-retryable") },
+        )
         .await;
         assert!(!committed);
     }
@@ -572,12 +670,17 @@ mod tests {
     #[tokio::test]
     async fn permanent_error_commits_token_rejected_and_stops() {
         let session = unreachable_slot();
-        let committed = reconnect_loop(session.clone(), instant_config(), || async {
-            Attempt::Permanent(DormancyReason::TokenRejected {
-                host: "gitlab.example.com".into(),
-                detail: "401".into(),
-            })
-        })
+        let committed = reconnect_loop(
+            session.clone(),
+            instant_config(),
+            &Reconnect::default(),
+            || async {
+                Attempt::Permanent(DormancyReason::TokenRejected {
+                    host: "gitlab.example.com".into(),
+                    detail: "401".into(),
+                })
+            },
+        )
         .await;
         assert!(!committed);
         assert!(matches!(
@@ -694,30 +797,164 @@ mod tests {
     async fn an_unlocked_keychain_that_cannot_reach_gitlab_reads_unreachable() {
         let session = locked_slot(None);
         let calls = AtomicUsize::new(0);
-        let committed = reconnect_loop(session.clone(), instant_config(), || {
-            let n = calls.fetch_add(1, SeqCst);
-            let seen = session.clone();
-            async move {
-                if n == 0 {
-                    return Attempt::Transient(refused("connection refused"));
+        let committed = reconnect_loop(
+            session.clone(),
+            instant_config(),
+            &Reconnect::default(),
+            || {
+                let n = calls.fetch_add(1, SeqCst);
+                let seen = session.clone();
+                async move {
+                    if n == 0 {
+                        return Attempt::Transient(refused("connection refused"));
+                    }
+                    // The keychain is no longer what the daemon waits for, and
+                    // the outage keeps the detail it began with.
+                    assert!(matches!(
+                        &*seen.read().await,
+                        ConnState::Dormant(DormancyReason::Unreachable { host, detail })
+                            if host == "gitlab.example.com" && detail == "connection refused"
+                    ));
+                    if n == 1 {
+                        Attempt::Transient(refused("timed out"))
+                    } else {
+                        Attempt::Connected(connected_session())
+                    }
                 }
-                // The keychain is no longer what the daemon waits for, and
-                // the outage keeps the detail it began with.
-                assert!(matches!(
-                    &*seen.read().await,
-                    ConnState::Dormant(DormancyReason::Unreachable { host, detail })
-                        if host == "gitlab.example.com" && detail == "connection refused"
-                ));
-                if n == 1 {
-                    Attempt::Transient(refused("timed out"))
-                } else {
-                    Attempt::Connected(connected_session())
+            },
+        )
+        .await;
+        assert!(committed);
+        assert_eq!(calls.load(SeqCst), 3);
+    }
+
+    /// Since when there is no session is stamped where the session is
+    /// lost, and outlives a change of the reason; a new session ends it.
+    #[tokio::test]
+    async fn a_demotion_stamps_since_when() {
+        let client: Arc<dyn GitlabApi> = Arc::new(FakeGitlab::default());
+        let session: SessionSlot = Arc::new(RwLock::new(ConnState::Connected(Session {
+            gitlab: Arc::clone(&client),
+            ..connected_session()
+        })));
+        let standing = Reconnect::default();
+        assert_eq!(standing.standing(), Standing::default());
+
+        let before = now_secs();
+        commit_unreachable(&session, &standing, &client, "connection refused".into()).await;
+        let lost = standing.standing();
+        assert!(lost.since.is_some_and(|at| at >= before), "{lost:?}");
+        assert_eq!((lost.attempts, lost.retry_at), (0, None));
+
+        // What was tried belongs to the reason it was tried for; since when
+        // there is no session doesn't change with the reason.
+        standing.attempted(Some("timed out".into()), Some(Duration::from_secs(4)));
+        standing.lost();
+        assert_eq!(
+            standing.standing(),
+            Standing {
+                since: lost.since,
+                ..Standing::default()
+            }
+        );
+
+        standing.connected();
+        assert_eq!(standing.standing(), Standing::default());
+    }
+
+    /// Each failed attempt is on record with its reason and the time of the
+    /// next; the session that ends them clears the record.
+    #[tokio::test]
+    async fn the_attempts_and_the_next_one_are_on_record() {
+        let session = unreachable_slot();
+        let standing = Reconnect::default();
+        standing.lost();
+        let calls = AtomicUsize::new(0);
+        let before = now_secs();
+        let committed = reconnect_loop(session.clone(), instant_config(), &standing, || {
+            let n = calls.fetch_add(1, SeqCst);
+            let seen = standing.standing();
+            async move {
+                match n {
+                    0 => Attempt::Transient(refused("connection refused")),
+                    1 => {
+                        assert_eq!(seen.attempts, 1);
+                        let why = seen.last_error.unwrap();
+                        assert!(why.ends_with("connection refused"), "{why}");
+                        assert!(seen.retry_at.is_some_and(|at| at >= before));
+                        Attempt::Transient(refused("timed out"))
+                    }
+                    _ => {
+                        assert_eq!(seen.attempts, 2);
+                        assert!(seen.last_error.unwrap().ends_with("timed out"));
+                        Attempt::Connected(connected_session())
+                    }
                 }
             }
         })
         .await;
         assert!(committed);
-        assert_eq!(calls.load(SeqCst), 3);
+        assert_eq!(standing.standing(), Standing::default());
+    }
+
+    /// An attempt GitLab refuses for good is the last: nothing is planned.
+    #[tokio::test]
+    async fn a_refused_attempt_plans_no_other() {
+        let session = unreachable_slot();
+        let standing = Reconnect::default();
+        standing.lost();
+        reconnect_loop(session.clone(), instant_config(), &standing, || async {
+            Attempt::Permanent(DormancyReason::TokenRejected {
+                host: "gitlab.example.com".into(),
+                detail: "401".into(),
+            })
+        })
+        .await;
+        let after = standing.standing();
+        assert_eq!((after.attempts, after.retry_at), (1, None));
+        assert_eq!(after.last_error.as_deref(), Some("gitlab.example.com: 401"));
+        assert!(after.since.is_some());
+    }
+
+    /// While it waits for the keychain the supervisor says when it looks
+    /// next; parked with nothing to do, it plans nothing.
+    #[tokio::test]
+    async fn the_supervisor_says_when_it_looks_at_the_keychain_next() {
+        let signal = Arc::new(Reconnect::default());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let sig = Arc::clone(&signal);
+        let looks = AtomicUsize::new(0);
+        let handle = tokio::spawn(async move {
+            supervise(paced(3600, 3600), sig, move || {
+                let n = looks.fetch_add(1, SeqCst);
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(());
+                    if n == 0 {
+                        Engaged::Locked
+                    } else {
+                        Engaged::Stable
+                    }
+                }
+            })
+            .await;
+        });
+        rx.recv().await.expect("the first look");
+        let now = now_secs();
+        crate::testing::eventually("the wait to be on record", || {
+            signal.standing().retry_at.is_some()
+        })
+        .await;
+        let next = signal.standing().retry_at.unwrap();
+        assert!((now + 3590..=now + 3610).contains(&next), "{next} vs {now}");
+
+        signal.notify_one();
+        rx.recv().await.expect("the second look");
+        crate::testing::eventually("the plan to be dropped", || {
+            signal.standing().retry_at.is_none()
+        })
+        .await;
+        handle.abort();
     }
 
     #[tokio::test]
@@ -771,7 +1008,7 @@ mod tests {
         let looks = AtomicUsize::new(0);
         // Nothing signals: only the back-off (zeroed) brings the next look.
         let handle = tokio::spawn(async move {
-            supervise(paced(0, 3600), Arc::new(Notify::new()), move || {
+            supervise(paced(0, 3600), Arc::new(Reconnect::default()), move || {
                 let n = looks.fetch_add(1, SeqCst);
                 let tx = tx.clone();
                 async move {
@@ -796,7 +1033,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_nudge_cuts_the_wait_for_an_unlock_short() {
-        let signal = Arc::new(Notify::new());
+        let signal = Arc::new(Reconnect::default());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let sig = Arc::clone(&signal);
         let handle = tokio::spawn(async move {
@@ -828,16 +1065,21 @@ mod tests {
     async fn retries_transient_then_reconnects() {
         let session = unreachable_slot();
         let calls = AtomicUsize::new(0);
-        let committed = reconnect_loop(session.clone(), instant_config(), || {
-            let n = calls.fetch_add(1, SeqCst);
-            async move {
-                if n < 2 {
-                    Attempt::Transient(refused("connection refused"))
-                } else {
-                    Attempt::Connected(connected_session())
+        let committed = reconnect_loop(
+            session.clone(),
+            instant_config(),
+            &Reconnect::default(),
+            || {
+                let n = calls.fetch_add(1, SeqCst);
+                async move {
+                    if n < 2 {
+                        Attempt::Transient(refused("connection refused"))
+                    } else {
+                        Attempt::Connected(connected_session())
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
         assert!(committed);
         assert_eq!(calls.load(SeqCst), 3, "two transient failures then success");
@@ -852,7 +1094,7 @@ mod tests {
             c.reconnect.enabled = false;
             Arc::new(std::sync::RwLock::new(c))
         };
-        let committed = reconnect_loop(session.clone(), cfg, || async {
+        let committed = reconnect_loop(session.clone(), cfg, &Reconnect::default(), || async {
             panic!("connect must not run when auto-reconnect is disabled")
         })
         .await;
@@ -873,7 +1115,7 @@ mod tests {
             username: "tester".into(),
             token: Default::default(),
         })));
-        let signal = Notify::new();
+        let signal = Reconnect::default();
 
         commit_unreachable(&session, &signal, &client, "connection refused".into()).await;
 
@@ -910,7 +1152,7 @@ mod tests {
             },
         ] {
             let session: SessionSlot = Arc::new(RwLock::new(ConnState::Dormant(reason)));
-            let signal = Notify::new();
+            let signal = Reconnect::default();
 
             commit_unreachable(&session, &signal, &client, "second".into()).await;
 
@@ -944,7 +1186,7 @@ mod tests {
             username: "tester".into(),
             token: Default::default(),
         })));
-        let signal = Notify::new();
+        let signal = Reconnect::default();
 
         commit_unreachable(&session, &signal, &client_a, "stale error".into()).await;
 
@@ -996,7 +1238,7 @@ mod tests {
             gitlab: Arc::clone(&client),
             ..connected_session()
         })));
-        let signal = Notify::new();
+        let signal = Reconnect::default();
 
         commit_token_replaced(&session, &signal, &stale).await;
         assert!(
@@ -1016,7 +1258,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_engages_at_boot_then_on_each_signal() {
-        let signal = Arc::new(Notify::new());
+        let signal = Arc::new(Reconnect::default());
         // Default config: `max_delay` is 60 s, so the periodic re-check tick can't
         // fire during this test — only the signal drives re-engagement here.
         let config: SharedConfig = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
@@ -1059,7 +1301,7 @@ mod tests {
             c.reconnect.max_delay_secs = 3600;
             Arc::new(std::sync::RwLock::new(c))
         };
-        let signal = Arc::new(Notify::new());
+        let signal = Arc::new(Reconnect::default());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
         let calls = Arc::new(AtomicUsize::new(0));
         let sig = Arc::clone(&signal);
@@ -1109,7 +1351,7 @@ mod tests {
             c.reconnect.max_delay_secs = 1;
             Arc::new(std::sync::RwLock::new(c))
         };
-        let signal = Arc::new(Notify::new());
+        let signal = Arc::new(Reconnect::default());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let sig = Arc::clone(&signal);
         let handle = tokio::spawn(async move {
