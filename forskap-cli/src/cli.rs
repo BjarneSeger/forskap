@@ -174,8 +174,9 @@ pub enum Command {
     },
     /// Writes the daemon queued because GitLab was unreachable.
     ///
-    /// One that GitLab then rejects, or that outlives the retry window, is
-    /// kept here as failed.
+    /// They are sent once it is back, in the order they were made. One that
+    /// GitLab then rejects, or that outlives the retry window, is kept here
+    /// as failed.
     Queue {
         #[command(subcommand)]
         command: QueueCommand,
@@ -458,7 +459,8 @@ pub enum RefreshScope {
 
 #[derive(Subcommand)]
 pub enum QueueCommand {
-    /// List the failed writes.
+    /// List the writes waiting to be sent, each with what it waits for, and
+    /// the failed ones.
     List {
         #[command(flatten)]
         output: OutputArgs,

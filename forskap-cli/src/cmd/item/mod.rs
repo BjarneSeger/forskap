@@ -13,11 +13,11 @@ use anyhow::{Result, bail};
 use forskap_api::{Scope, SearchOptions, VarlinkClient, VarlinkClientInterface};
 
 use crate::cli::{ItemCommand, TargetArgs};
-use crate::client;
-use crate::cmd::project;
+use crate::cmd::{project, queue};
 use crate::friendly::friendly;
 use crate::item::{self, Item};
 use crate::refspec::{self, RefKind};
+use crate::{client, style};
 
 pub async fn run(kind: RefKind, command: ItemCommand) -> Result<()> {
     match command {
@@ -27,6 +27,41 @@ pub async fn run(kind: RefKind, command: ItemCommand) -> Result<()> {
         ItemCommand::Close { target } => close::run(kind, target).await,
         ItemCommand::Assign { target } => assign::run(kind, target).await,
         ItemCommand::Unassign { target } => unassign::run(kind, target).await,
+    }
+}
+
+/// What a write to `iid` came to: `done` ("closed"), or, where the daemon
+/// only `queued` it, `doing` ("closing") under way and a line saying so. A
+/// daemon too old to say reads as done, as it always did.
+fn said(
+    queued: Option<bool>,
+    done: &str,
+    doing: &str,
+    kind: RefKind,
+    iid: i64,
+    project_id: i64,
+) -> Result<()> {
+    out!("{}", said_text(queued, done, doing, kind, iid, project_id))
+}
+
+fn said_text(
+    queued: Option<bool>,
+    done: &str,
+    doing: &str,
+    kind: RefKind,
+    iid: i64,
+    project_id: i64,
+) -> String {
+    let on = style::reference(refspec::sigil(kind), iid);
+    let project = format!("(project {project_id})");
+    let project = style::muted(&project);
+    match queued {
+        Some(true) => format!(
+            "{} {doing} {on} {project}\n{}\n",
+            style::state("queued"),
+            style::muted(queue::NOT_SENT)
+        ),
+        _ => format!("{} {on} {project}\n", style::success(done)),
     }
 }
 
@@ -102,4 +137,41 @@ pub async fn lookup(
         "{}{iid} in project {project_id} is not in the daemon's caches yet — try `forskap sync refresh --scope search`",
         refspec::sigil(kind)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A write the daemon only queued doesn't claim to be done: it says
+    /// what is under way, and that it isn't sent yet. Applied, or from a
+    /// daemon too old to tell, it reads as it always did.
+    #[test]
+    fn a_queued_write_says_so_instead_of_done() {
+        for applied in [None, Some(false)] {
+            assert_eq!(
+                said_text(applied, "closed", "closing", RefKind::Issue, 42, 7),
+                "closed #42 (project 7)\n"
+            );
+        }
+        assert_eq!(
+            said_text(Some(true), "closed", "closing", RefKind::Mr, 42, 7),
+            "queued closing !42 (project 7)\n\
+             not sent yet: the daemon sends it once it reaches GitLab (`forskap queue list`)\n"
+        );
+        assert_eq!(
+            said_text(
+                Some(true),
+                "assigned to",
+                "assigning you to",
+                RefKind::Issue,
+                3,
+                7
+            ),
+            format!(
+                "queued assigning you to #3 (project 7)\n{}\n",
+                queue::NOT_SENT
+            )
+        );
+    }
 }
