@@ -1,6 +1,6 @@
 //! Projections of stored GitLab rows onto the varlink wire types.
 
-use forskap_api::admin::{SyncJob, SyncJobStatus};
+use forskap_api::admin::{SyncJob, SyncJobHold, SyncJobStatus};
 use forskap_api::{
     ActivityEvent, DescriptionTemplate, Group, HistoryEvent, HistorySource, IssuableKind,
     MergeRequest, Project, WorkItem, WorkItemRef, WorkItemState,
@@ -8,7 +8,7 @@ use forskap_api::{
 
 use crate::gitlab::Issuable;
 use crate::query::{board_column, namespace_of};
-use crate::sync::{JobInfo, JobStatus, model};
+use crate::sync::{Hold, JobInfo, JobStatus, model};
 
 /// What a wire item shows of its project.
 pub struct ProjectInfo {
@@ -203,6 +203,14 @@ pub fn timelog(t: model::Timelog) -> HistoryEvent {
 /// `last_ok`. `unavailable` is on every job, and `fetched` on every running
 /// one, so a client tells this daemon from one too old to say.
 pub fn sync_job(j: JobInfo) -> SyncJob {
+    let (held_by, behind) = match j.hold {
+        Some(Hold::Session) => (Some(SyncJobHold::session), None),
+        Some(Hold::RateLimit) => (Some(SyncJobHold::rate_limit), None),
+        Some(Hold::Lane(ahead)) => (Some(SyncJobHold::lane), Some(ahead)),
+        Some(Hold::Slots) => (Some(SyncJobHold::slots), None),
+        Some(Hold::Startup) => (Some(SyncJobHold::startup), None),
+        None => (None, None),
+    };
     SyncJob {
         key: j.key,
         status: match j.status {
@@ -221,6 +229,8 @@ pub fn sync_job(j: JobInfo) -> SyncJob {
         full: j.full,
         fetched: j.fetched.map(|rows| rows as i64),
         expected: j.expected.map(|rows| rows as i64),
+        held_by,
+        behind,
     }
 }
 
@@ -350,6 +360,37 @@ mod tests {
             failures: 0,
             last_error: None,
             unavailable: false,
+            hold: None,
+        }
+    }
+
+    /// What holds a job back goes out as its kind, and for a lane with the
+    /// job ahead; a job nothing holds says nothing.
+    #[test]
+    fn a_sync_job_says_what_holds_it_back() {
+        let held = |hold| {
+            let job = sync_job(JobInfo {
+                hold: Some(hold),
+                ..info("project/9/issues", JobStatus::Due)
+            });
+            (job.held_by, job.behind)
+        };
+        assert_eq!(held(Hold::Session), (Some(SyncJobHold::session), None));
+        assert_eq!(held(Hold::RateLimit), (Some(SyncJobHold::rate_limit), None));
+        assert_eq!(
+            held(Hold::Lane("project/9/merge_requests".into())),
+            (
+                Some(SyncJobHold::lane),
+                Some("project/9/merge_requests".to_string())
+            )
+        );
+        assert_eq!(held(Hold::Slots), (Some(SyncJobHold::slots), None));
+        assert_eq!(held(Hold::Startup), (Some(SyncJobHold::startup), None));
+
+        let next = sync_job(info("project/9/issues", JobStatus::Due));
+        let json = serde_json::to_value(&next).unwrap();
+        for key in ["held_by", "behind"] {
+            assert!(json.get(key).is_none(), "{key} in {json}");
         }
     }
 

@@ -663,7 +663,7 @@ that name means.
 
 ## Sync status
 
-### `GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int)`
+### `GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int, connected: ?bool)`
 
 Lists the jobs the sync worker has planned, in the order it runs them: the ones in
 flight, the ones demanded ahead of the schedule (a `ClearCache`, a write that just
@@ -685,10 +685,28 @@ requests, a group's epics, `all/issues`, `all/merge_requests` and `events`.
 `paused_until` (unix seconds) is set while a GitLab rate limit (429) holds every
 job back; the statuses then say what runs once the pause is over.
 
+**Holds.** A `demanded` or `due` job that doesn't run says in `held_by` what keeps
+it, the first of these that applies:
+
+| `held_by`    | the job waits for                                                    |
+|--------------|----------------------------------------------------------------------|
+| `session`    | a GitLab session (`connected` is false; `GetStatus` says why)         |
+| `rate_limit` | the end of the pause (`paused_until`)                                |
+| `lane`       | the running job `behind` names: one per project, per group's epics, per list |
+| `slots`      | one of the `sync.max_in_flight` slots                                |
+
+Absent, nothing holds it: it starts with the worker's next launch, after the jobs
+ahead of it and the gap between two launches (`sync.job_gap_ms`). A `waiting` job has
+one hold, `startup`: its interval has passed, and only the spread after the daemon's
+start (`sync.startup_spread_secs`) keeps it until `next_due`. `connected` is the
+session the worker found when it answered, which is what its jobs are held by; a
+daemon that didn't hear from its worker in time replies no jobs and no `connected`.
+
 Status, not GitLab data: never errors and is served while dormant. A dormant
-daemon runs nothing, so its jobs stay `due` until a session exists. `last_error`
-is kept in memory only — after a daemon restart a job can be `backing_off` without
-one.
+daemon runs nothing, so its jobs stay `due`, held by `session`, until one exists;
+it drops what was demanded. `last_error` is stored with the state of a job that
+backs off or rests for it, so it is still there after a daemon restart; a failure
+that holds the job back no further (a rate limit) is kept in memory only.
 
 **Unavailable jobs.** Some listings GitLab refuses for good, and failing them
 forever would only drown the failures that matter. Two mechanisms keep them out:
@@ -703,8 +721,8 @@ forever would only drown the failures that matter. Two mechanisms keep them out:
 - *Refused three times in a row.* A per-project or per-group listing (`project/<id>/issues`,
   `…/merge_requests`, `…/boards`, `…/issue_templates`, `…/merge_request_templates`, `…/avatar`, `group/<id>/epics`) that GitLab answers
   `403` or `404` three times in a row is `unavailable: true`: it rests about a day
-  between attempts and reports `waiting` with that `next_due`, its `failures` and (until
-  a daemon restart) its `last_error` kept, and the daemon logs its refusals at debug
+  between attempts and reports `waiting` with that `next_due`, its `failures` and its
+  `last_error` kept, and the daemon logs its refusals at debug
   level only. An epics listing is unavailable at its first rejection of any status (an
   instance without GitLab Premium has none). Network errors, `429`, `5xx` and `401`
   neither count nor start the count over — they say nothing about the listing; any
@@ -717,7 +735,7 @@ forever would only drown the failures that matter. Two mechanisms keep them out:
 
 ## Cache control
 
-### `ClearCache(scope: ?[]CacheScope) -> ()`
+### `ClearCache(scope: ?[]CacheScope) -> (pending: ?[]string)`
 
 Clears cached state and makes its sync jobs due at once. Omitted or empty `scope`
 clears everything synced. Otherwise each scope selects a slice:
@@ -738,6 +756,13 @@ for a history band and the empty scope. Everything else refills in the
 background — the `ListWorkItems` lists among it, so that method can reply empty right
 after a clear; `usage` alone makes no GitLab call. Replies success even when
 dormant — the cleared state then stays empty until the next successful sync.
+
+A success is the clear, not the refill: `pending` names the jobs the reply waited
+for that have had no successful run since — every one of them while dormant (the
+wait is over at once then) or held by a rate limit, the one whose fetch failed,
+the ones still running or queued when the 30 s were up. Absent, everything it
+waited for is fresh. `GetSyncJobs` says for each what it is at (`held_by`,
+`last_error`, its progress).
 
 To show the refill while waiting, ask `GetSyncJobs` on a second connection: the
 daemon answers the calls of one connection one after the other.

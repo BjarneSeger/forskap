@@ -106,22 +106,28 @@ impl VarlinkInterface for Handlers {
         {
             warn!("refill still running; replying before it lands");
         }
-        call.reply()
+        // Whatever ended the wait, the caller hears what it didn't bring:
+        // the jobs with no run since the clear.
+        let pending: Vec<String> = refill
+            .iter()
+            .filter(|job| !self.sync.synced_since(**job, now))
+            .map(Job::key)
+            .collect();
+        call.reply(Some(pending).filter(|p| !p.is_empty()))
     }
 
     /// Status, not GitLab data: served whatever the session is.
     #[instrument(skip(self, call))]
     async fn get_sync_jobs(&self, call: &mut dyn Call_GetSyncJobs) -> ::varlink::Result<()> {
-        let snapshot = match tokio::time::timeout(SYNC_JOBS_TIMEOUT, self.sync.jobs()).await {
-            Ok(s) => s,
-            Err(_) => {
-                warn!("the sync worker didn't report its jobs in time; returning empty");
-                Default::default()
-            }
+        let Ok(snapshot) = tokio::time::timeout(SYNC_JOBS_TIMEOUT, self.sync.jobs()).await else {
+            warn!("the sync worker didn't report its jobs in time; returning empty");
+            // Nothing is known, the session included.
+            return call.reply(Vec::new(), None, None);
         };
         call.reply(
             snapshot.jobs.into_iter().map(wire::sync_job).collect(),
             snapshot.paused_until.map(|at| at as i64),
+            Some(snapshot.connected),
         )
     }
 

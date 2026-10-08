@@ -18,7 +18,7 @@ pub mod schedule;
 pub mod store;
 
 pub use avatars::AvatarDir;
-pub use engine::{Clear, JobInfo, JobStatus, Snapshot, SyncHandle};
+pub use engine::{Clear, Hold, JobInfo, JobStatus, Snapshot, SyncHandle};
 pub use jobs::Job;
 
 /// Unix seconds; 0 for a clock before the epoch.

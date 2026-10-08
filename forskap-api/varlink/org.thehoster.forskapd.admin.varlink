@@ -17,6 +17,22 @@ type SyncJobStatus (
   backing_off
 )
 
+# What keeps a SyncJob from starting.
+type SyncJobHold (
+  # The daemon has no GitLab session.
+  session,
+  # A GitLab rate limit pauses every job, until paused_until.
+  rate_limit,
+  # Another job of its lane (the same project, the same list) is running;
+  # behind names it.
+  lane,
+  # sync.max_in_flight fetches are running already.
+  slots,
+  # Due by its interval, but spread out after the daemon's start
+  # (sync.startup_spread_secs) until next_due.
+  startup
+)
+
 # A job of the sync worker.
 type SyncJob (
   # Stable job id: "assigned/issues", "recent/authored/issues",
@@ -45,7 +61,13 @@ type SyncJob (
   # running. Sent since forskap-api 0.30.0.
   fetched: ?int,
   # Rows GitLab announced for the running fetch; absent where it announced none.
-  expected: ?int
+  expected: ?int,
+  # What holds a demanded or due job back; absent when nothing does (it is
+  # next) and from an older daemon. A waiting job is held by startup or
+  # nothing.
+  held_by: ?SyncJobHold,
+  # With held_by lane: the key of the running job it waits behind.
+  behind: ?string
 )
 
 # GitLab answered and refused Login.
@@ -80,11 +102,16 @@ type CacheScope (
 )
 
 # Clears cached state, all of it or the given scopes, and syncs it again.
-method ClearCache(scope: ?[]CacheScope) -> ()
+# pending: the keys of the jobs it waited for that have not synced again when
+# it replies (no session, a rate limit, a failure, or still running after its
+# 30 s); absent when all did, and from an older daemon. GetSyncJobs says why.
+method ClearCache(scope: ?[]CacheScope) -> (pending: ?[]string)
 
-# The sync worker's jobs in the order it runs them, and until when a GitLab rate
-# limit pauses them all. Never an error.
-method GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int)
+# The sync worker's jobs in the order it runs them, until when a GitLab rate
+# limit pauses them all, and whether the worker has a session to run them with
+# (absent from an older daemon, and when the worker didn't answer in time).
+# Never an error.
+method GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int, connected: ?bool)
 
 # Connects to a GitLab host with a personal access token and stores it in the
 # keychain.

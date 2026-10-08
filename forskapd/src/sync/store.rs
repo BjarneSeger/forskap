@@ -249,6 +249,25 @@ impl SyncStore {
         Ok(read_json(&self.jobs, key)?.unwrap_or_default())
     }
 
+    /// Why each job's last run failed, by key, for the jobs stored holding
+    /// back after a failure (see [`Commit::set_failed_job`]).
+    pub fn job_errors(&self) -> Result<Vec<(String, String)>> {
+        /// The field a failed job's error is stored in, beside its state.
+        #[derive(serde::Deserialize)]
+        struct Failed {
+            error: Option<String>,
+        }
+        let mut out = Vec::new();
+        for guard in self.jobs.iter() {
+            let (k, v) = guard.into_inner()?;
+            // An unreadable state is reported where the states are read.
+            if let Ok(Failed { error: Some(error) }) = serde_json::from_slice(&v) {
+                out.push((String::from_utf8_lossy(&k).into_owned(), error));
+            }
+        }
+        Ok(out)
+    }
+
     /// Every persisted job state, by key.
     pub fn job_states(&self) -> Result<Vec<(String, JobState)>> {
         let mut out = Vec::new();
@@ -357,6 +376,21 @@ impl Commit<'_> {
         Ok(())
     }
 
+    /// [`Self::set_job`] for a job held back after a failure, with why it
+    /// failed stored beside its state: a restart must not leave a job
+    /// backing off for a day without a reason. A field of its own, which
+    /// reading a [`JobState`] skips, so that stays `Copy`; any other write of
+    /// the job's state drops it again.
+    pub fn set_failed_job(&mut self, key: &str, state: &JobState, error: &str) -> Result<()> {
+        let mut stored = serde_json::to_value(state)?;
+        if let Some(fields) = stored.as_object_mut() {
+            fields.insert("error".to_string(), error.into());
+        }
+        self.batch
+            .insert(&self.store.jobs, key, serde_json::to_vec(&stored)?);
+        Ok(())
+    }
+
     pub fn remove_job(&mut self, key: &str) {
         self.batch.remove(&self.store.jobs, key);
     }
@@ -425,6 +459,35 @@ mod tests {
             iid: 1,
             ..Default::default()
         }
+    }
+
+    /// A failed job's error is stored beside its state and read apart from
+    /// it; the next plain write of the state takes it away again.
+    #[test]
+    fn a_failed_jobs_error_is_stored_beside_its_state() {
+        let (s, _d) = store();
+        let failed = JobState {
+            failures: 2,
+            retry_at: 9,
+            ..Default::default()
+        };
+        let mut c = s.begin();
+        c.set_failed_job("project/7/boards", &failed, "403 Forbidden")
+            .unwrap();
+        c.set_job("events", &JobState::default()).unwrap();
+        c.commit().unwrap();
+        // The state reads as it always did, on its own and in the scan.
+        assert_eq!(s.job_state("project/7/boards").unwrap(), failed);
+        assert_eq!(s.job_states().unwrap().len(), 2);
+        assert_eq!(
+            s.job_errors().unwrap(),
+            [("project/7/boards".to_string(), "403 Forbidden".to_string())]
+        );
+
+        let mut c = s.begin();
+        c.set_job("project/7/boards", &JobState::default()).unwrap();
+        c.commit().unwrap();
+        assert!(s.job_errors().unwrap().is_empty());
     }
 
     #[test]

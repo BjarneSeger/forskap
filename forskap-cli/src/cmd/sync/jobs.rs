@@ -7,22 +7,40 @@
 //! per project) would drown the rest, so they share one line per kind, and so
 //! do the jobs GitLab refuses for good (a project's merge requests switched
 //! off): those are no failures to fix, and the daemon asks again once a day.
+//!
+//! A job whose turn has come and that still doesn't run says what it waits
+//! for: a session (the reason stands above the table), the end of a rate
+//! limit, the job that holds its lane, a free slot.
 
 use anyhow::Result;
 use chrono::Utc;
-use forskap_api::admin::{GetSyncJobs_Reply, SyncJob, SyncJobStatus, VarlinkClientInterface};
+use forskap_api::VarlinkClientInterface as _;
+use forskap_api::admin::{
+    GetSyncJobs_Reply, SyncJob, SyncJobHold, SyncJobStatus, VarlinkClientInterface,
+};
 
 use crate::cli::{OutputFormat, WatchArgs};
-use crate::friendly::friendly;
+use crate::friendly::{self, friendly};
 use crate::{client, output, style, watch};
 
 pub async fn run(all: bool, format: OutputFormat, watch: WatchArgs) -> Result<()> {
-    match watch::interval(watch, format)? {
-        Some(every) => watch::run(every, || async { Ok(text(&fetch().await?, all)) }).await,
-        None => output::emit(format, &fetch().await?, |reply| {
-            out!("{}", text(reply, all))
-        }),
+    if let Some(every) = watch::interval(watch, format)? {
+        let frame = || async {
+            let reply = fetch().await?;
+            let on_hold = on_hold(&reply).await;
+            Ok(text(&reply, on_hold.as_deref(), all))
+        };
+        return watch::run(every, frame).await;
     }
+    let reply = fetch().await?;
+    // Structured output carries `connected` itself; only the text asks why.
+    let on_hold = match format {
+        OutputFormat::Text => on_hold(&reply).await,
+        OutputFormat::Json | OutputFormat::Yaml => None,
+    };
+    output::emit(format, &reply, |reply| {
+        out!("{}", text(reply, on_hold.as_deref(), all))
+    })
 }
 
 // Connects per call: a watch has to find a restarted daemon again.
@@ -35,8 +53,32 @@ pub(super) async fn fetch() -> Result<GetSyncJobs_Reply> {
         .map_err(|e| friendly("GetSyncJobs", e))
 }
 
-fn text(reply: &GetSyncJobs_Reply, all: bool) -> String {
-    render(&reply.jobs, reply.paused_until, Utc::now().timestamp(), all)
+/// Why the worker has no session to run its jobs with, for the line above
+/// the table; `None` while it has one, and from a daemon too old to say.
+/// The session's own words where it can be asked, else just the fact.
+pub(super) async fn on_hold(reply: &GetSyncJobs_Reply) -> Option<String> {
+    if reply.connected != Some(false) {
+        return None;
+    }
+    let status = match client::connect_default().await {
+        Ok(client) => client.get_status().call().await.ok(),
+        Err(_) => None,
+    };
+    Some(match status.filter(|s| !s.connected) {
+        Some(s) => format!(
+            "no GitLab session: {}",
+            friendly::message_for(s.reason, s.detail.as_deref())
+        ),
+        None => "no GitLab session".to_string(),
+    })
+}
+
+fn text(reply: &GetSyncJobs_Reply, on_hold: Option<&str>, all: bool) -> String {
+    let table = render(&reply.jobs, reply.paused_until, Utc::now().timestamp(), all);
+    match on_hold {
+        Some(why) => format!("{}\n\n{table}", style::warning(why)),
+        None => table,
+    }
 }
 
 /// One line of the table: a job, or the settled or unavailable jobs of one
@@ -213,8 +255,8 @@ fn render(jobs: &[SyncJob], paused_until: Option<i64>, now: i64, all: bool) -> S
     out
 }
 
-/// Why GitLab refuses a job, as far as the daemon still knows: its last
-/// error is gone after a restart.
+/// Why GitLab refuses a job, as far as the daemon knows: an older one
+/// forgets the error at a restart.
 fn refused(error: Option<&str>) -> String {
     match error {
         Some(error) => format!("refused by GitLab: {error}"),
@@ -233,13 +275,27 @@ pub(super) fn summary(jobs: &[SyncJob], paused_until: Option<i64>, now: i64) -> 
             None => job.key.clone(),
         })
         .collect();
-    let waiting = of(SyncJobStatus::demanded).count();
-    match (running.is_empty(), waiting) {
+    let waiting: Vec<&SyncJob> = of(SyncJobStatus::demanded).collect();
+    // What they all wait for, where it is the same thing.
+    let shared = waiting.split_first().and_then(|(first, rest)| {
+        let same = |job: &&SyncJob| (&job.held_by, &job.behind) == (&first.held_by, &first.behind);
+        rest.iter().all(same).then_some(*first)
+    });
+    let what = match shared.and_then(|job| Some((job.held_by.as_ref()?, job.behind.as_deref()))) {
+        Some((SyncJobHold::slots, _)) => " for a free slot".to_string(),
+        Some((SyncJobHold::lane, Some(ahead))) => format!(" behind {ahead}"),
+        _ => String::new(),
+    };
+    match (running.is_empty(), waiting.len()) {
         (false, 0) => format!("syncing {}", running.join(", ")),
-        (false, n) => format!("syncing {}; {n} waiting", running.join(", ")),
+        (false, n) => format!("syncing {}; {n} waiting{what}", running.join(", ")),
         (true, n) => match pause(paused_until, now) {
             Some(pause) => pause,
             None if n > 0 => format!("{n} waiting to sync"),
+            // A dormant worker drops its demands: the due jobs say why.
+            None if jobs.iter().any(|j| j.held_by == Some(SyncJobHold::session)) => {
+                "waiting for a GitLab session".to_string()
+            }
             None => String::new(),
         },
     }
@@ -254,8 +310,8 @@ pub fn pause(paused_until: Option<i64>, now: i64) -> Option<String> {
     ))
 }
 
-/// How a job has been failing: `failed 2 times: 403 Forbidden`. The error
-/// is gone after a daemon restart, the count is not.
+/// How a job has been failing: `failed 2 times: 403 Forbidden`. An older
+/// daemon forgets the error at a restart, the count it keeps.
 pub fn failure(failures: i64, error: Option<&str>) -> String {
     let times = match failures {
         0 => None,
@@ -319,12 +375,30 @@ fn next(job: &SyncJob, now: i64) -> String {
             }
             cell
         }
-        (SyncJobStatus::demanded, _) => "next".to_string(),
-        (SyncJobStatus::due, _) => "now".to_string(),
+        (SyncJobStatus::demanded, _) => held(job).unwrap_or_else(|| "next".to_string()),
+        (SyncJobStatus::due, _) => held(job).unwrap_or_else(|| "now".to_string()),
+        // Its interval has passed: the daemon's start spreads it out.
+        (_, Some(at)) if job.held_by == Some(SyncJobHold::startup) => {
+            format!("{} (startup)", when(at, now))
+        }
         (_, Some(at)) => when(at, now),
         // Nothing left to do until what it syncs changes (an avatar).
         (_, None) => "-".to_string(),
     }
+}
+
+/// What a job whose turn has come waits for, as the daemon says; nothing
+/// where it is simply next, and from a daemon too old to say.
+pub fn held(job: &SyncJob) -> Option<String> {
+    Some(match (job.held_by.as_ref()?, job.behind.as_deref()) {
+        (SyncJobHold::session, _) => "needs a session".to_string(),
+        (SyncJobHold::rate_limit, _) => "after the pause".to_string(),
+        (SyncJobHold::lane, Some(ahead)) => format!("after {ahead}"),
+        (SyncJobHold::lane, None) => "after a running job".to_string(),
+        (SyncJobHold::slots, _) => "when a slot is free".to_string(),
+        // No hold of a job whose turn has come.
+        (SyncJobHold::startup, _) => return None,
+    })
 }
 
 /// A time to come relative to `now`: `in 3h 5m`, or `now` once it passed.
@@ -370,7 +444,83 @@ mod tests {
             full: None,
             fetched: None,
             expected: None,
+            held_by: None,
+            behind: None,
         }
+    }
+
+    /// `job`, due and held back by `hold`.
+    fn held_job(key: &str, hold: SyncJobHold, behind: Option<&str>) -> SyncJob {
+        SyncJob {
+            last_ok: Some(NOW - 300),
+            next_due: Some(NOW - 10),
+            held_by: Some(hold),
+            behind: behind.map(str::to_string),
+            ..job(key, SyncJobStatus::due)
+        }
+    }
+
+    /// A job whose turn has come says what it waits for where the daemon
+    /// knows; one that is simply next says so as before.
+    #[test]
+    fn a_held_job_says_what_it_waits_for() {
+        let jobs = [
+            SyncJob {
+                running_since: Some(NOW - 3),
+                ..job("project/7/issues", SyncJobStatus::running)
+            },
+            SyncJob {
+                held_by: Some(SyncJobHold::lane),
+                behind: Some("project/7/issues".to_string()),
+                ..job("project/7/merge_requests", SyncJobStatus::demanded)
+            },
+            job("timelogs/recent", SyncJobStatus::demanded),
+            held_job("member/groups", SyncJobHold::slots, None),
+            held_job("assigned/issues", SyncJobHold::session, None),
+            held_job("all/issues", SyncJobHold::rate_limit, None),
+            SyncJob {
+                next_due: Some(NOW - 10),
+                ..job("events", SyncJobStatus::due)
+            },
+            SyncJob {
+                next_due: Some(NOW + 40),
+                held_by: Some(SyncJobHold::startup),
+                ..job("member/projects", SyncJobStatus::waiting)
+            },
+        ];
+        assert_eq!(
+            render(&jobs, None, NOW, false),
+            "\
+JOB                       STATUS    LAST SYNC  NEXT
+project/7/issues          running   never      for 3s
+project/7/merge_requests  demanded  never      after project/7/issues
+timelogs/recent           demanded  never      next
+member/groups             due       5m ago     when a slot is free
+assigned/issues           due       5m ago     needs a session
+all/issues                due       5m ago     after the pause
+events                    due       never      now
+member/projects           waiting   never      in 40s (startup)
+"
+        );
+    }
+
+    /// Why there is no session stands above the table, like the rate
+    /// limit's pause does inside it.
+    #[test]
+    fn the_reason_for_no_session_stands_above_the_table() {
+        let reply = GetSyncJobs_Reply {
+            jobs: vec![held_job("assigned/issues", SyncJobHold::session, None)],
+            paused_until: None,
+            connected: Some(false),
+        };
+        let why = "no GitLab session: Logged out. Run `forskap auth login` to authenticate.";
+        let shown = text(&reply, Some(why), false);
+        let (above, table) = shown.split_once("\n\n").unwrap();
+        assert_eq!(above, why);
+        assert!(table.starts_with("JOB"), "{table}");
+        assert!(table.contains("needs a session"), "{table}");
+        // A daemon with a session, or too old to say, gets no line.
+        assert!(text(&reply, None, false).starts_with("JOB"));
     }
 
     /// A job GitLab refuses for good, resting until `next_in` from now.
@@ -486,6 +636,47 @@ timelogs/recent            demanded  5m ago     next
             "paused by a GitLab rate limit for another 1m"
         );
         assert_eq!(summary(&jobs[5..], None, NOW), "");
+    }
+
+    /// Waiting jobs that all wait for the same thing say what it is.
+    #[test]
+    fn the_summary_says_what_the_waiting_jobs_share() {
+        let behind = |key: &str, hold, ahead: Option<&str>| SyncJob {
+            held_by: Some(hold),
+            behind: ahead.map(str::to_string),
+            ..job(key, SyncJobStatus::demanded)
+        };
+        let running = running("assigned/issues", 2, 12, Some(40));
+        let slots = [
+            running.clone(),
+            behind("events", SyncJobHold::slots, None),
+            behind("member/groups", SyncJobHold::slots, None),
+        ];
+        assert_eq!(
+            summary(&slots, None, NOW),
+            "syncing assigned/issues 12/40; 2 waiting for a free slot"
+        );
+        let lane = [
+            running.clone(),
+            behind(
+                "recent/authored/issues",
+                SyncJobHold::lane,
+                Some("assigned/issues"),
+            ),
+        ];
+        assert_eq!(
+            summary(&lane, None, NOW),
+            "syncing assigned/issues 12/40; 1 waiting behind assigned/issues"
+        );
+        // Not the same thing: just the count.
+        let mixed = [running, slots[1].clone(), lane[1].clone()];
+        assert_eq!(
+            summary(&mixed, None, NOW),
+            "syncing assigned/issues 12/40; 2 waiting"
+        );
+        // Nothing runs and nothing is demanded while dormant.
+        let dormant = [held_job("assigned/issues", SyncJobHold::session, None)];
+        assert_eq!(summary(&dormant, None, NOW), "waiting for a GitLab session");
     }
 
     /// Refused jobs are no failures: they say `unavailable` and why, without

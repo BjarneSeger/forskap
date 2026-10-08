@@ -770,7 +770,9 @@ fn sync(a: &Answers, link: Link, now: i64) -> Check<SyncFacts> {
             findings.push(Finding::new(Level::Error, line).details(details));
         }
     }
-    if link == Link::Dormant {
+    // The worker's own word where it gives one: it is what its jobs wait for.
+    let on_hold = reply.connected.map_or(link == Link::Dormant, |c| !c);
+    if on_hold {
         // Nothing runs without a session: the session check says why.
         findings.push(Finding::new(
             Level::Skipped,
@@ -811,8 +813,11 @@ fn sync(a: &Answers, link: Link, now: i64) -> Check<SyncFacts> {
                     "{n} jobs overdue, none started in the last {}",
                     span(OVERDUE_SECS)
                 );
+                // Where the daemon says what keeps it: a lane or every slot
+                // taken, by fetches that don't end.
+                let held = jobs::held(oldest).map_or(String::new(), |h| format!(": it runs {h}"));
                 findings.push(Finding::new(Level::Warning, line).details(vec![
-                    format!("the oldest, {}, by {}", oldest.key, span(late)),
+                    format!("the oldest, {}, by {}{held}", oldest.key, span(late)),
                     format!(
                         "The sync worker is not getting to them; restarting the daemon may \
                          help: {}.",
@@ -1025,6 +1030,7 @@ fn verdict(rows: &[Row]) -> (&'static str, String) {
 #[cfg(test)]
 mod tests {
     use forskap_api::Error as ApiError;
+    use forskap_api::admin::SyncJobHold;
 
     use super::*;
 
@@ -1061,6 +1067,8 @@ mod tests {
             full: None,
             fetched: None,
             expected: None,
+            held_by: None,
+            behind: None,
         }
     }
 
@@ -1098,6 +1106,7 @@ mod tests {
         Answer::Got(GetSyncJobs_Reply {
             jobs,
             paused_until: None,
+            connected: None,
         })
     }
 
@@ -1362,6 +1371,7 @@ mod tests {
             jobs: Answer::Got(GetSyncJobs_Reply {
                 jobs: vec![fresh("assigned/issues")],
                 paused_until: Some(NOW + 240),
+                connected: None,
             }),
             ..healthy()
         };
@@ -1374,6 +1384,7 @@ mod tests {
             jobs: Answer::Got(GetSyncJobs_Reply {
                 jobs: vec![fresh("assigned/issues")],
                 paused_until: Some(NOW - 1),
+                connected: None,
             }),
             ..healthy()
         };
@@ -1659,6 +1670,18 @@ healthy
         assert_eq!(sync.summary, "2 jobs overdue, none started in the last 30m");
         assert_eq!(sync.details[0], "the oldest, project/7/issues, by 2h");
 
+        // Where the daemon says what keeps the oldest, so does the check.
+        let mut held = idle.clone();
+        held[1].held_by = Some(SyncJobHold::slots);
+        let answers = Answers {
+            jobs: jobs(held),
+            ..healthy()
+        };
+        assert_eq!(
+            report(&answers).checks.sync.details[0],
+            "the oldest, project/7/issues, by 2h: it runs when a slot is free"
+        );
+
         // Something runs: it is catching up, as after a suspend.
         let mut busy = idle.clone();
         busy[0] = SyncJob {
@@ -1682,6 +1705,7 @@ healthy
             jobs: Answer::Got(GetSyncJobs_Reply {
                 jobs: idle.clone(),
                 paused_until: Some(NOW + 60),
+                connected: None,
             }),
             ..healthy()
         };
@@ -1709,6 +1733,7 @@ healthy
                 },
             ],
             paused_until: Some(NOW + 600),
+            connected: None,
         });
         let answers = Answers {
             jobs: paused_failing_overdue,
@@ -1736,6 +1761,43 @@ healthy
         let sync = evaluate(&answers, now()).checks.sync;
         assert_eq!(sync.level, Level::Error);
         assert_eq!(sync.details[1], "on hold while there is no GitLab session");
+    }
+
+    /// The worker says itself whether it has a session to run its jobs with;
+    /// what `WhoAmI` answered a moment earlier only stands in for a daemon
+    /// too old to say.
+    #[test]
+    fn the_sync_is_on_hold_by_the_workers_own_word() {
+        let overdue = SyncJob {
+            last_ok: Some(NOW - DAY),
+            next_due: Some(NOW - DAY / 2),
+            ..job("assigned/issues", SyncJobStatus::due)
+        };
+        let said = |connected| {
+            Answer::Got(GetSyncJobs_Reply {
+                jobs: vec![overdue.clone()],
+                paused_until: None,
+                connected,
+            })
+        };
+        // Lost between the two answers.
+        let answers = Answers {
+            jobs: said(Some(false)),
+            ..healthy()
+        };
+        let sync = report(&answers).checks.sync;
+        assert_eq!(
+            (sync.level, sync.summary.as_str()),
+            (Level::Skipped, "on hold while there is no GitLab session")
+        );
+        // Back between the two answers: the jobs are what the check is about.
+        let answers = Answers {
+            jobs: said(Some(true)),
+            ..dormant_with(Some(NotAuthReason::unreachable), None)
+        };
+        let sync = report(&answers).checks.sync;
+        assert_ne!(sync.level, Level::Skipped, "{}", sync.summary);
+        assert!(sync.summary.contains("overdue") || sync.details[0].contains("overdue"));
     }
 
     #[test]

@@ -6,8 +6,8 @@ use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 
 use forskap_api::admin::{
-    self, CacheScope, Call_ClearCache, Call_GetSyncJobs, Call_Login, Call_Logout,
-    GetSyncJobs_Reply, SyncJobStatus, VarlinkInterface as _,
+    self, CacheScope, Call_ClearCache, Call_GetSyncJobs, Call_Login, Call_Logout, ClearCache_Reply,
+    GetSyncJobs_Reply, SyncJobHold, SyncJobStatus, VarlinkInterface as _,
 };
 use forskap_api::{
     AsyncCall, Call_AssignSelf, Call_Close, Call_CreateWorkItem, Call_DismissFailure,
@@ -672,12 +672,13 @@ fn created_json(iid: i64, title: &str, assignees: &[i64]) -> serde_json::Value {
     row
 }
 
-async fn clear_cache(h: &Handlers, scope: Option<Vec<CacheScope>>) {
+/// `ClearCache`; returns the jobs it says have not synced again.
+async fn clear_cache(h: &Handlers, scope: Option<Vec<CacheScope>>) -> Option<Vec<String>> {
     let mut call = admin::AsyncCall::default();
     h.clear_cache(&mut call as &mut dyn Call_ClearCache, scope)
         .await
         .unwrap();
-    assert_eq!(reply_error(&mut call), None);
+    reply::<ClearCache_Reply>(&mut call).pending
 }
 
 async fn history(h: &Handlers, days: Option<i64>) -> Vec<forskap_api::HistoryEvent> {
@@ -2797,12 +2798,44 @@ async fn clear_cache_refills_the_foreground_before_replying() {
     let (h, _dir) = connected_handlers(&fake);
     seed_assigned_issues(&h);
 
-    clear_cache(&h, None).await;
+    let pending = clear_cache(&h, None).await;
+    assert_eq!(pending, None, "everything it waited for synced again");
     let issues = assigned_work_items(&h, None).await;
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0].title, "fresh");
     assert_eq!(fake.calls_to("merge_requests").len(), 1);
     assert_eq!(fake.timelog_calls().len(), 2, "recent and full history");
+}
+
+/// Without a session nothing refills: the reply comes at once and names the
+/// jobs it would have waited for, so the caller doesn't take the cleared
+/// cache for a fresh one.
+#[tokio::test]
+async fn clear_cache_names_what_it_could_not_refill_while_dormant() {
+    let (h, _dir) = unreachable_handlers();
+    seed_assigned_issues(&h);
+
+    let pending = clear_cache(&h, Some(vec![CacheScope::assigned])).await;
+    assert_eq!(
+        pending,
+        Some(vec![
+            ASSIGNED_ISSUES.to_string(),
+            "assigned/merge_requests".to_string()
+        ])
+    );
+    // What isn't synced has nothing to wait for.
+    assert_eq!(clear_cache(&h, Some(vec![CacheScope::usage])).await, None);
+}
+
+/// A refill that fails is as little a refill as one that never ran.
+#[tokio::test]
+async fn clear_cache_names_the_job_whose_refill_failed() {
+    let fake = Arc::new(FakeGitlab::default());
+    fake.fail_next("merge_requests", FakeErr::Rejected);
+    let (h, _dir) = connected_handlers(&fake);
+
+    let pending = clear_cache(&h, Some(vec![CacheScope::assigned])).await;
+    assert_eq!(pending, Some(vec!["assigned/merge_requests".to_string()]));
 }
 
 /// Only the refill of what a scope cleared is awaited: open statistics are
@@ -2918,6 +2951,12 @@ async fn get_sync_jobs_lists_the_plan_while_dormant() {
     assert_eq!(job.unavailable, Some(false));
     // Progress is a running job's.
     assert_eq!((job.full, job.fetched, job.expected), (None, None, None));
+    // Due, and not running: the reply says what it waits for.
+    assert_eq!(reply.connected, Some(false));
+    assert_eq!(
+        (job.held_by.clone(), job.behind.as_deref()),
+        (Some(SyncJobHold::session), None)
+    );
 }
 
 /// A fetch in flight says how far it is: the rows GitLab announced, none of

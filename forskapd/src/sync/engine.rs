@@ -139,6 +139,22 @@ enum Command {
     Snapshot(oneshot::Sender<Snapshot>),
 }
 
+/// What keeps a job from starting though its turn has come, or in the case
+/// of [`Hold::Startup`] though its interval has passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hold {
+    /// No session: nothing runs until the daemon has one.
+    Session,
+    /// A 429 pauses every launch (see [`Snapshot::paused_until`]).
+    RateLimit,
+    /// The fetch with this key holds the job's lane.
+    Lane(String),
+    /// `sync.max_in_flight` fetches are in flight.
+    Slots,
+    /// A background job waiting out its startup offset.
+    Startup,
+}
+
 /// Where a planned job stands with the worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
@@ -177,11 +193,17 @@ pub struct JobInfo {
     pub expected: Option<u64>,
     /// Consecutive failures.
     pub failures: u32,
-    /// Why the last run failed, until a run succeeds. Kept in memory only.
+    /// Why the last run failed, until a run succeeds. Stored with the state
+    /// of a job that backs off or rests, so it outlives a restart; a failure
+    /// that holds the job back no further (a rate limit) is in memory only.
     pub last_error: Option<String>,
     /// GitLab refused it for good (see [`Job::unavailable`]): it rests a day
     /// at a time, and its status is no `BackingOff`.
     pub unavailable: bool,
+    /// What holds a demanded or due job back; `None` when it is simply next
+    /// (only the gap between launches or the order is in its way). A waiting
+    /// job has [`Hold::Startup`] or none.
+    pub hold: Option<Hold>,
 }
 
 /// The worker's jobs at one moment, in the order it would run them.
@@ -191,6 +213,8 @@ pub struct Snapshot {
     pub jobs: Vec<JobInfo>,
     /// While set and in the future, a 429 holds every launch back.
     pub paused_until: Option<u64>,
+    /// Whether the worker had a session when it answered.
+    pub connected: bool,
 }
 
 /// The handlers' side of the sync layer: read access to the store plus
@@ -284,8 +308,16 @@ impl SyncHandle {
             fetches: JoinSet::new(),
             launched: None,
             lost: None,
-            errors: HashMap::new(),
+            errors: store
+                .job_errors()
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "reading the sync jobs' last errors failed");
+                    Vec::new()
+                })
+                .into_iter()
+                .collect(),
             landings: Vec::new(),
+            asked: Vec::new(),
             replan: true,
             incomplete: BTreeSet::new(),
             relisted: BTreeSet::new(),
@@ -374,7 +406,8 @@ impl SyncHandle {
 
     /// The planned jobs as the worker sees them now, in the order it would
     /// run them. Answered while jobs are in flight and while the session is
-    /// dormant; empty once the worker is gone.
+    /// dormant, on the worker's next turn: with the session it then finds
+    /// and after it started what it could. Empty once the worker is gone.
     pub fn jobs(&self) -> impl Future<Output = Snapshot> + Send + 'static {
         let (reply, wait) = oneshot::channel();
         let _ = self.tx.send(Command::Snapshot(reply));
@@ -387,6 +420,17 @@ impl SyncHandle {
             Ok(s) => s.last_ok > 0,
             Err(e) => {
                 warn!(error = %e, "sync job state read failed; treating as never synced");
+                false
+            }
+        }
+    }
+
+    /// Whether a run of `job` that started at `since` or later completed.
+    pub fn synced_since(&self, job: Job, since: u64) -> bool {
+        match self.store.job_state(&job.key()) {
+            Ok(s) => s.last_ok >= since.max(1),
+            Err(e) => {
+                warn!(error = %e, "sync job state read failed; treating as not synced");
                 false
             }
         }
@@ -501,12 +545,16 @@ struct Worker {
     /// The client whose session a failed fetch already gave up, so its
     /// siblings' failures don't do it again.
     lost: Option<Arc<dyn GitlabApi>>,
-    /// Why each job's last run failed, by state key. Not persisted: the
-    /// persisted [`JobState`] stays `Copy`.
+    /// Why each job's last run failed, by state key. Stored beside the
+    /// [`JobState`] of a job held back for it (see [`Self::rest`]), not in
+    /// it: that stays `Copy`.
     errors: HashMap<String, String>,
     /// Created issues waiting to be stored: [`Self::handle`] can run before
     /// the session's account was checked against the store.
     landings: Vec<(Issue, Identity, oneshot::Sender<()>)>,
+    /// Whoever asked for the jobs, answered once this turn read the session
+    /// and started what it could: only then is it known what holds the rest.
+    asked: Vec<oneshot::Sender<Snapshot>>,
     replan: bool,
     /// Plan-feeding jobs a clear reset that haven't synced since. Until they
     /// have, their evidence is missing, so a replan only adds jobs.
@@ -541,6 +589,7 @@ impl Worker {
                 self.land(issue, &by);
                 let _ = done.send(());
             }
+            let connected = session.is_some();
             let idle = match session {
                 Some(session) => {
                     if self.replan {
@@ -553,6 +602,12 @@ impl Worker {
                     DORMANT_RECHECK
                 }
             };
+            if !self.asked.is_empty() {
+                let snapshot = self.snapshot(now_secs(), connected);
+                for reply in self.asked.drain(..) {
+                    let _ = reply.send(snapshot.clone());
+                }
+            }
             tokio::select! {
                 cmd = self.rx.recv() => match cmd {
                     Some(cmd) => self.handle(cmd),
@@ -629,24 +684,52 @@ impl Worker {
             Command::LoggedIn => self.unpark(),
             Command::Note(note) => self.persist_note(note),
             Command::Land(issue, by, done) => self.landings.push((*issue, by, done)),
-            Command::Snapshot(reply) => {
-                let _ = reply.send(self.snapshot(now_secs()));
-            }
+            Command::Snapshot(reply) => self.asked.push(reply),
         }
     }
 
-    /// When `job` is due by its schedule, with the state that says so.
-    /// Background jobs additionally wait out their startup offset.
-    fn due(&self, job: Job, cfg: &Config) -> (u64, JobState, Cadence) {
+    /// When `job` is due by its schedule alone, with the state that says so.
+    fn scheduled(&self, job: Job, cfg: &Config) -> (u64, JobState, Cadence) {
         let key = job.key();
         let state = self.states.get(&key).copied().unwrap_or_default();
         let cadence = job.cadence(cfg);
         let fingerprint = self.plan.fingerprint(job, cfg);
-        let mut at = schedule::due_at(&key, &state, cadence, fingerprint, cfg.sync.jitter);
-        if job.priority() > 0 {
-            at = at.max(self.boot + schedule::startup_offset(&key, cfg.sync.startup_spread_secs));
-        }
+        let at = schedule::due_at(&key, &state, cadence, fingerprint, cfg.sync.jitter);
         (at, state, cadence)
+    }
+
+    /// Until when `job` waits out its startup offset: background jobs are
+    /// spread out after the daemon's start. 0 for the others.
+    fn spread_until(&self, job: Job, cfg: &Config) -> u64 {
+        if job.priority() == 0 {
+            return 0;
+        }
+        self.boot + schedule::startup_offset(&job.key(), cfg.sync.startup_spread_secs)
+    }
+
+    /// When `job` is due: by its schedule, and for a background job not
+    /// before its startup offset passed.
+    fn due(&self, job: Job, cfg: &Config) -> (u64, JobState, Cadence) {
+        let (at, state, cadence) = self.scheduled(job, cfg);
+        (at.max(self.spread_until(job, cfg)), state, cadence)
+    }
+
+    /// What keeps `job` from starting now that its turn has come: the
+    /// reasons [`Self::run`] and [`Self::launch`] turn it down for, in their
+    /// order. `None` when only the gap between launches or the jobs ahead of
+    /// it are in its way.
+    fn hold(&self, job: Job, now: u64, connected: bool, max_in_flight: usize) -> Option<Hold> {
+        if !connected {
+            return Some(Hold::Session);
+        }
+        if self.paused_until > now {
+            return Some(Hold::RateLimit);
+        }
+        let lane = job.lane();
+        if let Some(ahead) = self.flights.values().find(|f| f.job.lane() == lane) {
+            return Some(Hold::Lane(ahead.key.clone()));
+        }
+        (self.flights.len() >= max_in_flight).then_some(Hold::Slots)
     }
 
     /// The class a due job competes in (see [`Self::next_job`]).
@@ -662,15 +745,18 @@ impl Worker {
 
     /// Every planned job as of `now`, in the order [`Self::next_job`] would
     /// pick them: the running ones (longest first), the demanded ones, the
-    /// due ones, then the rest by due time.
-    fn snapshot(&self, now: u64) -> Snapshot {
+    /// due ones, then the rest by due time. `connected` is whether this turn
+    /// found a session.
+    fn snapshot(&self, now: u64, connected: bool) -> Snapshot {
         let cfg = self.config.read().unwrap();
+        let max_in_flight = cfg.sync.max_in_flight();
         let mut jobs: Vec<((u8, u8, u64, Job), JobInfo)> = self
             .plan
             .jobs
             .iter()
             .map(|&job| {
-                let (at, state, cadence) = self.due(job, &cfg);
+                let (by_schedule, state, cadence) = self.scheduled(job, &cfg);
+                let at = by_schedule.max(self.spread_until(job, &cfg));
                 let flight = self.flights.values().find(|f| f.job == job);
                 let running_since = flight.map(|f| f.started);
                 // Only where a delta exists does "full" say anything.
@@ -694,6 +780,14 @@ impl Worker {
                     status,
                     JobStatus::Due | JobStatus::Waiting | JobStatus::BackingOff
                 );
+                let hold = match status {
+                    JobStatus::Demanded | JobStatus::Due => {
+                        self.hold(job, now, connected, max_in_flight)
+                    }
+                    // Its interval has passed; only the spread keeps it.
+                    JobStatus::Waiting if by_schedule <= now => Some(Hold::Startup),
+                    _ => None,
+                };
                 let key = job.key();
                 let info = JobInfo {
                     status,
@@ -706,6 +800,7 @@ impl Worker {
                     failures: state.failures,
                     last_error: self.errors.get(&key).cloned(),
                     unavailable,
+                    hold,
                     key,
                 };
                 ((order.0, order.1, order.2, job), info)
@@ -715,6 +810,7 @@ impl Worker {
         Snapshot {
             jobs: jobs.into_iter().map(|(_, info)| info).collect(),
             paused_until: Some(self.paused_until).filter(|&until| until > now),
+            connected,
         }
     }
 
@@ -1353,7 +1449,11 @@ impl Worker {
         };
         let persisted = (|| -> Result<()> {
             let mut c = self.store.begin();
-            c.set_job(key, &next)?;
+            // With why, so the job still says it after a restart.
+            match self.errors.get(key) {
+                Some(error) => c.set_failed_job(key, &next, error)?,
+                None => c.set_job(key, &next)?,
+            }
             c.commit()
         })();
         if let Err(e) = persisted {
@@ -2179,6 +2279,72 @@ mod tests {
         assert!(snapshot.jobs.iter().all(|j| j.running_since.is_none()));
     }
 
+    #[tokio::test]
+    async fn a_due_job_waits_for_a_session_while_dormant() {
+        let env = start(ConnState::Dormant(DormancyReason::NoCredentials));
+        let snapshot = env.sync.jobs().await;
+        assert!(!snapshot.connected);
+        assert_eq!(snapshot.jobs.len(), BASE.len());
+        for job in &snapshot.jobs {
+            assert_eq!(
+                (job.status, &job.hold),
+                (JobStatus::Due, &Some(Hold::Session)),
+                "{job:?}"
+            );
+        }
+    }
+
+    /// The pause is no job's fault and every job's hold: nothing starts
+    /// before it is over, whatever else would let it.
+    #[tokio::test]
+    async fn a_rate_limit_holds_every_due_job() {
+        let fake = Arc::new(FakeGitlab::default());
+        fake.fail_next("issues", FakeErr::Throttled(429));
+        let env = start(connected(&fake, 1));
+        let paused = |s: &Snapshot| s.paused_until.is_some();
+        let snapshot = snapshot_when(&env, "the rate-limit pause", paused).await;
+        assert!(snapshot.connected);
+        let due = snapshot.jobs.iter().filter(|j| j.status == JobStatus::Due);
+        let holds: Vec<&Option<Hold>> = due.map(|j| &j.hold).collect();
+        assert!(holds.len() > 1, "{snapshot:?}");
+        assert!(
+            holds.iter().all(|h| **h == Some(Hold::RateLimit)),
+            "{snapshot:?}"
+        );
+    }
+
+    /// Background jobs are spread over the time after the daemon's start: one
+    /// whose interval has long passed says that this is what it waits for.
+    #[tokio::test]
+    async fn after_a_start_the_background_jobs_say_they_are_spread_out() {
+        let config = instant_config();
+        config.write().unwrap().sync.startup_spread_secs = 3600;
+        let (store, dir) = open_store();
+        let probe = crate::reconnect::no_keychain_probe();
+        // Dormant, so nothing runs and every job shows what it waits for.
+        let dormant = ConnState::Dormant(DormancyReason::NoCredentials);
+        let env = start_configured(store, avatar_dir(&dir), dormant, probe, config);
+
+        let snapshot = env.sync.jobs().await;
+        let now = now_secs();
+        let spread = snapshot
+            .jobs
+            .iter()
+            .filter(|j| j.hold == Some(Hold::Startup));
+        let spread: Vec<&JobInfo> = spread.collect();
+        assert!(!spread.is_empty(), "{snapshot:?}");
+        for job in &spread {
+            assert_eq!(job.status, JobStatus::Waiting, "{job:?}");
+            assert!(job.next_due.is_some_and(|at| at > now), "{job:?}");
+        }
+        // The foreground lists wait for nothing but the session.
+        let foreground = info(&env, Job::AssignedIssues).await;
+        assert_eq!(
+            (foreground.status, foreground.hold),
+            (JobStatus::Due, Some(Hold::Session))
+        );
+    }
+
     /// The member group above a corpus project gets its epics synced once
     /// both listings are in.
     #[tokio::test]
@@ -2653,7 +2819,9 @@ mod tests {
         assert!(line.unavailable, "{line:?}");
         assert_eq!(line.status, JobStatus::Waiting);
         assert_eq!(line.next_due, Some(before.retry_at));
-        assert_eq!(line.last_error, None, "kept in memory only");
+        // A day of rest without a reason helps nobody: it is stored too.
+        let refused = line.last_error.as_deref().unwrap_or_default();
+        assert!(refused.contains("403"), "{line:?}");
         assert!(
             again.calls_to("projects/7/boards").is_empty(),
             "still resting"
@@ -2663,6 +2831,38 @@ mod tests {
         assert_eq!(state(&second, job).rejections, 4);
         assert_eq!(logs.count("WARN", &job.key()), warned, "{}", logs.text());
         assert!(info(&second, job).await.unavailable);
+    }
+
+    /// A job backing off says why also after a restart, until it runs
+    /// through: the error is stored with the backoff it explains.
+    #[tokio::test]
+    async fn a_failed_jobs_reason_outlives_a_restart() {
+        let (store, _dir) = open_store();
+        let fake = Arc::new(FakeGitlab::default());
+        fake.fail_next("merge_requests", FakeErr::Throttled(503));
+        let job = Job::AssignedMergeRequests;
+        let first = start_on(Arc::clone(&store), connected(&fake, 1));
+        let failed = failed(&first, job).await;
+        let before = failed.jobs.iter().find(|j| j.key == job.key()).unwrap();
+        let why = before.last_error.clone().unwrap();
+        assert!(why.contains("503"), "{why}");
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Dormant, so the job can't run and lose its error that way.
+        let dormant = ConnState::Dormant(DormancyReason::NoCredentials);
+        let second = start_on(Arc::clone(&store), dormant);
+        let restarted = info(&second, job).await;
+        assert_eq!(restarted.status, JobStatus::BackingOff);
+        assert_eq!((restarted.failures, restarted.last_error), (1, Some(why)));
+        drop(second);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A run that succeeds takes the stored error with it.
+        let third = start_on(store, connected(&fake, 1));
+        rerun(&third, job).await;
+        assert_eq!(info(&third, job).await.last_error, None);
+        assert!(third.store.job_errors().unwrap().is_empty());
     }
 
     /// GitLab refusing an account-wide listing means something is wrong
@@ -3574,6 +3774,62 @@ mod tests {
                 && state(&env, Job::ProjectMergeRequests(7)).last_ok > 0
         })
         .await;
+    }
+
+    /// One slot, and it is taken: what waits says whether it waits for the
+    /// slot or for the very fetch that holds its lane.
+    #[tokio::test]
+    async fn with_every_slot_taken_the_next_job_waits_for_one() {
+        let fake = Arc::new(FakeGitlab::default());
+        let _gate = fake.gate("issues");
+        let (store, dir) = open_store();
+        let env = start_flying(1, store, &dir, connected(&fake, 1));
+        called(&fake, "issues", 1).await;
+        env.sync.refresh_soon(&[Job::MemberGroups]);
+
+        let demanded = |s: &Snapshot| s.jobs.iter().any(|j| j.status == JobStatus::Demanded);
+        let snapshot = snapshot_when(&env, "the demand", demanded).await;
+        assert!(snapshot.connected);
+        let (running, queued) = snapshot.jobs.split_first().unwrap();
+        assert_eq!(
+            (running.key.as_str(), running.status, &running.hold),
+            (ASSIGNED_ISSUES, JobStatus::Running, &None)
+        );
+        // The other issue lists store the same rows: they wait for this fetch
+        // even with a slot to spare.
+        let lists = [Job::RecentAuthoredIssues, Job::RecentAssignedIssues].map(|j| j.key());
+        for job in queued {
+            let expected = if lists.contains(&job.key) {
+                Hold::Lane(ASSIGNED_ISSUES.into())
+            } else {
+                Hold::Slots
+            };
+            assert_eq!(job.hold, Some(expected), "{job:?}");
+        }
+    }
+
+    /// Free slots don't help a job whose lane is taken: it names the fetch
+    /// it waits behind.
+    #[tokio::test]
+    async fn a_job_behind_a_running_one_of_its_lane_names_it() {
+        let (store, dir) = open_store();
+        seed_two_projects(&store);
+        let fake = Arc::new(FakeGitlab::default());
+        let _gate = fake.gate("projects/7/boards");
+        let env = start_flying(4, store, &dir, connected(&fake, 1));
+        called(&fake, "projects/7/boards", 1).await;
+
+        for job in [Job::ProjectIssues(7), Job::ProjectMergeRequests(7)] {
+            let held = info(&env, job).await;
+            assert_eq!(
+                (held.status, held.hold),
+                (
+                    JobStatus::Due,
+                    Some(Hold::Lane(Job::ProjectBoards(7).key()))
+                ),
+                "{job:?}"
+            );
+        }
     }
 
     #[tokio::test]
