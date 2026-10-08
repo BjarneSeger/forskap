@@ -164,6 +164,7 @@ impl VarlinkInterface for Handlers {
         let session = Session::from_client(client);
         info!(host, user_id = session.user_id, "logged in");
         *self.session.write().await = ConnState::Connected(session);
+        self.reconnect.connected();
         self.queue.drain_waker().notify_one();
         self.sync.logged_in();
         self.rotation.reevaluate();
@@ -178,6 +179,7 @@ impl VarlinkInterface for Handlers {
             return reply_failed(call, &e, format!("logging out is disabled: {e}"));
         }
         *self.session.write().await = ConnState::Dormant(DormancyReason::LoggedOut);
+        self.reconnect.lost();
         self.rotation.reevaluate();
         if let Err(e) = self.keychain.delete(Unlock::Ask).await {
             warn!(error = %e, "Logout: keychain delete failed");

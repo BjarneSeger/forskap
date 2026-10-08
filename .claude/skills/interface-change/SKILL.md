@@ -38,6 +38,10 @@ main one only.
   value refused inside one is named by its path (`Invalid::new("options.limit", …)`).
   `build.rs` derives `Default` for every struct without a required field, so Rust
   callers write `..Default::default()`.
+- A reply that grows takes what is new in one optional struct too
+  (`GetStatus.dormancy`, `WhoAmI.rotation`): the Go generator returns a reply's fields
+  one by one, so every field of its own changes the generated `Call`'s signature and
+  breaks `client.go` again; a struct does so once.
 - Document in the file itself: a short `#` comment on the lines before each new type,
   method and error, and before each field or enum variant whose name doesn't say it
   all (units, when it is absent or empty, since which version it is sent). Comments go
@@ -150,7 +154,11 @@ go build ./... && go vet ./...
 ```
 
 Commit the regenerated `orgthehosterforskapd.go` and `version.go` — never hand-edit
-them. `version.go` holds `APIVersion`, the api crate's version, so a version bump alone
+them. `client.go` is the hand-written face of the binding: a method whose reply or
+arguments changed stops compiling there (`go build` says where), and a new method
+wants its wrapper and a line in the binding's README; its exported signatures are
+what Go callers build against, so they stay (a write that now replies `queued` still
+returns just `error`). `version.go` holds `APIVersion`, the api crate's version, so a version bump alone
 makes the binding stale too. CI (`.github/workflows/go-binding.yml`, which also runs on
 `forskap-api/Cargo.toml`) regenerates and fails on `git diff` if the committed binding
 is stale.

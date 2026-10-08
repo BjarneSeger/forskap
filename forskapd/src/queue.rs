@@ -11,10 +11,14 @@
 //! 7 days; a GitLab rejection or an exhausted retry window moves the task to a
 //! persistent dead-letter store, surfaced via `forskap queue`. Either way the
 //! settle hook hears about it.
+//!
+//! Where each write is in that schedule is the coordinator's alone to know, so
+//! it publishes it after every turn ([`Board`]); [`RetryQueue::queued`] lays
+//! that over the persisted tasks for whoever asks what waits and why.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -103,6 +107,9 @@ pub struct RetryQueue {
     sender: mpsc::Sender<QueuedTask>,
     store: KvStore<u64, StoredTask>,
     dead_letter: KvStore<u64, StoredFailure>,
+    config: SharedConfig,
+    /// The worker's schedule as it last published it.
+    board: Arc<Mutex<Board>>,
     next_id: AtomicU64,
     /// Fired to wake the worker early while it is deferring for lack of a
     /// session, so a freshly re-established connection drains the queue at once
@@ -115,6 +122,43 @@ pub struct RetryQueue {
 pub struct PendingWrite {
     pub write: Write,
     pub queued_at_secs: u64,
+}
+
+/// A write waiting in the retry queue and where it is in its retry schedule,
+/// for the view of what waits and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedWriteView {
+    /// The id it keeps as a dead letter, should it fail for good.
+    pub id: u64,
+    pub op_kind: &'static str,
+    pub project_id: i64,
+    pub iid: i64,
+    pub kind: Issuable,
+    /// Human-readable op detail (e.g. PostTime's duration + summary).
+    pub detail: String,
+    pub queued_at_secs: u64,
+    /// Attempts started since the daemon's start.
+    pub attempts: u32,
+    /// An attempt is in flight.
+    pub running: bool,
+    /// An earlier write to the same issuable goes first.
+    pub blocked: bool,
+    /// Unix seconds it is not tried again before, while it backs off.
+    pub next_attempt_at: Option<u64>,
+    /// Why its latest attempt failed.
+    pub last_error: Option<String>,
+    /// Unix seconds its retry window ends at: a failure after that is its
+    /// last.
+    pub expires_at: u64,
+}
+
+/// The waiting writes, and what holds them all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueView {
+    /// Oldest first, the order they are sent in.
+    pub writes: Vec<QueuedWriteView>,
+    /// Unix seconds a 429 holds every write back until.
+    pub paused_until: Option<u64>,
 }
 
 /// A dead-lettered task, projected for the `forskap queue` view.
@@ -173,16 +217,18 @@ impl RetryQueue {
         let (tx, rx) = mpsc::channel(256);
         let drain_wake = Arc::new(Notify::new());
         let settle_hook = Arc::new(OnceLock::new());
+        let board = Arc::new(Mutex::new(Board::default()));
 
         let mut worker = Worker::new(
             session,
             store.clone(),
             dead_letter.clone(),
             rx,
-            config,
+            Arc::clone(&config),
             Arc::clone(&drain_wake),
             Arc::clone(&settle_hook),
         );
+        worker.board = Arc::clone(&board);
         // Admitted before anything enqueued from now on, so a reloaded write
         // keeps its place ahead of a fresh sibling on the same issuable.
         for task in initial_tasks {
@@ -194,6 +240,8 @@ impl RetryQueue {
             sender: tx,
             store,
             dead_letter,
+            config,
+            board,
             next_id: AtomicU64::new(max_id + 1),
             drain_wake,
             settle_hook,
@@ -236,6 +284,42 @@ impl RetryQueue {
     /// history view shows queued PostTimes from it before GitLab has them.
     pub fn pending(&self) -> Result<Vec<PendingWrite>> {
         snapshot_pending(&self.store)
+    }
+
+    /// The writes still waiting, oldest first, each with where the worker
+    /// has it: how often it was tried, when it is tried next and why the
+    /// last attempt failed. Read from the persisted tasks, so a write the
+    /// worker hasn't taken up yet is listed too, as untried.
+    pub fn queued(&self) -> Result<QueueView> {
+        let mut tasks = self.store.scan(|id, stored| Ok((id, stored)))?;
+        tasks.sort_by_key(|(id, _)| *id);
+        let max_lifetime = self.config.read().unwrap().queue.max_lifetime();
+        let board = self.board.lock().unwrap().clone();
+        let mut ahead: HashSet<Key> = HashSet::new();
+        let writes = tasks.into_iter().map(|(id, task)| {
+            let standing = board.writes.get(&id).cloned().unwrap_or_default();
+            // Writes to one issuable land in the order they were made.
+            let blocked = !ahead.insert((task.kind, task.project_id, task.iid));
+            QueuedWriteView {
+                id,
+                op_kind: task.op.name(),
+                project_id: task.project_id,
+                iid: task.iid,
+                kind: task.kind,
+                detail: task.op.detail(),
+                queued_at_secs: task.queued_at_secs,
+                attempts: standing.attempts,
+                running: standing.running,
+                blocked,
+                next_attempt_at: standing.next_attempt_at,
+                last_error: standing.last_error,
+                expires_at: task.queued_at_secs.saturating_add(max_lifetime.as_secs()),
+            }
+        });
+        Ok(QueueView {
+            writes: writes.collect(),
+            paused_until: board.paused_until.filter(|&until| until > now_secs()),
+        })
     }
 
     /// Persist `stored` under a fresh ID and hand it to the worker, keeping its
@@ -342,6 +426,28 @@ struct Pending {
     delay: Duration,
     /// Not before this; `None` is ready.
     due: Option<Instant>,
+    /// Why the latest attempt failed.
+    last_error: Option<String>,
+}
+
+/// Where one queued write is in its retry schedule.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Standing {
+    attempts: u32,
+    running: bool,
+    /// Unix seconds; only while it backs off.
+    next_attempt_at: Option<u64>,
+    last_error: Option<String>,
+}
+
+/// The coordinator's schedule in wall-clock terms, as it publishes it for
+/// [`RetryQueue::queued`]: its own state is `Instant`s nobody else can read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Board {
+    /// By task id.
+    writes: HashMap<u64, Standing>,
+    /// Unix seconds; a 429 holds every launch until then.
+    paused_until: Option<u64>,
 }
 
 /// The coordinator's scheduling state. Clock-free — every method takes
@@ -440,6 +546,26 @@ impl Backlog {
         wait
     }
 
+    /// The schedule as of `now`, which is the unix second `wall`.
+    fn board(&self, now: Instant, wall: u64) -> Board {
+        let at = |instant: Instant| wall + instant.saturating_duration_since(now).as_secs();
+        let standing = |pending: &Pending, running: bool| Standing {
+            attempts: pending.attempt,
+            running,
+            next_attempt_at: pending.due.filter(|due| *due > now).map(at),
+            last_error: pending.last_error.clone(),
+        };
+        let waiting = self.waiting.iter().map(|(id, p)| (*id, standing(p, false)));
+        let running = self
+            .in_flight
+            .iter()
+            .map(|(id, p)| (*id, standing(p, true)));
+        Board {
+            writes: waiting.chain(running).collect(),
+            paused_until: self.paused_until.filter(|until| *until > now).map(at),
+        }
+    }
+
     /// The earliest instant after `now` worth a timer: the end of the pause
     /// while paused (nothing launches before it), else the earliest due time
     /// still ahead. `None` when a timer would change nothing — a ready task
@@ -489,7 +615,7 @@ fn verdict(
             if elapsed >= max_lifetime {
                 return Verdict::DeadLetter {
                     error: format!(
-                        "timed out after {}, seconds retry window: {}",
+                        "gave up after the retry window of {} seconds: {}",
                         max_lifetime.as_secs(),
                         e
                     ),
@@ -521,6 +647,8 @@ struct Worker {
     drain_wake: Arc<Notify>,
     settle_hook: Arc<OnceLock<SettleHook>>,
     backlog: Backlog,
+    /// Where the schedule is published after every turn.
+    board: Arc<Mutex<Board>>,
     /// One spawned `Write::apply` per running attempt.
     attempts: JoinSet<Result<()>>,
     /// Queue id per running attempt, by tokio task id: a panic reports only that.
@@ -547,6 +675,7 @@ impl Worker {
             drain_wake,
             settle_hook,
             backlog: Backlog::default(),
+            board: Arc::default(),
             attempts: JoinSet::new(),
             attempt_ids: HashMap::new(),
         }
@@ -560,6 +689,7 @@ impl Worker {
             attempt: 0,
             delay,
             due: None,
+            last_error: None,
         });
     }
 
@@ -585,6 +715,9 @@ impl Worker {
             }
             let now = Instant::now();
             let deferring = self.launch(now).await;
+            // After every turn: what was admitted, started or settled since
+            // the last one is in it.
+            *self.board.lock().unwrap() = self.backlog.board(now, now_secs());
             let next_wake = if deferring {
                 None
             } else {
@@ -672,7 +805,7 @@ impl Worker {
             .attempt_ids
             .remove(&tid)
             .expect("every attempt is registered");
-        let pending = self.backlog.finish(id);
+        let mut pending = self.backlog.finish(id);
         let elapsed = Duration::from_secs(now_secs().saturating_sub(pending.task.queued_at_secs));
         let (max_lifetime, max_delay) = {
             let cfg = self.config.read().unwrap();
@@ -718,6 +851,7 @@ impl Worker {
             }
             Verdict::Retry { error, pause } => {
                 let now = Instant::now();
+                pending.last_error = Some(error.to_string());
                 let wait = self.backlog.back_off(
                     pending,
                     now,
@@ -1579,7 +1713,51 @@ mod tests {
             attempt: 0,
             delay: Duration::from_secs(1),
             due,
+            last_error: None,
         }
+    }
+
+    /// The board is the schedule in wall-clock terms: what runs, what was
+    /// tried and failed and when it is tried again, what was never tried.
+    #[test]
+    fn the_board_says_how_often_a_write_was_tried_and_when_it_is_tried_next() {
+        let secs = Duration::from_secs;
+        let (now, wall) = (Instant::now(), 1_800_000_000);
+        let mut b = Backlog::default();
+        for id in 1..=3 {
+            b.push(pending(id, id as i64, None));
+        }
+        b.start(1);
+        b.start(2);
+        let mut failed = b.finish(2);
+        failed.last_error = Some("network error: reset".into());
+        // Its first backoff: the second it was admitted with.
+        b.back_off(failed, now, None, secs(3600), secs(60));
+        b.pause_until(now + secs(30));
+
+        let board = b.board(now, wall);
+        let running = Standing {
+            attempts: 1,
+            running: true,
+            ..Standing::default()
+        };
+        let backing_off = Standing {
+            attempts: 1,
+            running: false,
+            next_attempt_at: Some(wall + 1),
+            last_error: Some("network error: reset".into()),
+        };
+        assert_eq!(board.writes[&1], running);
+        assert_eq!(board.writes[&2], backing_off);
+        assert_eq!(board.writes[&3], Standing::default(), "never tried");
+        assert_eq!(board.paused_until, Some(wall + 30));
+
+        // Once the backoff and the pause are over they are no news; why the
+        // last attempt failed still is.
+        let board = b.board(now + secs(31), wall + 31);
+        assert_eq!(board.writes[&2].next_attempt_at, None);
+        assert!(board.writes[&2].last_error.is_some());
+        assert_eq!(board.paused_until, None);
     }
 
     #[test]
@@ -1820,6 +1998,147 @@ mod tests {
         let config = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
         let q = RetryQueue::new(session, &test_db(&dir), config).unwrap();
         (q, dir)
+    }
+
+    fn close(iid: i64) -> Write {
+        Write {
+            kind: Issuable::Issue,
+            project_id: 7,
+            iid,
+            op: WriteOp::Close,
+        }
+    }
+
+    /// A queue on a session to `gitlab`, the config being `cfg`.
+    fn connected_queue(
+        gitlab: &Arc<FakeGitlab>,
+        cfg: crate::config::Config,
+    ) -> (RetryQueue, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let session: SessionSlot =
+            Arc::new(tokio::sync::RwLock::new(ConnState::Connected(Session {
+                gitlab: Arc::clone(gitlab) as Arc<dyn GitlabApi>,
+                host: "test".to_string(),
+                user_id: 0,
+                username: "tester".into(),
+                token: Default::default(),
+            })));
+        let config = Arc::new(std::sync::RwLock::new(cfg));
+        let q = RetryQueue::new(session, &test_db(&dir), config).unwrap();
+        (q, dir)
+    }
+
+    /// What waits is listed oldest first, the order it is sent in, and a
+    /// write behind an earlier one to the same issue says so. Nothing was
+    /// tried: there is no session to try it with.
+    #[tokio::test]
+    async fn the_queue_lists_what_waits_and_what_goes_behind_an_earlier_write() {
+        let (q, _dir) = retry_queue();
+        let before = now_secs();
+        q.enqueue(close(42)).await;
+        q.enqueue(Write {
+            op: WriteOp::PostTime {
+                duration: "1h".into(),
+                summary: None,
+                issuable_id: None,
+            },
+            ..close(42)
+        })
+        .await;
+        q.enqueue(close(43)).await;
+
+        let view = q.queued().unwrap();
+        assert_eq!(view.paused_until, None);
+        let writes = &view.writes;
+        let listed: Vec<_> = writes
+            .iter()
+            .map(|w| (w.op_kind, w.iid, w.blocked))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("Close", 42, false),
+                ("PostTime", 42, true),
+                ("Close", 43, false)
+            ]
+        );
+        assert!(writes.windows(2).all(|w| w[0].id < w[1].id));
+        let window = crate::config::defaults().queue.max_lifetime().as_secs();
+        for write in writes {
+            assert_eq!((write.attempts, write.running), (0, false), "{write:?}");
+            assert_eq!((write.next_attempt_at, &write.last_error), (None, &None));
+            assert!(write.queued_at_secs >= before);
+            assert_eq!(write.expires_at, write.queued_at_secs + window);
+        }
+    }
+
+    /// A write the worker hasn't taken up is in the store already, and that
+    /// is where the list comes from.
+    #[tokio::test]
+    async fn a_write_not_yet_admitted_is_listed_as_waiting() {
+        let (q, _dir) = retry_queue();
+        q.store.put(5, &close_task(9, 100)).unwrap();
+        let view = q.queued().unwrap();
+        let [write] = &view.writes[..] else {
+            panic!("one write: {view:?}");
+        };
+        assert_eq!((write.id, write.iid, write.attempts), (5, 9, 0));
+    }
+
+    #[tokio::test]
+    async fn the_worker_publishes_its_board_while_an_attempt_runs() {
+        let gitlab = Arc::new(FakeGitlab::default());
+        let gate = gitlab.gate_writes();
+        let (q, _dir) = connected_queue(&gitlab, crate::config::defaults());
+        q.enqueue(close(42)).await;
+
+        eventually("the attempt to show", || {
+            let view = q.queued().unwrap();
+            view.writes.first().is_some_and(|w| w.running)
+        })
+        .await;
+        let running = &q.queued().unwrap().writes[0];
+        assert_eq!((running.attempts, running.blocked), (1, false));
+
+        gate.release();
+        eventually("the write to land", || {
+            q.queued().unwrap().writes.is_empty()
+        })
+        .await;
+    }
+
+    /// A failed attempt leaves the write in the queue with why it failed
+    /// and when it is tried again.
+    #[tokio::test]
+    async fn a_write_that_backs_off_says_why_and_until_when() {
+        let gitlab = Arc::new(FakeGitlab::default());
+        gitlab.fail_next_write(FakeErr::Transient);
+        // An hour between attempts, so it is still backing off when read.
+        let mut cfg = crate::config::defaults();
+        cfg.queue.base_delay_secs = 3600;
+        cfg.queue.max_delay_secs = 3600;
+        let (q, _dir) = connected_queue(&gitlab, cfg);
+        let before = now_secs();
+        q.enqueue(close(42)).await;
+
+        eventually("the failed attempt to show", || {
+            let view = q.queued().unwrap();
+            view.writes.first().is_some_and(|w| w.last_error.is_some())
+        })
+        .await;
+        let view = q.queued().unwrap();
+        let failed = &view.writes[0];
+        assert_eq!((failed.attempts, failed.running), (1, false));
+        assert!(
+            failed.next_attempt_at.is_some_and(|at| at > before + 3000),
+            "{failed:?}"
+        );
+        let why = failed.last_error.as_deref().unwrap();
+        assert!(why.contains("network error"), "{why}");
+        assert_eq!(
+            view.paused_until, None,
+            "no rate limit: only this write waits"
+        );
     }
 
     #[tokio::test]

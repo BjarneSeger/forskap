@@ -15,17 +15,19 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use forskap_api::QueuedWrite;
 use forskap_api::admin::{
     self, GetSyncJobs_Reply, SyncJob, SyncJobStatus, VarlinkClientInterface as _,
 };
 use forskap_api::{
-    API_VERSION, ErrorKind as ApiErrorKind, FailedTask, NotAuthReason, VarlinkClient,
-    VarlinkClientInterface, WhoAmI_Reply,
+    API_VERSION, Dormancy, ErrorKind as ApiErrorKind, FailedTask, GetQueue_Reply, NotAuthReason,
+    TokenRotation, VarlinkClient, VarlinkClientInterface, WhoAmI_Reply,
 };
 use serde::Serialize;
 
 use crate::cli::{OutputFormat, WatchArgs};
-use crate::cmd::auth::status::{EXPIRY_WARN_SECS, expiry, token_line};
+use crate::cmd::auth::status::{EXPIRY_WARN_SECS, expiry, rotation_notes, token_line};
 use crate::cmd::sync::jobs::{self, failure, kind, pause, span};
 use crate::friendly::DaemonError;
 use crate::{client, config, friendly, output, style, watch};
@@ -99,8 +101,13 @@ struct Answers {
     /// The interface version it speaks; `None` from a daemon older than
     /// `GetStatus`.
     interface: Answer<Option<String>>,
+    /// How the daemon stands without a session, as `GetStatus` says since
+    /// 1.3.
+    dormancy: Option<Dormancy>,
     who: Answer<Login>,
     jobs: Answer<GetSyncJobs_Reply>,
+    /// The writes still waiting; `None` from a daemon too old to list them.
+    queued: Answer<Option<GetQueue_Reply>>,
     failures: Answer<Vec<FailedTask>>,
 }
 
@@ -136,6 +143,9 @@ enum Login {
     Dormant {
         reason: Option<NotAuthReason>,
         detail: Option<String>,
+        /// Whether the daemon gets a session by itself; `None` from one too
+        /// old to say.
+        retrying: Option<bool>,
     },
 }
 
@@ -149,8 +159,10 @@ async fn gather(socket: &str) -> Answers {
         connected: Ok(()),
         info: Answer::Unasked,
         interface: Answer::Unasked,
+        dormancy: None,
         who: Answer::Unasked,
         jobs: Answer::Unasked,
+        queued: Answer::Unasked,
         failures: Answer::Unasked,
     };
     let conn = match ask(client::open(socket)).await {
@@ -178,7 +190,11 @@ async fn gather(socket: &str) -> Answers {
     let api = VarlinkClient::new(Arc::clone(&conn));
     let admin = admin::VarlinkClient::new(conn);
     answers.interface = match ask(api.get_status().call()).await {
-        Some(Err(e)) if is_method_not_found(&e) => Answer::Got(None),
+        Some(Err(e)) if friendly::is_method_not_found(&e) => Answer::Got(None),
+        Some(Ok(status)) => {
+            answers.dormancy = status.dormancy;
+            Answer::Got(Some(status.api_version))
+        }
         other => answer(other).map(|status| Some(status.api_version)),
     };
     if matches!(answers.interface, Answer::TimedOut) {
@@ -189,6 +205,7 @@ async fn gather(socket: &str) -> Answers {
             ApiErrorKind::NotAuthenticated(args) => Answer::Got(Login::Dormant {
                 reason: args.as_ref().and_then(|a| a.reason.clone()),
                 detail: args.as_ref().and_then(|a| a.detail.clone()),
+                retrying: args.as_ref().and_then(|a| a.retrying),
             }),
             _ => Answer::Failed(describe(&e)),
         },
@@ -199,6 +216,13 @@ async fn gather(socket: &str) -> Answers {
     }
     answers.jobs = answer(ask(admin.get_sync_jobs().call()).await);
     if matches!(answers.jobs, Answer::TimedOut) {
+        return answers;
+    }
+    answers.queued = match ask(api.get_queue().call()).await {
+        Some(Err(e)) if friendly::is_method_not_found(&e) => Answer::Got(None),
+        other => answer(other).map(Some),
+    };
+    if matches!(answers.queued, Answer::TimedOut) {
         return answers;
     }
     answers.failures = answer(ask(api.get_failures().call()).await).map(|r| r.failures);
@@ -218,13 +242,6 @@ fn answer<T>(asked: Option<Result<T, impl DaemonError>>) -> Answer<T> {
         Some(Err(e)) => Answer::Failed(describe(&e)),
         None => Answer::TimedOut,
     }
-}
-
-fn is_method_not_found(e: &impl DaemonError) -> bool {
-    matches!(
-        e.varlink_kind(),
-        Some(varlink::ErrorKind::MethodNotFound(_))
-    )
 }
 
 /// A failed call in a few words, rather than the generated client's dump.
@@ -370,6 +387,15 @@ struct SessionFacts {
     /// Why there is no session.
     reason: Option<NotAuthReason>,
     detail: Option<String>,
+    /// Whether the daemon gets one by itself, and since when it has none;
+    /// absent while connected and from a daemon too old to say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retrying: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dormant_since: Option<i64>,
+    /// What the token rotation is at; absent from a daemon too old to say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rotation: Option<TokenRotation>,
 }
 
 #[derive(Serialize)]
@@ -402,6 +428,10 @@ struct JobCounts {
 #[derive(Serialize)]
 struct QueueFacts {
     failed_writes: usize,
+    /// The writes still waiting to be sent; absent from a daemon too old to
+    /// say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queued_writes: Option<usize>,
 }
 
 fn evaluate(a: &Answers, now: DateTime<Utc>) -> Report {
@@ -409,7 +439,7 @@ fn evaluate(a: &Answers, now: DateTime<Utc>) -> Report {
         daemon: daemon(a),
         session: session(a, now),
         sync: sync(a, link(&a.who), now.timestamp()),
-        queue: queue(a),
+        queue: queue(a, link(&a.who), now.timestamp()),
     };
     let level = checks.rows().iter().map(|row| row.level).max();
     Report {
@@ -551,7 +581,14 @@ fn daemon(a: &Answers) -> Check<DaemonFacts> {
 fn session(a: &Answers, now: DateTime<Utc>) -> Check<SessionFacts> {
     match reply("session", "WhoAmI", &a.who, a) {
         Ok(Login::Connected(me)) => connected(me, now),
-        Ok(Login::Dormant { reason, detail }) => dormant(reason.as_ref(), detail.as_deref()),
+        Ok(Login::Dormant {
+            reason,
+            detail,
+            retrying,
+        }) => {
+            let standing = a.dormancy.as_ref();
+            dormant(reason.as_ref(), detail.as_deref(), *retrying, standing, now)
+        }
         Err(check) => check,
     }
 }
@@ -568,7 +605,7 @@ fn connected(me: &WhoAmI_Reply, now: DateTime<Utc>) -> Check<SessionFacts> {
             format!("{who}, but the token {}", expiry(at, now)),
         )
         .details(vec![
-            friendly::remedy(Some(&NotAuthReason::token_rejected)).to_string(),
+            friendly::remedy(Some(&NotAuthReason::token_rejected), None).to_string(),
         ]),
         Some(at) if !me.token_rotates && (at - now).num_seconds() < EXPIRY_WARN_SECS => Check::new(
             "session",
@@ -583,9 +620,23 @@ fn connected(me: &WhoAmI_Reply, now: DateTime<Utc>) -> Check<SessionFacts> {
         _ => Check::new("session", Level::Ok, who).details(vec![token_line(
             me.token_expires_at,
             me.token_rotates,
+            me.rotation.as_ref(),
             now,
         )]),
     };
+    // What the rotation has to report follows, and a rotated token that
+    // isn't saved is worth a warning: a restart would lose the session.
+    let notes = rotation_notes(me.rotation.as_ref(), now);
+    let unsaved = me.rotation.as_ref().and_then(|r| r.unsaved) == Some(true);
+    let mut check = check;
+    check.details.extend(notes);
+    if unsaved && check.level < Level::Warning {
+        check.level = Level::Warning;
+        check.summary = format!(
+            "{}; the rotated token is not in the keychain yet",
+            check.summary
+        );
+    }
     check.facts(SessionFacts {
         connected: true,
         host: Some(me.host.clone()),
@@ -595,33 +646,57 @@ fn connected(me: &WhoAmI_Reply, now: DateTime<Utc>) -> Check<SessionFacts> {
         token_rotates: Some(me.token_rotates),
         reason: None,
         detail: None,
+        retrying: None,
+        dormant_since: None,
+        rotation: me.rotation.clone(),
     })
 }
 
-fn dormant(reason: Option<&NotAuthReason>, detail: Option<&str>) -> Check<SessionFacts> {
-    // Only `unreachable` heals by itself; the rest wait for the user.
+fn dormant(
+    reason: Option<&NotAuthReason>,
+    detail: Option<&str>,
+    retrying: Option<bool>,
+    standing: Option<&Dormancy>,
+    now: DateTime<Utc>,
+) -> Check<SessionFacts> {
+    let locked = friendly::locked(reason, retrying);
+    // What heals by itself is a warning; the rest waits for the user.
     let (level, summary) = match reason {
         Some(NotAuthReason::unreachable) => (Level::Warning, "GitLab not reachable"),
         Some(NotAuthReason::no_credentials) => (Level::Error, "not logged in"),
         Some(NotAuthReason::logged_out) => (Level::Error, "logged out"),
         Some(NotAuthReason::token_rejected) => (Level::Error, "GitLab rejected the token"),
+        Some(NotAuthReason::keychain_error) if locked => (Level::Warning, "the keychain is locked"),
         Some(NotAuthReason::keychain_error) => {
             (Level::Error, "can't read the credentials from the keychain")
         }
         None => (Level::Error, "not connected to GitLab"),
     };
-    let detail = detail.filter(|d| !d.is_empty());
-    let next = match reason {
-        Some(NotAuthReason::unreachable) => {
-            "The daemon reconnects by itself unless `reconnect.enabled` is off; meanwhile \
-             cached reads keep working and writes are queued."
+    // A locked keychain's detail is its summary again.
+    let detail = detail.filter(|d| !d.is_empty() && !locked);
+    let meanwhile = "meanwhile cached reads keep working and writes are queued";
+    let next = match (reason, retrying) {
+        (Some(NotAuthReason::unreachable), Some(true)) => {
+            format!("The daemon reconnects by itself; {meanwhile}.")
         }
-        _ => friendly::remedy(reason),
+        (Some(NotAuthReason::unreachable), Some(false)) => format!(
+            "Auto-reconnect is off (`reconnect.enabled`): restart the daemon once GitLab is \
+             reachable; {meanwhile}."
+        ),
+        // A daemon too old to say whether it retries.
+        (Some(NotAuthReason::unreachable), None) => format!(
+            "The daemon reconnects by itself unless `reconnect.enabled` is off; {meanwhile}."
+        ),
+        _ if locked => {
+            format!("The daemon connects by itself once it is unlocked; {meanwhile}.")
+        }
+        _ => friendly::remedy(reason, retrying).to_string(),
     };
     let details = detail
         .map(str::to_string)
         .into_iter()
-        .chain([next.to_string()]);
+        .chain([next])
+        .chain(standing.and_then(|s| stands(s, locked, detail, now.timestamp())));
     Check::new("session", level, summary)
         .details(details.collect())
         .facts(SessionFacts {
@@ -633,7 +708,40 @@ fn dormant(reason: Option<&NotAuthReason>, detail: Option<&str>) -> Check<Sessio
             token_rotates: None,
             reason: reason.cloned(),
             detail: detail.map(str::to_string),
+            retrying,
+            dormant_since: standing.and_then(|s| s.since),
+            rotation: None,
         })
+}
+
+/// How the daemon stands without a session, in a line: since when, what
+/// its attempts came to, when the next comes. `None` where it says nothing.
+/// `said` is the detail shown beside it: an attempt that failed the same way
+/// doesn't repeat it.
+pub fn stands(standing: &Dormancy, locked: bool, said: Option<&str>, now: i64) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(since) = standing.since {
+        parts.push(format!("No session for {}", span((now - since).max(0))));
+    }
+    if let Some(attempts) = standing.attempts.filter(|&n| n > 0) {
+        let tried = match attempts {
+            1 => "1 attempt".to_string(),
+            n => format!("{n} attempts"),
+        };
+        parts.push(match standing.last_error.as_deref() {
+            Some(error) if Some(error) != said => {
+                format!("{tried}, the latest failed: {error}")
+            }
+            _ => tried,
+        });
+    }
+    let next = standing.retry_at.filter(|_| standing.retrying);
+    if let Some(left) = next.map(|at| at - now).filter(|&left| left > 0) {
+        // The keychain is looked at; GitLab is tried.
+        let what = if locked { "looks again" } else { "next" };
+        parts.push(format!("{what} in {}", span(left)));
+    }
+    (!parts.is_empty()).then(|| format!("{}.", parts.join("; ")))
 }
 
 /// Whether the daemon has a GitLab session, as far as `WhoAmI` told.
@@ -918,28 +1026,45 @@ fn conclude<F>(name: &'static str, fine: String, findings: Vec<Finding>) -> Chec
     check
 }
 
-fn queue(a: &Answers) -> Check<QueueFacts> {
+fn queue(a: &Answers, link: Link, now: i64) -> Check<QueueFacts> {
     let failures = match reply("queue", "GetFailures", &a.failures, a) {
         Ok(failures) => failures,
         Err(check) => return check,
     };
+    // What waits is a note beside the failures, never a failure of the
+    // check: its answer missing leaves the failures to judge.
+    let queued = match &a.queued {
+        Answer::Got(queued) => queued.as_ref(),
+        _ => None,
+    };
+    let waiting = queued.map_or(0, |q| q.writes.len());
     let facts = QueueFacts {
         failed_writes: failures.len(),
+        queued_writes: queued.map(|q| q.writes.len()),
     };
-    let check = match failures.len() {
-        0 => Check::new("queue", Level::Ok, "no failed writes"),
-        n => Check::new(
-            "queue",
-            Level::Warning,
-            format!("{n} failed {}", if n == 1 { "write" } else { "writes" }),
-        )
-        .details(vec![
-            "GitLab rejected them, or they outlived the retry window: `forskap queue list` \
-             shows them, to retry or dismiss."
+    let writes = |n: usize| if n == 1 { "write" } else { "writes" };
+    let mut findings = Vec::new();
+    if !failures.is_empty() {
+        let n = failures.len();
+        findings.push(
+            Finding::new(Level::Warning, format!("{n} failed {}", writes(n))).details(vec![
+                "GitLab rejected them, or they outlived the retry window: `forskap queue list` \
+                 shows them, to retry or dismiss."
+                    .to_string(),
+            ]),
+        );
+    }
+    if let Some(queued) = queued.filter(|_| waiting > 0) {
+        let why = match (link, pause(queued.paused_until, now)) {
+            (Link::Dormant, _) => "They are sent once there is a GitLab session.".to_string(),
+            (_, Some(paused)) => format!("They are {paused}."),
+            _ => "The daemon is sending them; `forskap queue list` shows how far each is."
                 .to_string(),
-        ]),
-    };
-    check.facts(facts)
+        };
+        let line = format!("{waiting} {} queued", writes(waiting));
+        findings.push(Finding::new(Level::Ok, line).details(vec![why]));
+    }
+    conclude("queue", "no failed writes".to_string(), findings).facts(facts)
 }
 
 /// One line of the table.
@@ -1049,6 +1174,7 @@ mod tests {
             username: "ada".to_string(),
             token_expires_at: Some(NOW + 90 * DAY),
             token_rotates: true,
+            rotation: None,
         }
     }
 
@@ -1110,6 +1236,14 @@ mod tests {
         })
     }
 
+    /// A daemon of 1.3 with nothing waiting.
+    fn no_queue() -> GetQueue_Reply {
+        GetQueue_Reply {
+            writes: Vec::new(),
+            paused_until: None,
+        }
+    }
+
     fn healthy() -> Answers {
         Answers {
             socket: SOCKET.to_string(),
@@ -1119,12 +1253,14 @@ mod tests {
                 version: VERSION.to_string(),
             }),
             interface: Answer::Got(Some(API_VERSION.to_string())),
+            dormancy: None,
             who: Answer::Got(Login::Connected(me())),
             jobs: jobs(vec![
                 fresh("assigned/issues"),
                 fresh("events"),
                 fresh("project/7/issues"),
             ]),
+            queued: Answer::Got(Some(no_queue())),
             failures: Answer::Got(Vec::new()),
         }
     }
@@ -1135,8 +1271,10 @@ mod tests {
             connected: Err("No socket exists there.".to_string()),
             info: Answer::Unasked,
             interface: Answer::Unasked,
+            dormancy: None,
             who: Answer::Unasked,
             jobs: Answer::Unasked,
+            queued: Answer::Unasked,
             failures: Answer::Unasked,
         }
     }
@@ -1146,6 +1284,7 @@ mod tests {
             who: Answer::Got(Login::Dormant {
                 reason,
                 detail: detail.map(str::to_string),
+                retrying: None,
             }),
             ..healthy()
         }
@@ -1207,8 +1346,10 @@ mod tests {
         let answers = Answers {
             info: Answer::TimedOut,
             interface: Answer::Unasked,
+            dormancy: None,
             who: Answer::Unasked,
             jobs: Answer::Unasked,
+            queued: Answer::Unasked,
             failures: Answer::Unasked,
             ..healthy()
         };
@@ -1229,6 +1370,7 @@ mod tests {
         // Later: the check that asked is the error.
         let answers = Answers {
             jobs: Answer::TimedOut,
+            queued: Answer::Unasked,
             failures: Answer::Unasked,
             ..healthy()
         };
@@ -1763,6 +1905,179 @@ healthy
         assert_eq!(sync.details[1], "on hold while there is no GitLab session");
     }
 
+    /// A dormant daemon of 1.3: why, whether it gets over it by itself, and
+    /// how it stands.
+    fn dormant_standing(
+        reason: NotAuthReason,
+        detail: Option<&str>,
+        standing: Dormancy,
+    ) -> Answers {
+        Answers {
+            who: Answer::Got(Login::Dormant {
+                reason: Some(reason),
+                detail: detail.map(str::to_string),
+                retrying: Some(standing.retrying),
+            }),
+            dormancy: Some(standing),
+            ..healthy()
+        }
+    }
+
+    fn standing(retrying: bool) -> Dormancy {
+        Dormancy {
+            since: Some(NOW - 180),
+            retrying,
+            retry_at: None,
+            attempts: None,
+            last_error: None,
+        }
+    }
+
+    /// The daemon started before the login found the keyring locked: no
+    /// error, it connects by itself — and says since when it waits and when
+    /// it looks next.
+    #[test]
+    fn a_locked_keychain_is_a_warning_that_heals() {
+        let waiting = Dormancy {
+            since: Some(NOW - (2 * DAY + 18 * 3600)),
+            retry_at: Some(NOW + 48),
+            ..standing(true)
+        };
+        let detail = "it is locked; the daemon connects by itself once it is unlocked";
+        let answers = dormant_standing(NotAuthReason::keychain_error, Some(detail), waiting);
+        let report = report(&answers);
+        let session = &report.checks.session;
+        assert_eq!(
+            (session.level, session.summary.as_str()),
+            (Level::Warning, "the keychain is locked")
+        );
+        assert_eq!(
+            session.details,
+            [
+                "The daemon connects by itself once it is unlocked; meanwhile cached reads \
+                 keep working and writes are queued.",
+                "No session for 2d 18h; looks again in 48s.",
+            ]
+        );
+        assert!(outcome(&report).is_ok());
+        let facts = session.facts.as_ref().unwrap();
+        assert_eq!(facts.retrying, Some(true));
+        assert_eq!(facts.dormant_since, Some(NOW - (2 * DAY + 18 * 3600)));
+
+        // A keychain that can't be read takes a login, and is an error.
+        let broken = "secret store: no such service";
+        let answers =
+            dormant_standing(NotAuthReason::keychain_error, Some(broken), standing(false));
+        let unreadable = evaluate(&answers, now());
+        let session = &unreadable.checks.session;
+        assert_eq!(
+            (session.level, session.summary.as_str()),
+            (Level::Error, "can't read the credentials from the keychain")
+        );
+        assert_eq!(session.details[0], broken);
+        assert_eq!(
+            session.details[1],
+            "Run `forskap auth login` to store them again."
+        );
+        assert_eq!(session.details[2], "No session for 3m.");
+        assert!(outcome(&unreadable).is_err());
+    }
+
+    /// An outage says how the reconnect stands instead of hedging on
+    /// whether there is one.
+    #[test]
+    fn an_outage_says_how_the_reconnect_stands() {
+        let trying = Dormancy {
+            retry_at: Some(NOW + 32),
+            attempts: Some(5),
+            last_error: Some("gitlab.example.com: timed out".to_string()),
+            ..standing(true)
+        };
+        let lost = "gitlab.example.com: connection reset";
+        let answers = dormant_standing(NotAuthReason::unreachable, Some(lost), trying);
+        let session = report(&answers).checks.session;
+        assert_eq!(session.level, Level::Warning);
+        assert_eq!(
+            session.details,
+            [
+                lost,
+                "The daemon reconnects by itself; meanwhile cached reads keep working and \
+                 writes are queued.",
+                "No session for 3m; 5 attempts, the latest failed: gitlab.example.com: timed \
+                 out; next in 32s.",
+            ]
+        );
+
+        // An attempt failing the way the session was lost says so once.
+        let same = Dormancy {
+            attempts: Some(2),
+            last_error: Some(lost.to_string()),
+            ..standing(true)
+        };
+        let answers = dormant_standing(NotAuthReason::unreachable, Some(lost), same);
+        assert_eq!(
+            report(&answers).checks.session.details[2],
+            "No session for 3m; 2 attempts."
+        );
+
+        // Switched off: nothing is tried, and the check says what to do.
+        let answers = dormant_standing(NotAuthReason::unreachable, Some(lost), standing(false));
+        let session = report(&answers).checks.session;
+        assert!(session.details[1].starts_with("Auto-reconnect is off (`reconnect.enabled`)"));
+        assert_eq!(session.details[2], "No session for 3m.");
+    }
+
+    /// Connected, the check says when the token rotates and what the
+    /// rotation's last attempt came to; a rotated token that isn't saved
+    /// yet is worth a warning.
+    #[test]
+    fn the_session_says_what_the_token_rotation_is_at() {
+        let rotation = |unsaved| TokenRotation {
+            at: Some(NOW + 60 * DAY),
+            skipped: None,
+            last_error: None,
+            retry_at: None,
+            unsaved,
+        };
+        let with = |rotation| Answers {
+            who: Answer::Got(Login::Connected(WhoAmI_Reply {
+                rotation: Some(rotation),
+                ..me()
+            })),
+            ..healthy()
+        };
+        let session = report(&with(rotation(None))).checks.session;
+        assert_eq!(session.level, Level::Ok);
+        assert_eq!(
+            session.details,
+            ["The token expires on 2027-04-15 (in 90 days); the daemon rotates it on 2027-03-16."]
+        );
+
+        let session = report(&with(rotation(Some(true)))).checks.session;
+        assert_eq!(session.level, Level::Warning);
+        assert_eq!(
+            session.summary,
+            "@ada on gitlab.example.com; the rotated token is not in the keychain yet"
+        );
+        assert!(
+            session.details[1].contains("`forskap auth login`"),
+            "{:?}",
+            session.details
+        );
+
+        let failed = TokenRotation {
+            last_error: Some("rotating the GitLab token failed: network error: reset".to_string()),
+            retry_at: Some(NOW + 240),
+            ..rotation(None)
+        };
+        let session = report(&with(failed)).checks.session;
+        assert_eq!(session.level, Level::Ok, "it is tried again");
+        assert_eq!(
+            session.details[1],
+            "rotating the GitLab token failed: network error: reset; the next attempt comes in 4m."
+        );
+    }
+
     /// The worker says itself whether it has a session to run its jobs with;
     /// what `WhoAmI` answered a moment earlier only stands in for a daemon
     /// too old to say.
@@ -1823,9 +2138,9 @@ healthy
         assert_eq!(sync.facts.unwrap().never_synced, ["events", "timelogs/all"]);
     }
 
-    #[test]
-    fn failed_writes_warn_with_the_count_and_where_to_look() {
-        let failed = |id| FailedTask {
+    /// A write the daemon gave up.
+    fn failed(id: i64) -> FailedTask {
+        FailedTask {
             id,
             op: "post_time".to_string(),
             kind: forskap_api::IssuableKind::work_item,
@@ -1835,7 +2150,11 @@ healthy
             error: "403 Forbidden".to_string(),
             queued_at: NOW - DAY,
             failed_at: NOW - 60,
-        };
+        }
+    }
+
+    #[test]
+    fn failed_writes_warn_with_the_count_and_where_to_look() {
         let answers = Answers {
             failures: Answer::Got(vec![failed(1), failed(2)]),
             ..healthy()
@@ -1855,6 +2174,121 @@ healthy
             evaluate(&answers, now()).checks.queue.summary,
             "1 failed write"
         );
+    }
+
+    /// A write still to be sent.
+    fn waiting(id: i64, iid: i64) -> QueuedWrite {
+        QueuedWrite {
+            id,
+            op: "PostTime".to_string(),
+            kind: forskap_api::IssuableKind::work_item,
+            project_id: 7,
+            iid,
+            detail: "1h".to_string(),
+            queued_at: NOW - 180,
+            attempts: 0,
+            running: false,
+            blocked: false,
+            next_attempt_at: None,
+            last_error: None,
+            expires_at: NOW + 7 * DAY,
+        }
+    }
+
+    fn queue_of(
+        writes: Vec<QueuedWrite>,
+        paused_until: Option<i64>,
+    ) -> Answer<Option<GetQueue_Reply>> {
+        Answer::Got(Some(GetQueue_Reply {
+            writes,
+            paused_until,
+        }))
+    }
+
+    /// Writes waiting to be sent are no trouble, only worth knowing: the
+    /// check stays ok and says how many, and what they wait for.
+    #[test]
+    fn queued_writes_are_noted_with_what_they_wait_for() {
+        let answers = Answers {
+            queued: queue_of(vec![waiting(1, 42), waiting(2, 43)], None),
+            ..healthy()
+        };
+        let queue = report(&answers).checks.queue;
+        assert_eq!(queue.level, Level::Ok);
+        assert_eq!(queue.summary, "no failed writes");
+        assert_eq!(queue.details[0], "2 writes queued");
+        assert!(queue.details[1].starts_with("The daemon is sending them"));
+        let facts = queue.facts.unwrap();
+        assert_eq!((facts.failed_writes, facts.queued_writes), (0, Some(2)));
+
+        // Without a session they wait for one, however long.
+        let answers = Answers {
+            queued: queue_of(vec![waiting(1, 42)], None),
+            ..dormant_with(Some(NotAuthReason::unreachable), None)
+        };
+        let queue = report(&answers).checks.queue;
+        assert_eq!(queue.level, Level::Ok);
+        assert_eq!(
+            queue.details,
+            [
+                "1 write queued",
+                "They are sent once there is a GitLab session."
+            ]
+        );
+
+        let answers = Answers {
+            queued: queue_of(vec![waiting(1, 42)], Some(NOW + 240)),
+            ..healthy()
+        };
+        assert_eq!(
+            report(&answers).checks.queue.details[1],
+            "They are paused by a GitLab rate limit for another 4m."
+        );
+    }
+
+    /// Failed writes stay what the check warns about; the waiting ones
+    /// follow as a note.
+    #[test]
+    fn failed_writes_come_before_the_queued_ones() {
+        let answers = Answers {
+            queued: queue_of(vec![waiting(5, 42)], None),
+            failures: Answer::Got(vec![failed(1)]),
+            ..healthy()
+        };
+        let queue = report(&answers).checks.queue;
+        assert_eq!(
+            (queue.level, queue.summary.as_str()),
+            (Level::Warning, "1 failed write")
+        );
+        assert!(
+            queue.details.iter().any(|d| d == "1 write queued"),
+            "{:?}",
+            queue.details
+        );
+    }
+
+    /// A daemon before 1.3 lists no queue: the check is what it was, and
+    /// its facts say nothing of what waits.
+    #[test]
+    fn a_daemon_too_old_to_list_its_queue_is_judged_by_its_failures() {
+        let answers = Answers {
+            queued: Answer::Got(None),
+            ..healthy()
+        };
+        let queue = report(&answers).checks.queue;
+        assert_eq!(
+            (queue.level, queue.summary.as_str()),
+            (Level::Ok, "no failed writes")
+        );
+        assert!(queue.details.is_empty());
+        assert_eq!(queue.facts.unwrap().queued_writes, None);
+
+        // An answer that failed is no failure of the check either.
+        let answers = Answers {
+            queued: Answer::Failed("boom".to_string()),
+            ..healthy()
+        };
+        assert_eq!(report(&answers).checks.queue.level, Level::Ok);
     }
 
     fn of_version(version: &str, interface: Answer<Option<String>>) -> Answers {
@@ -1931,8 +2365,8 @@ healthy
     fn a_method_the_daemon_lacks_is_told_from_other_failures() {
         let error = |kind| ApiError::from(varlink::Error::from(kind));
         let missing = varlink::ErrorKind::MethodNotFound("org.thehoster.forskapd.GetStatus".into());
-        assert!(is_method_not_found(&error(missing)));
-        assert!(!is_method_not_found(&error(
+        assert!(friendly::is_method_not_found(&error(missing)));
+        assert!(!friendly::is_method_not_found(&error(
             varlink::ErrorKind::ConnectionClosed
         )));
     }
@@ -2001,8 +2435,10 @@ healthy
         // Silent on the second call: stuck as on the first.
         let answers = Answers {
             interface: Answer::TimedOut,
+            dormancy: None,
             who: Answer::Unasked,
             jobs: Answer::Unasked,
+            queued: Answer::Unasked,
             failures: Answer::Unasked,
             ..healthy()
         };
@@ -2124,6 +2560,7 @@ unhealthy: 1 error, 3 skipped
     fn render_colours_the_levels_and_keeps_the_columns() {
         style::force(true);
         let answers = Answers {
+            queued: Answer::Got(Some(no_queue())),
             failures: Answer::Got(vec![]),
             jobs: Answer::TimedOut,
             ..healthy()

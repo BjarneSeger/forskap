@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinError, JoinSet};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -55,7 +55,7 @@ use crate::config::{Config, SharedConfig};
 use crate::error::{Error, Result};
 use crate::gitlab::{GitlabApi, Progress};
 use crate::handlers::{ConnState, Session, SessionSlot};
-use crate::reconnect::KeychainProbe;
+use crate::reconnect::{KeychainProbe, Reconnect};
 use crate::write::Write;
 
 /// How often a dormant worker re-checks the session without being woken.
@@ -233,7 +233,7 @@ impl SyncHandle {
         avatars: AvatarDir,
         session: SessionSlot,
         config: SharedConfig,
-        reconnect_signal: Arc<Notify>,
+        reconnect_signal: Arc<Reconnect>,
         keychain_probe: KeychainProbe,
     ) -> Arc<Self> {
         Self::start(
@@ -255,7 +255,7 @@ impl SyncHandle {
         avatars: AvatarDir,
         session: SessionSlot,
         config: SharedConfig,
-        reconnect_signal: Arc<Notify>,
+        reconnect_signal: Arc<Reconnect>,
     ) -> Arc<Self> {
         let probe = crate::reconnect::no_keychain_probe();
         Self::start(
@@ -275,7 +275,7 @@ impl SyncHandle {
         avatars: AvatarDir,
         session: SessionSlot,
         config: SharedConfig,
-        reconnect_signal: Arc<Notify>,
+        reconnect_signal: Arc<Reconnect>,
         keychain_probe: KeychainProbe,
         scheduled: bool,
     ) -> Arc<Self> {
@@ -517,7 +517,7 @@ struct Worker {
     avatars: AvatarDir,
     session: SessionSlot,
     config: SharedConfig,
-    reconnect_signal: Arc<Notify>,
+    reconnect_signal: Arc<Reconnect>,
     /// Asked on a 401, before the session is parked.
     keychain_probe: KeychainProbe,
     rx: mpsc::UnboundedReceiver<Command>,
@@ -1340,6 +1340,7 @@ impl Worker {
                 } else {
                     crate::reconnect::commit_token_rejected(
                         &self.session,
+                        &self.reconnect_signal,
                         &session.gitlab,
                         detail.clone(),
                     )
@@ -1737,7 +1738,7 @@ mod tests {
         sync: Arc<SyncHandle>,
         config: SharedConfig,
         session: SessionSlot,
-        reconnect: Arc<Notify>,
+        reconnect: Arc<Reconnect>,
         store: Arc<SyncStore>,
         avatars: AvatarDir,
         _dir: Option<tempfile::TempDir>,
@@ -1832,7 +1833,7 @@ mod tests {
         config: SharedConfig,
     ) -> Env {
         let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(state));
-        let reconnect = Arc::new(Notify::new());
+        let reconnect = Arc::new(Reconnect::default());
         let sync = SyncHandle::spawn(
             Arc::clone(&store),
             avatars.clone(),
@@ -4256,7 +4257,7 @@ mod tests {
         let avatars = AvatarDir::new(tmp.path());
         let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(state));
         let config = flying(3);
-        let reconnect = Arc::new(Notify::new());
+        let reconnect = Arc::new(Reconnect::default());
         let sync = SyncHandle::spawn_on_demand(
             Arc::clone(&store),
             avatars.clone(),

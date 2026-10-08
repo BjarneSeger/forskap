@@ -19,13 +19,13 @@ use forskap_api::{
     AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearFailures, Call_Close,
     Call_CreateWorkItem, Call_DismissFailure, Call_GetActivity, Call_GetAssignedMergeRequests,
     Call_GetAssignedWorkItems, Call_GetDescriptionTemplates, Call_GetFailures, Call_GetHistory,
-    Call_GetStatus, Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
-    Call_Search, Call_UnassignSelf, Call_WhoAmI, ClearFailures_Args, Close_Args,
+    Call_GetQueue, Call_GetStatus, Call_ListWorkItems, Call_PostTime, Call_RecordOpen,
+    Call_RetryFailure, Call_Search, Call_UnassignSelf, Call_WhoAmI, ClearFailures_Args, Close_Args,
     CreateWorkItem_Args, DismissFailure_Args, GetActivity_Args, GetAssignedMergeRequests_Args,
     GetAssignedWorkItems_Args, GetDescriptionTemplates_Args, GetFailures_Args, GetHistory_Args,
-    GetStatus_Args, ListWorkItems_Args, PostTime_Args, RecordOpen_Args, RetryFailure_Args,
-    Search_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
-    WhoAmI_Args,
+    GetQueue_Args, GetStatus_Args, ListWorkItems_Args, PostTime_Args, RecordOpen_Args,
+    RetryFailure_Args, Search_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION,
+    VarlinkInterface as _, WhoAmI_Args,
 };
 
 use crate::handlers::Handlers;
@@ -242,6 +242,12 @@ async fn handle_forskapd(
                     args.project_id,
                     args.kind,
                 )
+                .await?;
+        }
+        "org.thehoster.forskapd.GetQueue" => {
+            let GetQueue_Args {} = args!(method, params);
+            handlers
+                .get_queue(&mut call as &mut dyn Call_GetQueue)
                 .await?;
         }
         "org.thehoster.forskapd.GetFailures" => {
@@ -828,6 +834,11 @@ mod tests {
                 r#""op""#,
             ),
             (
+                "GetQueue",
+                Some(serde_json::json!({"op": "Close"})),
+                r#""op""#,
+            ),
+            (
                 "ClearFailures",
                 Some(serde_json::json!({"ids": [1]})),
                 r#""ids""#,
@@ -877,6 +888,7 @@ mod tests {
             ("admin.ClearCache", None),
             ("GetHistory", None),
             ("GetFailures", None),
+            ("GetQueue", None),
             ("ClearFailures", None),
             ("admin.GetSyncJobs", None),
             ("GetStatus", None),
@@ -913,6 +925,21 @@ mod tests {
         let status = reply.parameters.expect("a result");
         assert_eq!(status["api_version"], forskap_api::API_VERSION);
         assert_eq!(status["connected"], false);
+    }
+
+    #[tokio::test]
+    async fn dispatch_has_an_arm_for_get_queue() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        let reply = handle_forskapd("org.thehoster.forskapd.GetQueue", None, &handlers)
+            .await
+            .unwrap()
+            .expect("a reply");
+        assert!(
+            reply.error.is_none(),
+            "GetQueue is missing its dispatch arm: {:?}",
+            reply.error
+        );
+        assert!(reply.parameters.unwrap()["writes"].is_array());
     }
 
     #[tokio::test]

@@ -12,10 +12,11 @@ use forskap_api::{
     ActivityEvent, Call_AssignSelf, Call_ClearFailures, Call_Close, Call_CreateWorkItem,
     Call_DismissFailure, Call_GetActivity, Call_GetAssignedMergeRequests,
     Call_GetAssignedWorkItems, Call_GetDescriptionTemplates, Call_GetFailures, Call_GetHistory,
-    Call_GetStatus, Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_RetryFailure,
-    Call_Search, Call_UnassignSelf, Call_WhoAmI, FailedTask, Group, HistoryEvent, HistorySource,
-    IssuableKind, MergeRequest, NewWorkItem, Project, Scope, SearchKind, SearchOptions,
-    VarlinkInterface, WorkItem, WorkItemFilter, WorkItemRole, WorkItemState,
+    Call_GetQueue, Call_GetStatus, Call_ListWorkItems, Call_PostTime, Call_RecordOpen,
+    Call_RetryFailure, Call_Search, Call_UnassignSelf, Call_WhoAmI, Dormancy, FailedTask, Group,
+    HistoryEvent, HistorySource, IssuableKind, MergeRequest, NewWorkItem, Project, Scope,
+    SearchKind, SearchOptions, VarlinkInterface, WorkItem, WorkItemFilter, WorkItemRole,
+    WorkItemState,
 };
 
 use crate::error::{DormancyReason, Error};
@@ -31,8 +32,8 @@ use crate::usage::{UsageEntry, UsageRecord};
 use crate::write::{Write, WriteOp};
 
 use super::{
-    Handlers, Invalid, dormant_args, issue_ref_error, looks_like_duration, new_issue_error,
-    now_secs, open_key, parent_epic, reply_failed, wire,
+    Handlers, Invalid, issue_ref_error, looks_like_duration, new_issue_error, now_secs, open_key,
+    parent_epic, reply_failed, wire,
 };
 
 /// How long `CreateWorkItem` waits for the worker to store the new issue before
@@ -52,8 +53,10 @@ enum Cold {
 
 /// How [`Handlers::perform_write`] ended.
 enum WriteOutcome {
-    /// Applied, or queued for the retry worker.
-    Accepted,
+    /// GitLab applied it.
+    Applied,
+    /// Queued for the retry worker, which sends it once it can.
+    Queued,
     NotAuthenticated(DormancyReason),
     /// Neither applied nor queued: GitLab refused it, or it may have landed
     /// (a non-idempotent write on a 5xx).
@@ -69,22 +72,24 @@ macro_rules! reply_if_cold {
         match $self.cold($job).await {
             Some(Cold::Pending) => return $call.reply($($empty),*),
             Some(Cold::Dormant(r)) => {
-                let (reason, detail) = dormant_args(&r);
-                return $call.reply_not_authenticated(reason, detail);
+                let (reason, detail, retrying) = $self.dormant_args(&r);
+                return $call.reply_not_authenticated(reason, detail, retrying);
             }
             None => {}
         }
     };
 }
 
-/// Reply to a write call from its [`WriteOutcome`].
+/// Reply to a write call from its [`WriteOutcome`]: `queued` is sent only
+/// where it says something, for a write that wasn't applied.
 macro_rules! reply_write {
-    ($call:expr, $outcome:expr) => {
+    ($self:ident, $call:expr, $outcome:expr) => {
         match $outcome {
-            WriteOutcome::Accepted => $call.reply(),
+            WriteOutcome::Applied => $call.reply(None),
+            WriteOutcome::Queued => $call.reply(Some(true)),
             WriteOutcome::NotAuthenticated(r) => {
-                let (reason, detail) = dormant_args(&r);
-                $call.reply_not_authenticated(reason, detail)
+                let (reason, detail, retrying) = $self.dormant_args(&r);
+                $call.reply_not_authenticated(reason, detail, retrying)
             }
             WriteOutcome::Failed(e) => reply_failed($call, &e, e.to_string()),
         }
@@ -94,6 +99,21 @@ macro_rules! reply_write {
 impl Handlers {
     fn store(&self) -> &SyncStore {
         self.sync.store()
+    }
+
+    /// How the daemon stands without a session, for `GetStatus`: since
+    /// when, and what the reconnect supervisor is at where it is at it.
+    fn dormancy(&self, reason: &DormancyReason) -> Dormancy {
+        let standing = self.reconnect.standing();
+        let retrying = self.retrying(reason);
+        Dormancy {
+            since: standing.since.map(|at| at as i64),
+            retrying,
+            // A time it once planned says nothing once it stopped.
+            retry_at: standing.retry_at.filter(|_| retrying).map(|at| at as i64),
+            attempts: Some(i64::from(standing.attempts)).filter(|&n| n > 0),
+            last_error: standing.last_error,
+        }
     }
 
     async fn cold(&self, job: Job) -> Option<Cold> {
@@ -255,7 +275,7 @@ impl Handlers {
                     "no GitLab session for now, queuing write for retry"
                 );
                 self.defer(write).await;
-                return WriteOutcome::Accepted;
+                return WriteOutcome::Queued;
             }
             Err(r) => return WriteOutcome::NotAuthenticated(r),
         };
@@ -264,12 +284,12 @@ impl Handlers {
                 info!(project_id, iid, ?kind, op, "write applied");
                 self.sync.note_write(&write);
                 self.sync.refresh_soon(&Job::affected_by(&write));
-                WriteOutcome::Accepted
+                WriteOutcome::Applied
             }
             Err(e) if e.is_retryable(write.op.idempotent()) => {
                 warn!(error = %e, project_id, iid, op, "write failed transiently, queuing for retry");
                 self.defer(write).await;
-                WriteOutcome::Accepted
+                WriteOutcome::Queued
             }
             Err(e) => {
                 warn!(error = %e, project_id, iid, op, "write failed, not queued");
@@ -970,7 +990,7 @@ impl VarlinkInterface for Handlers {
                 issuable_id: None,
             },
         };
-        reply_write!(call, self.perform_write(write).await)
+        reply_write!(self, call, self.perform_write(write).await)
     }
 
     #[instrument(skip(self, call))]
@@ -1057,9 +1077,10 @@ impl VarlinkInterface for Handlers {
                 Some(s.host),
                 Some(s.username),
                 Some(s.user_id),
+                None,
             ),
             Err(e) => {
-                let (reason, detail) = dormant_args(&e);
+                let (reason, detail, _) = self.dormant_args(&e);
                 call.reply(
                     api_version,
                     daemon_version,
@@ -1069,6 +1090,7 @@ impl VarlinkInterface for Handlers {
                     None,
                     None,
                     None,
+                    Some(self.dormancy(&e)),
                 )
             }
         }
@@ -1149,6 +1171,19 @@ impl VarlinkInterface for Handlers {
             "serving description templates"
         );
         call.reply(rows.into_iter().map(wire::description_template).collect())
+    }
+
+    /// Status, not GitLab data: never an error, whatever the session is.
+    #[instrument(skip(self, call))]
+    async fn get_queue(&self, call: &mut dyn Call_GetQueue) -> varlink::Result<()> {
+        let queue = self.queue.queued().unwrap_or_else(|e| {
+            warn!(error = %e, "queue read failed; returning empty");
+            Default::default()
+        });
+        call.reply(
+            queue.writes.into_iter().map(wire::queued_write).collect(),
+            queue.paused_until.map(|at| at as i64),
+        )
     }
 
     #[instrument(skip(self, call))]
@@ -1269,7 +1304,7 @@ impl VarlinkInterface for Handlers {
             iid,
             op: WriteOp::Close,
         };
-        reply_write!(call, self.perform_write(write).await)
+        reply_write!(self, call, self.perform_write(write).await)
     }
 
     #[instrument(skip(self, call))]
@@ -1289,7 +1324,7 @@ impl VarlinkInterface for Handlers {
             iid,
             op: WriteOp::AssignSelf,
         };
-        reply_write!(call, self.perform_write(write).await)
+        reply_write!(self, call, self.perform_write(write).await)
     }
 
     #[instrument(skip(self, call))]
@@ -1309,7 +1344,7 @@ impl VarlinkInterface for Handlers {
             iid,
             op: WriteOp::UnassignSelf,
         };
-        reply_write!(call, self.perform_write(write).await)
+        reply_write!(self, call, self.perform_write(write).await)
     }
 
     /// Direct, never queued: a create has no target to address a replay by
@@ -1341,8 +1376,8 @@ impl VarlinkInterface for Handlers {
         let session = match self.current_session().await {
             Ok(s) => s,
             Err(r) => {
-                let (reason, detail) = dormant_args(&r);
-                return call.reply_not_authenticated(reason, detail);
+                let (reason, detail, retrying) = self.dormant_args(&r);
+                return call.reply_not_authenticated(reason, detail, retrying);
             }
         };
         // Resolved before the create, so a failed lookup creates nothing.
@@ -1408,18 +1443,19 @@ impl VarlinkInterface for Handlers {
         match self.current_session().await {
             Ok(s) => {
                 let auth = self.config.read().unwrap().auth;
-                let (token_expires_at, token_rotates) = self.rotation.report(&s.gitlab, &auth);
+                let token = self.rotation.report(&s.gitlab, &auth, chrono::Utc::now());
                 call.reply(
                     s.host,
                     s.user_id,
                     s.username,
-                    token_expires_at,
-                    token_rotates,
+                    token.expires_at,
+                    token.rotates,
+                    Some(wire::token_rotation(token)),
                 )
             }
             Err(e) => {
-                let (reason, detail) = dormant_args(&e);
-                call.reply_not_authenticated(reason, detail)
+                let (reason, detail, retrying) = self.dormant_args(&e);
+                call.reply_not_authenticated(reason, detail, retrying)
             }
         }
     }

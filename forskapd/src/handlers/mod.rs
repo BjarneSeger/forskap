@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 
 use forskap_api::{IssuableKind, NotAuthReason, VarlinkCallError, WorkItemRef};
 
@@ -25,6 +25,7 @@ use crate::config::SharedConfig;
 use crate::error::{DormancyReason, Error, Verdict};
 use crate::gitlab::{GitlabApi, GitlabClient};
 use crate::queue::RetryQueue;
+use crate::reconnect::Reconnect;
 use crate::rotate::Rotation;
 use crate::secrets::{Keychain, Token};
 use crate::sync::{SyncHandle, now_secs};
@@ -100,11 +101,12 @@ pub struct Handlers {
     /// Live daemon config, read at use time so a hot reload takes effect
     /// without a restart.
     pub config: SharedConfig,
-    /// Nudged when the sync worker demotes the session to
-    /// `Dormant(Unreachable)` (see [`crate::reconnect::commit_unreachable`]),
-    /// and when a call finds the session waiting for a locked keychain,
-    /// waking the reconnect supervisor.
-    pub reconnect_signal: Arc<Notify>,
+    /// The reconnect supervisor's wakeup — nudged when the sync worker
+    /// demotes the session to `Dormant(Unreachable)` (see
+    /// [`crate::reconnect::commit_unreachable`]) and when a call finds the
+    /// session waiting for a locked keychain — and how the daemon stands
+    /// without a session: since when, and what the supervisor is at.
+    pub reconnect: Arc<Reconnect>,
     /// What the rotation supervisor knows about the session's token, and its
     /// wakeup.
     pub rotation: Arc<Rotation>,
@@ -120,6 +122,25 @@ impl Handlers {
         self.current_session().await.map(|s| s.gitlab)
     }
 
+    /// The `(reason, detail, retrying)` of a `NotAuthenticated` reply for a
+    /// dormancy.
+    fn dormant_args(
+        &self,
+        reason: &DormancyReason,
+    ) -> (Option<NotAuthReason>, Option<String>, Option<bool>) {
+        let retrying = self.retrying(reason);
+        (Some(reason.reason()), reason.detail(), Some(retrying))
+    }
+
+    /// Whether the daemon ends the dormancy `reason` by itself: one of the
+    /// kind the reconnect supervisor retries, with the supervisor running
+    /// (it lives off a keychain) and switched on.
+    fn retrying(&self, reason: &DormancyReason) -> bool {
+        reason.is_auto_retryable()
+            && self.keychain.require().is_ok()
+            && self.config.read().unwrap().reconnect.enabled
+    }
+
     /// Resolve the full session, or `NotAuthenticated` carrying the dormancy
     /// reason.
     async fn current_session(&self) -> std::result::Result<Session, DormancyReason> {
@@ -130,17 +151,12 @@ impl Handlers {
                 // unlocked the keychain: the supervisor looks now, not after
                 // its back-off. This call still gets the reason it found.
                 if matches!(r, DormancyReason::KeychainLocked { .. }) {
-                    self.reconnect_signal.notify_one();
+                    self.reconnect.notify_one();
                 }
                 Err(r.clone())
             }
         }
     }
-}
-
-/// Extract the varlink `(reason, detail)` pair from a dormancy error.
-fn dormant_args(reason: &DormancyReason) -> (Option<NotAuthReason>, Option<String>) {
-    (Some(reason.reason()), reason.detail())
 }
 
 /// An argument value refused before anything is sent or stored: which

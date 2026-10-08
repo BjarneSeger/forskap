@@ -65,10 +65,11 @@ pub(super) async fn on_hold(reply: &GetSyncJobs_Reply) -> Option<String> {
         Err(_) => None,
     };
     Some(match status.filter(|s| !s.connected) {
-        Some(s) => format!(
-            "no GitLab session: {}",
-            friendly::message_for(s.reason, s.detail.as_deref())
-        ),
+        Some(s) => {
+            let retrying = s.dormancy.as_ref().map(|d| d.retrying);
+            let why = friendly::message_for(s.reason, s.detail.as_deref(), retrying);
+            format!("no GitLab session: {why}")
+        }
         None => "no GitLab session".to_string(),
     })
 }

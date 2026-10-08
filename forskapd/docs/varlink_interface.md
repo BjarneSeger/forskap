@@ -33,7 +33,8 @@ methods serve whatever was last synced from the local store
 **Write model**: the methods that change an existing issue or merge request reply
 success even when GitLab is unreachable — the
 operation is persisted to a retry queue and drained on reconnect (exponential backoff,
-dead-lettered after the retry window; see `GetFailures`). Only GitLab *refusing* it
+dead-lettered after the retry window; see `GetQueue` and `GetFailures`), and the
+reply says `queued`. Only GitLab *refusing* it
 surfaces as `GitlabError`, and a `PostTime` GitLab answered with a 5xx as
 `GitlabUnavailable` (see [Errors](#errors)). The reads reflect a write at once — a queued
 or just-applied close/unassign hides the item from the assigned lists, and
@@ -105,6 +106,10 @@ Within a major version, a client can rely on these:
   carries (`IssuableKind`, `HistorySource`, `NotAuthReason`), gets no new variants: a
   new state is a new optional field. The enums only arguments take (`SearchKind`,
   `WorkItemRole`, `WorkItemState`) may get new ones, which an older daemon refuses.
+- A reply that grows by more than one thing takes them in one optional struct
+  (`GetStatus.dormancy`, `WhoAmI.rotation`): the Go binding returns a reply's fields
+  one by one, so each field of its own changes the generated call's signature, and a
+  struct does so once.
 - New methods, types and errors may appear.
 
 And it must tolerate these:
@@ -238,10 +243,12 @@ answer files the issue twice.
 its storage failed (`RecordOpen`, `RetryFailure`, `DismissFailure`,
 `ClearFailures`). Not GitLab's doing; the daemon's log says more.
 
-`NotAuthenticated (reason: ?NotAuthReason, detail: ?string)` — the daemon has no live
-GitLab session (it is *dormant*). `reason` says why; `detail` carries free text (host,
-underlying error) for the reasons that have one. Both fields are optional so older
-daemons that send neither stay compatible — clients fall back to a generic
+`NotAuthenticated (reason: ?NotAuthReason, detail: ?string, retrying: ?bool)` — the
+daemon has no live GitLab session (it is *dormant*). `reason` says why; `detail`
+carries free text (host, underlying error) for the reasons that have one; `retrying`
+(since 1.3) says whether the daemon gets a session by itself, so that there is nothing
+to do but wait, or whether it takes the user. All fields are optional so older
+daemons that send none stay compatible — clients fall back to a generic
 "run `forskap auth login`" message. The `NotAuthReason`s:
 
 | reason           | meaning                                                            |
@@ -261,6 +268,12 @@ waiting for it; meanwhile writes are queued as during an outage. A token GitLab
 rejects while the keychain holds a newer one (rotated by another machine sharing the
 keychain) is reported as `unreachable` for the moment it takes to reconnect with that
 one.
+
+`retrying` is that distinction as the daemon makes it at the moment: true for
+`unreachable` and for a locked keychain, unless auto-reconnect is switched off or
+the daemon runs without a keychain (a dry run), false for every reason that takes a
+login. It is what tells a locked keychain from one that can't be read: both are a
+`keychain_error`, and the enum can't grow.
 
 # Methods
 
@@ -439,7 +452,7 @@ has no templates of; where no kind asked for has synced and there is no session,
 `NotAuthenticated`. A create without a template works regardless: `CreateWorkItem`
 takes the description as given.
 
-### `WhoAmI() -> (host: string, user_id: int, username: string, token_expires_at: ?int, token_rotates: bool)`
+### `WhoAmI() -> (host: string, user_id: int, username: string, token_expires_at: ?int, token_rotates: bool, rotation: ?TokenRotation)`
 
 The connected GitLab host and the authenticated user's ID and login name (`username`:
 the `@name` GitLab shows, what `author_username=` filters take), answered from the
@@ -452,10 +465,22 @@ the token by a fresh one before that, under the current `[auth]` config: `false`
 a token without an expiry or without the needed scope, with `rotate = "never"`, and
 once GitLab refused to rotate it.
 
+`rotation` (since 1.3; every such daemon sends it, empty until it has read the
+token's details) says what is behind that: `at`, the moment the daemon rotates the
+token — the very one it waits for, its share of the spread between machines sharing a
+keychain included — or `skipped`, why it doesn't, in words meant for the user ("it
+lacks the self_rotate scope", "GitLab refused to rotate it", "the keychain holds other
+credentials than the session"). After a failed attempt — reading the token's details,
+or the rotation itself — `last_error` says why and `retry_at` when the next comes; a
+success clears both. `unsaved` is true for as long as a rotated token has not reached
+the keychain: the session runs on it, but the keychain still holds the one GitLab
+revoked, so a daemon restart before the write lands needs a new login. The daemon
+keeps trying.
+
 A dry run (`forskapd --dry-run`) answers with the host `dry-run.invalid` and the user
 `demo`.
 
-### `GetStatus() -> (api_version: string, daemon_version: string, connected: bool, reason: ?NotAuthReason, detail: ?string, host: ?string, username: ?string, user_id: ?int)`
+### `GetStatus() -> (api_version: string, daemon_version: string, connected: bool, reason: ?NotAuthReason, detail: ?string, host: ?string, username: ?string, user_id: ?int, dormancy: ?Dormancy)`
 
 What a client asks first: which version of this interface the daemon speaks and
 whether it has a GitLab session. `api_version` is the version of the `forskap-api`
@@ -470,6 +495,15 @@ and `reason` and `detail` are absent; otherwise `reason` and `detail` are what
 `NotAuthenticated` would carry and the other three are absent. Never an error:
 served whatever the session is, without a GitLab round-trip.
 
+Without a session, `dormancy` (since 1.3) says how the daemon stands: `since` when
+it has none (its start, if it began without one; a change of the reason doesn't move
+it), and `retrying`, as `NotAuthenticated` carries it. While it retries, `retry_at`
+is the time of its next attempt — a connect to GitLab, or a look at a locked
+keychain — `attempts` how many it made since, and `last_error` why the latest
+failed. `detail` stays what the session was lost with; `last_error` follows the
+attempts. A call that finds the session waiting for a locked keychain makes the
+daemon look at once, so `retry_at` can lie in the past by the time it is read.
+
 ## Writing (queued when GitLab is away)
 
 The four methods of this section take the target as `(project_id, iid, kind)` —
@@ -479,25 +513,30 @@ malformed one without attempting or queuing anything. On an unreachable session,
 network failure, a 429 or a 5xx the operation is queued for retry and the call
 **replies success**, except a `PostTime` GitLab answered with a 5xx: it may have
 booked the time, so it is not queued and replies `GitlabUnavailable`. GitLab refusing
-it replies `GitlabError`. Other dormancy reasons reply `NotAuthenticated`.
+it replies `GitlabError`. A session waiting for a locked keychain queues like an
+unreachable one; other dormancy reasons reply `NotAuthenticated`.
 
-### `PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()`
+The reply says which success it was: `queued: true` (since 1.3) when the write went
+to the queue, nothing when GitLab applied it. A daemon before 1.3 says nothing either
+way. `GetQueue` lists what is queued.
+
+### `PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> (queued: ?bool)`
 
 Records spent time on the issuable. `duration` uses GitLab's time-tracking syntax
 (`"1h30m"`, `"45m"`, `"2d"`); an obviously malformed duration replies
 `InvalidArgument` up front. `summary` becomes the timelog note.
 
-### `Close(project_id: int, iid: int, kind: IssuableKind) -> ()`
+### `Close(project_id: int, iid: int, kind: IssuableKind) -> (queued: ?bool)`
 
 Closes the issuable. Immediately reflected: the assigned lists stop showing it
 before the next sync, and `ListWorkItems` shows it as `closed`.
 
-### `AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()`
+### `AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> (queued: ?bool)`
 
 Assigns the authenticated user to the issuable. The assigned list is re-synced
 right after the write lands, so it appears within seconds.
 
-### `UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()`
+### `UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> (queued: ?bool)`
 
 Removes the authenticated user from the issuable's assignees. Immediately
 reflected: the assigned lists, and `ListWorkItems` for the `assignee` role, stop
@@ -553,6 +592,30 @@ Work-item status widgets are out of scope (GitLab sets them through GraphQL
 `workItemUpdate`, a second call with another API surface): the issue starts in the
 project's default status.
 
+## The retry queue
+
+### `GetQueue() -> (writes: []QueuedWrite, paused_until: ?int)`
+
+Since 1.3. The writes waiting to be sent, oldest first — the order they go out in,
+up to `queue.max_in_flight` at once — each with where it is in its retry schedule:
+
+- `running`: an attempt is in flight; `attempts` counts the ones started, since the
+  daemon's start (the schedule is not persisted: after a restart every write is
+  untried and ready).
+- `next_attempt_at`: it backs off until then after a failure, `last_error` being
+  why. The wait doubles from `queue.base_delay_secs` to `queue.max_delay_secs`.
+- `blocked`: an earlier write to the same issue or merge request goes first — also
+  one that backs off — so that they land in the order they were made.
+- `expires_at`: `queued_at` plus `queue.max_lifetime_secs`. An attempt that fails
+  after that is the last, and the write becomes a `FailedTask` with the same `id`.
+
+What holds every write is said once: `paused_until` while a GitLab rate limit (429)
+does, and the session — without one nothing is sent and nothing counts as an
+attempt, so the writes sit there untried; `GetStatus` says whether there is one and
+why not. Never errors; storage trouble degrades to an empty list. A write whose
+`running` attempt succeeds is gone from the list; one GitLab refuses moves to the
+dead letters.
+
 ## Retry-queue failures (dead letters)
 
 Writes that exhausted their retry window or were rejected while draining land in a
@@ -601,6 +664,9 @@ SOCKET=unix:$XDG_RUNTIME_DIR/forskapd.socket
 
 # the interface version the daemon speaks, and its session
 varlinkctl call $SOCKET org.thehoster.forskapd.GetStatus '{}'
+
+# the writes waiting to be sent, and where each is in its retry schedule
+varlinkctl call $SOCKET org.thehoster.forskapd.GetQueue '{}'
 
 # list assigned issues
 varlinkctl call $SOCKET org.thehoster.forskapd.GetAssignedWorkItems '{}'

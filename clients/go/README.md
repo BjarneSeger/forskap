@@ -94,7 +94,11 @@ case !status.Compatible():
 `Compatible` holds for a daemon of the same major version and a minor version at least
 the binding's; a patch apart is a fix to a binding alone.
 `GetStatus` also says whether the daemon has a GitLab session, and never fails for
-want of one.
+want of one. Without one, `status.Dormancy` (nil from a daemon older than v1.3.0)
+says since when, and whether there is anything to do but wait: `Retrying` is true
+while the daemon gets a session by itself — it reconnects to a GitLab it can't
+reach, or waits for a locked keychain — with `Retry_at` the time of its next
+attempt. A `*forskap.NotAuthenticated` carries the same `Retrying`.
 
 ### Errors
 
@@ -136,6 +140,14 @@ connection releaser. Enum values come from constants: `KindWorkItem` /
 `KindMergeRequest` for an `IssuableKind`, `Search*` for the kinds of `Search`,
 `RoleAuthor` / `RoleAssignee` and `StateOpened` / `StateClosed` for the role and
 the states of `ListWorkItems`.
+
+`c.PostTime`, `c.CloseIssuable`, `c.AssignSelf` and `c.UnassignSelf` return nil when
+GitLab applied the write and when the daemon queued it because GitLab was away.
+`c.GetQueue` (v1.3.0) lists what is queued, oldest first, with where each write is
+in its retry schedule (`Attempts`, `Running`, `Next_attempt_at`, `Last_error`,
+`Blocked` behind an earlier write to the same item, `Expires_at`), and
+`Queue.PausedUntil` while a GitLab rate limit holds them all; `c.GetFailures` lists
+the ones the daemon gave up on.
 
 ### Work items
 
@@ -215,7 +227,9 @@ those of one `IssuableKind` — for a client that lets the user pick one before
 project, or not yet — as for one that has none.
 
 `c.WhoAmI` returns the `Account` the daemon is connected as, its token's expiry and
-rotation included.
+rotation included; `Account.Rotation` (nil from a daemon older than v1.3.0) says
+when the daemon rotates the token or why it doesn't, and what its latest attempt
+came to.
 
 It is the one write the daemon never queues: while GitLab is unreachable it fails
 with `*forskap.NotAuthenticated`, GitLab refusing it (a parent it can't find

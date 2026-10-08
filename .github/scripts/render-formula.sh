@@ -189,7 +189,11 @@ cat <<'RUBY'
         sleep 0.5
       end
       assert_predicate socket, :socket?
-      assert_equal "[]", shell_output("#{bin}/forskap queue list --output json").strip
+      # Nothing queued and nothing failed: one object since 1.3, the array of
+      # failures before.
+      listed = JSON.parse(shell_output("#{bin}/forskap queue list --output json"))
+      assert_empty listed["queued"]
+      assert_empty listed["failures"]
     ensure
       Process.kill("TERM", pid)
       Process.wait(pid)

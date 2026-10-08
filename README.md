@@ -63,7 +63,8 @@ file.
 The suggested scopes include `self_rotate`: with it the daemon replaces the token by a
 fresh one shortly before it expires, so a short expiry doesn't mean logging in again
 ([details](forskapd/README.md#token-rotation)). `forskap auth status` shows when the
-token expires and whether it is rotated.
+token expires and when the daemon rotates it — or why it doesn't, and what a failed
+attempt came to.
 
 The daemon keeps working offline: reads serve the local cache, and time you log
 while GitLab is unreachable is queued and posted once it reconnects.
@@ -92,7 +93,7 @@ forskap time log 42 1h30m       # log time on issue #42
 forskap time log '!42' 1h30m    # ... on merge request !42 (or: forskap time log 42 1h30m --mr)
 forskap time history            # what you tracked recently (including queued entries)
 forskap activity --days 30      # what you did on GitLab: pushes, comments, opened and merged items
-forskap queue list              # writes that failed permanently; `retry`/`dismiss` them
+forskap queue list              # writes waiting to be sent, and the ones that failed for good; `retry`/`dismiss` those
 forskap sync refresh            # drop the cache and fetch again; a terminal sees how far that is
 forskap sync jobs               # what the background sync runs now, next, and what failed
 forskap status                  # is anything not working? daemon, login, sync, failed writes
@@ -129,6 +130,15 @@ waits for: `needs a session` (why there is none stands above the table),
 time), `when a slot is free`; `in 40s (startup)` is a job the daemon's start spreads
 out.
 
+A write made while GitLab is away is queued, and the command says so: `queued 1h on
+#42` instead of `logged 1h on #42`, with a line that it is not sent yet.
+`forskap queue list` shows what waits, oldest first, each write with what it waits
+for — `waits for a GitLab session` (why there is none stands above the list),
+`after an earlier write to it`, `failed 3 times: …; next try in 4m` — above the
+writes that failed for good. `-o json` is one object, `{"queued": […], "failures":
+[…]}` (it was the array of failures before 1.3), with `paused_until` while a rate
+limit holds the queue.
+
 `forskap sync refresh` replies once the daemon has fetched the assigned lists and
 the history again. Where it couldn't, a second line says what is missing and why —
 `not synced again: no GitLab session: …`, a rate limit's pause, the job whose fetch
@@ -139,7 +149,12 @@ so a cleared cache is not taken for a fresh one.
 daemon answers (and runs the CLI's version), that it is logged in to GitLab, that no
 sync job fails, hangs or is left waiting, and that no queued write failed for good.
 Each check comes out `ok`, `warning` or `error`; the exit status is non-zero only when
-one is an error, so a script or a shell prompt can call it too.
+one is an error, so a script or a shell prompt can call it too. Without a GitLab
+session it says how the daemon stands: since when, whether it gets one by itself —
+it reconnects to a GitLab it can't reach, and waits for a keychain that is locked,
+as one is when the daemon starts before you log in — what its attempts came to and
+when the next one comes. Those two are warnings; what takes a `forskap auth login`
+is an error.
 
 ## Config
 
