@@ -1049,6 +1049,7 @@ mod tests {
             username: "ada".to_string(),
             token_expires_at: Some(NOW + 90 * DAY),
             token_rotates: true,
+            rotation: None,
         }
     }
 

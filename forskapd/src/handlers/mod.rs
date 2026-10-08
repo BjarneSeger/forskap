@@ -122,6 +122,25 @@ impl Handlers {
         self.current_session().await.map(|s| s.gitlab)
     }
 
+    /// The `(reason, detail, retrying)` of a `NotAuthenticated` reply for a
+    /// dormancy.
+    fn dormant_args(
+        &self,
+        reason: &DormancyReason,
+    ) -> (Option<NotAuthReason>, Option<String>, Option<bool>) {
+        let retrying = self.retrying(reason);
+        (Some(reason.reason()), reason.detail(), Some(retrying))
+    }
+
+    /// Whether the daemon ends the dormancy `reason` by itself: one of the
+    /// kind the reconnect supervisor retries, with the supervisor running
+    /// (it lives off a keychain) and switched on.
+    fn retrying(&self, reason: &DormancyReason) -> bool {
+        reason.is_auto_retryable()
+            && self.keychain.require().is_ok()
+            && self.config.read().unwrap().reconnect.enabled
+    }
+
     /// Resolve the full session, or `NotAuthenticated` carrying the dormancy
     /// reason.
     async fn current_session(&self) -> std::result::Result<Session, DormancyReason> {
@@ -138,11 +157,6 @@ impl Handlers {
             }
         }
     }
-}
-
-/// Extract the varlink `(reason, detail)` pair from a dormancy error.
-fn dormant_args(reason: &DormancyReason) -> (Option<NotAuthReason>, Option<String>) {
-    (Some(reason.reason()), reason.detail())
 }
 
 /// An argument value refused before anything is sent or stored: which
