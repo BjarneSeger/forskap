@@ -1408,7 +1408,8 @@ impl VarlinkInterface for Handlers {
         match self.current_session().await {
             Ok(s) => {
                 let auth = self.config.read().unwrap().auth;
-                let (token_expires_at, token_rotates) = self.rotation.report(&s.gitlab, &auth);
+                let token = self.rotation.report(&s.gitlab, &auth, chrono::Utc::now());
+                let (token_expires_at, token_rotates) = (token.expires_at, token.rotates);
                 call.reply(
                     s.host,
                     s.user_id,

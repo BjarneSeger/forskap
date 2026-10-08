@@ -14,6 +14,7 @@
 //! A failed rotation never demotes the session: the sync worker stays the
 //! demotion authority. The token itself is never logged.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -52,19 +53,49 @@ const PACING: Pacing = Pacing {
 };
 
 /// What the supervisor shares with the handlers: its wakeup, and what it
-/// knows about the session's token (for `WhoAmI`).
+/// knows about the session's token and is at with it (for `WhoAmI`).
 #[derive(Default)]
 pub struct Rotation {
     signal: Notify,
     status: Mutex<Option<Status>>,
+    /// A rotated token is not in the keychain yet (see [`keep_storing`]).
+    /// The keychain's state, not one session's: it outlives the status.
+    unsaved: AtomicBool,
 }
 
 struct Status {
     /// The client whose token this is about.
     client: Arc<dyn GitlabApi>,
-    info: TokenInfo,
-    /// GitLab refused to rotate this token.
-    refused: bool,
+    /// `None` while the token's lifetime couldn't be read yet.
+    info: Option<TokenInfo>,
+    /// The supervisor's share of the rotation point's spread (see [`plan`]):
+    /// the moment it rotates at is the one reported.
+    spread: f64,
+    /// Why this token is left alone though it could rotate by its lifetime
+    /// and scopes: GitLab refused, or the keychain holds another one.
+    left_alone: Option<&'static str>,
+    /// Why the latest attempt failed, with the unix seconds of the next.
+    failure: Option<(String, Option<i64>)>,
+}
+
+/// What `WhoAmI` says about the session's token.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenReport {
+    /// Unix seconds it expires at; `None` for one that doesn't, and while
+    /// that isn't known.
+    pub expires_at: Option<i64>,
+    /// Whether the daemon rotates it before that.
+    pub rotates: bool,
+    /// Unix seconds it rotates at, while it does.
+    pub at: Option<i64>,
+    /// Why it doesn't, in words, where that is known.
+    pub skipped: Option<String>,
+    /// Why the latest attempt (reading its lifetime, or rotating) failed.
+    pub last_error: Option<String>,
+    /// Unix seconds of the next attempt after a failure.
+    pub retry_at: Option<i64>,
+    /// The rotated token is not in the keychain yet.
+    pub unsaved: bool,
 }
 
 impl Rotation {
@@ -73,30 +104,82 @@ impl Rotation {
         self.signal.notify_one();
     }
 
-    /// For `WhoAmI`: when the token of `client` expires (unix seconds), and
-    /// whether it rotates under `auth`. Unknown reads as `(None, false)`.
-    pub fn report(&self, client: &Arc<dyn GitlabApi>, auth: &AuthConfig) -> (Option<i64>, bool) {
+    /// For `WhoAmI`: when the token of `client` expires, whether and when it
+    /// rotates under `auth` as of `now` or why not, and what the last attempt
+    /// came to. What isn't known yet is left out.
+    pub fn report(
+        &self,
+        client: &Arc<dyn GitlabApi>,
+        auth: &AuthConfig,
+        now: DateTime<Utc>,
+    ) -> TokenReport {
+        let unsaved = self.unsaved.load(Ordering::SeqCst);
         let status = self.status.lock().unwrap();
         let Some(status) = status.as_ref().filter(|s| Arc::ptr_eq(&s.client, client)) else {
-            return (None, false);
+            return TokenReport {
+                unsaved,
+                ..TokenReport::default()
+            };
         };
-        let rotates =
-            !status.refused && matches!(plan(auth, &status.info, Utc::now(), 0.0), Plan::At(_));
-        let expires_at = status.info.expires_at.map(|d| expiry(d).timestamp());
-        (expires_at, rotates)
+        let (last_error, retry_at) = match &status.failure {
+            Some((error, retry_at)) => (Some(error.clone()), *retry_at),
+            None => (None, None),
+        };
+        let planned = status
+            .info
+            .as_ref()
+            .map(|info| plan(auth, info, now, status.spread));
+        let (at, skipped) = match (planned, status.left_alone) {
+            (Some(Plan::Idle(why)), _) => (None, Some(why.describe().to_string())),
+            (Some(Plan::At(_)), Some(why)) => (None, Some(why.to_string())),
+            (Some(Plan::At(at)), None) => (Some(at.timestamp()), None),
+            (None, _) => (None, None),
+        };
+        let expires = status.info.as_ref().and_then(|info| info.expires_at);
+        TokenReport {
+            expires_at: expires.map(|d| expiry(d).timestamp()),
+            rotates: at.is_some(),
+            at,
+            skipped,
+            last_error,
+            retry_at,
+            unsaved,
+        }
     }
 
-    pub(crate) fn publish(&self, client: &Arc<dyn GitlabApi>, info: &TokenInfo) {
+    /// The lifetime of the token of `client` is known: `info`.
+    pub(crate) fn publish(&self, client: &Arc<dyn GitlabApi>, info: &TokenInfo, spread: f64) {
         *self.status.lock().unwrap() = Some(Status {
             client: Arc::clone(client),
-            info: info.clone(),
-            refused: false,
+            info: Some(info.clone()),
+            spread,
+            left_alone: None,
+            failure: None,
         });
     }
 
-    fn refuse(&self) {
+    /// An attempt on the token of `client` failed for `error`; the next comes
+    /// at `retry_at`, or none does. Kept also where the token's lifetime
+    /// never got read: that failure is all there is to say then.
+    fn failed(&self, client: &Arc<dyn GitlabApi>, error: String, retry_at: Option<i64>) {
+        let mut slot = self.status.lock().unwrap();
+        let status = match slot.as_mut().filter(|s| Arc::ptr_eq(&s.client, client)) {
+            Some(status) => status,
+            None => slot.insert(Status {
+                client: Arc::clone(client),
+                info: None,
+                spread: 0.0,
+                left_alone: None,
+                failure: None,
+            }),
+        };
+        status.failure = Some((error, retry_at));
+    }
+
+    /// The token is left alone for `why`, whatever its lifetime says.
+    fn leave_alone(&self, why: &'static str) {
         if let Some(status) = self.status.lock().unwrap().as_mut() {
-            status.refused = true;
+            status.left_alone = Some(why);
         }
     }
 
@@ -349,10 +432,12 @@ impl<E: Env> Supervisor<E> {
                 Ok(info) => {
                     watch.info = Some(info.clone());
                     watch.backoff = None;
-                    self.rotation.publish(&session.gitlab, &info);
+                    self.rotation.publish(&session.gitlab, &info, self.spread);
                     info
                 }
-                Err(e) => return self.failed(e, "reading the GitLab token's expiry", false),
+                Err(e) => {
+                    return self.failed(&session, e, "reading the GitLab token's expiry", false);
+                }
             },
         };
 
@@ -393,12 +478,17 @@ impl<E: Env> Supervisor<E> {
                         "the keychain holds other credentials than the session; not rotating its token"
                     );
                 }
+                self.rotation
+                    .leave_alone("the keychain holds other credentials than the session");
                 return self.pacing.recheck;
             }
             // Unreadable is unwritable: the new token would have no home.
             Err(e) => {
                 let wait = self.retry_later();
                 warn!(error = %e, retry_secs = wait.as_secs(), "keychain read failed; postponing the token rotation");
+                let error = format!("reading the keychain failed: {e}");
+                self.rotation
+                    .failed(&session.gitlab, error, Some(self.after(wait)));
                 return wait;
             }
         }
@@ -414,7 +504,7 @@ impl<E: Env> Supervisor<E> {
         };
         let mut rotated = match rotated {
             Ok(rotated) => rotated,
-            Err(e) => return self.failed(e, "rotating the GitLab token", true),
+            Err(e) => return self.failed(session, e, "rotating the GitLab token", true),
         };
         // Without it the lead isn't capped, and a short default lifetime
         // would be due again at once.
@@ -434,9 +524,11 @@ impl<E: Env> Supervisor<E> {
                  token, so after a daemon restart `forskap auth login` with a new token is \
                  needed; still retrying"
             );
+            self.rotation.unsaved.store(true, Ordering::SeqCst);
             tokio::spawn(keep_storing(
                 Arc::clone(&self.env),
                 Arc::clone(&self.session),
+                Arc::clone(&self.rotation),
                 creds.clone(),
                 self.pacing,
             ));
@@ -455,7 +547,7 @@ impl<E: Env> Supervisor<E> {
             info!("session switched to the rotated GitLab token");
             // Without the lifetime the next evaluation reads it.
             if let Some(info) = &rotated.info {
-                self.rotation.publish(&client, info);
+                self.rotation.publish(&client, info, self.spread);
             }
             self.watch = Some(Watch::new(&client, rotated.info));
             self.env.swapped();
@@ -547,13 +639,25 @@ impl<E: Env> Supervisor<E> {
         wait
     }
 
+    /// The unix second `wait` from now, by the supervisor's clock.
+    fn after(&self, wait: Duration) -> i64 {
+        let wait = TimeDelta::from_std(wait).unwrap_or(TimeDelta::MAX);
+        self.env
+            .now()
+            .checked_add_signed(wait)
+            .map_or(i64::MAX, |at| at.timestamp())
+    }
+
     /// Sort a GitLab failure: retry with backoff, leave a dead token to the
     /// sync worker, or give this token up.
-    fn failed(&mut self, e: Error, what: &str, loud: bool) -> Duration {
+    fn failed(&mut self, session: &Session, e: Error, what: &str, loud: bool) -> Duration {
         if e.is_retryable(true) {
             let wait = self.retry_later();
             let wait = e.retry_after().map_or(wait, |r| r.max(wait));
             warn!(error = %e, retry_secs = wait.as_secs(), "{what} failed; retrying");
+            let error = format!("{what} failed: {e}");
+            self.rotation
+                .failed(&session.gitlab, error, Some(self.after(wait)));
             return wait;
         }
         if matches!(e, Error::Unauthorized(_)) {
@@ -570,7 +674,10 @@ impl<E: Env> Supervisor<E> {
         if let Some(watch) = &mut self.watch {
             watch.refused = true;
         }
-        self.rotation.refuse();
+        // No further attempt: what GitLab said is all that is left to say.
+        self.rotation
+            .failed(&session.gitlab, format!("{what} was refused: {e}"), None);
+        self.rotation.leave_alone("GitLab refused to rotate it");
         self.pacing.recheck
     }
 }
@@ -608,6 +715,7 @@ async fn commit_rotated(slot: &SessionSlot, rotated: &Session, fresh: Session) -
 async fn keep_storing<E: Env>(
     env: Arc<E>,
     session: SessionSlot,
+    rotation: Arc<Rotation>,
     creds: Credentials,
     pacing: Pacing,
 ) {
@@ -622,16 +730,18 @@ async fn keep_storing<E: Env>(
             }
         };
         if obsolete {
-            return;
+            break;
         }
         match env.store(&creds).await {
             Ok(()) => {
                 info!("stored the rotated GitLab token after all");
-                return;
+                break;
             }
             Err(e) => debug!(error = %e, "storing the rotated GitLab token still fails"),
         }
     }
+    // Stored, or no longer the token to store: nothing is unsaved either way.
+    rotation.unsaved.store(false, Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -974,14 +1084,15 @@ mod tests {
         assert_eq!(rig.fake.token_info_calls(), 1);
         assert!(rig.fake.rotations().is_empty());
         let client: Arc<dyn GitlabApi> = rig.fake.clone();
-        assert_eq!(
-            rig.rotation.report(&client, &auth(RotatePolicy::Scoped)),
-            (Some(at("2026-12-31T00:00:00Z").timestamp()), true)
-        );
-        assert_eq!(
-            rig.rotation.report(&client, &auth(RotatePolicy::Never)),
-            (Some(at("2026-12-31T00:00:00Z").timestamp()), false)
-        );
+        let expires = Some(at("2026-12-31T00:00:00Z").timestamp());
+        let scoped = rig
+            .rotation
+            .report(&client, &auth(RotatePolicy::Scoped), rig.env.now);
+        assert_eq!((scoped.expires_at, scoped.rotates), (expires, true));
+        let never = rig
+            .rotation
+            .report(&client, &auth(RotatePolicy::Never), rig.env.now);
+        assert_eq!((never.expires_at, never.rotates), (expires, false));
     }
 
     #[tokio::test]
@@ -1002,8 +1113,10 @@ mod tests {
         assert_eq!(rig.fake.token_info_calls(), 1);
         assert!(rig.fake.rotations().is_empty());
         let client: Arc<dyn GitlabApi> = rig.fake.clone();
-        let (expires_at, rotates) = rig.rotation.report(&client, &auth(RotatePolicy::Scoped));
-        assert!(expires_at.is_some() && !rotates);
+        let report = rig
+            .rotation
+            .report(&client, &auth(RotatePolicy::Scoped), rig.env.now);
+        assert!(report.expires_at.is_some() && !report.rotates);
     }
 
     #[tokio::test]
@@ -1024,9 +1137,11 @@ mod tests {
         let ConnState::Connected(fresh) = &*rig.session.read().await else {
             panic!("connected");
         };
+        let report = rig
+            .rotation
+            .report(&fresh.gitlab, &auth(RotatePolicy::Scoped), rig.env.now);
         assert_eq!(
-            rig.rotation
-                .report(&fresh.gitlab, &auth(RotatePolicy::Scoped)),
+            (report.expires_at, report.rotates),
             (Some(at("2027-12-25T00:00:00Z").timestamp()), true)
         );
     }
@@ -1121,9 +1236,133 @@ mod tests {
             retry_after: Some(Duration::from_secs(500)),
             detail: "busy".into(),
         };
+        let session = session_on(&rig.fake, "old");
         assert_eq!(
-            rig.supervisor.failed(throttled, "rotating", true),
+            rig.supervisor.failed(&session, throttled, "rotating", true),
             Duration::from_secs(500)
+        );
+    }
+
+    /// `WhoAmI` says when the token rotates, at the very moment the
+    /// supervisor waits for, or why it doesn't.
+    #[tokio::test]
+    async fn the_report_says_when_the_token_rotates_or_why_not() {
+        let mut rig = rig(yearly(), "2026-06-01T00:00:00Z");
+        rig.supervisor.spread = 0.5;
+        rig.supervisor.engage().await;
+        let client: Arc<dyn GitlabApi> = rig.fake.clone();
+
+        let scoped = auth(RotatePolicy::Scoped);
+        let report = rig.rotation.report(&client, &scoped, rig.env.now);
+        // The moment `plan` gives this daemon's share of the spread.
+        let Plan::At(due) = plan(&scoped, &yearly(), rig.env.now, 0.5) else {
+            panic!("a year-long self_rotate token rotates");
+        };
+        assert_eq!((report.at, report.rotates), (Some(due.timestamp()), true));
+        assert_eq!((&report.skipped, &report.last_error), (&None, &None));
+
+        let off = rig
+            .rotation
+            .report(&client, &auth(RotatePolicy::Never), rig.env.now);
+        assert_eq!((off.at, off.rotates), (None, false));
+        assert_eq!(off.skipped.as_deref(), Some("auth.rotate is \"never\""));
+
+        // Before the supervisor looked, nothing is known.
+        let other: Arc<dyn GitlabApi> = Arc::new(FakeGitlab::default());
+        assert_eq!(
+            rig.rotation.report(&other, &scoped, rig.env.now),
+            TokenReport::default()
+        );
+    }
+
+    /// A token whose lifetime can't be read yet is no token without one: the
+    /// report carries the failure and when it is tried again.
+    #[tokio::test]
+    async fn a_failed_rotation_shows_with_its_retry_time() {
+        let mut rig = rig(yearly(), "2026-12-25T09:00:00Z");
+        rig.supervisor.pacing.retry_base = Duration::from_secs(30);
+        rig.supervisor.pacing.retry_max = Duration::from_secs(30);
+        rig.fake.fail_next(TOKEN_PATH, FakeErr::Transient);
+        let client: Arc<dyn GitlabApi> = rig.fake.clone();
+        let scoped = auth(RotatePolicy::Scoped);
+
+        rig.supervisor.engage().await;
+        let report = rig.rotation.report(&client, &scoped, rig.env.now);
+        assert_eq!((report.expires_at, report.rotates), (None, false));
+        let why = report.last_error.unwrap();
+        assert!(
+            why.starts_with("reading the GitLab token's expiry failed"),
+            "{why}"
+        );
+        let now = at("2026-12-25T09:00:00Z").timestamp();
+        assert_eq!(report.retry_at, Some(now + 30));
+
+        // The rotation itself failing keeps what is known about the token.
+        rig.fake.fail_next(ROTATE_PATH, FakeErr::Transient);
+        rig.supervisor.engage().await;
+        let report = rig.rotation.report(&client, &scoped, rig.env.now);
+        assert!(report.expires_at.is_some());
+        let why = report.last_error.unwrap();
+        assert!(why.starts_with("rotating the GitLab token failed"), "{why}");
+        assert_eq!(report.retry_at, Some(now + 30));
+
+        // GitLab refusing it ends the attempts, and says so.
+        rig.fake.fail_next(ROTATE_PATH, FakeErr::Rejected);
+        rig.fake.fail_next(ROTATE_PATH, FakeErr::Rejected);
+        rig.supervisor.engage().await;
+        let report = rig.rotation.report(&client, &scoped, rig.env.now);
+        assert_eq!((report.rotates, report.retry_at), (false, None));
+        assert_eq!(
+            report.skipped.as_deref(),
+            Some("GitLab refused to rotate it")
+        );
+        assert!(report.last_error.unwrap().contains("was refused"));
+    }
+
+    /// Until the rotated token reached the keychain, a restart would find
+    /// the revoked one there: that is said for as long as it lasts.
+    #[tokio::test]
+    async fn a_rotated_token_the_keychain_refuses_shows_as_unsaved_until_stored() {
+        let mut rig = rig(yearly(), "2026-12-25T09:00:00Z");
+        rig.supervisor.pacing.retry_base = Duration::from_millis(20);
+        rig.supervisor.pacing.retry_max = Duration::from_millis(20);
+        rig.env
+            .store_failures
+            .store(KEYCHAIN_ATTEMPTS as usize + 2, SeqCst);
+
+        rig.supervisor.engage().await;
+        let ConnState::Connected(fresh) = &*rig.session.read().await else {
+            panic!("connected on the rotated token");
+        };
+        let client = Arc::clone(&fresh.gitlab);
+        let scoped = auth(RotatePolicy::Scoped);
+        assert!(rig.rotation.report(&client, &scoped, rig.env.now).unsaved);
+
+        eventually("the background keychain write", || {
+            !rig.rotation.report(&client, &scoped, rig.env.now).unsaved
+        })
+        .await;
+        assert_eq!(rig.env.stored().as_deref(), Some("rotated-1"));
+    }
+
+    /// Another machine rotated first: this daemon leaves the token alone and
+    /// says why, though by its lifetime it would be due.
+    #[tokio::test]
+    async fn a_token_rotated_elsewhere_says_why_it_is_left_alone() {
+        let mut rig = rig(yearly(), "2026-12-25T09:00:00Z");
+        *rig.env.keychain.lock().unwrap() = Some(Credentials {
+            host: HOST.into(),
+            token: Token::new("rotated-elsewhere"),
+        });
+        rig.supervisor.engage().await;
+        let client: Arc<dyn GitlabApi> = rig.fake.clone();
+        let report = rig
+            .rotation
+            .report(&client, &auth(RotatePolicy::Scoped), rig.env.now);
+        assert!(!report.rotates);
+        assert_eq!(
+            report.skipped.as_deref(),
+            Some("the keychain holds other credentials than the session")
         );
     }
 
@@ -1145,7 +1384,10 @@ mod tests {
         assert_eq!(live_token(&rig.session).await.as_deref(), Some("old"));
         assert_eq!(rig.env.stored().as_deref(), Some("old"));
         let client: Arc<dyn GitlabApi> = rig.fake.clone();
-        let (_, rotates) = rig.rotation.report(&client, &auth(RotatePolicy::Scoped));
+        let rotates = rig
+            .rotation
+            .report(&client, &auth(RotatePolicy::Scoped), rig.env.now)
+            .rotates;
         assert!(!rotates);
     }
 
@@ -1172,10 +1414,10 @@ mod tests {
         assert_eq!(rig.fake.token_info_calls(), 1);
         assert!(rig.fake.rotations().is_empty());
         let client: Arc<dyn GitlabApi> = rig.fake.clone();
-        assert_eq!(
-            rig.rotation.report(&client, &auth(RotatePolicy::Scoped)),
-            (None, false)
-        );
+        let report = rig
+            .rotation
+            .report(&client, &auth(RotatePolicy::Scoped), rig.env.now);
+        assert_eq!((report.expires_at, report.rotates), (None, false));
     }
 
     #[tokio::test]
