@@ -3,11 +3,13 @@
 use forskap_api::admin::{SyncJob, SyncJobHold, SyncJobStatus};
 use forskap_api::{
     ActivityEvent, DescriptionTemplate, Group, HistoryEvent, HistorySource, IssuableKind,
-    MergeRequest, Project, WorkItem, WorkItemRef, WorkItemState,
+    MergeRequest, Project, QueuedWrite, TokenRotation, WorkItem, WorkItemRef, WorkItemState,
 };
 
 use crate::gitlab::Issuable;
 use crate::query::{board_column, namespace_of};
+use crate::queue::QueuedWriteView;
+use crate::rotate::TokenReport;
 use crate::sync::{Hold, JobInfo, JobStatus, model};
 
 /// What a wire item shows of its project.
@@ -231,6 +233,37 @@ pub fn sync_job(j: JobInfo) -> SyncJob {
         expected: j.expected.map(|rows| rows as i64),
         held_by,
         behind,
+    }
+}
+
+/// A write waiting in the retry queue, as the queue lists it.
+pub fn queued_write(w: QueuedWriteView) -> QueuedWrite {
+    QueuedWrite {
+        id: w.id as i64,
+        op: w.op_kind.to_string(),
+        kind: kind(w.kind),
+        project_id: w.project_id,
+        iid: w.iid,
+        detail: w.detail,
+        queued_at: w.queued_at_secs as i64,
+        attempts: i64::from(w.attempts),
+        running: w.running,
+        blocked: w.blocked,
+        next_attempt_at: w.next_attempt_at.map(|at| at as i64),
+        last_error: w.last_error,
+        expires_at: w.expires_at as i64,
+    }
+}
+
+/// What the token rotation is at, beside the expiry `WhoAmI` always had.
+/// `unsaved` is sent only while it is the case.
+pub fn token_rotation(t: TokenReport) -> TokenRotation {
+    TokenRotation {
+        at: t.at,
+        skipped: t.skipped,
+        last_error: t.last_error,
+        retry_at: t.retry_at,
+        unsaved: t.unsaved.then_some(true),
     }
 }
 

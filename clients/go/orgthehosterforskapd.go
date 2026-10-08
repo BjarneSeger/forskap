@@ -89,6 +89,23 @@ type FailedTask struct {
 	Failed_at  int64        `json:"failed_at"`
 }
 
+// A write waiting in the retry queue. Since 1.3.
+type QueuedWrite struct {
+	Id              int64        `json:"id"`
+	Op              string       `json:"op"`
+	Kind            IssuableKind `json:"kind"`
+	Project_id      int64        `json:"project_id"`
+	Iid             int64        `json:"iid"`
+	Detail          string       `json:"detail"`
+	Queued_at       int64        `json:"queued_at"`
+	Attempts        int64        `json:"attempts"`
+	Running         bool         `json:"running"`
+	Blocked         bool         `json:"blocked"`
+	Next_attempt_at *int64       `json:"next_attempt_at,omitempty"`
+	Last_error      *string      `json:"last_error,omitempty"`
+	Expires_at      int64        `json:"expires_at"`
+}
+
 type MergeRequest struct {
 	Id             int64    `json:"id"`
 	Iid            int64    `json:"iid"`
@@ -176,6 +193,24 @@ type DescriptionTemplate struct {
 	Content string       `json:"content"`
 }
 
+// How the daemon stands without a GitLab session. Since 1.3.
+type Dormancy struct {
+	Since      *int64  `json:"since,omitempty"`
+	Retrying   bool    `json:"retrying"`
+	Retry_at   *int64  `json:"retry_at,omitempty"`
+	Attempts   *int64  `json:"attempts,omitempty"`
+	Last_error *string `json:"last_error,omitempty"`
+}
+
+// What the daemon's token rotation is at. Since 1.3.
+type TokenRotation struct {
+	At         *int64  `json:"at,omitempty"`
+	Skipped    *string `json:"skipped,omitempty"`
+	Last_error *string `json:"last_error,omitempty"`
+	Retry_at   *int64  `json:"retry_at,omitempty"`
+	Unsaved    *bool   `json:"unsaved,omitempty"`
+}
+
 // The call fits the interface, but an argument's value is not acceptable (a
 // number that isn't positive, a malformed duration, a blank title, …): nothing
 // was sent to GitLab or stored. argument names it, a nested value by its path
@@ -239,15 +274,18 @@ func (e Internal) Error() string {
 }
 
 // The daemon has no live GitLab session; detail carries the host and the
-// underlying error for the reasons that have one.
+// underlying error for the reasons that have one. retrying (since 1.3): true
+// while the daemon gets a session by itself and there is nothing to do but
+// wait, false where it takes the user.
 type NotAuthenticated struct {
-	Reason *NotAuthReason `json:"reason,omitempty"`
-	Detail *string        `json:"detail,omitempty"`
+	Reason   *NotAuthReason `json:"reason,omitempty"`
+	Detail   *string        `json:"detail,omitempty"`
+	Retrying *bool          `json:"retrying,omitempty"`
 }
 
 func (e NotAuthenticated) Error() string {
 	s := "org.thehoster.forskapd.NotAuthenticated"
-	s += fmt.Sprintf("(Reason: %v, Detail: %v)", e.Reason, e.Detail)
+	s += fmt.Sprintf("(Reason: %v, Detail: %v, Retrying: %v)", e.Reason, e.Detail, e.Retrying)
 	return s
 }
 
@@ -588,20 +626,22 @@ func (m Search_methods) Upgrade(ctx context.Context, c *varlink.Connection, quer
 }
 
 // Logs spent time on an issue or merge request; queued while GitLab is away.
+// queued (since 1.3): true when it was queued instead of applied (GetQueue
+// lists it), absent when GitLab applied it.
 type PostTime_methods struct{}
 
 func PostTime() PostTime_methods { return PostTime_methods{} }
 
-func (m PostTime_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind, duration_in_ string, summary_in_ *string) (err_ error) {
+func (m PostTime_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind, duration_in_ string, summary_in_ *string) (queued_out_ *bool, err_ error) {
 	receive, err_ := m.Send(ctx, c, 0, project_id_in_, iid_in_, kind_in_, duration_in_, summary_in_)
 	if err_ != nil {
 		return
 	}
-	_, err_ = receive(ctx)
+	queued_out_, _, err_ = receive(ctx)
 	return
 }
 
-func (m PostTime_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind, duration_in_ string, summary_in_ *string) (func(ctx context.Context) (uint64, error), error) {
+func (m PostTime_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind, duration_in_ string, summary_in_ *string) (func(ctx context.Context) (*bool, uint64, error), error) {
 	var in struct {
 		Project_id int64        `json:"project_id"`
 		Iid        int64        `json:"iid"`
@@ -618,17 +658,21 @@ func (m PostTime_methods) Send(ctx context.Context, c *varlink.Connection, flags
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (flags uint64, err error) {
-		flags, err = receive(ctx, nil)
+	return func(context.Context) (queued_out_ *bool, flags uint64, err error) {
+		var out struct {
+			Queued *bool `json:"queued,omitempty"`
+		}
+		flags, err = receive(ctx, &out)
 		if err != nil {
 			err = Dispatch_Error(err)
 			return
 		}
+		queued_out_ = out.Queued
 		return
 	}, nil
 }
 
-func (m PostTime_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind, duration_in_ string, summary_in_ *string) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m PostTime_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind, duration_in_ string, summary_in_ *string) (func(ctx context.Context) (queued_out_ *bool, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
 		Project_id int64        `json:"project_id"`
 		Iid        int64        `json:"iid"`
@@ -645,31 +689,36 @@ func (m PostTime_methods) Upgrade(ctx context.Context, c *varlink.Connection, pr
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (flags uint64, conn varlink.ReadWriterContext, err error) {
-		flags, conn, err = receive(ctx, nil)
+	return func(context.Context) (queued_out_ *bool, flags uint64, conn varlink.ReadWriterContext, err error) {
+		var out struct {
+			Queued *bool `json:"queued,omitempty"`
+		}
+		flags, conn, err = receive(ctx, &out)
 		if err != nil {
 			err = Dispatch_Error(err)
 			return
 		}
+		queued_out_ = out.Queued
 		return
 	}, nil
 }
 
-// Closes an issue or merge request; queued while GitLab is away.
+// Closes an issue or merge request; queued while GitLab is away. queued: as
+// for PostTime.
 type Close_methods struct{}
 
 func Close() Close_methods { return Close_methods{} }
 
-func (m Close_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (err_ error) {
+func (m Close_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (queued_out_ *bool, err_ error) {
 	receive, err_ := m.Send(ctx, c, 0, project_id_in_, iid_in_, kind_in_)
 	if err_ != nil {
 		return
 	}
-	_, err_ = receive(ctx)
+	queued_out_, _, err_ = receive(ctx)
 	return
 }
 
-func (m Close_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (uint64, error), error) {
+func (m Close_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (*bool, uint64, error), error) {
 	var in struct {
 		Project_id int64        `json:"project_id"`
 		Iid        int64        `json:"iid"`
@@ -682,17 +731,21 @@ func (m Close_methods) Send(ctx context.Context, c *varlink.Connection, flags ui
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (flags uint64, err error) {
-		flags, err = receive(ctx, nil)
+	return func(context.Context) (queued_out_ *bool, flags uint64, err error) {
+		var out struct {
+			Queued *bool `json:"queued,omitempty"`
+		}
+		flags, err = receive(ctx, &out)
 		if err != nil {
 			err = Dispatch_Error(err)
 			return
 		}
+		queued_out_ = out.Queued
 		return
 	}, nil
 }
 
-func (m Close_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m Close_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (queued_out_ *bool, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
 		Project_id int64        `json:"project_id"`
 		Iid        int64        `json:"iid"`
@@ -705,31 +758,36 @@ func (m Close_methods) Upgrade(ctx context.Context, c *varlink.Connection, proje
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (flags uint64, conn varlink.ReadWriterContext, err error) {
-		flags, conn, err = receive(ctx, nil)
+	return func(context.Context) (queued_out_ *bool, flags uint64, conn varlink.ReadWriterContext, err error) {
+		var out struct {
+			Queued *bool `json:"queued,omitempty"`
+		}
+		flags, conn, err = receive(ctx, &out)
 		if err != nil {
 			err = Dispatch_Error(err)
 			return
 		}
+		queued_out_ = out.Queued
 		return
 	}, nil
 }
 
 // Assigns the user to an issue or merge request; queued while GitLab is away.
+// queued: as for PostTime.
 type AssignSelf_methods struct{}
 
 func AssignSelf() AssignSelf_methods { return AssignSelf_methods{} }
 
-func (m AssignSelf_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (err_ error) {
+func (m AssignSelf_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (queued_out_ *bool, err_ error) {
 	receive, err_ := m.Send(ctx, c, 0, project_id_in_, iid_in_, kind_in_)
 	if err_ != nil {
 		return
 	}
-	_, err_ = receive(ctx)
+	queued_out_, _, err_ = receive(ctx)
 	return
 }
 
-func (m AssignSelf_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (uint64, error), error) {
+func (m AssignSelf_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (*bool, uint64, error), error) {
 	var in struct {
 		Project_id int64        `json:"project_id"`
 		Iid        int64        `json:"iid"`
@@ -742,17 +800,21 @@ func (m AssignSelf_methods) Send(ctx context.Context, c *varlink.Connection, fla
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (flags uint64, err error) {
-		flags, err = receive(ctx, nil)
+	return func(context.Context) (queued_out_ *bool, flags uint64, err error) {
+		var out struct {
+			Queued *bool `json:"queued,omitempty"`
+		}
+		flags, err = receive(ctx, &out)
 		if err != nil {
 			err = Dispatch_Error(err)
 			return
 		}
+		queued_out_ = out.Queued
 		return
 	}, nil
 }
 
-func (m AssignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m AssignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (queued_out_ *bool, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
 		Project_id int64        `json:"project_id"`
 		Iid        int64        `json:"iid"`
@@ -765,32 +827,36 @@ func (m AssignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection, 
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (flags uint64, conn varlink.ReadWriterContext, err error) {
-		flags, conn, err = receive(ctx, nil)
+	return func(context.Context) (queued_out_ *bool, flags uint64, conn varlink.ReadWriterContext, err error) {
+		var out struct {
+			Queued *bool `json:"queued,omitempty"`
+		}
+		flags, conn, err = receive(ctx, &out)
 		if err != nil {
 			err = Dispatch_Error(err)
 			return
 		}
+		queued_out_ = out.Queued
 		return
 	}, nil
 }
 
 // Removes the user from an issue's or merge request's assignees; queued while
-// GitLab is away.
+// GitLab is away. queued: as for PostTime.
 type UnassignSelf_methods struct{}
 
 func UnassignSelf() UnassignSelf_methods { return UnassignSelf_methods{} }
 
-func (m UnassignSelf_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (err_ error) {
+func (m UnassignSelf_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (queued_out_ *bool, err_ error) {
 	receive, err_ := m.Send(ctx, c, 0, project_id_in_, iid_in_, kind_in_)
 	if err_ != nil {
 		return
 	}
-	_, err_ = receive(ctx)
+	queued_out_, _, err_ = receive(ctx)
 	return
 }
 
-func (m UnassignSelf_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (uint64, error), error) {
+func (m UnassignSelf_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (*bool, uint64, error), error) {
 	var in struct {
 		Project_id int64        `json:"project_id"`
 		Iid        int64        `json:"iid"`
@@ -803,17 +869,21 @@ func (m UnassignSelf_methods) Send(ctx context.Context, c *varlink.Connection, f
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (flags uint64, err error) {
-		flags, err = receive(ctx, nil)
+	return func(context.Context) (queued_out_ *bool, flags uint64, err error) {
+		var out struct {
+			Queued *bool `json:"queued,omitempty"`
+		}
+		flags, err = receive(ctx, &out)
 		if err != nil {
 			err = Dispatch_Error(err)
 			return
 		}
+		queued_out_ = out.Queued
 		return
 	}, nil
 }
 
-func (m UnassignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m UnassignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (queued_out_ *bool, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
 		Project_id int64        `json:"project_id"`
 		Iid        int64        `json:"iid"`
@@ -826,12 +896,16 @@ func (m UnassignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (flags uint64, conn varlink.ReadWriterContext, err error) {
-		flags, conn, err = receive(ctx, nil)
+	return func(context.Context) (queued_out_ *bool, flags uint64, conn varlink.ReadWriterContext, err error) {
+		var out struct {
+			Queued *bool `json:"queued,omitempty"`
+		}
+		flags, conn, err = receive(ctx, &out)
 		if err != nil {
 			err = Dispatch_Error(err)
 			return
 		}
+		queued_out_ = out.Queued
 		return
 	}, nil
 }
@@ -1159,6 +1233,65 @@ func (m GetDescriptionTemplates_methods) Upgrade(ctx context.Context, c *varlink
 	}, nil
 }
 
+// The writes waiting in the retry queue, oldest first, which is the order they
+// are sent in, and until when (unix seconds) a GitLab rate limit holds them
+// all. Without a session none is sent: GetStatus says whether there is one.
+// Never an error. Since 1.3.
+type GetQueue_methods struct{}
+
+func GetQueue() GetQueue_methods { return GetQueue_methods{} }
+
+func (m GetQueue_methods) Call(ctx context.Context, c *varlink.Connection) (writes_out_ []QueuedWrite, paused_until_out_ *int64, err_ error) {
+	receive, err_ := m.Send(ctx, c, 0)
+	if err_ != nil {
+		return
+	}
+	writes_out_, paused_until_out_, _, err_ = receive(ctx)
+	return
+}
+
+func (m GetQueue_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64) (func(ctx context.Context) ([]QueuedWrite, *int64, uint64, error), error) {
+	receive, err := c.Send(ctx, "org.thehoster.forskapd.GetQueue", nil, flags)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (writes_out_ []QueuedWrite, paused_until_out_ *int64, flags uint64, err error) {
+		var out struct {
+			Writes       []QueuedWrite `json:"writes"`
+			Paused_until *int64        `json:"paused_until,omitempty"`
+		}
+		flags, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		writes_out_ = []QueuedWrite(out.Writes)
+		paused_until_out_ = out.Paused_until
+		return
+	}, nil
+}
+
+func (m GetQueue_methods) Upgrade(ctx context.Context, c *varlink.Connection) (func(ctx context.Context) (writes_out_ []QueuedWrite, paused_until_out_ *int64, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.GetQueue", nil)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (writes_out_ []QueuedWrite, paused_until_out_ *int64, flags uint64, conn varlink.ReadWriterContext, err error) {
+		var out struct {
+			Writes       []QueuedWrite `json:"writes"`
+			Paused_until *int64        `json:"paused_until,omitempty"`
+		}
+		flags, conn, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		writes_out_ = []QueuedWrite(out.Writes)
+		paused_until_out_ = out.Paused_until
+		return
+	}, nil
+}
+
 // The dead-lettered writes.
 type GetFailures_methods struct{}
 
@@ -1360,26 +1493,27 @@ func (m ClearFailures_methods) Upgrade(ctx context.Context, c *varlink.Connectio
 }
 
 // The interface version the daemon speaks, its own version and its session:
-// the account while connected, else why not. Never an error.
+// the account while connected, else why not and, since 1.3, how it stands
+// without one (dormancy). Never an error.
 type GetStatus_methods struct{}
 
 func GetStatus() GetStatus_methods { return GetStatus_methods{} }
 
-func (m GetStatus_methods) Call(ctx context.Context, c *varlink.Connection) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, err_ error) {
+func (m GetStatus_methods) Call(ctx context.Context, c *varlink.Connection) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, dormancy_out_ *Dormancy, err_ error) {
 	receive, err_ := m.Send(ctx, c, 0)
 	if err_ != nil {
 		return
 	}
-	api_version_out_, daemon_version_out_, connected_out_, reason_out_, detail_out_, host_out_, username_out_, user_id_out_, _, err_ = receive(ctx)
+	api_version_out_, daemon_version_out_, connected_out_, reason_out_, detail_out_, host_out_, username_out_, user_id_out_, dormancy_out_, _, err_ = receive(ctx)
 	return
 }
 
-func (m GetStatus_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64) (func(ctx context.Context) (string, string, bool, *NotAuthReason, *string, *string, *string, *int64, uint64, error), error) {
+func (m GetStatus_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64) (func(ctx context.Context) (string, string, bool, *NotAuthReason, *string, *string, *string, *int64, *Dormancy, uint64, error), error) {
 	receive, err := c.Send(ctx, "org.thehoster.forskapd.GetStatus", nil, flags)
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, flags uint64, err error) {
+	return func(context.Context) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, dormancy_out_ *Dormancy, flags uint64, err error) {
 		var out struct {
 			Api_version    string         `json:"api_version"`
 			Daemon_version string         `json:"daemon_version"`
@@ -1389,6 +1523,7 @@ func (m GetStatus_methods) Send(ctx context.Context, c *varlink.Connection, flag
 			Host           *string        `json:"host,omitempty"`
 			Username       *string        `json:"username,omitempty"`
 			User_id        *int64         `json:"user_id,omitempty"`
+			Dormancy       *Dormancy      `json:"dormancy,omitempty"`
 		}
 		flags, err = receive(ctx, &out)
 		if err != nil {
@@ -1403,16 +1538,17 @@ func (m GetStatus_methods) Send(ctx context.Context, c *varlink.Connection, flag
 		host_out_ = out.Host
 		username_out_ = out.Username
 		user_id_out_ = out.User_id
+		dormancy_out_ = out.Dormancy
 		return
 	}, nil
 }
 
-func (m GetStatus_methods) Upgrade(ctx context.Context, c *varlink.Connection) (func(ctx context.Context) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m GetStatus_methods) Upgrade(ctx context.Context, c *varlink.Connection) (func(ctx context.Context) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, dormancy_out_ *Dormancy, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.GetStatus", nil)
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, flags uint64, conn varlink.ReadWriterContext, err error) {
+	return func(context.Context) (api_version_out_ string, daemon_version_out_ string, connected_out_ bool, reason_out_ *NotAuthReason, detail_out_ *string, host_out_ *string, username_out_ *string, user_id_out_ *int64, dormancy_out_ *Dormancy, flags uint64, conn varlink.ReadWriterContext, err error) {
 		var out struct {
 			Api_version    string         `json:"api_version"`
 			Daemon_version string         `json:"daemon_version"`
@@ -1422,6 +1558,7 @@ func (m GetStatus_methods) Upgrade(ctx context.Context, c *varlink.Connection) (
 			Host           *string        `json:"host,omitempty"`
 			Username       *string        `json:"username,omitempty"`
 			User_id        *int64         `json:"user_id,omitempty"`
+			Dormancy       *Dormancy      `json:"dormancy,omitempty"`
 		}
 		flags, conn, err = receive(ctx, &out)
 		if err != nil {
@@ -1436,36 +1573,39 @@ func (m GetStatus_methods) Upgrade(ctx context.Context, c *varlink.Connection) (
 		host_out_ = out.Host
 		username_out_ = out.Username
 		user_id_out_ = out.User_id
+		dormancy_out_ = out.Dormancy
 		return
 	}, nil
 }
 
-// The connected host and user, and when the token expires.
+// The connected host and user, when the token expires and, since 1.3, what
+// the rotation is at.
 type WhoAmI_methods struct{}
 
 func WhoAmI() WhoAmI_methods { return WhoAmI_methods{} }
 
-func (m WhoAmI_methods) Call(ctx context.Context, c *varlink.Connection) (host_out_ string, user_id_out_ int64, username_out_ string, token_expires_at_out_ *int64, token_rotates_out_ bool, err_ error) {
+func (m WhoAmI_methods) Call(ctx context.Context, c *varlink.Connection) (host_out_ string, user_id_out_ int64, username_out_ string, token_expires_at_out_ *int64, token_rotates_out_ bool, rotation_out_ *TokenRotation, err_ error) {
 	receive, err_ := m.Send(ctx, c, 0)
 	if err_ != nil {
 		return
 	}
-	host_out_, user_id_out_, username_out_, token_expires_at_out_, token_rotates_out_, _, err_ = receive(ctx)
+	host_out_, user_id_out_, username_out_, token_expires_at_out_, token_rotates_out_, rotation_out_, _, err_ = receive(ctx)
 	return
 }
 
-func (m WhoAmI_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64) (func(ctx context.Context) (string, int64, string, *int64, bool, uint64, error), error) {
+func (m WhoAmI_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64) (func(ctx context.Context) (string, int64, string, *int64, bool, *TokenRotation, uint64, error), error) {
 	receive, err := c.Send(ctx, "org.thehoster.forskapd.WhoAmI", nil, flags)
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (host_out_ string, user_id_out_ int64, username_out_ string, token_expires_at_out_ *int64, token_rotates_out_ bool, flags uint64, err error) {
+	return func(context.Context) (host_out_ string, user_id_out_ int64, username_out_ string, token_expires_at_out_ *int64, token_rotates_out_ bool, rotation_out_ *TokenRotation, flags uint64, err error) {
 		var out struct {
-			Host             string `json:"host"`
-			User_id          int64  `json:"user_id"`
-			Username         string `json:"username"`
-			Token_expires_at *int64 `json:"token_expires_at,omitempty"`
-			Token_rotates    bool   `json:"token_rotates"`
+			Host             string         `json:"host"`
+			User_id          int64          `json:"user_id"`
+			Username         string         `json:"username"`
+			Token_expires_at *int64         `json:"token_expires_at,omitempty"`
+			Token_rotates    bool           `json:"token_rotates"`
+			Rotation         *TokenRotation `json:"rotation,omitempty"`
 		}
 		flags, err = receive(ctx, &out)
 		if err != nil {
@@ -1477,22 +1617,24 @@ func (m WhoAmI_methods) Send(ctx context.Context, c *varlink.Connection, flags u
 		username_out_ = out.Username
 		token_expires_at_out_ = out.Token_expires_at
 		token_rotates_out_ = out.Token_rotates
+		rotation_out_ = out.Rotation
 		return
 	}, nil
 }
 
-func (m WhoAmI_methods) Upgrade(ctx context.Context, c *varlink.Connection) (func(ctx context.Context) (host_out_ string, user_id_out_ int64, username_out_ string, token_expires_at_out_ *int64, token_rotates_out_ bool, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m WhoAmI_methods) Upgrade(ctx context.Context, c *varlink.Connection) (func(ctx context.Context) (host_out_ string, user_id_out_ int64, username_out_ string, token_expires_at_out_ *int64, token_rotates_out_ bool, rotation_out_ *TokenRotation, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	receive, err := c.Upgrade(ctx, "org.thehoster.forskapd.WhoAmI", nil)
 	if err != nil {
 		return nil, err
 	}
-	return func(context.Context) (host_out_ string, user_id_out_ int64, username_out_ string, token_expires_at_out_ *int64, token_rotates_out_ bool, flags uint64, conn varlink.ReadWriterContext, err error) {
+	return func(context.Context) (host_out_ string, user_id_out_ int64, username_out_ string, token_expires_at_out_ *int64, token_rotates_out_ bool, rotation_out_ *TokenRotation, flags uint64, conn varlink.ReadWriterContext, err error) {
 		var out struct {
-			Host             string `json:"host"`
-			User_id          int64  `json:"user_id"`
-			Username         string `json:"username"`
-			Token_expires_at *int64 `json:"token_expires_at,omitempty"`
-			Token_rotates    bool   `json:"token_rotates"`
+			Host             string         `json:"host"`
+			User_id          int64          `json:"user_id"`
+			Username         string         `json:"username"`
+			Token_expires_at *int64         `json:"token_expires_at,omitempty"`
+			Token_rotates    bool           `json:"token_rotates"`
+			Rotation         *TokenRotation `json:"rotation,omitempty"`
 		}
 		flags, conn, err = receive(ctx, &out)
 		if err != nil {
@@ -1504,6 +1646,7 @@ func (m WhoAmI_methods) Upgrade(ctx context.Context, c *varlink.Connection) (fun
 		username_out_ = out.Username
 		token_expires_at_out_ = out.Token_expires_at
 		token_rotates_out_ = out.Token_rotates
+		rotation_out_ = out.Rotation
 		return
 	}, nil
 }
@@ -1524,6 +1667,7 @@ type orgthehosterforskapdInterface interface {
 	GetHistory(ctx context.Context, c VarlinkCall, days_ *int64) error
 	GetActivity(ctx context.Context, c VarlinkCall, days_ *int64) error
 	GetDescriptionTemplates(ctx context.Context, c VarlinkCall, project_id_ int64, kind_ *IssuableKind) error
+	GetQueue(ctx context.Context, c VarlinkCall) error
 	GetFailures(ctx context.Context, c VarlinkCall) error
 	RetryFailure(ctx context.Context, c VarlinkCall, id_ int64) error
 	DismissFailure(ctx context.Context, c VarlinkCall, id_ int64) error
@@ -1581,11 +1725,14 @@ func (c *VarlinkCall) ReplyInternal(ctx context.Context, message_ string) error 
 }
 
 // The daemon has no live GitLab session; detail carries the host and the
-// underlying error for the reasons that have one.
-func (c *VarlinkCall) ReplyNotAuthenticated(ctx context.Context, reason_ *NotAuthReason, detail_ *string) error {
+// underlying error for the reasons that have one. retrying (since 1.3): true
+// while the daemon gets a session by itself and there is nothing to do but
+// wait, false where it takes the user.
+func (c *VarlinkCall) ReplyNotAuthenticated(ctx context.Context, reason_ *NotAuthReason, detail_ *string, retrying_ *bool) error {
 	var out NotAuthenticated
 	out.Reason = reason_
 	out.Detail = detail_
+	out.Retrying = retrying_
 	return c.ReplyError(ctx, "org.thehoster.forskapd.NotAuthenticated", &out)
 }
 
@@ -1629,20 +1776,36 @@ func (c *VarlinkCall) ReplySearch(ctx context.Context, work_items_ []WorkItem, m
 	return c.Reply(ctx, &out)
 }
 
-func (c *VarlinkCall) ReplyPostTime(ctx context.Context) error {
-	return c.Reply(ctx, nil)
+func (c *VarlinkCall) ReplyPostTime(ctx context.Context, queued_ *bool) error {
+	var out struct {
+		Queued *bool `json:"queued,omitempty"`
+	}
+	out.Queued = queued_
+	return c.Reply(ctx, &out)
 }
 
-func (c *VarlinkCall) ReplyClose(ctx context.Context) error {
-	return c.Reply(ctx, nil)
+func (c *VarlinkCall) ReplyClose(ctx context.Context, queued_ *bool) error {
+	var out struct {
+		Queued *bool `json:"queued,omitempty"`
+	}
+	out.Queued = queued_
+	return c.Reply(ctx, &out)
 }
 
-func (c *VarlinkCall) ReplyAssignSelf(ctx context.Context) error {
-	return c.Reply(ctx, nil)
+func (c *VarlinkCall) ReplyAssignSelf(ctx context.Context, queued_ *bool) error {
+	var out struct {
+		Queued *bool `json:"queued,omitempty"`
+	}
+	out.Queued = queued_
+	return c.Reply(ctx, &out)
 }
 
-func (c *VarlinkCall) ReplyUnassignSelf(ctx context.Context) error {
-	return c.Reply(ctx, nil)
+func (c *VarlinkCall) ReplyUnassignSelf(ctx context.Context, queued_ *bool) error {
+	var out struct {
+		Queued *bool `json:"queued,omitempty"`
+	}
+	out.Queued = queued_
+	return c.Reply(ctx, &out)
 }
 
 func (c *VarlinkCall) ReplyCreateWorkItem(ctx context.Context, iid_ *int64, web_url_ *string) error {
@@ -1683,6 +1846,16 @@ func (c *VarlinkCall) ReplyGetDescriptionTemplates(ctx context.Context, template
 	return c.Reply(ctx, &out)
 }
 
+func (c *VarlinkCall) ReplyGetQueue(ctx context.Context, writes_ []QueuedWrite, paused_until_ *int64) error {
+	var out struct {
+		Writes       []QueuedWrite `json:"writes"`
+		Paused_until *int64        `json:"paused_until,omitempty"`
+	}
+	out.Writes = []QueuedWrite(writes_)
+	out.Paused_until = paused_until_
+	return c.Reply(ctx, &out)
+}
+
 func (c *VarlinkCall) ReplyGetFailures(ctx context.Context, failures_ []FailedTask) error {
 	var out struct {
 		Failures []FailedTask `json:"failures"`
@@ -1703,7 +1876,7 @@ func (c *VarlinkCall) ReplyClearFailures(ctx context.Context) error {
 	return c.Reply(ctx, nil)
 }
 
-func (c *VarlinkCall) ReplyGetStatus(ctx context.Context, api_version_ string, daemon_version_ string, connected_ bool, reason_ *NotAuthReason, detail_ *string, host_ *string, username_ *string, user_id_ *int64) error {
+func (c *VarlinkCall) ReplyGetStatus(ctx context.Context, api_version_ string, daemon_version_ string, connected_ bool, reason_ *NotAuthReason, detail_ *string, host_ *string, username_ *string, user_id_ *int64, dormancy_ *Dormancy) error {
 	var out struct {
 		Api_version    string         `json:"api_version"`
 		Daemon_version string         `json:"daemon_version"`
@@ -1713,6 +1886,7 @@ func (c *VarlinkCall) ReplyGetStatus(ctx context.Context, api_version_ string, d
 		Host           *string        `json:"host,omitempty"`
 		Username       *string        `json:"username,omitempty"`
 		User_id        *int64         `json:"user_id,omitempty"`
+		Dormancy       *Dormancy      `json:"dormancy,omitempty"`
 	}
 	out.Api_version = api_version_
 	out.Daemon_version = daemon_version_
@@ -1722,22 +1896,25 @@ func (c *VarlinkCall) ReplyGetStatus(ctx context.Context, api_version_ string, d
 	out.Host = host_
 	out.Username = username_
 	out.User_id = user_id_
+	out.Dormancy = dormancy_
 	return c.Reply(ctx, &out)
 }
 
-func (c *VarlinkCall) ReplyWhoAmI(ctx context.Context, host_ string, user_id_ int64, username_ string, token_expires_at_ *int64, token_rotates_ bool) error {
+func (c *VarlinkCall) ReplyWhoAmI(ctx context.Context, host_ string, user_id_ int64, username_ string, token_expires_at_ *int64, token_rotates_ bool, rotation_ *TokenRotation) error {
 	var out struct {
-		Host             string `json:"host"`
-		User_id          int64  `json:"user_id"`
-		Username         string `json:"username"`
-		Token_expires_at *int64 `json:"token_expires_at,omitempty"`
-		Token_rotates    bool   `json:"token_rotates"`
+		Host             string         `json:"host"`
+		User_id          int64          `json:"user_id"`
+		Username         string         `json:"username"`
+		Token_expires_at *int64         `json:"token_expires_at,omitempty"`
+		Token_rotates    bool           `json:"token_rotates"`
+		Rotation         *TokenRotation `json:"rotation,omitempty"`
 	}
 	out.Host = host_
 	out.User_id = user_id_
 	out.Username = username_
 	out.Token_expires_at = token_expires_at_
 	out.Token_rotates = token_rotates_
+	out.Rotation = rotation_
 	return c.Reply(ctx, &out)
 }
 
@@ -1766,22 +1943,26 @@ func (s *VarlinkInterface) Search(ctx context.Context, c VarlinkCall, query_ str
 }
 
 // Logs spent time on an issue or merge request; queued while GitLab is away.
+// queued (since 1.3): true when it was queued instead of applied (GetQueue
+// lists it), absent when GitLab applied it.
 func (s *VarlinkInterface) PostTime(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind, duration_ string, summary_ *string) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.PostTime")
 }
 
-// Closes an issue or merge request; queued while GitLab is away.
+// Closes an issue or merge request; queued while GitLab is away. queued: as
+// for PostTime.
 func (s *VarlinkInterface) Close(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.Close")
 }
 
 // Assigns the user to an issue or merge request; queued while GitLab is away.
+// queued: as for PostTime.
 func (s *VarlinkInterface) AssignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.AssignSelf")
 }
 
 // Removes the user from an issue's or merge request's assignees; queued while
-// GitLab is away.
+// GitLab is away. queued: as for PostTime.
 func (s *VarlinkInterface) UnassignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.UnassignSelf")
 }
@@ -1816,6 +1997,14 @@ func (s *VarlinkInterface) GetDescriptionTemplates(ctx context.Context, c Varlin
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetDescriptionTemplates")
 }
 
+// The writes waiting in the retry queue, oldest first, which is the order they
+// are sent in, and until when (unix seconds) a GitLab rate limit holds them
+// all. Without a session none is sent: GetStatus says whether there is one.
+// Never an error. Since 1.3.
+func (s *VarlinkInterface) GetQueue(ctx context.Context, c VarlinkCall) error {
+	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetQueue")
+}
+
 // The dead-lettered writes.
 func (s *VarlinkInterface) GetFailures(ctx context.Context, c VarlinkCall) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetFailures")
@@ -1837,12 +2026,14 @@ func (s *VarlinkInterface) ClearFailures(ctx context.Context, c VarlinkCall) err
 }
 
 // The interface version the daemon speaks, its own version and its session:
-// the account while connected, else why not. Never an error.
+// the account while connected, else why not and, since 1.3, how it stands
+// without one (dormancy). Never an error.
 func (s *VarlinkInterface) GetStatus(ctx context.Context, c VarlinkCall) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.GetStatus")
 }
 
-// The connected host and user, and when the token expires.
+// The connected host and user, when the token expires and, since 1.3, what
+// the rotation is at.
 func (s *VarlinkInterface) WhoAmI(ctx context.Context, c VarlinkCall) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.forskapd.WhoAmI")
 }
@@ -1996,6 +2187,9 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
 		return s.orgthehosterforskapdInterface.GetDescriptionTemplates(ctx, VarlinkCall{call}, in.Project_id, in.Kind)
+
+	case "GetQueue":
+		return s.orgthehosterforskapdInterface.GetQueue(ctx, VarlinkCall{call})
 
 	case "GetFailures":
 		return s.orgthehosterforskapdInterface.GetFailures(ctx, VarlinkCall{call})
@@ -2181,6 +2375,34 @@ type FailedTask (
   failed_at: int
 )
 
+# A write waiting in the retry queue. Since 1.3.
+type QueuedWrite (
+  # The FailedTask id it gets should it fail for good.
+  id: int,
+  # Which write: "PostTime", "Close", "AssignSelf", "UnassignSelf".
+  op: string,
+  kind: IssuableKind,
+  project_id: int,
+  iid: int,
+  # Operation-specific summary, e.g. the duration.
+  detail: string,
+  # Unix seconds.
+  queued_at: int,
+  # Attempts started so far, since the daemon's start.
+  attempts: int,
+  # An attempt is running.
+  running: bool,
+  # An earlier write to the same issue or merge request goes first.
+  blocked: bool,
+  # Unix seconds, not tried again before; absent unless it backs off.
+  next_attempt_at: ?int,
+  # Why the latest attempt failed; absent before the first failure.
+  last_error: ?string,
+  # Unix seconds its retry window ends at: an attempt that fails after that
+  # is its last (see FailedTask).
+  expires_at: int
+)
+
 type MergeRequest (
   # Global MR ID, unique across the GitLab instance.
   id: int,
@@ -2256,7 +2478,8 @@ error Internal (message: string)
 type NotAuthReason (
   # No credentials stored (never logged in).
   no_credentials,
-  # Reading the OS keychain failed (detail: the error).
+  # Reading the OS keychain failed (detail: the error), or it is locked
+  # (detail says so): then the daemon waits for it, and retrying is true.
   keychain_error,
   # Credentials exist but GitLab could not be reached (detail set); heals by
   # itself.
@@ -2268,8 +2491,10 @@ type NotAuthReason (
 )
 
 # The daemon has no live GitLab session; detail carries the host and the
-# underlying error for the reasons that have one.
-error NotAuthenticated (reason: ?NotAuthReason, detail: ?string)
+# underlying error for the reasons that have one. retrying (since 1.3): true
+# while the daemon gets a session by itself and there is nothing to do but
+# wait, false where it takes the user.
+error NotAuthenticated (reason: ?NotAuthReason, detail: ?string, retrying: ?bool)
 
 # The projects and groups a call keeps to: an item passes if it lies in any of
 # them. Nothing listed is no filter.
@@ -2333,17 +2558,21 @@ type SearchOptions (
 method Search(query: string, options: ?SearchOptions) -> (work_items: []WorkItem, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
 
 # Logs spent time on an issue or merge request; queued while GitLab is away.
-method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
+# queued (since 1.3): true when it was queued instead of applied (GetQueue
+# lists it), absent when GitLab applied it.
+method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> (queued: ?bool)
 
-# Closes an issue or merge request; queued while GitLab is away.
-method Close(project_id: int, iid: int, kind: IssuableKind) -> ()
+# Closes an issue or merge request; queued while GitLab is away. queued: as
+# for PostTime.
+method Close(project_id: int, iid: int, kind: IssuableKind) -> (queued: ?bool)
 
 # Assigns the user to an issue or merge request; queued while GitLab is away.
-method AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
+# queued: as for PostTime.
+method AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> (queued: ?bool)
 
 # Removes the user from an issue's or merge request's assignees; queued while
-# GitLab is away.
-method UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
+# GitLab is away. queued: as for PostTime.
+method UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> (queued: ?bool)
 
 # The issue CreateWorkItem files.
 type NewWorkItem (
@@ -2393,6 +2622,12 @@ type DescriptionTemplate (
 # synced (not a member project, or not yet), as for one that has none.
 method GetDescriptionTemplates(project_id: int, kind: ?IssuableKind) -> (templates: []DescriptionTemplate)
 
+# The writes waiting in the retry queue, oldest first, which is the order they
+# are sent in, and until when (unix seconds) a GitLab rate limit holds them
+# all. Without a session none is sent: GetStatus says whether there is one.
+# Never an error. Since 1.3.
+method GetQueue() -> (writes: []QueuedWrite, paused_until: ?int)
+
 # The dead-lettered writes.
 method GetFailures() -> (failures: []FailedTask)
 
@@ -2405,12 +2640,46 @@ method DismissFailure(id: int) -> ()
 # Drops every dead-lettered write.
 method ClearFailures() -> ()
 
-# The interface version the daemon speaks, its own version and its session:
-# the account while connected, else why not. Never an error.
-method GetStatus() -> (api_version: string, daemon_version: string, connected: bool, reason: ?NotAuthReason, detail: ?string, host: ?string, username: ?string, user_id: ?int)
+# How the daemon stands without a GitLab session. Since 1.3.
+type Dormancy (
+  # Unix seconds, since when it has none; its start, if it had none then.
+  since: ?int,
+  # True while the daemon gets a session by itself: it reconnects to a GitLab
+  # it can't reach, or waits for a locked keychain. False where it waits for
+  # a login, or auto-reconnect is off.
+  retrying: bool,
+  # Unix seconds of its next attempt; absent when none is scheduled.
+  retry_at: ?int,
+  # Attempts since ` + "`" + `since` + "`" + `; absent before the first.
+  attempts: ?int,
+  # Why the latest attempt failed; detail keeps why the session was lost.
+  last_error: ?string
+)
 
-# The connected host and user, and when the token expires.
-method WhoAmI() -> (host: string, user_id: int, username: string, token_expires_at: ?int, token_rotates: bool)
+# The interface version the daemon speaks, its own version and its session:
+# the account while connected, else why not and, since 1.3, how it stands
+# without one (dormancy). Never an error.
+method GetStatus() -> (api_version: string, daemon_version: string, connected: bool, reason: ?NotAuthReason, detail: ?string, host: ?string, username: ?string, user_id: ?int, dormancy: ?Dormancy)
+
+# What the daemon's token rotation is at. Since 1.3.
+type TokenRotation (
+  # Unix seconds the daemon rotates the token at; absent while it doesn't.
+  at: ?int,
+  # Why the token is not rotated, in words; absent while it is, and while the
+  # daemon hasn't read the token's lifetime yet.
+  skipped: ?string,
+  # Why the latest attempt (reading the lifetime, or rotating) failed.
+  last_error: ?string,
+  # Unix seconds of the next attempt after a failure.
+  retry_at: ?int,
+  # True while the rotated token is not in the keychain yet: a daemon
+  # restart before then needs ` + "`" + `forskap auth login` + "`" + ` with a new token.
+  unsaved: ?bool
+)
+
+# The connected host and user, when the token expires and, since 1.3, what
+# the rotation is at.
+method WhoAmI() -> (host: string, user_id: int, username: string, token_expires_at: ?int, token_rotates: bool, rotation: ?TokenRotation)
 `
 }
 

@@ -12,11 +12,12 @@ use forskap_api::admin::{
 use forskap_api::{
     AsyncCall, Call_AssignSelf, Call_Close, Call_CreateWorkItem, Call_DismissFailure,
     Call_GetActivity, Call_GetAssignedMergeRequests, Call_GetAssignedWorkItems,
-    Call_GetDescriptionTemplates, Call_GetHistory, Call_GetStatus, Call_ListWorkItems,
-    Call_PostTime, Call_RecordOpen, Call_RetryFailure, Call_Search, Call_UnassignSelf, Call_WhoAmI,
-    CreateWorkItem_Reply, GetActivity_Reply, GetAssignedMergeRequests_Reply,
-    GetAssignedWorkItems_Reply, GetDescriptionTemplates_Reply, GetHistory_Reply, GetStatus_Reply,
-    HistorySource, IssuableKind, ListWorkItems_Reply, MergeRequest, NewWorkItem, Scope,
+    Call_GetDescriptionTemplates, Call_GetHistory, Call_GetQueue, Call_GetStatus,
+    Call_ListWorkItems, Call_PostTime, Call_RecordOpen, Call_RetryFailure, Call_Search,
+    Call_UnassignSelf, Call_WhoAmI, CreateWorkItem_Reply, GetActivity_Reply,
+    GetAssignedMergeRequests_Reply, GetAssignedWorkItems_Reply, GetDescriptionTemplates_Reply,
+    GetHistory_Reply, GetQueue_Reply, GetStatus_Reply, HistorySource, IssuableKind,
+    ListWorkItems_Reply, MergeRequest, NewWorkItem, PostTime_Reply, QueuedWrite, Scope,
     Search_Reply, SearchKind, SearchOptions, VarlinkInterface, WhoAmI_Reply, WorkItem,
     WorkItemFilter, WorkItemRef, WorkItemRole, WorkItemState,
 };
@@ -2876,6 +2877,105 @@ async fn clear_cache_waits_for_new_board_columns() {
     assert_eq!(issues[0].board_column.as_deref(), Some("Doing"));
 }
 
+// ── The queue ──────────────────────────────────────────────────────────
+
+async fn queue(h: &Handlers) -> GetQueue_Reply {
+    let mut call = AsyncCall::default();
+    h.get_queue(&mut call as &mut dyn Call_GetQueue)
+        .await
+        .unwrap();
+    reply(&mut call)
+}
+
+/// `PostTime`; whether it says it was queued.
+async fn post_time_queued(h: &Handlers, iid: i64) -> Option<bool> {
+    let mut call = AsyncCall::default();
+    h.post_time(
+        &mut call as &mut dyn Call_PostTime,
+        7,
+        iid,
+        IssuableKind::work_item,
+        "30m".to_string(),
+        None,
+    )
+    .await
+    .unwrap();
+    reply::<PostTime_Reply>(&mut call).queued
+}
+
+/// A write that only reached the queue says so; one GitLab took says
+/// nothing, like a daemon before 1.3 does for either.
+#[tokio::test]
+async fn a_queued_write_replies_queued_and_an_applied_one_does_not() {
+    let fake = Arc::new(FakeGitlab::default());
+    let (h, _dir) = connected_handlers(&fake);
+    assert_eq!(post_time_queued(&h, 42).await, None);
+    assert!(queue(&h).await.writes.is_empty());
+
+    // Refused before GitLab did anything: safe to send again later.
+    fake.fail_next_write(FakeErr::Throttled(429));
+    assert_eq!(post_time_queued(&h, 42).await, Some(true));
+
+    let (h, _dir) = unreachable_handlers();
+    assert_eq!(post_time_queued(&h, 42).await, Some(true));
+}
+
+/// What `forskap queue list` shows above the failed writes: the write that
+/// waits, what it is, since when, and that nothing was tried yet for want of
+/// a session.
+#[tokio::test]
+async fn get_queue_lists_a_write_queued_through_an_outage() {
+    let (h, _dir) = unreachable_handlers();
+    let before = now_secs() as i64;
+    assert_eq!(post_time_queued(&h, 42).await, Some(true));
+
+    let reply = queue(&h).await;
+    assert_eq!(reply.paused_until, None);
+    let [write] = &reply.writes[..] else {
+        panic!("one write: {:?}", reply.writes);
+    };
+    assert_eq!(
+        (
+            write.op.as_str(),
+            write.kind.clone(),
+            write.project_id,
+            write.iid
+        ),
+        ("PostTime", IssuableKind::work_item, 7, 42)
+    );
+    assert_eq!(write.detail, "30m");
+    assert!(write.queued_at >= before);
+    assert_eq!(
+        (write.attempts, write.running, write.blocked),
+        (0, false, false)
+    );
+    assert_eq!((write.next_attempt_at, &write.last_error), (None, &None));
+    let window = h.config.read().unwrap().queue.max_lifetime().as_secs() as i64;
+    assert_eq!(write.expires_at, write.queued_at + window);
+    // The id is the one it would fail under.
+    assert!(write.id > 0);
+}
+
+#[tokio::test]
+async fn get_queue_marks_a_later_write_to_the_same_issue_as_blocked() {
+    let (h, _dir) = unreachable_handlers();
+    assert_eq!(post_time_queued(&h, 42).await, Some(true));
+    assert_eq!(close(&h, 7, 42, IssuableKind::work_item).await, None);
+    assert_eq!(close(&h, 7, 43, IssuableKind::work_item).await, None);
+
+    let listed = |w: &QueuedWrite| (w.op.clone(), w.iid, w.blocked);
+    let writes: Vec<_> = queue(&h).await.writes.iter().map(listed).collect();
+    assert_eq!(
+        writes,
+        [
+            ("PostTime".to_string(), 42, false),
+            ("Close".to_string(), 42, true),
+            ("Close".to_string(), 43, false),
+        ],
+        "oldest first, as they are sent"
+    );
+}
+
 // ── Dead letters ───────────────────────────────────────────────────────
 
 /// An id the dead-letter store doesn't hold is the daemon's, not GitLab's.
@@ -3106,9 +3206,24 @@ async fn who_am_i_reports_the_token_once_it_is_known() {
     assert_eq!(me.token_expires_at, Some(midnight.timestamp()));
     assert!(me.token_rotates);
 
+    // When, too: the lead is a third of the month the token lives.
+    let rotation = me
+        .rotation
+        .expect("a daemon of 1.3 says what the rotation is at");
+    let at = rotation.at.expect("a token that rotates has its moment");
+    assert!(at < midnight.timestamp() && at > chrono::Utc::now().timestamp());
+    assert_eq!((rotation.skipped, rotation.unsaved), (None, None));
+
     // Read from the config at each call, so a reload shows at once.
     h.config.write().unwrap().auth.rotate = crate::config::RotatePolicy::Never;
-    assert!(!who_am_i(&h).await.token_rotates);
+    let off = who_am_i(&h).await;
+    assert!(!off.token_rotates);
+    let rotation = off.rotation.unwrap();
+    assert_eq!(rotation.at, None);
+    assert_eq!(
+        rotation.skipped.as_deref(),
+        Some("auth.rotate is \"never\"")
+    );
     assert_eq!(fake.read_calls() + fake.token_info_calls(), 0);
 }
 
@@ -3161,6 +3276,69 @@ async fn get_status_says_why_while_dormant() {
         (status.reason, status.detail),
         (Some(forskap_api::NotAuthReason::no_credentials), None)
     );
+}
+
+/// An outage with the reconnect supervisor at work: one a client can wait
+/// out.
+fn reconnecting_handlers() -> (Handlers, tempfile::TempDir) {
+    let (mut h, dir) = unreachable_handlers();
+    // The tests' usual keychain is none at all, and without one nothing
+    // reconnects.
+    h.keychain = crate::secrets::Keychain::Fake(crate::secrets::FakeKeychain::locked(None));
+    (h, dir)
+}
+
+/// Without a session the daemon says since when, whether it gets one by
+/// itself and what the supervisor is at; with one it says none of that.
+#[tokio::test]
+async fn get_status_says_since_when_and_what_the_supervisor_is_at() {
+    let before = now_secs() as i64;
+    let (h, _dir) = reconnecting_handlers();
+    let waiting = get_status(&h).await.dormancy.expect("dormant");
+    assert!(waiting.since.is_some_and(|at| at >= before), "{waiting:?}");
+    assert!(waiting.retrying);
+    assert_eq!(
+        (waiting.attempts, waiting.retry_at, &waiting.last_error),
+        (None, None, &None),
+        "nothing tried yet"
+    );
+
+    // Auto-reconnect switched off: the outage stays one, nothing ends it.
+    h.config.write().unwrap().reconnect.enabled = false;
+    assert!(!get_status(&h).await.dormancy.unwrap().retrying);
+
+    // What only a login ends is no matter of waiting.
+    let (h, _dir) = dormant_handlers();
+    let logged_out = get_status(&h).await.dormancy.unwrap();
+    assert!(!logged_out.retrying);
+    assert!(logged_out.since.is_some());
+
+    let fake = Arc::new(FakeGitlab::default());
+    let (h, _dir) = connected_handlers(&fake);
+    assert!(get_status(&h).await.dormancy.is_none());
+}
+
+/// The error a call gets carries the same word as `GetStatus`: wait, or
+/// act.
+#[tokio::test]
+async fn not_authenticated_says_whether_the_daemon_retries() {
+    let retrying = |h: Handlers| async move {
+        let mut call = AsyncCall::default();
+        h.who_am_i(&mut call as &mut dyn Call_WhoAmI).await.unwrap();
+        let (name, params) = reply_error_with(&mut call).unwrap();
+        assert_eq!(name, NOT_AUTHENTICATED);
+        params["retrying"].as_bool()
+    };
+    let (h, _dir) = reconnecting_handlers();
+    assert_eq!(retrying(h).await, Some(true));
+    let fake = crate::secrets::FakeKeychain::locked(None);
+    let (h, _dir) = locked_handlers(&fake);
+    assert_eq!(retrying(h).await, Some(true), "a locked keychain heals too");
+    let (h, _dir) = dormant_handlers();
+    assert_eq!(retrying(h).await, Some(false));
+    // A dry run has no supervisor: its outage, were there one, would stay.
+    let (h, _dir) = unreachable_handlers();
+    assert_eq!(retrying(h).await, Some(false));
 }
 
 // ── Properties ─────────────────────────────────────────────────────────

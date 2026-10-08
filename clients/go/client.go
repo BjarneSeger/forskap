@@ -199,26 +199,32 @@ func (c *Client) Search(ctx context.Context, query string, options *SearchOption
 }
 
 // PostTime logs a time-tracking entry on an issue or merge request (per kind).
-// summary is optional (nil to omit).
+// summary is optional (nil to omit). Like the other writes it succeeds when
+// GitLab applied it and when the daemon queued it for later, GitLab being
+// away; GetQueue lists what is queued.
 func (c *Client) PostTime(ctx context.Context, projectID, iid int64, kind IssuableKind, duration string, summary *string) error {
-	return PostTime().Call(ctx, c.conn, projectID, iid, kind, duration, summary)
+	_, err := PostTime().Call(ctx, c.conn, projectID, iid, kind, duration, summary)
+	return err
 }
 
 // CloseIssuable closes an issue or merge request (per kind). Wraps the varlink
 // method `Close`; the Go name differs because Close is taken by the
 // connection-releasing io.Closer method above.
 func (c *Client) CloseIssuable(ctx context.Context, projectID, iid int64, kind IssuableKind) error {
-	return Close().Call(ctx, c.conn, projectID, iid, kind)
+	_, err := Close().Call(ctx, c.conn, projectID, iid, kind)
+	return err
 }
 
 // AssignSelf assigns the authenticated user to an issue or merge request.
 func (c *Client) AssignSelf(ctx context.Context, projectID, iid int64, kind IssuableKind) error {
-	return AssignSelf().Call(ctx, c.conn, projectID, iid, kind)
+	_, err := AssignSelf().Call(ctx, c.conn, projectID, iid, kind)
+	return err
 }
 
 // UnassignSelf removes the authenticated user from an issuable's assignees.
 func (c *Client) UnassignSelf(ctx context.Context, projectID, iid int64, kind IssuableKind) error {
-	return UnassignSelf().Call(ctx, c.conn, projectID, iid, kind)
+	_, err := UnassignSelf().Call(ctx, c.conn, projectID, iid, kind)
+	return err
 }
 
 // CreatedWorkItem is the issue CreateWorkItem filed.
@@ -276,6 +282,27 @@ func (c *Client) GetDescriptionTemplates(ctx context.Context, projectID int64, k
 	return GetDescriptionTemplates().Call(ctx, c.conn, projectID, kind)
 }
 
+// Queue is what GetQueue reports.
+type Queue struct {
+	// Writes are the writes waiting to be sent, oldest first, which is the
+	// order they are sent in.
+	Writes []QueuedWrite
+	// PausedUntil is until when a GitLab rate limit holds them all, in unix
+	// seconds; nil while none does.
+	PausedUntil *int64
+}
+
+// GetQueue returns the writes waiting in the daemon's retry queue and where
+// each is in its retry schedule. Without a GitLab session none is sent:
+// GetStatus says whether there is one. A daemon older than v1.3.0 doesn't
+// have it and fails with *varlink.MethodNotFound.
+func (c *Client) GetQueue(ctx context.Context) (Queue, error) {
+	var q Queue
+	var err error
+	q.Writes, q.PausedUntil, err = GetQueue().Call(ctx, c.conn)
+	return q, err
+}
+
 // GetFailures returns queued operations that have failed.
 func (c *Client) GetFailures(ctx context.Context) ([]FailedTask, error) {
 	return GetFailures().Call(ctx, c.conn)
@@ -300,6 +327,10 @@ type Status struct {
 	Host     *string
 	Username *string
 	UserID   *int64
+	// Dormancy says how the daemon stands without a session: since when,
+	// whether it gets one by itself and when it tries next. Nil while
+	// Connected, and from a daemon older than v1.3.0.
+	Dormancy *Dormancy
 }
 
 // Compatible tells whether the daemon speaks an interface this binding can use.
@@ -347,7 +378,7 @@ func majorMinor(version string) (major, minor uint64, ok bool) {
 func (c *Client) GetStatus(ctx context.Context) (Status, error) {
 	var s Status
 	var err error
-	s.APIVersion, s.DaemonVersion, s.Connected, s.Reason, s.Detail, s.Host, s.Username, s.UserID, err = GetStatus().Call(ctx, c.conn)
+	s.APIVersion, s.DaemonVersion, s.Connected, s.Reason, s.Detail, s.Host, s.Username, s.UserID, s.Dormancy, err = GetStatus().Call(ctx, c.conn)
 	return s, err
 }
 
@@ -376,6 +407,10 @@ type Account struct {
 	TokenExpiresAt *int64
 	// TokenRotates tells whether the daemon replaces the token before that.
 	TokenRotates bool
+	// Rotation says what the rotation is at: when it happens or why not,
+	// and what its latest attempt came to. Nil from a daemon older than
+	// v1.3.0.
+	Rotation *TokenRotation
 }
 
 // WhoAmI returns the account the daemon is connected as: the host, the GitLab
@@ -384,6 +419,6 @@ type Account struct {
 func (c *Client) WhoAmI(ctx context.Context) (Account, error) {
 	var a Account
 	var err error
-	a.Host, a.UserID, a.Username, a.TokenExpiresAt, a.TokenRotates, err = WhoAmI().Call(ctx, c.conn)
+	a.Host, a.UserID, a.Username, a.TokenExpiresAt, a.TokenRotates, a.Rotation, err = WhoAmI().Call(ctx, c.conn)
 	return a, err
 }
