@@ -141,7 +141,9 @@ A token with an expiry date and the `self_rotate` scope is rotated by the daemon
 shortly before it expires (see `[auth]` above): GitLab issues a new token living as
 long as the old one did (its default lifetime if the instance refuses that) and
 revokes the old one. The new token replaces the old one in the keychain;
-`forskap auth status` shows the expiry and whether rotation is active.
+`forskap auth status` shows the expiry and when the token is rotated, or why it is
+not; after a failed attempt also what it came to and when the next one comes, and
+for as long as a rotated token hasn't reached the keychain, that too.
 
 Should the keychain refuse the new token, the daemon keeps running on it, logs an
 error and keeps retrying the write. If it is restarted before that worked, the

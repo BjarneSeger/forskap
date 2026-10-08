@@ -96,6 +96,13 @@ once a day, and `forskap status` only notes it under an `ok` sync check (`-o jso
 lists it under `unavailable`). Against a daemon older than this, such jobs still
 count as failing, the epics excepted.
 
+Without a session the session check says how the daemon stands — `No session for
+3m; 5 attempts, the latest failed: …; next in 32s.` — and whether there is anything
+to do: a GitLab it can't reach and a keychain that is still locked (the daemon
+started before the login) end by themselves and are warnings. With one it says when
+the token is rotated or why not, and warns while a rotated token hasn't reached the
+keychain. The queue check notes how many writes wait to be sent.
+
 The exit status is non-zero only when a check is an error: an unreachable or
 stuck daemon, a login that needs `forskap auth login`, a sync job that hangs.
 Warnings, like a sync job GitLab keeps failing or a rate limit pause, exit zero,

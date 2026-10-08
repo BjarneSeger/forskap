@@ -11,8 +11,9 @@ use forskap_api::{ErrorKind, NotAuthReason, admin};
 
 /// A failed call, of either interface's generated client.
 pub trait DaemonError: std::fmt::Display {
-    /// `NotAuthenticated`'s reason and detail; `None` for any other error.
-    fn not_authenticated(&self) -> Option<(Option<NotAuthReason>, Option<&str>)>;
+    /// `NotAuthenticated`'s reason, detail and whether the daemon gets a
+    /// session by itself; `None` for any other error.
+    fn not_authenticated(&self) -> Option<NotAuth<'_>>;
 
     /// The message of an error the daemon replied, with the argument it
     /// refused or GitLab's HTTP status where it has one.
@@ -24,13 +25,16 @@ pub trait DaemonError: std::fmt::Display {
 }
 
 impl DaemonError for forskap_api::Error {
-    fn not_authenticated(&self) -> Option<(Option<NotAuthReason>, Option<&str>)> {
+    fn not_authenticated(&self) -> Option<NotAuth<'_>> {
         let ErrorKind::NotAuthenticated(args) = self.kind() else {
             return None;
         };
         let args = args.as_ref();
-        let reason = args.and_then(|a| a.reason.clone());
-        Some((reason, args.and_then(|a| a.detail.as_deref())))
+        Some(NotAuth {
+            reason: args.and_then(|a| a.reason.clone()),
+            detail: args.and_then(|a| a.detail.as_deref()),
+            retrying: args.and_then(|a| a.retrying),
+        })
     }
 
     fn message(&self) -> Option<String> {
@@ -52,7 +56,7 @@ impl DaemonError for forskap_api::Error {
 }
 
 impl DaemonError for admin::Error {
-    fn not_authenticated(&self) -> Option<(Option<NotAuthReason>, Option<&str>)> {
+    fn not_authenticated(&self) -> Option<NotAuth<'_>> {
         None
     }
 
@@ -94,8 +98,8 @@ pub fn is_method_not_found(e: &impl DaemonError) -> bool {
 /// `NotAuthenticated` what it means and what to do. An error the daemon
 /// didn't reply (a broken connection) reads as the client describes it.
 pub fn friendly(op: &str, e: impl DaemonError) -> anyhow::Error {
-    if let Some((reason, detail)) = e.not_authenticated() {
-        return anyhow::anyhow!("{}", message_for(reason, detail));
+    if let Some(why) = e.not_authenticated() {
+        return anyhow::anyhow!("{}", message_for(why.reason, why.detail, why.retrying));
     }
     match (e.message(), e.varlink_kind()) {
         (Some(message), _) => anyhow::anyhow!("{op} failed: {message}"),
@@ -114,24 +118,51 @@ pub fn friendly(op: &str, e: impl DaemonError) -> anyhow::Error {
     }
 }
 
+/// Why the daemon has no session, as a `NotAuthenticated` reply carries it.
+pub struct NotAuth<'a> {
+    pub reason: Option<NotAuthReason>,
+    pub detail: Option<&'a str>,
+    /// Whether the daemon gets a session by itself; `None` from a daemon
+    /// before 1.3, which doesn't say.
+    pub retrying: Option<bool>,
+}
+
 /// The message for a dormancy `reason` code, with `detail` appended in
 /// parentheses when present. Unknown codes and a missing reason (older daemon)
-/// fall back to the generic "run `forskap auth login`" line. Also for a view
-/// that says beside its own content why there is no session.
-pub fn message_for(reason: Option<NotAuthReason>, detail: Option<&str>) -> String {
-    let base = format!("{} {}", problem(reason.as_ref()), remedy(reason.as_ref()));
+/// fall back to the generic "run `forskap auth login`" line. `retrying` is the
+/// daemon's word on whether it gets a session by itself: wait, or act. Also
+/// for a view that says beside its own content why there is no session.
+pub fn message_for(
+    reason: Option<NotAuthReason>,
+    detail: Option<&str>,
+    retrying: Option<bool>,
+) -> String {
+    let reason = reason.as_ref();
+    let base = format!("{} {}", problem(reason, retrying), remedy(reason, retrying));
+    // A keychain the daemon waits for: its detail says just that again.
+    let detail = detail.filter(|_| !locked(reason, retrying));
     match detail {
         Some(d) if !d.is_empty() => format!("{base} ({d})"),
         _ => base,
     }
 }
 
+/// Whether the dormancy is a locked keychain: a keychain error the daemon
+/// gets over by itself is that and nothing else, an unreadable keychain
+/// takes a login.
+pub fn locked(reason: Option<&NotAuthReason>, retrying: Option<bool>) -> bool {
+    reason == Some(&NotAuthReason::keychain_error) && retrying == Some(true)
+}
+
 /// What a dormancy `reason` means for the user.
-fn problem(reason: Option<&NotAuthReason>) -> &'static str {
+fn problem(reason: Option<&NotAuthReason>, retrying: Option<bool>) -> &'static str {
     match reason {
         Some(NotAuthReason::no_credentials) | None => "Not connected to GitLab.",
         Some(NotAuthReason::token_rejected) => "GitLab rejected the stored token.",
         Some(NotAuthReason::unreachable) => "Can't reach GitLab — the daemon is not connected.",
+        Some(NotAuthReason::keychain_error) if locked(reason, retrying) => {
+            "The keychain holding your credentials is locked."
+        }
         Some(NotAuthReason::keychain_error) => {
             "Couldn't read your saved credentials from the keychain."
         }
@@ -139,20 +170,32 @@ fn problem(reason: Option<&NotAuthReason>) -> &'static str {
     }
 }
 
-/// What to do about a dormancy `reason`.
-pub fn remedy(reason: Option<&NotAuthReason>) -> &'static str {
-    match reason {
-        Some(NotAuthReason::no_credentials | NotAuthReason::logged_out) | None => {
+/// What to do about a dormancy `reason`: nothing but wait where the daemon
+/// says it is `retrying`.
+pub fn remedy(reason: Option<&NotAuthReason>, retrying: Option<bool>) -> &'static str {
+    match (reason, retrying) {
+        (Some(NotAuthReason::no_credentials | NotAuthReason::logged_out) | None, _) => {
             "Run `forskap auth login` to authenticate."
         }
-        Some(NotAuthReason::token_rejected) => "Run `forskap auth login` to re-authenticate.",
-        Some(NotAuthReason::unreachable) => {
+        (Some(NotAuthReason::token_rejected), _) => "Run `forskap auth login` to re-authenticate.",
+        (Some(NotAuthReason::unreachable), Some(true)) => "It reconnects by itself.",
+        (Some(NotAuthReason::unreachable), Some(false)) => {
+            "Auto-reconnect is off: restart the daemon once GitLab is reachable."
+        }
+        // A daemon too old to say whether it retries.
+        (Some(NotAuthReason::unreachable), None) => {
             "It retries automatically unless auto-reconnect is disabled; if so, \
              restart it once GitLab is reachable."
         }
-        // The daemon waits for a locked keychain and says so in the detail;
-        // any other failure to read it takes a new login.
-        Some(NotAuthReason::keychain_error) => {
+        (Some(NotAuthReason::keychain_error), Some(true)) => {
+            "The daemon connects by itself once it is unlocked."
+        }
+        (Some(NotAuthReason::keychain_error), Some(false)) => {
+            "Run `forskap auth login` to store them again."
+        }
+        // A daemon before 1.3 waits for a locked keychain without saying so
+        // here (its detail does); one before that never did.
+        (Some(NotAuthReason::keychain_error), None) => {
             "If it is locked, unlock it and the daemon connects by itself; otherwise run \
              `forskap auth login` to store them again."
         }
@@ -264,12 +307,13 @@ mod tests {
     #[test]
     fn maps_each_known_reason() {
         assert!(
-            message_for(Some(NotAuthReason::no_credentials), None).contains("forskap auth login")
+            message_for(Some(NotAuthReason::no_credentials), None, None)
+                .contains("forskap auth login")
         );
-        assert!(message_for(Some(NotAuthReason::token_rejected), None).contains("rejected"));
-        assert!(message_for(Some(NotAuthReason::unreachable), None).contains("reach GitLab"));
-        assert!(message_for(Some(NotAuthReason::keychain_error), None).contains("keychain"));
-        assert!(message_for(Some(NotAuthReason::logged_out), None).contains("Logged out"));
+        assert!(message_for(Some(NotAuthReason::token_rejected), None, None).contains("rejected"));
+        assert!(message_for(Some(NotAuthReason::unreachable), None, None).contains("reach GitLab"));
+        assert!(message_for(Some(NotAuthReason::keychain_error), None, None).contains("keychain"));
+        assert!(message_for(Some(NotAuthReason::logged_out), None, None).contains("Logged out"));
     }
 
     #[test]
@@ -299,7 +343,54 @@ mod tests {
                 "Logged out. Run `forskap auth login` to authenticate.",
             ),
         ] {
-            assert_eq!(message_for(Some(reason), None), message);
+            assert_eq!(message_for(Some(reason), None, None), message);
+        }
+    }
+
+    /// A daemon of 1.3 says whether it gets a session by itself, and the
+    /// message says wait or act instead of hedging.
+    #[test]
+    fn a_daemon_that_says_whether_it_retries_gets_a_plain_answer() {
+        let locked = "it is locked; the daemon connects by itself once it is unlocked";
+        for (reason, detail, retrying, message) in [
+            (
+                NotAuthReason::unreachable,
+                Some("gitlab.example.com: timed out"),
+                true,
+                "Can't reach GitLab — the daemon is not connected. It reconnects by itself. \
+                 (gitlab.example.com: timed out)",
+            ),
+            (
+                NotAuthReason::unreachable,
+                None,
+                false,
+                "Can't reach GitLab — the daemon is not connected. Auto-reconnect is off: \
+                 restart the daemon once GitLab is reachable.",
+            ),
+            // The detail of a locked keychain says what the message does.
+            (
+                NotAuthReason::keychain_error,
+                Some(locked),
+                true,
+                "The keychain holding your credentials is locked. The daemon connects by \
+                 itself once it is unlocked.",
+            ),
+            (
+                NotAuthReason::keychain_error,
+                Some("secret store: no such service"),
+                false,
+                "Couldn't read your saved credentials from the keychain. Run \
+                 `forskap auth login` to store them again. (secret store: no such service)",
+            ),
+            // What takes a login reads the same either way.
+            (
+                NotAuthReason::logged_out,
+                None,
+                false,
+                "Logged out. Run `forskap auth login` to authenticate.",
+            ),
+        ] {
+            assert_eq!(message_for(Some(reason), detail, Some(retrying)), message);
         }
     }
 
@@ -308,7 +399,7 @@ mod tests {
         // A daemon predating the `reason` field sends it absent (`None`); the
         // enum type makes an *unknown* code unrepresentable.
         let fallback = "Not connected to GitLab. Run `forskap auth login` to authenticate.";
-        assert_eq!(message_for(None, None), fallback);
+        assert_eq!(message_for(None, None, None), fallback);
     }
 
     #[test]
@@ -316,9 +407,10 @@ mod tests {
         let m = message_for(
             Some(NotAuthReason::unreachable),
             Some("gitlab.example.com: connection refused"),
+            None,
         );
         assert!(m.ends_with("(gitlab.example.com: connection refused)"));
         // An empty detail is ignored rather than rendered as "()".
-        assert!(!message_for(Some(NotAuthReason::unreachable), Some("")).ends_with("()"));
+        assert!(!message_for(Some(NotAuthReason::unreachable), Some(""), None).ends_with("()"));
     }
 }

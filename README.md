@@ -63,7 +63,8 @@ file.
 The suggested scopes include `self_rotate`: with it the daemon replaces the token by a
 fresh one shortly before it expires, so a short expiry doesn't mean logging in again
 ([details](forskapd/README.md#token-rotation)). `forskap auth status` shows when the
-token expires and whether it is rotated.
+token expires and when the daemon rotates it — or why it doesn't, and what a failed
+attempt came to.
 
 The daemon keeps working offline: reads serve the local cache, and time you log
 while GitLab is unreachable is queued and posted once it reconnects.
@@ -148,7 +149,12 @@ so a cleared cache is not taken for a fresh one.
 daemon answers (and runs the CLI's version), that it is logged in to GitLab, that no
 sync job fails, hangs or is left waiting, and that no queued write failed for good.
 Each check comes out `ok`, `warning` or `error`; the exit status is non-zero only when
-one is an error, so a script or a shell prompt can call it too.
+one is an error, so a script or a shell prompt can call it too. Without a GitLab
+session it says how the daemon stands: since when, whether it gets one by itself —
+it reconnects to a GitLab it can't reach, and waits for a keychain that is locked,
+as one is when the daemon starts before you log in — what its attempts came to and
+when the next one comes. Those two are warnings; what takes a `forskap auth login`
+is an error.
 
 ## Config
 
