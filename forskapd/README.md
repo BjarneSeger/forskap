@@ -116,8 +116,8 @@ Keys are grouped into TOML tables, one per concern:
 | `[queue]` `max_lifetime_secs` | `604800` | How long a task retries before being dead-lettered (7 days). |
 | `[queue]` `session_wait_secs` | `30` | Worker sleep while the daemon is dormant (no session). |
 | `[queue]` `max_in_flight` | `4` | Most queued writes sent to GitLab at once; writes to the same issue or MR go one at a time, in order (floor 1). |
-| `[reconnect]` `enabled` | `true` | Auto-reconnect after an unreachable-GitLab dormancy (down at boot or dropped mid-run). When `false`, recovery is manual (`forskap auth login` or restart). |
-| `[reconnect]` `base_delay_secs` | `2` | Auto-reconnect backoff initial delay. |
+| `[reconnect]` `enabled` | `true` | Auto-reconnect after an unreachable-GitLab dormancy (down at boot or dropped mid-run), and connect once a keychain found locked is unlocked (a daemon started before the desktop session). When `false`, recovery is manual (`forskap auth login` or restart). |
+| `[reconnect]` `base_delay_secs` | `2` | Auto-reconnect backoff initial delay; also the first wait before looking at a locked keychain again. |
 | `[reconnect]` `max_delay_secs` | `60` | Auto-reconnect backoff cap (1 min); retries continue indefinitely at the cap. |
 | `[search]` `population` | `"tracked"` | What the search corpus holds for issues/MRs: `"tracked"` = the member projects you are active in (assignments, pushes, issues, MRs, comments, timelogs — see `tracked_retention_hours`; activity in a non-member project, such as an upstream you contribute to, only keeps your assigned items there), `"member"` = every member project, `"all"` = everything the token can see (`scope=all`; huge on large instances, rejected by gitlab.com). `"auto"` is an alias of `"tracked"`. Projects and groups are always membership-scoped; epics (GitLab Premium and up) come from the member groups above the corpus projects. |
 | `[search]` `partial_interval_secs` | `1800` | Seconds between incremental syncs of each corpus project (30 min). Restarting inside this window does not re-poll GitLab. |

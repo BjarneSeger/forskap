@@ -102,3 +102,41 @@ dbus-run-session -- bash -c '
 ```
 
 Afterwards `stat ~/.local/share/keyrings/login.keyring` must show an unchanged mtime.
+
+### Locked at the daemon's start
+
+What a daemon started before the desktop session meets (a lingering user's, at
+boot): a locked keyring, no display for its unlock prompt, and a login that unlocks
+the keyring later. In the same private session, started with
+`env -u DISPLAY -u WAYLAND_DISPLAY dbus-run-session -- …` (with a display,
+gcr-prompter raises a real dialog for the scratch keyring), after the `secret-tool
+store` above:
+
+```bash
+  # Before the login: a keyring daemon without the password takes the place of
+  # the unlocked one.
+  gnome-keyring-daemon --replace --components=secrets --daemonize < /dev/null
+  ./target/debug/forskapd > $XDG_DATA_HOME/../daemon.log 2>&1 & D=$!
+  # … "the keychain is locked; starting dormant and connecting once it is unlocked" …
+  # The login: one with the password takes the place of the locked one.
+  echo -n "test-pw" | gnome-keyring-daemon --replace --unlock --components=secrets --daemonize
+  ./target/debug/forskap auth status   # finds it waiting, which makes it look now
+```
+
+- The daemon serves its socket at once, dormant on a `keychain_error` whose detail
+  says locked. However long it waits, the session's output has one
+  `Activating service name='org.gnome.keyring.SystemPrompter'`, the start's one
+  attempt to ask.
+- A moment after the `auth status`, the log says "the keychain is unlocked;
+  connecting to GitLab" and, with credentials for `localhost:8930`, the session reads
+  `unreachable`.
+- `--replace` reaches the keyring daemon behind `$GNOME_KEYRING_CONTROL` (set by the
+  first `eval`) or `$XDG_RUNTIME_DIR/keyring`: the scratch one, as long as both point
+  into the scratch dir. The scratch daemons go with the session's bus; don't kill
+  one by name, the real one matches too.
+- This is harder on the daemon than a real login, where PAM unlocks the *running*
+  keyring daemon over its control socket: here the service is replaced under the
+  daemon's client, whose first call fails with "The session does not exist" and is
+  tried again on a new one. gnome-keyring has no command that unlocks a running
+  daemon with a password, and `oo7-cli unlock` asks the service to unlock, which
+  raises the very prompt that has no display.

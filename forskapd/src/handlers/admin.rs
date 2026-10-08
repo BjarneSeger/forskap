@@ -12,7 +12,7 @@ use forskap_api::admin::{
 
 use crate::error::{DormancyReason, Error, Verdict};
 use crate::gitlab::GitlabClient;
-use crate::secrets::{Credentials, Token};
+use crate::secrets::{Credentials, Token, Unlock};
 use crate::sync::{Clear, Job};
 
 use super::{ConnState, Handlers, Session, now_secs, wire};
@@ -150,7 +150,8 @@ impl VarlinkInterface for Handlers {
             host: host.clone(),
             token,
         };
-        if let Err(e) = self.keychain.store(&creds).await {
+        // The user is at the terminal: a locked keyring may ask them.
+        if let Err(e) = self.keychain.store(&creds, Unlock::Ask).await {
             warn!(error = %e, "Login: keychain write failed");
             return reply_failed(call, &e, format!("keychain write failed: {e}"));
         }
@@ -172,7 +173,7 @@ impl VarlinkInterface for Handlers {
         }
         *self.session.write().await = ConnState::Dormant(DormancyReason::LoggedOut);
         self.rotation.reevaluate();
-        if let Err(e) = self.keychain.delete().await {
+        if let Err(e) = self.keychain.delete(Unlock::Ask).await {
             warn!(error = %e, "Logout: keychain delete failed");
             return reply_failed(call, &e, format!("keychain delete failed: {e}"));
         }

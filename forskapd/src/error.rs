@@ -45,6 +45,13 @@ pub enum Error {
     #[error("secret store: {0}")]
     Secrets(String),
 
+    /// The keychain is locked and nobody unlocked it: the credentials are
+    /// unread, not gone. Only the Secret Service says so; the macOS Keychain
+    /// has no such answer.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    #[error("the keychain is locked")]
+    KeychainLocked,
+
     /// The daemon runs without a keychain (a dry run).
     #[error("this forskapd is a dry run and has no keychain")]
     NoKeychain,
@@ -97,6 +104,7 @@ impl Error {
                 Verdict::Unavailable
             }
             Self::Secrets(_)
+            | Self::KeychainLocked
             | Self::NoKeychain
             | Self::Fjall(_)
             | Self::Db(_)
@@ -128,6 +136,11 @@ pub enum DormancyReason {
     NoCredentials,
     /// Reading the OS keychain failed.
     KeychainError(String),
+    /// The OS keychain is locked, so the credentials in it can't be read
+    /// until the user unlocks it (a login to the desktop session does).
+    /// `host` is the one of the outage it was found locked in; `None` when
+    /// the daemon started with it locked.
+    KeychainLocked { host: Option<String> },
     /// Credentials exist but GitLab was unreachable (network / transient error).
     Unreachable { host: String, detail: String },
     /// Credentials exist but GitLab rejected the token (auth failure).
@@ -143,7 +156,8 @@ impl DormancyReason {
     pub fn reason(&self) -> NotAuthReason {
         match self {
             Self::NoCredentials => NotAuthReason::no_credentials,
-            Self::KeychainError(_) => NotAuthReason::keychain_error,
+            // The wire enum is carried by replies: it can't grow a variant.
+            Self::KeychainError(_) | Self::KeychainLocked { .. } => NotAuthReason::keychain_error,
             Self::Unreachable { .. } => NotAuthReason::unreachable,
             Self::TokenRejected { .. } => NotAuthReason::token_rejected,
             Self::LoggedOut => NotAuthReason::logged_out,
@@ -155,6 +169,9 @@ impl DormancyReason {
         match self {
             Self::NoCredentials | Self::LoggedOut => None,
             Self::KeychainError(d) => Some(d.clone()),
+            Self::KeychainLocked { .. } => {
+                Some("it is locked; the daemon connects by itself once it is unlocked".to_string())
+            }
             Self::Unreachable { host, detail } | Self::TokenRejected { host, detail } => {
                 Some(format!("{host}: {detail}"))
             }
@@ -181,15 +198,26 @@ impl DormancyReason {
         }
     }
 
+    /// Why a failed keychain read leaves the daemon without a session: the
+    /// keychain is locked, or it can't be read at all.
+    pub fn from_keychain_error(e: &Error) -> Self {
+        match e {
+            Error::KeychainLocked => Self::KeychainLocked { host: None },
+            other => Self::KeychainError(other.to_string()),
+        }
+    }
+
     /// Whether the daemon should keep retrying the connection on its own.
     ///
-    /// Only a transient network failure (`Unreachable`) is worth auto-retrying:
-    /// the credentials are known-good and the outage is expected to clear. Every
-    /// other reason needs the user to act — `forskap auth login` after a `TokenRejected` /
-    /// `NoCredentials` / `LoggedOut`, or fixing the keychain — so retrying would
-    /// just spin. Consumed by the background reconnect task (see `reconnect`).
+    /// A transient network failure (`Unreachable`) is worth auto-retrying: the
+    /// credentials are known-good and the outage is expected to clear. So is a
+    /// locked keychain (`KeychainLocked`): the credentials are there, and
+    /// looking again costs no prompt. Every other reason needs the user to
+    /// act — `forskap auth login` after a `TokenRejected` / `NoCredentials` /
+    /// `LoggedOut`, or fixing the keychain — so retrying would just spin.
+    /// Consumed by the background reconnect task (see `reconnect`).
     pub fn is_auto_retryable(&self) -> bool {
-        matches!(self, Self::Unreachable { .. })
+        matches!(self, Self::Unreachable { .. } | Self::KeychainLocked { .. })
     }
 }
 
@@ -303,6 +331,7 @@ mod tests {
             (throttled(503), Verdict::Unavailable),
             (Error::RotationLost("x".into()), Verdict::Unavailable),
             (Error::Secrets("locked".into()), Verdict::Internal),
+            (Error::KeychainLocked, Verdict::Internal),
             (Error::NoKeychain, Verdict::Internal),
             (Error::Db("bad key"), Verdict::Internal),
             (Error::Json(json), Verdict::Internal),
@@ -333,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn only_unreachable_is_auto_retryable() {
+    fn only_an_outage_and_a_locked_keychain_are_auto_retryable() {
         let host = "gitlab.example.com".to_string();
         assert!(
             DormancyReason::Unreachable {
@@ -342,6 +371,7 @@ mod tests {
             }
             .is_auto_retryable()
         );
+        assert!(DormancyReason::KeychainLocked { host: None }.is_auto_retryable());
         assert!(
             !DormancyReason::TokenRejected {
                 host,
@@ -352,5 +382,21 @@ mod tests {
         assert!(!DormancyReason::NoCredentials.is_auto_retryable());
         assert!(!DormancyReason::KeychainError("boom".into()).is_auto_retryable());
         assert!(!DormancyReason::LoggedOut.is_auto_retryable());
+    }
+
+    #[test]
+    fn a_locked_keychain_reads_as_a_keychain_error_that_heals() {
+        let locked = DormancyReason::from_keychain_error(&Error::KeychainLocked);
+        assert!(matches!(
+            locked,
+            DormancyReason::KeychainLocked { host: None }
+        ));
+        // The wire has no reason of its own for it: the detail says so.
+        assert_eq!(locked.reason(), NotAuthReason::keychain_error);
+        assert!(locked.detail().unwrap().contains("locked"));
+
+        let broken = DormancyReason::from_keychain_error(&Error::Secrets("no bus".into()));
+        assert!(matches!(&broken, DormancyReason::KeychainError(d) if d.contains("no bus")));
+        assert!(!broken.is_auto_retryable());
     }
 }

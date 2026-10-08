@@ -102,6 +102,7 @@ pub struct Handlers {
     pub config: SharedConfig,
     /// Nudged when the sync worker demotes the session to
     /// `Dormant(Unreachable)` (see [`crate::reconnect::commit_unreachable`]),
+    /// and when a call finds the session waiting for a locked keychain,
     /// waking the reconnect supervisor.
     pub reconnect_signal: Arc<Notify>,
     /// What the rotation supervisor knows about the session's token, and its
@@ -116,10 +117,7 @@ impl Handlers {
     /// Resolve the live GitLab client, or `NotAuthenticated` carrying the
     /// dormancy reason.
     async fn gitlab(&self) -> std::result::Result<Arc<dyn GitlabApi>, DormancyReason> {
-        match &*self.session.read().await {
-            ConnState::Connected(s) => Ok(s.gitlab.clone()),
-            ConnState::Dormant(r) => Err(r.clone()),
-        }
+        self.current_session().await.map(|s| s.gitlab)
     }
 
     /// Resolve the full session, or `NotAuthenticated` carrying the dormancy
@@ -127,7 +125,15 @@ impl Handlers {
     async fn current_session(&self) -> std::result::Result<Session, DormancyReason> {
         match &*self.session.read().await {
             ConnState::Connected(s) => Ok(s.clone()),
-            ConnState::Dormant(r) => Err(r.clone()),
+            ConnState::Dormant(r) => {
+                // Someone is asking, so the user is around and may just have
+                // unlocked the keychain: the supervisor looks now, not after
+                // its back-off. This call still gets the reason it found.
+                if matches!(r, DormancyReason::KeychainLocked { .. }) {
+                    self.reconnect_signal.notify_one();
+                }
+                Err(r.clone())
+            }
         }
     }
 }
