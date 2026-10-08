@@ -1044,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "forskap-cli"
-version = "1.1.0"
+version = "1.2.0-rc.1"
 dependencies = [
  "anstyle",
  "anyhow",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "forskapd"
-version = "1.1.0"
+version = "1.2.0-rc.1"
 dependencies = [
  "async-trait",
  "bytes",
