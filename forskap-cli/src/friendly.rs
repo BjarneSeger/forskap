@@ -106,8 +106,9 @@ pub fn friendly(op: &str, e: impl DaemonError) -> anyhow::Error {
 
 /// The message for a dormancy `reason` code, with `detail` appended in
 /// parentheses when present. Unknown codes and a missing reason (older daemon)
-/// fall back to the generic "run `forskap auth login`" line.
-fn message_for(reason: Option<NotAuthReason>, detail: Option<&str>) -> String {
+/// fall back to the generic "run `forskap auth login`" line. Also for a view
+/// that says beside its own content why there is no session.
+pub fn message_for(reason: Option<NotAuthReason>, detail: Option<&str>) -> String {
     let base = format!("{} {}", problem(reason.as_ref()), remedy(reason.as_ref()));
     match detail {
         Some(d) if !d.is_empty() => format!("{base} ({d})"),

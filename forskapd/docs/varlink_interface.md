@@ -663,7 +663,7 @@ that name means.
 
 ## Sync status
 
-### `GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int)`
+### `GetSyncJobs() -> (jobs: []SyncJob, paused_until: ?int, connected: ?bool)`
 
 Lists the jobs the sync worker has planned, in the order it runs them: the ones in
 flight, the ones demanded ahead of the schedule (a `ClearCache`, a write that just
@@ -685,10 +685,27 @@ requests, a group's epics, `all/issues`, `all/merge_requests` and `events`.
 `paused_until` (unix seconds) is set while a GitLab rate limit (429) holds every
 job back; the statuses then say what runs once the pause is over.
 
+**Holds.** A `demanded` or `due` job that doesn't run says in `held_by` what keeps
+it, the first of these that applies:
+
+| `held_by`    | the job waits for                                                    |
+|--------------|----------------------------------------------------------------------|
+| `session`    | a GitLab session (`connected` is false; `GetStatus` says why)         |
+| `rate_limit` | the end of the pause (`paused_until`)                                |
+| `lane`       | the running job `behind` names: one per project, per group's epics, per list |
+| `slots`      | one of the `sync.max_in_flight` slots                                |
+
+Absent, nothing holds it: it starts with the worker's next launch, after the jobs
+ahead of it and the gap between two launches (`sync.job_gap_ms`). A `waiting` job has
+one hold, `startup`: its interval has passed, and only the spread after the daemon's
+start (`sync.startup_spread_secs`) keeps it until `next_due`. `connected` is the
+session the worker found when it answered, which is what its jobs are held by; a
+daemon that didn't hear from its worker in time replies no jobs and no `connected`.
+
 Status, not GitLab data: never errors and is served while dormant. A dormant
-daemon runs nothing, so its jobs stay `due` until a session exists. `last_error`
-is kept in memory only — after a daemon restart a job can be `backing_off` without
-one.
+daemon runs nothing, so its jobs stay `due`, held by `session`, until one exists;
+it drops what was demanded. `last_error` is kept in memory only — after a daemon
+restart a job can be `backing_off` without one.
 
 **Unavailable jobs.** Some listings GitLab refuses for good, and failing them
 forever would only drown the failures that matter. Two mechanisms keep them out:

@@ -123,7 +123,11 @@ project) on one line per kind, and does the same for the jobs GitLab refuses for
 Premium; the daemon asks again once a day); `-a`/`--all` lists each, with GitLab's
 answer. A running job says how far it is: `for 8s · 400/1000 (full)` is 400 of the
 1000 rows GitLab announced, in a full run rather than a delta; `400/?` where GitLab
-announced no total.
+announced no total. A job whose turn has come and that still doesn't run says what it
+waits for: `needs a session` (why there is none stands above the table),
+`after the pause` of a rate limit, `after project/7/issues` (one job per project at a
+time), `when a slot is free`; `in 40s (startup)` is a job the daemon's start spreads
+out.
 
 `forskap status` is the first thing to run when forskap seems off. It checks that the
 daemon answers (and runs the CLI's version), that it is logged in to GitLab, that no

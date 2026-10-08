@@ -7,7 +7,7 @@ use tokio::sync::{Notify, RwLock};
 
 use forskap_api::admin::{
     self, CacheScope, Call_ClearCache, Call_GetSyncJobs, Call_Login, Call_Logout,
-    GetSyncJobs_Reply, SyncJobStatus, VarlinkInterface as _,
+    GetSyncJobs_Reply, SyncJobHold, SyncJobStatus, VarlinkInterface as _,
 };
 use forskap_api::{
     AsyncCall, Call_AssignSelf, Call_Close, Call_CreateWorkItem, Call_DismissFailure,
@@ -2918,6 +2918,12 @@ async fn get_sync_jobs_lists_the_plan_while_dormant() {
     assert_eq!(job.unavailable, Some(false));
     // Progress is a running job's.
     assert_eq!((job.full, job.fetched, job.expected), (None, None, None));
+    // Due, and not running: the reply says what it waits for.
+    assert_eq!(reply.connected, Some(false));
+    assert_eq!(
+        (job.held_by.clone(), job.behind.as_deref()),
+        (Some(SyncJobHold::session), None)
+    );
 }
 
 /// A fetch in flight says how far it is: the rows GitLab announced, none of

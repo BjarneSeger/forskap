@@ -1061,6 +1061,8 @@ mod tests {
             full: None,
             fetched: None,
             expected: None,
+            held_by: None,
+            behind: None,
         }
     }
 
@@ -1098,6 +1100,7 @@ mod tests {
         Answer::Got(GetSyncJobs_Reply {
             jobs,
             paused_until: None,
+            connected: None,
         })
     }
 
@@ -1362,6 +1365,7 @@ mod tests {
             jobs: Answer::Got(GetSyncJobs_Reply {
                 jobs: vec![fresh("assigned/issues")],
                 paused_until: Some(NOW + 240),
+                connected: None,
             }),
             ..healthy()
         };
@@ -1374,6 +1378,7 @@ mod tests {
             jobs: Answer::Got(GetSyncJobs_Reply {
                 jobs: vec![fresh("assigned/issues")],
                 paused_until: Some(NOW - 1),
+                connected: None,
             }),
             ..healthy()
         };
@@ -1682,6 +1687,7 @@ healthy
             jobs: Answer::Got(GetSyncJobs_Reply {
                 jobs: idle.clone(),
                 paused_until: Some(NOW + 60),
+                connected: None,
             }),
             ..healthy()
         };
@@ -1709,6 +1715,7 @@ healthy
                 },
             ],
             paused_until: Some(NOW + 600),
+            connected: None,
         });
         let answers = Answers {
             jobs: paused_failing_overdue,
