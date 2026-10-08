@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 
 use forskapd::config::SharedConfig;
 use forskapd::error::DormancyReason;
@@ -60,7 +60,7 @@ pub fn dormant_env() -> BenchEnv {
         DormancyReason::NoCredentials,
     )));
     let config: SharedConfig = Arc::new(std::sync::RwLock::new(forskapd::config::defaults()));
-    let reconnect_signal = Arc::new(Notify::new());
+    let reconnect_signal = Arc::new(forskapd::reconnect::Reconnect::default());
     // A bench never reaches the OS keychain.
     let keychain = Keychain::disabled();
     let sync = SyncHandle::spawn(
@@ -81,7 +81,7 @@ pub fn dormant_env() -> BenchEnv {
             usage,
             queue,
             config,
-            reconnect_signal,
+            reconnect: reconnect_signal,
             rotation: Default::default(),
             keychain,
         },

@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::args::Args;
@@ -30,6 +30,7 @@ use crate::error::{DormancyReason, Error, Result};
 use crate::gitlab::GitlabClient;
 use crate::handlers::{ConnState, Handlers, Session, SessionSlot};
 use crate::queue::{RetryQueue, SettleHook};
+use crate::reconnect::Reconnect;
 use crate::secrets::{Keychain, Unlock};
 use crate::service::ServiceHandler;
 use crate::sync::store::SyncStore;
@@ -284,6 +285,13 @@ impl Daemon {
             listen,
             announce,
         } = env;
+        // Woken when the sync worker demotes the session to `Dormant(Unreachable)`,
+        // so the reconnect supervisor re-engages mid-run and not only at boot.
+        // A daemon that starts without a session has had none since now.
+        let reconnect_signal = Arc::new(Reconnect::default());
+        if matches!(session, ConnState::Dormant(_)) {
+            reconnect_signal.lost();
+        }
         let session: SessionSlot = Arc::new(RwLock::new(session));
 
         std::fs::create_dir_all(&db_dir)?;
@@ -297,9 +305,6 @@ impl Daemon {
         }
         let store = Arc::new(SyncStore::open(&db)?);
         let usage = Arc::new(UsageStats::open(&db)?);
-        // Woken when the sync worker demotes the session to `Dormant(Unreachable)`,
-        // so the reconnect supervisor re-engages mid-run and not only at boot.
-        let reconnect_signal = Arc::new(Notify::new());
         // The only GitLab reader: fetches on its jittered schedule into `store`,
         // which the handlers serve from.
         let sync = SyncHandle::spawn(
@@ -319,7 +324,7 @@ impl Daemon {
             usage,
             queue,
             config: Arc::clone(&config),
-            reconnect_signal,
+            reconnect: reconnect_signal,
             rotation: Arc::clone(&rotation),
             keychain,
         });

@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 
 use forskap_api::{IssuableKind, NotAuthReason, VarlinkCallError, WorkItemRef};
 
@@ -25,6 +25,7 @@ use crate::config::SharedConfig;
 use crate::error::{DormancyReason, Error, Verdict};
 use crate::gitlab::{GitlabApi, GitlabClient};
 use crate::queue::RetryQueue;
+use crate::reconnect::Reconnect;
 use crate::rotate::Rotation;
 use crate::secrets::{Keychain, Token};
 use crate::sync::{SyncHandle, now_secs};
@@ -100,11 +101,12 @@ pub struct Handlers {
     /// Live daemon config, read at use time so a hot reload takes effect
     /// without a restart.
     pub config: SharedConfig,
-    /// Nudged when the sync worker demotes the session to
-    /// `Dormant(Unreachable)` (see [`crate::reconnect::commit_unreachable`]),
-    /// and when a call finds the session waiting for a locked keychain,
-    /// waking the reconnect supervisor.
-    pub reconnect_signal: Arc<Notify>,
+    /// The reconnect supervisor's wakeup — nudged when the sync worker
+    /// demotes the session to `Dormant(Unreachable)` (see
+    /// [`crate::reconnect::commit_unreachable`]) and when a call finds the
+    /// session waiting for a locked keychain — and how the daemon stands
+    /// without a session: since when, and what the supervisor is at.
+    pub reconnect: Arc<Reconnect>,
     /// What the rotation supervisor knows about the session's token, and its
     /// wakeup.
     pub rotation: Arc<Rotation>,
@@ -130,7 +132,7 @@ impl Handlers {
                 // unlocked the keychain: the supervisor looks now, not after
                 // its back-off. This call still gets the reason it found.
                 if matches!(r, DormancyReason::KeychainLocked { .. }) {
-                    self.reconnect_signal.notify_one();
+                    self.reconnect.notify_one();
                 }
                 Err(r.clone())
             }

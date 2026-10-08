@@ -93,8 +93,11 @@ call)` asserts an `InvalidArgument` and returns the argument it names,
 `gitlab_status(&mut call)` asserts a `GitlabError` and returns its status.
 
 **Reconnect-signal assertions**: demotion woke the supervisor →
-`tokio::time::timeout(Duration::from_millis(200), h.reconnect_signal.notified())`
+`tokio::time::timeout(Duration::from_millis(200), h.reconnect.notified())`
 is `Ok`; "did not fire" → `.is_err()`.
+`h.reconnect` is the supervisor's `Reconnect`: its wakeup, and how the dormancy
+stands (`standing()`: since when, attempts, the latest error, the next attempt), which
+`handlers_with` stamps for a dormant state like the daemon's start does.
 
 ## Sync tests (`src/sync/*`)
 
