@@ -734,7 +734,7 @@ forever would only drown the failures that matter. Two mechanisms keep them out:
 
 ## Cache control
 
-### `ClearCache(scope: ?[]CacheScope) -> ()`
+### `ClearCache(scope: ?[]CacheScope) -> (pending: ?[]string)`
 
 Clears cached state and makes its sync jobs due at once. Omitted or empty `scope`
 clears everything synced. Otherwise each scope selects a slice:
@@ -755,6 +755,13 @@ for a history band and the empty scope. Everything else refills in the
 background — the `ListWorkItems` lists among it, so that method can reply empty right
 after a clear; `usage` alone makes no GitLab call. Replies success even when
 dormant — the cleared state then stays empty until the next successful sync.
+
+A success is the clear, not the refill: `pending` names the jobs the reply waited
+for that have had no successful run since — every one of them while dormant (the
+wait is over at once then) or held by a rate limit, the one whose fetch failed,
+the ones still running or queued when the 30 s were up. Absent, everything it
+waited for is fresh. `GetSyncJobs` says for each what it is at (`held_by`,
+`last_error`, its progress).
 
 To show the refill while waiting, ask `GetSyncJobs` on a second connection: the
 daemon answers the calls of one connection one after the other.

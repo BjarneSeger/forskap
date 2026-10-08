@@ -416,6 +416,17 @@ impl SyncHandle {
         }
     }
 
+    /// Whether a run of `job` that started at `since` or later completed.
+    pub fn synced_since(&self, job: Job, since: u64) -> bool {
+        match self.store.job_state(&job.key()) {
+            Ok(s) => s.last_ok >= since.max(1),
+            Err(e) => {
+                warn!(error = %e, "sync job state read failed; treating as not synced");
+                false
+            }
+        }
+    }
+
     /// Remember that `write` just reached GitLab, so views fetched before it
     /// can be corrected at read time (see [`Self::writes_since`]).
     pub fn note_write(&self, write: &Write) {

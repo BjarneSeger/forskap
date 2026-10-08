@@ -106,7 +106,14 @@ impl VarlinkInterface for Handlers {
         {
             warn!("refill still running; replying before it lands");
         }
-        call.reply()
+        // Whatever ended the wait, the caller hears what it didn't bring:
+        // the jobs with no run since the clear.
+        let pending: Vec<String> = refill
+            .iter()
+            .filter(|job| !self.sync.synced_since(**job, now))
+            .map(Job::key)
+            .collect();
+        call.reply(Some(pending).filter(|p| !p.is_empty()))
     }
 
     /// Status, not GitLab data: served whatever the session is.

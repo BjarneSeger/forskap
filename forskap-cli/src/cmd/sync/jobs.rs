@@ -389,7 +389,7 @@ fn next(job: &SyncJob, now: i64) -> String {
 
 /// What a job whose turn has come waits for, as the daemon says; nothing
 /// where it is simply next, and from a daemon too old to say.
-fn held(job: &SyncJob) -> Option<String> {
+pub fn held(job: &SyncJob) -> Option<String> {
     Some(match (job.held_by.as_ref()?, job.behind.as_deref()) {
         (SyncJobHold::session, _) => "needs a session".to_string(),
         (SyncJobHold::rate_limit, _) => "after the pause".to_string(),

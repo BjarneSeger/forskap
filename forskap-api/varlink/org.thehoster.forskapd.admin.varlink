@@ -102,7 +102,10 @@ type CacheScope (
 )
 
 # Clears cached state, all of it or the given scopes, and syncs it again.
-method ClearCache(scope: ?[]CacheScope) -> ()
+# pending: the keys of the jobs it waited for that have not synced again when
+# it replies (no session, a rate limit, a failure, or still running after its
+# 30 s); absent when all did, and from an older daemon. GetSyncJobs says why.
+method ClearCache(scope: ?[]CacheScope) -> (pending: ?[]string)
 
 # The sync worker's jobs in the order it runs them, until when a GitLab rate
 # limit pauses them all, and whether the worker has a session to run them with

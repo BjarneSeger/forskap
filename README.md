@@ -129,6 +129,12 @@ waits for: `needs a session` (why there is none stands above the table),
 time), `when a slot is free`; `in 40s (startup)` is a job the daemon's start spreads
 out.
 
+`forskap sync refresh` replies once the daemon has fetched the assigned lists and
+the history again. Where it couldn't, a second line says what is missing and why —
+`not synced again: no GitLab session: …`, a rate limit's pause, the job whose fetch
+failed, or `still syncing …` when the refill takes longer than the daemon waits —
+so a cleared cache is not taken for a fresh one.
+
 `forskap status` is the first thing to run when forskap seems off. It checks that the
 daemon answers (and runs the CLI's version), that it is logged in to GitLab, that no
 sync job fails, hangs or is left waiting, and that no queued write failed for good.
