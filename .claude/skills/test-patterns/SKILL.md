@@ -120,6 +120,9 @@ stands (`standing()`: since when, attempts, the latest error, the next attempt),
   `let (logs, _guard) = Logs::capture();` before starting it, then
   `logs.count("WARN", &job.key())` / `logs.said(level, key, "message")`: a
   `#[tokio::test]` runs the worker on its own thread, where the capture applies.
+  The subscriber behind it is one for the whole test binary, handing each thread's
+  lines to its capture. Never a thread's own (`set_default`): tracing caches per
+  callsite whether anyone listens, so it loses what another test logged first.
 
 ## Dry-run tests (`src/daemon.rs`, `src/demo.rs`)
 

@@ -2420,9 +2420,23 @@ mod tests {
     #[derive(Clone, Default)]
     struct Logs(Arc<Mutex<Vec<u8>>>);
 
-    impl std::io::Write for Logs {
+    thread_local! {
+        /// The capture of the test running on this thread.
+        static CAPTURE: std::cell::RefCell<Option<Logs>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Writes a line to the capture of the thread that logged it.
+    struct ToCapture;
+
+    impl std::io::Write for ToCapture {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            // Not `with`: a thread may still log while it ends.
+            let _ = CAPTURE.try_with(|capture| {
+                if let Some(logs) = &*capture.borrow() {
+                    logs.0.lock().unwrap().extend_from_slice(buf);
+                }
+            });
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -2430,23 +2444,34 @@ mod tests {
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
-        type Writer = Logs;
-        fn make_writer(&'a self) -> Logs {
-            self.clone()
+    /// Ends the capture on its thread.
+    struct Capturing;
+
+    impl Drop for Capturing {
+        fn drop(&mut self) {
+            CAPTURE.set(None);
         }
     }
 
     impl Logs {
-        /// Capture everything from debug up until the guard drops.
-        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        /// Capture everything this thread logs from debug up until the guard
+        /// drops. The subscriber is the test binary's, not this thread's:
+        /// tracing caches per callsite whether anyone listens, and asks only
+        /// the thread reaching it first, which may be another test's.
+        fn capture() -> (Self, Capturing) {
+            static SUBSCRIBER: std::sync::Once = std::sync::Once::new();
+            SUBSCRIBER.call_once(|| {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(|| ToCapture)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .with_ansi(false)
+                    .finish();
+                tracing::subscriber::set_global_default(subscriber)
+                    .expect("no other subscriber in the test binary");
+            });
             let logs = Logs::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(logs.clone())
-                .with_max_level(tracing::Level::DEBUG)
-                .with_ansi(false)
-                .finish();
-            (logs, tracing::subscriber::set_default(subscriber))
+            CAPTURE.set(Some(logs.clone()));
+            (logs, Capturing)
         }
 
         fn text(&self) -> String {
@@ -2468,6 +2493,18 @@ mod tests {
                 .filter(|l| l.contains(&level) && l.contains(what))
                 .count()
         }
+    }
+
+    /// Other tests log from their own threads, often first.
+    #[test]
+    fn a_capture_holds_a_line_another_thread_logged_first() {
+        fn log() {
+            warn!("logged by two threads");
+        }
+        let (logs, _guard) = Logs::capture();
+        std::thread::spawn(log).join().unwrap();
+        log();
+        assert_eq!(logs.text().matches("logged by two threads").count(), 1);
     }
 
     /// Project 7, tracked through an event and listed as a member, so its
