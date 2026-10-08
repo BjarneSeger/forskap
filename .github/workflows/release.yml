@@ -5,6 +5,11 @@ name: Release
 # kache store is saved — Actions caches are only visible to the ref that
 # saved them and to the default branch, so a tag can never reuse another
 # tag's cache.
+#
+# A published release is immutable (the repository's "release immutability"
+# setting): assets and tag are locked, and the tag name is gone for good. So
+# what a tag can get wrong is checked before the build, and publishing is the
+# release job's last step.
 on:
   push:
     branches:
@@ -14,14 +19,36 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  # Before anything is built. A tag has the workspace's version (the binaries
+  # report that one, the packages the tag's) and its section in CHANGELOG.md,
+  # which opens the release notes.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the changelog's headings
+        run: bash .github/scripts/release-notes.sh --check
+
+      - name: Check the tag
+        if: github.ref_type == 'tag'
+        run: |
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::the tag is $GITHUB_REF_NAME, Cargo.toml is at $version"
+            exit 1
+          fi
+          bash .github/scripts/release-notes.sh "$version"
+
   # GoReleaser cross-compiles for Linux only: the daemon links
   # Security.framework, which needs Apple's SDK. The macOS archive is built
   # here, for snapshots as well, so a macOS-only break shows before a tag,
   # and the release job publishes it with the Linux ones.
   macos:
+    needs: check
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -59,6 +86,11 @@ jobs:
   release:
     needs: macos
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # The attestation: a token to sign it with, and storing it.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -87,11 +119,21 @@ jobs:
 
       # GoReleaser's ignore_tags globs only cover the nearest-tag lookup: a
       # tag on HEAD itself is compared literally, and main is often tagged
-      # `clients/go/v*` (the Go binding).
+      # `clients/go/v*` (the Go binding). The previous tag is where the
+      # generated notes start: for a stable release the stable one before it,
+      # not its own release candidate.
       - name: Pick the release tag
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             tag=$GITHUB_REF_NAME
+            echo "CHECKSUMS=dist/forskap_${tag#v}_checksums.txt" >> "$GITHUB_ENV"
+            case "$tag" in
+              *-*) ;;
+              *)
+                previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' "$tag^")
+                echo "GORELEASER_PREVIOUS_TAG=$previous" >> "$GITHUB_ENV"
+                ;;
+            esac
           else
             tag=$(git describe --tags --abbrev=0 --match 'v*')
           fi
@@ -104,18 +146,75 @@ jobs:
           name: darwin-arm64
           path: dist-darwin
 
+      # The notes open with the tag's section of CHANGELOG.md; GitHub's list
+      # of merged pull requests follows (.goreleaser.yaml, changelog). Outside
+      # the checkout, where GoReleaser would call the tree dirty.
+      - name: Write the header of the release notes
+        if: github.ref_type == 'tag'
+        run: bash .github/scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > "$RUNNER_TEMP/release-header.md"
+
+      # A tag leaves a draft release holding every asset (.goreleaser.yaml,
+      # release.draft). No shell expands the arguments, hence runner.temp.
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: ${{ github.ref_type == 'tag' && 'release --clean' || 'release --snapshot --clean' }}
+          args: ${{ github.ref_type == 'tag' && format('release --clean --release-header {0}/release-header.md', runner.temp) || 'release --snapshot --clean' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # What a tag publishes, or a snapshot would.
       - name: List the checksums
         run: cat dist/*_checksums.txt
+
+      # Build provenance for every archive and package the checksums file
+      # lists, the macOS archive among them.
+      - name: Attest the artifacts
+        if: github.ref_type == 'tag'
+        uses: actions/attest@v4
+        with:
+          subject-checksums: ${{ env.CHECKSUMS }}
+
+      # Last, since nothing after it could be repaired: GitHub locks the
+      # release here and attests it. --verify-tag: a tag deleted meanwhile
+      # would be made anew at main, and locked there.
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        run: gh release edit "$GITHUB_REF_NAME" --tag "$GITHUB_REF_NAME" --verify-tag --draft=false
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # Tags only: what README.md tells a user to run, on the release just
+  # published. Gates nothing, and is the one place that notices release
+  # immutability being switched off in the repository's settings.
+  verify:
+    if: github.ref_type == 'tag'
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Verify the release and one of its archives
+        run: |
+          if [ "$(gh release view "$GITHUB_REF_NAME" --json isImmutable --jq .isImmutable)" != true ]; then
+            echo "::error::$GITHUB_REF_NAME is not immutable: is release immutability still on?"
+            exit 1
+          fi
+          # GitHub writes the release attestation as it publishes.
+          for attempt in 1 2 3 4 5; do
+            gh release verify "$GITHUB_REF_NAME" && break
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 10))
+          done
+          gh release download "$GITHUB_REF_NAME" --pattern '*_linux_amd64.tar.gz' --dir "$RUNNER_TEMP/release"
+          gh release verify-asset "$GITHUB_REF_NAME" "$RUNNER_TEMP"/release/*.tar.gz
+          gh attestation verify "$RUNNER_TEMP"/release/*.tar.gz --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
 
   # Tags only: render the Homebrew formula (Formula/forskap.rb) for the
   # release just published, from its checksums file, and commit that to main.
@@ -125,6 +224,8 @@ jobs:
     if: github.ref_type == 'tag'
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       sha: ${{ steps.push.outputs.sha }}
     steps:

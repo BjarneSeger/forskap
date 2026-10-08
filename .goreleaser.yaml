@@ -73,7 +73,21 @@ checksum:
     - glob: dist-darwin/forskap_*_darwin_arm64.tar.gz
       name_template: "{{ .ProjectName }}_{{ .Version }}_darwin_arm64.tar.gz"
 
+# GitHub's generated list of merged pull requests. The tag's section of
+# CHANGELOG.md goes on top of it (release.yml, --release-header).
+changelog:
+  use: github-native
+
 release:
+  # A published release is immutable (a repository setting): GoReleaser
+  # leaves a draft, and release.yml publishes it as its last step. A run that
+  # fails before that is run again and replaces its draft.
+  draft: true
+  replace_existing_draft: true
+  prerelease: auto
+  # A tag that is published already stops here instead of after the build.
+  preflight:
+    fail_on_error: true
   extra_files:
     - glob: dist-darwin/forskap_*_darwin_arm64.tar.gz
       name_template: "{{ .ProjectName }}_{{ .Version }}_darwin_arm64.tar.gz"
