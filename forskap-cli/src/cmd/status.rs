@@ -15,12 +15,14 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use forskap_api::QueuedWrite;
 use forskap_api::admin::{
     self, GetSyncJobs_Reply, SyncJob, SyncJobStatus, VarlinkClientInterface as _,
 };
 use forskap_api::{
-    API_VERSION, ErrorKind as ApiErrorKind, FailedTask, NotAuthReason, VarlinkClient,
-    VarlinkClientInterface, WhoAmI_Reply,
+    API_VERSION, ErrorKind as ApiErrorKind, FailedTask, GetQueue_Reply, NotAuthReason,
+    VarlinkClient, VarlinkClientInterface, WhoAmI_Reply,
 };
 use serde::Serialize;
 
@@ -101,6 +103,8 @@ struct Answers {
     interface: Answer<Option<String>>,
     who: Answer<Login>,
     jobs: Answer<GetSyncJobs_Reply>,
+    /// The writes still waiting; `None` from a daemon too old to list them.
+    queued: Answer<Option<GetQueue_Reply>>,
     failures: Answer<Vec<FailedTask>>,
 }
 
@@ -151,6 +155,7 @@ async fn gather(socket: &str) -> Answers {
         interface: Answer::Unasked,
         who: Answer::Unasked,
         jobs: Answer::Unasked,
+        queued: Answer::Unasked,
         failures: Answer::Unasked,
     };
     let conn = match ask(client::open(socket)).await {
@@ -178,7 +183,7 @@ async fn gather(socket: &str) -> Answers {
     let api = VarlinkClient::new(Arc::clone(&conn));
     let admin = admin::VarlinkClient::new(conn);
     answers.interface = match ask(api.get_status().call()).await {
-        Some(Err(e)) if is_method_not_found(&e) => Answer::Got(None),
+        Some(Err(e)) if friendly::is_method_not_found(&e) => Answer::Got(None),
         other => answer(other).map(|status| Some(status.api_version)),
     };
     if matches!(answers.interface, Answer::TimedOut) {
@@ -201,6 +206,13 @@ async fn gather(socket: &str) -> Answers {
     if matches!(answers.jobs, Answer::TimedOut) {
         return answers;
     }
+    answers.queued = match ask(api.get_queue().call()).await {
+        Some(Err(e)) if friendly::is_method_not_found(&e) => Answer::Got(None),
+        other => answer(other).map(Some),
+    };
+    if matches!(answers.queued, Answer::TimedOut) {
+        return answers;
+    }
     answers.failures = answer(ask(api.get_failures().call()).await).map(|r| r.failures);
     answers
 }
@@ -218,13 +230,6 @@ fn answer<T>(asked: Option<Result<T, impl DaemonError>>) -> Answer<T> {
         Some(Err(e)) => Answer::Failed(describe(&e)),
         None => Answer::TimedOut,
     }
-}
-
-fn is_method_not_found(e: &impl DaemonError) -> bool {
-    matches!(
-        e.varlink_kind(),
-        Some(varlink::ErrorKind::MethodNotFound(_))
-    )
 }
 
 /// A failed call in a few words, rather than the generated client's dump.
@@ -402,6 +407,10 @@ struct JobCounts {
 #[derive(Serialize)]
 struct QueueFacts {
     failed_writes: usize,
+    /// The writes still waiting to be sent; absent from a daemon too old to
+    /// say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queued_writes: Option<usize>,
 }
 
 fn evaluate(a: &Answers, now: DateTime<Utc>) -> Report {
@@ -409,7 +418,7 @@ fn evaluate(a: &Answers, now: DateTime<Utc>) -> Report {
         daemon: daemon(a),
         session: session(a, now),
         sync: sync(a, link(&a.who), now.timestamp()),
-        queue: queue(a),
+        queue: queue(a, link(&a.who), now.timestamp()),
     };
     let level = checks.rows().iter().map(|row| row.level).max();
     Report {
@@ -918,28 +927,45 @@ fn conclude<F>(name: &'static str, fine: String, findings: Vec<Finding>) -> Chec
     check
 }
 
-fn queue(a: &Answers) -> Check<QueueFacts> {
+fn queue(a: &Answers, link: Link, now: i64) -> Check<QueueFacts> {
     let failures = match reply("queue", "GetFailures", &a.failures, a) {
         Ok(failures) => failures,
         Err(check) => return check,
     };
+    // What waits is a note beside the failures, never a failure of the
+    // check: its answer missing leaves the failures to judge.
+    let queued = match &a.queued {
+        Answer::Got(queued) => queued.as_ref(),
+        _ => None,
+    };
+    let waiting = queued.map_or(0, |q| q.writes.len());
     let facts = QueueFacts {
         failed_writes: failures.len(),
+        queued_writes: queued.map(|q| q.writes.len()),
     };
-    let check = match failures.len() {
-        0 => Check::new("queue", Level::Ok, "no failed writes"),
-        n => Check::new(
-            "queue",
-            Level::Warning,
-            format!("{n} failed {}", if n == 1 { "write" } else { "writes" }),
-        )
-        .details(vec![
-            "GitLab rejected them, or they outlived the retry window: `forskap queue list` \
-             shows them, to retry or dismiss."
+    let writes = |n: usize| if n == 1 { "write" } else { "writes" };
+    let mut findings = Vec::new();
+    if !failures.is_empty() {
+        let n = failures.len();
+        findings.push(
+            Finding::new(Level::Warning, format!("{n} failed {}", writes(n))).details(vec![
+                "GitLab rejected them, or they outlived the retry window: `forskap queue list` \
+                 shows them, to retry or dismiss."
+                    .to_string(),
+            ]),
+        );
+    }
+    if let Some(queued) = queued.filter(|_| waiting > 0) {
+        let why = match (link, pause(queued.paused_until, now)) {
+            (Link::Dormant, _) => "They are sent once there is a GitLab session.".to_string(),
+            (_, Some(paused)) => format!("They are {paused}."),
+            _ => "The daemon is sending them; `forskap queue list` shows how far each is."
                 .to_string(),
-        ]),
-    };
-    check.facts(facts)
+        };
+        let line = format!("{waiting} {} queued", writes(waiting));
+        findings.push(Finding::new(Level::Ok, line).details(vec![why]));
+    }
+    conclude("queue", "no failed writes".to_string(), findings).facts(facts)
 }
 
 /// One line of the table.
@@ -1111,6 +1137,14 @@ mod tests {
         })
     }
 
+    /// A daemon of 1.3 with nothing waiting.
+    fn no_queue() -> GetQueue_Reply {
+        GetQueue_Reply {
+            writes: Vec::new(),
+            paused_until: None,
+        }
+    }
+
     fn healthy() -> Answers {
         Answers {
             socket: SOCKET.to_string(),
@@ -1126,6 +1160,7 @@ mod tests {
                 fresh("events"),
                 fresh("project/7/issues"),
             ]),
+            queued: Answer::Got(Some(no_queue())),
             failures: Answer::Got(Vec::new()),
         }
     }
@@ -1138,6 +1173,7 @@ mod tests {
             interface: Answer::Unasked,
             who: Answer::Unasked,
             jobs: Answer::Unasked,
+            queued: Answer::Unasked,
             failures: Answer::Unasked,
         }
     }
@@ -1210,6 +1246,7 @@ mod tests {
             interface: Answer::Unasked,
             who: Answer::Unasked,
             jobs: Answer::Unasked,
+            queued: Answer::Unasked,
             failures: Answer::Unasked,
             ..healthy()
         };
@@ -1230,6 +1267,7 @@ mod tests {
         // Later: the check that asked is the error.
         let answers = Answers {
             jobs: Answer::TimedOut,
+            queued: Answer::Unasked,
             failures: Answer::Unasked,
             ..healthy()
         };
@@ -1824,9 +1862,9 @@ healthy
         assert_eq!(sync.facts.unwrap().never_synced, ["events", "timelogs/all"]);
     }
 
-    #[test]
-    fn failed_writes_warn_with_the_count_and_where_to_look() {
-        let failed = |id| FailedTask {
+    /// A write the daemon gave up.
+    fn failed(id: i64) -> FailedTask {
+        FailedTask {
             id,
             op: "post_time".to_string(),
             kind: forskap_api::IssuableKind::work_item,
@@ -1836,7 +1874,11 @@ healthy
             error: "403 Forbidden".to_string(),
             queued_at: NOW - DAY,
             failed_at: NOW - 60,
-        };
+        }
+    }
+
+    #[test]
+    fn failed_writes_warn_with_the_count_and_where_to_look() {
         let answers = Answers {
             failures: Answer::Got(vec![failed(1), failed(2)]),
             ..healthy()
@@ -1856,6 +1898,121 @@ healthy
             evaluate(&answers, now()).checks.queue.summary,
             "1 failed write"
         );
+    }
+
+    /// A write still to be sent.
+    fn waiting(id: i64, iid: i64) -> QueuedWrite {
+        QueuedWrite {
+            id,
+            op: "PostTime".to_string(),
+            kind: forskap_api::IssuableKind::work_item,
+            project_id: 7,
+            iid,
+            detail: "1h".to_string(),
+            queued_at: NOW - 180,
+            attempts: 0,
+            running: false,
+            blocked: false,
+            next_attempt_at: None,
+            last_error: None,
+            expires_at: NOW + 7 * DAY,
+        }
+    }
+
+    fn queue_of(
+        writes: Vec<QueuedWrite>,
+        paused_until: Option<i64>,
+    ) -> Answer<Option<GetQueue_Reply>> {
+        Answer::Got(Some(GetQueue_Reply {
+            writes,
+            paused_until,
+        }))
+    }
+
+    /// Writes waiting to be sent are no trouble, only worth knowing: the
+    /// check stays ok and says how many, and what they wait for.
+    #[test]
+    fn queued_writes_are_noted_with_what_they_wait_for() {
+        let answers = Answers {
+            queued: queue_of(vec![waiting(1, 42), waiting(2, 43)], None),
+            ..healthy()
+        };
+        let queue = report(&answers).checks.queue;
+        assert_eq!(queue.level, Level::Ok);
+        assert_eq!(queue.summary, "no failed writes");
+        assert_eq!(queue.details[0], "2 writes queued");
+        assert!(queue.details[1].starts_with("The daemon is sending them"));
+        let facts = queue.facts.unwrap();
+        assert_eq!((facts.failed_writes, facts.queued_writes), (0, Some(2)));
+
+        // Without a session they wait for one, however long.
+        let answers = Answers {
+            queued: queue_of(vec![waiting(1, 42)], None),
+            ..dormant_with(Some(NotAuthReason::unreachable), None)
+        };
+        let queue = report(&answers).checks.queue;
+        assert_eq!(queue.level, Level::Ok);
+        assert_eq!(
+            queue.details,
+            [
+                "1 write queued",
+                "They are sent once there is a GitLab session."
+            ]
+        );
+
+        let answers = Answers {
+            queued: queue_of(vec![waiting(1, 42)], Some(NOW + 240)),
+            ..healthy()
+        };
+        assert_eq!(
+            report(&answers).checks.queue.details[1],
+            "They are paused by a GitLab rate limit for another 4m."
+        );
+    }
+
+    /// Failed writes stay what the check warns about; the waiting ones
+    /// follow as a note.
+    #[test]
+    fn failed_writes_come_before_the_queued_ones() {
+        let answers = Answers {
+            queued: queue_of(vec![waiting(5, 42)], None),
+            failures: Answer::Got(vec![failed(1)]),
+            ..healthy()
+        };
+        let queue = report(&answers).checks.queue;
+        assert_eq!(
+            (queue.level, queue.summary.as_str()),
+            (Level::Warning, "1 failed write")
+        );
+        assert!(
+            queue.details.iter().any(|d| d == "1 write queued"),
+            "{:?}",
+            queue.details
+        );
+    }
+
+    /// A daemon before 1.3 lists no queue: the check is what it was, and
+    /// its facts say nothing of what waits.
+    #[test]
+    fn a_daemon_too_old_to_list_its_queue_is_judged_by_its_failures() {
+        let answers = Answers {
+            queued: Answer::Got(None),
+            ..healthy()
+        };
+        let queue = report(&answers).checks.queue;
+        assert_eq!(
+            (queue.level, queue.summary.as_str()),
+            (Level::Ok, "no failed writes")
+        );
+        assert!(queue.details.is_empty());
+        assert_eq!(queue.facts.unwrap().queued_writes, None);
+
+        // An answer that failed is no failure of the check either.
+        let answers = Answers {
+            queued: Answer::Failed("boom".to_string()),
+            ..healthy()
+        };
+        assert_eq!(report(&answers).checks.queue.level, Level::Ok);
     }
 
     fn of_version(version: &str, interface: Answer<Option<String>>) -> Answers {
@@ -1932,8 +2089,8 @@ healthy
     fn a_method_the_daemon_lacks_is_told_from_other_failures() {
         let error = |kind| ApiError::from(varlink::Error::from(kind));
         let missing = varlink::ErrorKind::MethodNotFound("org.thehoster.forskapd.GetStatus".into());
-        assert!(is_method_not_found(&error(missing)));
-        assert!(!is_method_not_found(&error(
+        assert!(friendly::is_method_not_found(&error(missing)));
+        assert!(!friendly::is_method_not_found(&error(
             varlink::ErrorKind::ConnectionClosed
         )));
     }
@@ -2004,6 +2161,7 @@ healthy
             interface: Answer::TimedOut,
             who: Answer::Unasked,
             jobs: Answer::Unasked,
+            queued: Answer::Unasked,
             failures: Answer::Unasked,
             ..healthy()
         };
@@ -2125,6 +2283,7 @@ unhealthy: 1 error, 3 skipped
     fn render_colours_the_levels_and_keeps_the_columns() {
         style::force(true);
         let answers = Answers {
+            queued: Answer::Got(Some(no_queue())),
             failures: Answer::Got(vec![]),
             jobs: Answer::TimedOut,
             ..healthy()

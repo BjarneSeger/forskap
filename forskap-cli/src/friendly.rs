@@ -79,6 +79,16 @@ fn refused(message: &str, status: Option<i64>) -> String {
     }
 }
 
+/// Whether the daemon doesn't have the method: it is older than this forskap,
+/// and a view that can do without the answer falls back to what it showed
+/// before.
+pub fn is_method_not_found(e: &impl DaemonError) -> bool {
+    matches!(
+        e.varlink_kind(),
+        Some(varlink::ErrorKind::MethodNotFound(_))
+    )
+}
+
 /// Map a failed varlink call to an `anyhow::Error` with a user-facing message:
 /// `"<op> failed: <message>"`, `op` being the method's name, or for
 /// `NotAuthenticated` what it means and what to do. An error the daemon

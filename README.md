@@ -92,7 +92,7 @@ forskap time log 42 1h30m       # log time on issue #42
 forskap time log '!42' 1h30m    # ... on merge request !42 (or: forskap time log 42 1h30m --mr)
 forskap time history            # what you tracked recently (including queued entries)
 forskap activity --days 30      # what you did on GitLab: pushes, comments, opened and merged items
-forskap queue list              # writes that failed permanently; `retry`/`dismiss` them
+forskap queue list              # writes waiting to be sent, and the ones that failed for good; `retry`/`dismiss` those
 forskap sync refresh            # drop the cache and fetch again; a terminal sees how far that is
 forskap sync jobs               # what the background sync runs now, next, and what failed
 forskap status                  # is anything not working? daemon, login, sync, failed writes
@@ -128,6 +128,15 @@ waits for: `needs a session` (why there is none stands above the table),
 `after the pause` of a rate limit, `after project/7/issues` (one job per project at a
 time), `when a slot is free`; `in 40s (startup)` is a job the daemon's start spreads
 out.
+
+A write made while GitLab is away is queued, and the command says so: `queued 1h on
+#42` instead of `logged 1h on #42`, with a line that it is not sent yet.
+`forskap queue list` shows what waits, oldest first, each write with what it waits
+for — `waits for a GitLab session` (why there is none stands above the list),
+`after an earlier write to it`, `failed 3 times: …; next try in 4m` — above the
+writes that failed for good. `-o json` is one object, `{"queued": […], "failures":
+[…]}` (it was the array of failures before 1.3), with `paused_until` while a rate
+limit holds the queue.
 
 `forskap sync refresh` replies once the daemon has fetched the assigned lists and
 the history again. Where it couldn't, a second line says what is missing and why —

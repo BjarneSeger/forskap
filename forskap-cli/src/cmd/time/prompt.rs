@@ -109,7 +109,7 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
     };
 
     let kind = picked.kind();
-    client
+    let posted = client
         .post_time(
             picked.project_id(),
             picked.iid(),
@@ -120,6 +120,7 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
         .call()
         .await
         .map_err(|e| crate::friendly::friendly("PostTime", e))?;
+    let queued = posted.queued == Some(true);
 
     let mut st = state::load().unwrap_or_default();
     st.last_issue = Some(state::LastIssue {
@@ -131,9 +132,12 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
 
     outln!(
         "{} {duration} on {} ({})",
-        style::success("logged"),
+        super::log::logged(queued),
         style::reference(refspec::sigil(kind), picked.iid()),
         picked.title()
     )?;
+    if queued {
+        outln!("{}", style::muted(crate::cmd::queue::NOT_SENT))?;
+    }
     Ok(true)
 }
