@@ -50,7 +50,7 @@ async fn locate(target: &EpicArgs) -> Result<(VarlinkClient, WorkItem)> {
 pub async fn resolve(client: &VarlinkClient, iid: i64, group: Option<&str>) -> Result<WorkItem> {
     if let Some(group) = group {
         let group = group_id(client, group).await?;
-        return in_group(cached(client, iid).await?, iid, group);
+        return lookup(client, group, iid).await;
     }
     let last = state::load()
         .ok()
