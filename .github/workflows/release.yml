@@ -8,8 +8,8 @@ name: Release
 #
 # A published release is immutable (the repository's "release immutability"
 # setting): assets and tag are locked, and the tag name is gone for good. So
-# what a tag can get wrong is checked before the build, and publishing is the
-# release job's last step.
+# what a tag can get wrong is checked before the build, and publishing is a
+# job of its own, after everything that builds.
 on:
   push:
     branches:
@@ -176,21 +176,39 @@ jobs:
         with:
           subject-checksums: ${{ env.CHECKSUMS }}
 
-      # Last, since nothing after it could be repaired: GitHub locks the
-      # release here and attests it. --verify-tag: a tag deleted meanwhile
-      # would be made anew at main, and locked there.
+  # Tags only: GitHub locks the release here and attests it. A job of its
+  # own, so that "Re-run failed jobs" comes back here and not to GoReleaser,
+  # which refuses a published tag. The release's state decides, not the
+  # call's answer: v1.2.0 was published behind a 500. --verify-tag: a tag
+  # deleted meanwhile would be made anew at main, and locked there.
+  publish:
+    if: github.ref_type == 'tag'
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
       - name: Publish the release
-        if: github.ref_type == 'tag'
-        run: gh release edit "$GITHUB_REF_NAME" --tag "$GITHUB_REF_NAME" --verify-tag --draft=false
-        env:
-          GH_TOKEN: ${{ github.token }}
+        run: |
+          published() {
+            [ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = false ]
+          }
+          for attempt in 1 2 3 4 5; do
+            published && exit 0
+            gh release edit "$GITHUB_REF_NAME" --tag "$GITHUB_REF_NAME" --verify-tag --draft=false && exit 0
+            sleep $((attempt * 10))
+          done
+          published
 
   # Tags only: what README.md tells a user to run, on the release just
   # published. Gates nothing, and is the one place that notices release
   # immutability being switched off in the repository's settings.
   verify:
     if: github.ref_type == 'tag'
-    needs: release
+    needs: publish
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -222,7 +240,7 @@ jobs:
   # formula test below.
   bump-formula:
     if: github.ref_type == 'tag'
-    needs: release
+    needs: publish
     runs-on: ubuntu-latest
     permissions:
       contents: write
