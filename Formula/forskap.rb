@@ -28,18 +28,18 @@ class Forskap < Formula
 
   stable do
     on_macos do
-      url "https://github.com/BjarneSeger/forskap/releases/download/v1.1.0/forskap_1.1.0_darwin_arm64.tar.gz"
-      sha256 "337f0a3656767819dad22e5e40dbe6b02cdbd555468c1a9d2ed1f4e1c8448226"
+      url "https://github.com/BjarneSeger/forskap/releases/download/v1.2.0/forskap_1.2.0_darwin_arm64.tar.gz"
+      sha256 "b28fa85ed17849ad89453b7f56c3de483b42d087462574ecf3565cba091438dd"
       depends_on ForskapAppleSiliconRequirement
     end
     on_linux do
       on_arm do
-        url "https://github.com/BjarneSeger/forskap/releases/download/v1.1.0/forskap_1.1.0_linux_arm64.tar.gz"
-        sha256 "bb955a15aeec726c67d932a793989abfd3fa53ad91a6b5d83a430a0afa055b74"
+        url "https://github.com/BjarneSeger/forskap/releases/download/v1.2.0/forskap_1.2.0_linux_arm64.tar.gz"
+        sha256 "d451c9f985f24a2212b44c901904efd181bbfd7bd70c84051112461ab148beb5"
       end
       on_intel do
-        url "https://github.com/BjarneSeger/forskap/releases/download/v1.1.0/forskap_1.1.0_linux_amd64.tar.gz"
-        sha256 "934e3af3ad12141da0ab8f4767992cc12899d0c7a4995f2745f29b92777e7c84"
+        url "https://github.com/BjarneSeger/forskap/releases/download/v1.2.0/forskap_1.2.0_linux_amd64.tar.gz"
+        sha256 "8443d31b0223178f9b1aacabff212beff1a8cbc2dd62dd809c7855529f8cb3fa"
       end
     end
   end
@@ -111,7 +111,11 @@ class Forskap < Formula
         sleep 0.5
       end
       assert_predicate socket, :socket?
-      assert_equal "[]", shell_output("#{bin}/forskap queue list --output json").strip
+      # Nothing queued and nothing failed: one object since 1.3, the array of
+      # failures before.
+      listed = JSON.parse(shell_output("#{bin}/forskap queue list --output json"))
+      assert_empty listed["queued"]
+      assert_empty listed["failures"]
     ensure
       Process.kill("TERM", pid)
       Process.wait(pid)
