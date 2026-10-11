@@ -5,7 +5,7 @@
 #
 #   bump-formula.sh v1.2.3 [formula]
 #
-# Run by the release workflow after GoReleaser published the tag; needs `gh`
+# Run by the release workflow after it published the tag; needs `gh`
 # with a token (GH_TOKEN). Exits 0 without touching the formula for a
 # pre-release tag or one that is not newer than what the formula already
 # names, so re-running an old release is safe. Fails if the release lacks the

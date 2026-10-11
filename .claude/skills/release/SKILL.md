@@ -76,18 +76,21 @@ no section — but only once the tag is pushed.
 
 ## 6. The run
 
-`check` → `macos` → `release` (a draft with every asset → the attestation → publish) →
+`check` → `macos` → `release` (a draft with every asset → the attestation) → `publish` →
 `verify`, and for a stable tag `bump-formula` → `brew`.
 
-- **Failed before "Publish the release"**: a draft is left and nothing is public.
-  Re-run the job; it replaces the draft. If it takes a fix in the repository, ask the
-  user: the tag is not locked yet and can still be moved, or the fix becomes the next
-  patch version.
+- **Failed before `publish`**: a draft is left and nothing is public. Re-run the job;
+  it replaces the draft. If it takes a fix in the repository, ask the user: the tag is
+  not locked yet and can still be moved, or the fix becomes the next patch version.
+- **`publish` failed**: the release may be public all the same (v1.2.0's publish landed
+  behind a 500 from GitHub). "Re-run failed jobs" either way: the job publishes a draft
+  and passes on a published release.
 - **Failed after it** (`verify`, `bump-formula`, `brew`): "Re-run failed jobs" only.
   "Re-run all jobs" fails in `release`, since the release exists and can't be replaced,
   and skips the rest. Then the formula is bumped by hand
   (`bash .github/scripts/bump-formula.sh vX.Y.Z`, commit, push) and tested with
-  `gh workflow run brew.yml`.
+  `gh workflow run brew.yml`. A fix to `release.yml` doesn't help a tag that is out:
+  a re-run uses the workflow of the tag's commit.
 - **Published and wrong**: notes and title can be edited
   (`gh release edit vX.Y.Z --notes-file …`). Anything else is a new patch version; a
   published tag is never moved, deleted or reused.

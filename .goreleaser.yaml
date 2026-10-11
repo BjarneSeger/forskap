@@ -80,7 +80,7 @@ changelog:
 
 release:
   # A published release is immutable (a repository setting): GoReleaser
-  # leaves a draft, and release.yml publishes it as its last step. A run that
+  # leaves a draft, and release.yml's publish job publishes it. A run that
   # fails before that is run again and replaces its draft.
   draft: true
   replace_existing_draft: true
